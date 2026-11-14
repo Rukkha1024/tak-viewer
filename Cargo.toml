@@ -1,0 +1,22 @@
+# Rust 프로그램 묶음(workspace). 아래 두 부분을 한 번에 빌드해요.
+#   tak_core   : 백엔드 핵심. TAK 읽기와 계산. 화면 코드 없음.
+#   tak_viewer : Windows 프로그램(화면). tak_core를 가져다 씀.
+# 빌드는 이 폴더의 `빌드.cmd`를 더블클릭. 자세한 설명은 README.md.
+[workspace]
+resolver = "2"
+members = ["tak_core", "tak_viewer"]
+
+[workspace.package]
+version = "0.30.1"
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+debug = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

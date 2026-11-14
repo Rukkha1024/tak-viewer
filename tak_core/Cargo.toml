@@ -1,0 +1,18 @@
+[package]
+name = "tak_core"
+description = "Read-only OptiTrack .tak reader and view data (no GUI)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 화면 라이브러리(eframe/egui)를 넣지 않아요. 넣으면 백엔드와 화면의 경계가 깨져요.
+[dependencies]
+serde_json = "1"
+roxmltree = "0.20"
+sha2 = "0.10"
+# Fast byte search (already used by serde_json; no new crate).
+memchr = "2"
+
+[[bin]]
+name = "tak_dump"
+path = "src/bin/tak_dump.rs"

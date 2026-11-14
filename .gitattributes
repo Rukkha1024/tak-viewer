@@ -1,0 +1,7 @@
+* text=auto
+.tak-viewer-root text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+Cargo.lock text eol=lf
+*.cmd text eol=crlf
