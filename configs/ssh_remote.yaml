@@ -1,0 +1,9 @@
+﻿{
+  "connect_timeout_seconds": 8,
+  "request_timeout_seconds": 120,
+  "maximum_payload_bytes": 268435456,
+  "directory_limit": 1000,
+  "probe_bytes": 256,
+  "linux_python": "python3",
+  "windows_python": "C:\\Python313\\python.exe"
+}

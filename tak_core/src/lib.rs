@@ -14,3 +14,5 @@ pub mod sample_tak;
 pub mod tak;
 pub mod takm;
 pub mod view_data;
+
+pub mod remote;

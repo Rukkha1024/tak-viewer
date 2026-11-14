@@ -1,0 +1,76 @@
+﻿{
+  "method": "Independent full compound decode versus SSH staged decode; canonical JSON MD5 includes all marker/analog float bits",
+  "samples": [
+    {
+      "sample": "linux-1",
+      "platform": "linux",
+      "file_bytes": 4922061,
+      "reference_file_md5": "403d9152b1b9c165c6bf9655e0853fda",
+      "markers_md5": "77f9fb52337442815bbda56ec4054514",
+      "complete_md5": "7256e690f8cb23acb96c384caa81a8b6",
+      "markers_ready_ms": 320.700333,
+      "complete_ms": 465.260416,
+      "marker_count": 45,
+      "analog_devices": 4,
+      "md5_match": true,
+      "directory_listing_passed": true
+    },
+    {
+      "sample": "linux-2",
+      "platform": "linux",
+      "file_bytes": 34657033,
+      "reference_file_md5": "231b4559fa67e168bc265b8b5230efc6",
+      "markers_md5": "ce7204a3a53d3854ff13ecda3b266d82",
+      "complete_md5": "abe8bdd44a85cf813a661d972b40b26f",
+      "markers_ready_ms": 624.7259160000001,
+      "complete_ms": 1769.681541,
+      "marker_count": 62,
+      "analog_devices": 4,
+      "md5_match": true,
+      "directory_listing_passed": true
+    },
+    {
+      "sample": "windows-1",
+      "platform": "windows",
+      "file_bytes": 5570560,
+      "reference_file_md5": "bbd36fb6047ae8582b52ec9d04adb136",
+      "markers_md5": "fe618d590ae6fe676641e7a7bcab1126",
+      "complete_md5": "72eeef979e4d0fa599be2b8980922787",
+      "markers_ready_ms": 706.059166,
+      "complete_ms": 1142.205,
+      "marker_count": 108,
+      "analog_devices": 3,
+      "md5_match": true,
+      "directory_listing_passed": true
+    },
+    {
+      "sample": "windows-2",
+      "platform": "windows",
+      "file_bytes": 7667712,
+      "reference_file_md5": "e3d69c41517f5bb039c863ba3d4a5539",
+      "markers_md5": "76820c66c1a03e29dd9751e347a2a6b2",
+      "complete_md5": "50a85d1de2ef3fb03a4e0d378dcc2344",
+      "markers_ready_ms": 479.423583,
+      "complete_ms": 748.413167,
+      "marker_count": 108,
+      "analog_devices": 3,
+      "md5_match": true,
+      "directory_listing_passed": true
+    },
+    {
+      "sample": "windows-3",
+      "platform": "windows",
+      "file_bytes": 11796480,
+      "reference_file_md5": "ce87fa3a2c070b0dc8da213fcabfb868",
+      "markers_md5": "c276c4d7d49efbcd68a63fa37dbd2f0c",
+      "complete_md5": "bd25b5c719956f12b827e623566e7e1a",
+      "markers_ready_ms": 806.9276669999999,
+      "complete_ms": 1422.518167,
+      "marker_count": 1193,
+      "analog_devices": 3,
+      "md5_match": true,
+      "directory_listing_passed": true
+    }
+  ],
+  "raw_files_saved": false
+}
