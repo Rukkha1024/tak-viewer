@@ -1,4 +1,4 @@
-//! Application shell: menu bar with the side toggles, keyboard, pane layout (VS Code
+﻿//! Application shell: menu bar with the side toggles, keyboard, pane layout (VS Code
 //! arrangement; every pane can still be dragged anywhere, `ui/dock.rs`) and status bar. Up to
 //! `MAX_VIEWS` 3D views, one file each (`views.rs`), each with its own playback bar under it;
 //! the side panes, status bar, title, keys and captures follow the active view.
@@ -9,6 +9,7 @@ use crate::instances::Registration;
 use crate::shot::{self, AutoShot};
 use crate::ui::comment_list::{self, Field, ListAction};
 use crate::ui::dock::{self, Pane, Side};
+use crate::platform::shortcut_text;
 use crate::ui::explorer::{self, ExplorerState, WsAction};
 use crate::ui::graph;
 use crate::ui::graph_float::{self, GraphBox, Kind, LaneSet};
@@ -302,6 +303,8 @@ pub struct TakViewerApp {
     /// Command line runs (`--screenshot`, `--capture`, `--bench`) never save settings and never
     /// write comment files (they still read them).
     no_persist: bool,
+    /// Registration failed: protect shared settings, while keeping interactive annotation.
+    registration_failed: bool,
     /// Appends comment events on its own thread (started with the first comment).
     comment_writer: Option<comments::Writer>,
     /// A playback bar's comment request this frame: (view, what), applied after drawing.
@@ -378,6 +381,7 @@ impl TakViewerApp {
     /// A window the user works in (not a command line run): remember its open-window entry.
     /// `others_at_start` = another window was already open (this one moves aside once).
     pub fn set_registration(&mut self, registration: Option<Registration>, others_at_start: bool) {
+        self.registration_failed = registration.is_none();
         self.registration = registration;
         self.others_open = others_at_start;
         self.others_checked = Some(Instant::now());
@@ -463,6 +467,7 @@ impl TakViewerApp {
             capture: capture_plan.map(CaptureRun::new),
             capture_done: None,
             no_persist,
+            registration_failed: false,
             comment_writer: None,
             deck_action: None,
             hold: None,
@@ -1227,8 +1232,10 @@ impl TakViewerApp {
             n => format!("고른 마커 {n}개"),
         };
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let multi = shortcut_text("Ctrl+클릭");
+        let undo = shortcut_text("Ctrl+Z");
         Ok(format!(
-            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labels에서 클릭, Ctrl+클릭 = 여러 개).\n{name} 안에 바로 저장해요. Ctrl+Z = 되돌리기."
+            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labels에서 클릭, {multi} = 여러 개).\n{name} 안에 바로 저장해요. {undo} = 되돌리기."
         ))
     }
 
@@ -1609,7 +1616,7 @@ impl TakViewerApp {
             v.picked = None;
         }
         self.push_comment(slot, Change::Deleted(c), None);
-        self.history.note = Some((format!("Comment {id} deleted · Ctrl+Z"), ctx.input(|i| i.time)));
+        self.history.note = Some((format!("Comment {id} deleted · {}", shortcut_text("Ctrl+Z")), ctx.input(|i| i.time)));
     }
 
     /// `M` held (v0.15.0), run every frame before the other keys. Cancels first (the window lost
@@ -2003,11 +2010,11 @@ impl TakViewerApp {
     }
 
     /// M is handled on press and release. Ctrl+Z and Ctrl+Y undo and redo across the app,
-    /// but are ignored while M is held. Ctrl+Shift+Z is consumed without redoing; plain Z and
-    /// Shift+Z remain available for gap navigation.
+    /// but are ignored while M is held. Command+Shift+Z also redoes on macOS; Windows
+    /// Ctrl+Shift+Z is consumed without redoing. Plain Z / Shift+Z still navigate gaps.
     fn undo_keys(&mut self, ctx: &egui::Context) {
-        ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
-        let redo = ctrl_key(ctx, Key::Y);
+        let shift_z = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+        let redo = ctrl_key(ctx, Key::Y) || (cfg!(target_os = "macos") && shift_z);
         let undo = ctrl_key(ctx, Key::Z);
         // Not while a cell of the COMMENTS pane is edited (Enter / Esc first; its line at the
         // top says so).
@@ -2042,27 +2049,27 @@ impl TakViewerApp {
         egui::TopBottomPanel::top("menu").frame(frame).show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("파일", |ui| {
-                    if ui.button("파일 열기…  (Ctrl+O)").clicked() {
+                    if ui.button(shortcut_text("파일 열기…  (Ctrl+O)")).clicked() {
                         ui.close_menu();
                         self.pick_file(ctx, false);
                     }
                     if ui
                         .button(format!("옆 화면에 파일 열기…  · 3D 화면 최대 {MAX_VIEWS}개"))
-                        .on_hover_text("Explorer에서 Ctrl+클릭해도 옆 화면에 열려요.")
+                        .on_hover_text(shortcut_text("Explorer에서 Ctrl+클릭해도 옆 화면에 열려요."))
                         .clicked()
                     {
                         ui.close_menu();
                         self.pick_file(ctx, true);
                     }
                     if ui
-                        .add_enabled(!self.workspace.is_full(), egui::Button::new(format!("폴더 추가…  (Ctrl+Shift+O)  · 최대 {MAX_ROOTS}개")))
+                        .add_enabled(!self.workspace.is_full(), egui::Button::new(shortcut_text(&format!("폴더 추가…  (Ctrl+Shift+O)  · 최대 {MAX_ROOTS}개"))))
                         .on_disabled_hover_text(format!("저장 폴더 {MAX_ROOTS}개가 다 찼어요. Explorer에서 ✕로 하나 빼세요."))
                         .clicked()
                     {
                         ui.close_menu();
                         self.pick_folder();
                     }
-                    if ui.button("경로로 열기…  (Ctrl+L)  · WSL 경로 가능").clicked() {
+                    if ui.button(shortcut_text("경로로 열기…  (Ctrl+L)  · WSL 경로 가능")).clicked() {
                         ui.close_menu();
                         self.open_path_dialog();
                     }
@@ -2101,7 +2108,7 @@ impl TakViewerApp {
                         }
                     });
                     if ui
-                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new("화면 캡처 저장 (지금 + 위·옆·앞)  (Ctrl+Shift+S)"))
+                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new(shortcut_text("화면 캡처 저장 (지금 + 위·옆·앞)  (Ctrl+Shift+S)")))
                         .on_hover_text("기본 캡처 폴더에 PNG, sheet.png, captures.json 저장 (완료 후 경로 표시)")
                         .clicked()
                     {
@@ -2123,7 +2130,7 @@ impl TakViewerApp {
                     ui.label(RichText::new("패널 한쪽 전체  (오른쪽 위 버튼과 같아요)").color(theme::TEXT_DIM));
                     for (side, label) in SIDE_TOGGLES {
                         let mut on = dock::side_open(&self.dock, self.dock_area, side);
-                        if ui.checkbox(&mut on, label).changed() {
+                        if ui.checkbox(&mut on, shortcut_text(label)).changed() {
                             self.toggle_side(side);
                         }
                     }
@@ -2138,7 +2145,7 @@ impl TakViewerApp {
                         (Pane::Graph, "Graph 패널 (선택 마커 X·Y·Z, 3D 아래)"),
                     ] {
                         let mut on = dock::has(&self.dock, pane);
-                        if ui.checkbox(&mut on, label).changed() {
+                        if ui.checkbox(&mut on, shortcut_text(label)).changed() {
                             if on {
                                 self.show_pane(pane);
                             } else {
@@ -2197,7 +2204,7 @@ impl TakViewerApp {
                     for (side, label) in SIDE_TOGGLES.into_iter().rev() {
                         let on = dock::side_open(&self.dock, self.dock_area, side);
                         let tip = format!("{label}\n{}", if on { "누르면 숨겨요. 다시 누르면 그 자리로 돌아와요." } else { "누르면 다시 보여요." });
-                        if side_toggle(ui, side, on).on_hover_text(tip).clicked() && self.capture.is_none() {
+                        if side_toggle(ui, side, on).on_hover_text(shortcut_text(&tip)).clicked() && self.capture.is_none() {
                             self.toggle_side(side);
                         }
                     }
@@ -3068,7 +3075,9 @@ impl TakViewerApp {
                 if let Some(dir) = &dir {
                     ui.horizontal(|ui| {
                         if ui.button("폴더 열기").clicked() {
-                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                            if let Err(error) = crate::platform::open_folder(dir) {
+                                self.error = Some(format!("폴더를 열 수 없어요:\n{}\n{error}", dir.display()));
+                            }
                         }
                         if let Some(w) = workspace::to_wsl_path(dir) {
                             if ui.button("WSL 경로 복사").clicked() {
@@ -3111,6 +3120,17 @@ impl TakViewerApp {
             let mut open = true;
             egui::Window::new("조작키").open(&mut open).collapsible(false).show(ctx, |ui| {
                 egui::Grid::new("help").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    if cfg!(target_os = "macos") {
+                        for (key, description) in [
+                            ("Option+드래그 / Option+Shift+드래그", "3D 회전 / 화면 이동 (트랙패드 한 손가락 클릭 후 끌기)"),
+                            ("그래프에서 Option+드래그", "그래프 가로 이동 (프레임은 그대로)"),
+                            ("두 손가락 스크롤 / 핀치", "3D · 그래프 확대 / 축소"),
+                        ] {
+                            ui.label(RichText::new(key).strong());
+                            ui.label(description);
+                            ui.end_row();
+                        }
+                    }
                     for (k, v) in [
                         ("왼쪽 클릭", "마커 선택 (Ctrl+클릭 = 여러 개)"),
                         ("왼쪽 드래그", "네모 안 마커 모두 선택 (Ctrl = 기존 선택에 더하기)"),
@@ -3152,8 +3172,9 @@ impl TakViewerApp {
                         ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),
                         ("Ctrl+Shift+S", "화면 캡처 저장 (지금 각도 + 위·옆·앞, repo 안)"),
                     ] {
-                        ui.label(RichText::new(k).strong());
-                        ui.label(v);
+                        let key = if cfg!(target_os = "macos") && k == "Ctrl+Z / Ctrl+Y" { "Cmd+Z / Cmd+Shift+Z / Cmd+Y" } else { k };
+                        ui.label(RichText::new(shortcut_text(key)).strong());
+                        ui.label(shortcut_text(v));
                         ui.end_row();
                     }
                 });
@@ -3281,7 +3302,7 @@ impl eframe::App for TakViewerApp {
     /// is the only open window, every `AUTO_SAVE`. Every call writes the file (`SAVED_KEY`),
     /// so the window that closes last leaves its settings.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if !self.no_persist {
+        if !self.no_persist && !self.registration_failed {
             self.sync_settings();
             eframe::set_value(storage, eframe::APP_KEY, &self.settings);
             self.saves += 1;
@@ -3293,7 +3314,7 @@ impl eframe::App for TakViewerApp {
     /// No periodic save while another window is open: windows would overwrite each other
     /// every 30 s. Command line runs never save.
     fn auto_save_interval(&self) -> Duration {
-        if self.no_persist || self.others_open {
+        if self.no_persist || self.registration_failed || self.others_open {
             Duration::MAX
         } else {
             AUTO_SAVE
@@ -3303,7 +3324,7 @@ impl eframe::App for TakViewerApp {
     /// Command line runs leave the settings file untouched (eframe would otherwise write its
     /// own UI memory, together with the settings read at start, back into the shared file).
     fn persist_egui_memory(&self) -> bool {
-        !self.no_persist
+        !self.no_persist && !self.registration_failed
     }
 }
 
@@ -3400,11 +3421,36 @@ mod tests {
         let mut app = window_app();
         assert!(app.persist_egui_memory());
         assert_eq!(app.auto_save_interval(), AUTO_SAVE);
-        app.set_registration(None, true);
+        let dir = std::env::temp_dir().join(format!("tak_periodic_save_{}", std::process::id()));
+        let registration = crate::instances::register(&dir).expect("register test window");
+        app.set_registration(Some(registration), true);
         assert_eq!(app.auto_save_interval(), Duration::MAX);
         assert!(app.shift_window, "a window opened next to another moves aside once");
-        app.set_registration(None, false);
+        let registration = app.registration.take();
+        app.set_registration(registration, false);
         assert_eq!(app.auto_save_interval(), AUTO_SAVE);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_registration_preserves_comments_but_never_saves_settings() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("registration_failed");
+        let mut app = comment_app(&ctx, &dir, false);
+        assert!(app.comment_writable(0).is_ok());
+        app.set_registration(None, false);
+        assert!(app.comment_writable(0).is_ok(), "registration failure must not disable annotations");
+        assert!(!app.no_persist);
+        let mut storage = FileLike::default();
+        app.save(&mut storage);
+        storage.flush();
+        assert_eq!(storage.writes, 0, "uncertain ownership must not change shared settings");
+        assert!(storage.kv.is_empty());
+        assert!(!app.persist_egui_memory());
+        assert_eq!(app.auto_save_interval(), Duration::MAX);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3737,6 +3783,77 @@ mod tests {
         let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, 50.0), modifiers: Modifiers::NONE };
         frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(row), wheel]);
         assert!(app.views[0].cam.distance < dist, "the 3D zoomed in");
+    }
+
+    #[test]
+    fn help_shortcuts_match_the_platform_and_describe_trackpad_controls() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        app.show_help = true;
+        let mut render = || ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4000.0, 3000.0))), ..Default::default() }, |ctx| app.frame(ctx));
+        render();
+        let out = render();
+        if cfg!(target_os = "macos") {
+            assert!(!text_rects(&out, "Cmd+O").is_empty());
+            assert!(!text_rects(&out, "Option+드래그 / Option+Shift+드래그").is_empty());
+            assert!(!text_rects(&out, "Cmd+Z / Cmd+Shift+Z / Cmd+Y").is_empty());
+            assert!(text_rects(&out, "Ctrl+O").is_empty());
+        } else {
+            assert!(!text_rects(&out, "Ctrl+O").is_empty());
+            assert!(text_rects(&out, "Option+드래그 / Option+Shift+드래그").is_empty());
+        }
+    }
+
+    #[test]
+    fn mac_option_scene_navigation_preserves_selection_frame_and_range() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        app.views[0].select(0, false);
+        app.views[0].range = Some((2, 6));
+        let at = app.views[0].scene_rect.center();
+        for shift in [false, true] {
+            let before = app.views[0].cam.clone();
+            let m = Modifiers { alt: true, shift, ..Modifiers::NONE };
+            let mut frame = |events, modifiers| {
+                let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 960.0))), focused: true, events, modifiers, ..Default::default() }, |ctx| app.frame(ctx));
+            };
+            frame(vec![egui::Event::PointerMoved(at)], m);
+            frame(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: m }], m);
+            let end = at + egui::vec2(80.0, 30.0);
+            frame(vec![egui::Event::PointerMoved(end)], m);
+            // Releasing Option first must not turn the gesture into selection.
+            frame(vec![egui::Event::PointerMoved(end + egui::vec2(10.0, 0.0))], Modifiers::NONE);
+            frame(vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
+            if cfg!(target_os = "macos") {
+                assert_eq!(app.views[0].selected.iter().copied().collect::<Vec<_>>(), vec![0]);
+                if shift {
+                    assert_ne!(app.views[0].cam.pivot, before.pivot, "Option+Shift pans");
+                    assert_eq!(app.views[0].cam.yaw, before.yaw);
+                } else {
+                    assert_ne!(app.views[0].cam.yaw, before.yaw, "Option orbits");
+                    assert_eq!(app.views[0].cam.pivot, before.pivot);
+                }
+            } else {
+                assert_eq!(app.views[0].cam.yaw, before.yaw);
+                assert_eq!(app.views[0].cam.pivot, before.pivot);
+            }
+            assert_eq!(app.views[0].pb.frame, 0);
+            assert_eq!(app.views[0].range, Some((2, 6)));
+        }
+    }
+
+    #[test]
+    fn scene_pinch_zooms_once_and_command_scroll_keeps_wheel_scale() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        let at = app.views[0].scene_rect.center();
+        frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(at)]);
+        let before = app.views[0].cam.distance;
+        frame_with(&ctx, &mut app, vec![egui::Event::Zoom(1.25)]);
+        assert!((app.views[0].cam.distance - before / 1.25).abs() < 0.01, "pinch applies once");
+        let before = app.views[0].cam.distance;
+        frame_with(&ctx, &mut app, vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, 50.0), modifiers: ctrl() }]);
+        assert!((app.views[0].cam.distance - before * (-0.1_f32).exp()).abs() < 0.01, "egui's synthesized wheel zoom must not apply twice");
     }
 
     #[test]
@@ -4870,7 +4987,7 @@ mod tests {
         assert_eq!((comment(&app, 3), app.views[0].range), (Some((vec![], 6, 8)), None));
         right_click_at(&ctx, &mut app, bar.band(4.5) - egui::vec2(0.0, 2.5));
         assert_eq!(comment(&app, 2), None);
-        assert_eq!(note(&app), "Comment 2 deleted · Ctrl+Z");
+        assert_eq!(note(&app), shortcut_text("Comment 2 deleted · Ctrl+Z"));
         undo_key(&ctx, &mut app);
         assert_eq!(comment(&app, 2), Some((vec![], 2, 5)));
         file_matches_memory(&ctx, &mut app, &dir);
@@ -4997,7 +5114,7 @@ mod tests {
         assert_eq!(ids(&app), vec![1, 2], "no menu: the block under the pointer (3) is gone at once");
         assert!(text_rects(&out, "Delete").is_empty(), "no Delete menu any more");
         assert_eq!(app.views[0].pb.frame, 0, "a right click does not jump");
-        assert_eq!(text_rects(&out, "Comment 3 deleted · Ctrl+Z").len(), 1, "a note in the status bar");
+        assert_eq!(text_rects(&out, &shortcut_text("Comment 3 deleted · Ctrl+Z")).len(), 1, "a note in the status bar");
         // Comment 1 alone again: the full height, the middle of the band hits it.
         right_click_at(&ctx, &mut app, bar.band(4.5));
         assert_eq!(ids(&app), vec![2]);
@@ -5110,7 +5227,7 @@ mod tests {
     }
 
     fn ctrl() -> Modifiers {
-        Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
+        Modifiers { ctrl: !cfg!(target_os = "macos"), mac_cmd: cfg!(target_os = "macos"), command: true, ..Modifiers::NONE }
     }
 
     fn spans(app: &TakViewerApp) -> Vec<(u64, i64, i64)> {
@@ -5408,10 +5525,10 @@ mod tests {
         assert_eq!(app.views[0].comments.list.list(), &[first.clone()]);
         assert_eq!(note(&app), "Redo · Comment 1 added");
         file_matches_memory(&ctx, &mut app, &dir);
-        // Ctrl+Shift+Z does not redo; Ctrl+Y does.
+        // Command+Shift+Z redoes on macOS; Command/Ctrl+Y remains supported.
         undo(&mut app);
         ctrl_shift_z(&mut app);
-        assert!(app.views[0].comments.list.is_empty(), "Ctrl+Shift+Z does not redo");
+        assert_eq!(app.views[0].comments.list.is_empty(), !cfg!(target_os = "macos"), "Command+Shift+Z redoes only on macOS");
         redo(&mut app);
         assert_eq!(app.views[0].comments.list.list(), &[first.clone()]);
         // Delete → Ctrl+Z restores it.
@@ -5507,6 +5624,8 @@ mod tests {
         key_down(&ctx, &mut app, Key::M);
         run_frame(&ctx, &mut app, &[(ctrl(), Key::Z)]);
         assert_eq!(app.views[0].comments.list.len(), 1, "Ctrl+Z ignored while M is down");
+        run_frame(&ctx, &mut app, &[(Modifiers { shift: true, ..ctrl() }, Key::Z)]);
+        assert_eq!(app.views[1].comments.list.len(), 0, "redo stays off while M is held");
         key_up(&ctx, &mut app, Key::M);
         assert_eq!(app.views[0].comments.list.len(), 2, "the short press saved");
         assert_eq!(steps(&app, 0), (2, 0), "the new comment dropped the redo side (view 1's comment)");
@@ -5860,7 +5979,7 @@ mod tests {
     }
 
     #[test]
-    fn no_undo_while_m_is_held_or_a_text_field_has_the_keys_and_ctrl_shift_z_does_nothing() {
+    fn history_keys_respect_typing_hold_and_platform_without_interfering_with_gaps() {
         let ctx = egui::Context::default();
         let dir = comment_dir("undo_off");
         // Marker M has no frames 4–6: Z / Shift+Z jump to that gap.
@@ -5889,30 +6008,40 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].range, steps(&app, 0)), (Some((8, 8)), (3, 1)));
-        // Ctrl+Shift+Z: no redo, no undo, no gap jump, no note.
+        // Command+Shift+Z redoes only on macOS and never falls through to gap navigation.
         app.views[0].pb.set_frame(8, 0.0);
         app.quiet();
         app.history.note = None;
         run_frame(&ctx, &mut app, &[(Modifiers { shift: true, ..ctrl() }, Key::Z)]);
-        assert_eq!((app.views[0].range, steps(&app, 0), app.views[0].pb.frame, note(&app)), (Some((8, 8)), (3, 1), 8, String::new()));
+        if cfg!(target_os = "macos") {
+            assert_eq!((app.views[0].range, steps(&app, 0), app.views[0].pb.frame), (Some((2, 8)), (4, 0), 8));
+            undo_key(&ctx, &mut app);
+        } else {
+            assert_eq!((app.views[0].range, steps(&app, 0), app.views[0].pb.frame, note(&app)), (Some((8, 8)), (3, 1), 8, String::new()));
+        }
         // While M is held: Ctrl+Z / Ctrl+Y do nothing.
         key_down(&ctx, &mut app, Key::M);
         assert!(app.hold.is_some());
         undo_key(&ctx, &mut app);
         redo_key(&ctx, &mut app);
+        run_frame(&ctx, &mut app, &[(Modifiers { shift: true, ..ctrl() }, Key::Z)]);
         assert_eq!((app.views[0].range, steps(&app, 0)), (Some((8, 8)), (3, 1)));
         key_up(&ctx, &mut app, Key::M);
         assert_eq!((ids(&app), app.views[0].range, steps(&app, 0)), (vec![1], None, (4, 0)), "the short press saved, with the range");
-        // A text field has the keys: its own Ctrl+Z.
+        // A text field has the keys, including native redo with a pending redo action.
+        undo_key(&ctx, &mut app);
         app.open_path_dialog();
         frame_with(&ctx, &mut app, vec![]);
         frame_with(&ctx, &mut app, vec![]);
         assert!(ctx.wants_keyboard_input());
         undo_key(&ctx, &mut app);
-        assert_eq!((ids(&app), steps(&app, 0)), (vec![1], (4, 0)));
+        run_frame(&ctx, &mut app, &[(Modifiers { shift: true, ..ctrl() }, Key::Z)]);
+        assert_eq!((ids(&app), steps(&app, 0)), (vec![], (3, 1)));
         app.path_input = None;
         frame_with(&ctx, &mut app, vec![]);
         frame_with(&ctx, &mut app, vec![]);
+        redo_key(&ctx, &mut app);
+        assert_eq!(ids(&app), vec![1], "redo works after leaving the field");
         undo_key(&ctx, &mut app);
         assert_eq!((ids(&app), app.views[0].range), (vec![], Some((8, 8))), "the add undone, its range back");
         until_saved(&ctx, &mut app);
@@ -6493,7 +6622,7 @@ mod tests {
         tap(&ctx, &mut app, row);
         assert_eq!(picked(&app), Some(2));
         tap(&ctx, &mut app, del);
-        assert_eq!((ids(&app), note(&app).as_str(), picked(&app)), (vec![1], "Comment 2 deleted · Ctrl+Z", None));
+        assert_eq!((ids(&app), note(&app).as_str(), picked(&app)), (vec![1], shortcut_text("Comment 2 deleted · Ctrl+Z").as_ref(), None));
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment+Selection"));
         undo_key(&ctx, &mut app);
         assert_eq!((ids(&app), picked(&app)), (vec![1, 2], Some(2)));

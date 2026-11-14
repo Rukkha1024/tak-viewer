@@ -828,7 +828,7 @@ mod tests {
         assert!(append(&tak, &[ev(Kind::Add, 1, &["M"], 0, 0)]).is_err());
         assert!(!tak.exists());
         assert!(check_target(&dir.join("x.comments.csv")).is_ok(), "outside any repository");
-        assert_eq!(file_label(Path::new(r"C:\d\a.tak"), 33_121_234), "a.tak|33121234");
+        assert_eq!(file_label(&Path::new("d").join("a.tak"), 33_121_234), "a.tak|33121234");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

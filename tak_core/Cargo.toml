@@ -13,6 +13,12 @@ sha2 = "0.10"
 # Fast byte search (already used by serde_json; no new crate).
 memchr = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [[bin]]
 name = "tak_dump"
 path = "src/bin/tak_dump.rs"

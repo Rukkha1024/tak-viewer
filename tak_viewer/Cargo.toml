@@ -25,3 +25,8 @@ path = "src/main.rs"
 # Tests only: read/write settings the way eframe stores them (RON).
 [dev-dependencies]
 ron = "0.8"
+
+# Native local time and validation of the macOS Korean font candidate.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+ab_glyph = "0.2"

@@ -297,6 +297,9 @@ pub fn write(w: &mut impl Write, tak: &[u8], source_name: &str, made_at: &str) -
 /// Why `out` may not be written for `tak` (plain Korean), None = it may: not inside a
 /// repository's `input/` (same rule as captures and comment files), not over an existing file.
 pub fn check_out(out: &Path, tak: &Path) -> std::result::Result<(), String> {
+    if crate::output::in_input(out).map_err(|e| e.to_string())? {
+        return Err(format!("input/ 폴더 안에는 .takm을 만들지 않아요: {}. --out-dir로 다른 폴더를 정해 주세요.", out.display()));
+    }
     let dir = out.parent().unwrap_or(out);
     let roots = [repo_root(tak), dir.ancestors().find(|a| a.exists()).and_then(repo_root)];
     for root in roots.into_iter().flatten() {
@@ -319,16 +322,72 @@ pub fn check_out(out: &Path, tak: &Path) -> std::result::Result<(), String> {
 /// `path` is inside a repository's `input/` (the repository found above it on disk). Looks at
 /// the disk: call it off the drawing thread.
 pub fn in_input(path: &Path) -> bool {
-    path.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root).is_some_and(|root| in_repo_input(path, &root))
+    crate::output::in_input(path).unwrap_or(true)
 }
 
 /// Why the viewer may not append Comments to the tail of `takm` (plain Korean), Ok when it may.
 /// Looks at the disk: call it off the drawing thread.
 pub fn check_tail(takm: &Path) -> std::result::Result<(), String> {
-    if in_input(takm) {
-        return Err("input/ 폴더 안 파일이라 Comment를 쓰지 않아요. 파일을 다른 폴더에 복사해서 여세요.".into());
+    open_tail(takm, false).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Open the exact regular file without following a final link; validate the opened handle
+/// before any append. Linked files cannot prove that all their names lie outside input/.
+fn open_tail(path: &Path, append: bool) -> io::Result<File> {
+    let refused = |message| io::Error::new(io::ErrorKind::PermissionDenied, message);
+    if in_input(path) {
+        return Err(refused("input/ 폴더 안 파일이라 Comment를 쓰지 않아요. 파일을 다른 폴더에 복사해서 여세요."));
     }
-    Ok(())
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(refused("링크 파일에는 Comment를 쓰지 않아요. 파일 사본을 열어 주세요."));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).append(append);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(refused("일반 파일이 아니라 Comment를 쓰지 않아요."));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.nlink() != 1 || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(refused("연결되었거나 바뀐 파일에는 Comment를 쓰지 않아요. 파일 사본을 열어 주세요."));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT};
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: the handle remains live, and the API initializes info only on success.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call above succeeded and filled the complete structure.
+        let info = unsafe { info.assume_init() };
+        if info.nNumberOfLinks != 1 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refused("링크 파일에는 Comment를 쓰지 않아요. 파일 사본을 열어 주세요."));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "cannot verify file links on this platform"));
+    if in_input(path) {
+        return Err(refused("input/ 폴더 안 파일에는 Comment를 쓰지 않아요."));
+    }
+    Ok(file)
 }
 
 /// What one conversion did.
@@ -363,9 +422,9 @@ fn place(tmp: &Path, out: &Path) -> std::result::Result<(), String> {
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(exists()),
-        // No hard links here (e.g. the WSL share): check, then rename.
-        Err(_) if out.exists() => Err(exists()),
-        Err(_) => std::fs::rename(tmp, out).map_err(|e| format!("이름을 바꾸지 못했어요: {e}")),
+        // A rename fallback can replace a concurrent writer's output on Unix. Fail safely
+        // when this filesystem cannot publish by an atomic no-replace hard link.
+        Err(e) => Err(format!("기존 파일을 보호하며 저장하지 못했어요 (하드 링크 필요): {e}")),
     }
 }
 
@@ -558,12 +617,7 @@ pub fn append_lines(path: &Path, lines: &[String]) -> Result<()> {
     if lines.iter().any(|l| l.contains(['\r', '\n'])) {
         return err("한 줄에 줄바꿈이 들어 있어요");
     }
-    if let Some(root) = path.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root) {
-        if in_repo_input(path, &root) {
-            return err("input/ 폴더 안 파일에는 쓰지 않아요");
-        }
-    }
-    let mut f = OpenOptions::new().read(true).append(true).open(path)?;
+    let mut f = open_tail(path, true)?;
     let (_, tail) = tail_bytes(&f)?;
     let mut out = String::new();
     if tail.last().is_some_and(|&b| b != b'\n') {
@@ -645,6 +699,109 @@ mod tests {
 
     fn file_sha(p: &Path) -> String {
         sha256_hex(&std::fs::read(p).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn aliased_input(tag: &str) -> (TempDir, PathBuf) {
+        let d = TempDir::new(tag);
+        let root = d.0.join("repo");
+        std::fs::create_dir_all(root.join("input")).unwrap();
+        std::fs::write(root.join(".tak-viewer-root"), b"tak-viewer\n").unwrap();
+        let alias = d.0.join("별칭 폴더");
+        std::os::unix::fs::symlink(root.join("input"), &alias).unwrap();
+        (d, alias)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_safety_takm_conversion_refuses_symlinked_input_parent() {
+        let (d, alias) = aliased_input("aliased_conversion");
+        // The requested output directory need not exist yet.
+        let out = alias.join("new/subdir/결과.TAKM");
+        assert!(check_out(&out, &d.0.join("원본.TAK")).is_err());
+        assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_safety_takm_comments_refuse_symlinked_input_parent() {
+        let (_d, alias) = aliased_input("aliased_comments");
+        let out = alias.join("원본.TAKM");
+        let mut original = Vec::new();
+        write(&mut original, &sample_tak(), "원본.TAK", "2026-01-01T00:00:00+00:00").unwrap();
+        std::fs::write(&out, &original).unwrap();
+        assert!(check_tail(&out).is_err());
+        assert!(append_lines(&out, &["comment".into()]).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), original);
+    }
+
+    fn protected_take(tag: &str) -> (TempDir, PathBuf) {
+        let (d, _tak, takm) = converted(tag);
+        let root = d.0.join("repo");
+        std::fs::create_dir_all(root.join("input")).unwrap();
+        std::fs::write(root.join(".tak-viewer-root"), b"tak-viewer\n").unwrap();
+        let protected = root.join("input/원본.TAKM");
+        std::fs::rename(takm, &protected).unwrap();
+        (d, protected)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_append_refuses_final_symlink_to_protected_input() {
+        let (d, protected) = protected_take("final_symlink");
+        let alias = d.0.join("바깥 별칭.TAKM");
+        std::os::unix::fs::symlink(&protected, &alias).unwrap();
+        let before = std::fs::read(&protected).unwrap();
+        let check = check_tail(&alias);
+        let append = append_lines(&alias, &["must not be appended".into()]);
+        assert!(check.is_err());
+        assert!(append.is_err());
+        assert_eq!(std::fs::read(protected).unwrap(), before);
+    }
+
+    #[test]
+    fn linked_append_refuses_hardlink_to_protected_input() {
+        let (d, protected) = protected_take("final_hardlink");
+        let alias = d.0.join("바깥 별칭.TAKM");
+        std::fs::hard_link(&protected, &alias).unwrap();
+        let before = std::fs::read(&protected).unwrap();
+        let check = check_tail(&alias);
+        let append = append_lines(&alias, &["must not be appended".into()]);
+        assert!(check.is_err());
+        assert!(append.is_err());
+        assert_eq!(std::fs::read(protected).unwrap(), before);
+    }
+
+    #[test]
+    fn output_safety_concurrent_publication_keeps_exactly_one_complete_file() {
+        let d = TempDir::new("concurrent_publish");
+        let out = d.0.join("결과 파일.TAKM");
+        let first = d.0.join("first.part");
+        let second = d.0.join("second.part");
+        std::fs::write(&first, b"first complete file").unwrap();
+        std::fs::write(&second, b"second complete file").unwrap();
+        let start = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let one = scope.spawn(|| { start.wait(); place(&first, &out) });
+            let two = scope.spawn(|| { start.wait(); place(&second, &out) });
+            [one.join().unwrap(), two.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+        let expected = if outcomes[0].is_ok() { b"first complete file".as_slice() } else { b"second complete file".as_slice() };
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_safety_publication_does_not_fall_back_to_rename_after_link_failure() {
+        let d = TempDir::new("link_failure");
+        let tmp = d.0.join("temporary");
+        let out = d.0.join("output.takm");
+        // Linking a directory is unsupported; the former rename fallback incorrectly succeeds.
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(place(&tmp, &out).is_err());
+        assert!(tmp.is_dir());
+        assert!(!out.exists());
     }
 
     #[test]

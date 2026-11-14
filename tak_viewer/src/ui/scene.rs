@@ -1,4 +1,4 @@
-//! 3D Perspective view in the Motive 3 style: black background, white/grey floor grid,
+﻿//! 3D Perspective view in the Motive 3 style: black background, white/grey floor grid,
 //! constraint-colored markers (14 mm), marker sticks, asset name pills, cyan primary /
 //! yellow secondary selection, selected-marker history trail, Motive HUD
 //! ("Perspective", marker count, frame readout, axis triad).
@@ -386,11 +386,13 @@ pub fn show(
     // Mouse (Motive): left click / left drag box = select markers, right drag = orbit
     // around the pivot, middle drag = pan, wheel = zoom.
     let delta = response.drag_delta();
-    if response.dragged_by(PointerButton::Secondary) {
+    let navigation = super::input::primary_navigation(ui, &response);
+    let primary_drag = response.dragged_by(PointerButton::Primary);
+    if response.dragged_by(PointerButton::Secondary) || (primary_drag && navigation == Some(super::input::PrimaryNavigation::Orbit)) {
         cam.orbit(delta.x, delta.y);
     }
     let box_id = response.id.with("box_select");
-    if response.drag_started_by(PointerButton::Primary) {
+    if navigation.is_none() && response.drag_started_by(PointerButton::Primary) {
         let start = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
         ui.data_mut(|d| d.insert_temp(box_id, start));
     }
@@ -405,11 +407,11 @@ pub fn show(
     if box_done || !box_active {
         ui.data_mut(|d| d.remove::<Option<Pos2>>(box_id));
     }
-    if response.dragged_by(PointerButton::Middle) {
+    if response.dragged_by(PointerButton::Middle) || (primary_drag && navigation == Some(super::input::PrimaryNavigation::Pan)) {
         cam.pan(delta.x, delta.y, rect);
     }
     if response.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = super::input::zoom_scroll(ui);
         if scroll != 0.0 {
             cam.zoom(scroll);
         }
@@ -539,7 +541,7 @@ pub fn show(
         out.plate = if marker.is_none() && !ctrl { pick_plate(&plate_quads, at) } else { None };
         out.ctrl = ctrl;
     };
-    if response.clicked() {
+    if navigation.is_none() && response.clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
             click(pointer);
         }
@@ -552,7 +554,7 @@ pub fn show(
             out.ctrl = ctrl;
         }
     }
-    if response.double_clicked() {
+    if navigation.is_none() && response.double_clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
             out.double_clicked = pick(&projected, pointer);
         }

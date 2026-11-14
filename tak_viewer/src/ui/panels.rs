@@ -1,4 +1,4 @@
-//! Panes (Labels, selected marker, its X/Y/Z graph, devices) and the playback bar of a 3D view,
+﻿//! Panes (Labels, selected marker, its X/Y/Z graph, devices) and the playback bar of a 3D view,
 //! styled after Motive 3 (Labels pane, Graph View pane, Edit-mode control deck).
 
 use super::graph::{self, Lane, Look};
@@ -1561,7 +1561,7 @@ fn timeline(
     let rect = Rect::from_min_size(whole.min, vec2(whole.width(), SEEK_H));
     let band = Rect::from_min_max(pos2(whole.left(), rect.bottom()), whole.max);
     let resp = ui.interact(rect, ui.id().with(("timeline_seek", slot)), Sense::click_and_drag());
-    let band_resp = ui.interact(band, ui.id().with(("timeline_band", slot)), Sense::click_and_drag()).on_hover_text(BAND_TIP);
+    let band_resp = ui.interact(band, ui.id().with(("timeline_band", slot)), Sense::click_and_drag()).on_hover_text(crate::platform::shortcut_text(BAND_TIP));
     ui.painter().rect_filled(whole, 2.0, theme::NAV_BG);
     let bar = rect.shrink2(vec2(TIMELINE_PAD, 0.0));
     let (first, last) = (pb.first, pb.last);
@@ -1654,6 +1654,7 @@ fn timeline(
                 } else {
                     "이 파일의 Comment는 쓸 수 없어서 지울 수도 없어요 (상태 줄에 마우스를 올려 이유를 보세요)"
                 };
+                let right = crate::platform::shortcut_text(right);
                 ui.label(RichText::new(format!("{press} · 끌기 = 구간 잡기\n{right}")).small().color(theme::TEXT_DIM));
             }
         });

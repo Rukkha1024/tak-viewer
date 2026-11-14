@@ -1,6 +1,6 @@
-# TAK 뷰어
+﻿# TAK 뷰어
 
-`.tak`과 `.takm`의 마커와 움직임을 3D로 살펴보는 Windows 프로그램이에요. `.tak`는 읽기만 해요. 주석을 달려면 `.takm` 사본을 만들어 사용해요. 파일 읽기 성공은 Motive와의 호환성이나 동등한 동작을 검증했다는 뜻이 아니에요.
+`.tak`과 `.takm`의 마커와 움직임을 3D로 살펴보는 Windows와 macOS에서 사용하는 프로그램이에요. `.tak`는 읽기만 해요. 주석을 달려면 `.takm` 사본을 만들어 사용해요. 파일 읽기 성공은 Motive와의 호환성이나 동등한 동작을 검증했다는 뜻이 아니에요.
 
 현재 공개물은 소스 코드예요. 별도 실행 파일이나 시험용 촬영 데이터는 포함하지 않아요. 아직 사용 허가 조건(라이선스)을 정하지 않았어요.
 
@@ -13,6 +13,15 @@ cargo build --release --locked
 ```
 
 `빌드.cmd`의 기본 결과는 `%LOCALAPPDATA%\tak_viewer\target_public\release\tak_viewer.exe`예요. 위 Cargo 명령은 별도 설정이 없다면 `target\release\tak_viewer.exe`를 만들어요. 처음 실행은 의존 도구를 내려받으므로 시간이 걸릴 수 있어요.
+
+macOS에서는 Rust와 Apple 명령줄 개발 도구가 필요해요. Xcode 편집기를 열지 않아도 돼요. 개발 도구가 없다면 `xcode-select --install`로 설치한 뒤 저장소 폴더에서 다음 명령을 실행해요.
+
+```sh
+bash scripts/01_build_macos.sh
+open "build/TAK Viewer.app"
+```
+
+결과는 `build/TAK Viewer.app`이에요. Finder에서 두 번 클릭해 실행하거나 응용 프로그램 폴더로 옮겨요. 완성된 앱을 실행할 때는 Rust나 Xcode가 필요하지 않아요. [Mac 사용법](docs/macos.md)에 단축키와 명령줄 사용법이 있어요.
 
 ## 사용
 

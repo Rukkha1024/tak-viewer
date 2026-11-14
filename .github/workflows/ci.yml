@@ -1,0 +1,23 @@
+name: Native builds and tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test all features
+        run: cargo test --workspace --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: bash scripts/01_build_macos.sh

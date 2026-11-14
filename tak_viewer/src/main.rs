@@ -24,6 +24,7 @@ mod camera;
 mod capture;
 mod headless;
 mod instances;
+mod platform;
 mod shot;
 mod soft_render;
 mod ui;
@@ -123,18 +124,10 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(headless::run(initial, auto, capture, size));
     }
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(version::window_title(None))
-            .with_inner_size(size)
-            .with_min_inner_size([900.0, 600.0])
-            .with_drag_and_drop(true),
-        persist_window: !command_run,
-        ..Default::default()
-    };
     // A window the user works in joins the open-window list (settings rule in `app.rs`).
     // Command line runs do not: they never save settings.
     let registration = if command_run { None } else { instances::default_dir().and_then(|d| instances::register(&d)) };
+    let options = native_options(size, command_run, registration.is_some());
     let others_at_start = registration.as_ref().is_some_and(|r| r.others_alive());
     eframe::run_native(
         "tak_viewer",
@@ -150,4 +143,26 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn native_options(size: [f32; 2], command_run: bool, registered: bool) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title(version::window_title(None))
+            .with_inner_size(size)
+            .with_min_inner_size([900.0, 600.0])
+            .with_drag_and_drop(true),
+        persist_window: !command_run && registered,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    #[test]
+    fn unregistered_or_command_windows_never_persist_native_state() {
+        assert!(!super::native_options([900.0, 600.0], false, false).persist_window);
+        assert!(!super::native_options([900.0, 600.0], true, false).persist_window);
+        assert!(super::native_options([900.0, 600.0], false, true).persist_window);
+    }
 }

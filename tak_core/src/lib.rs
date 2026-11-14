@@ -6,6 +6,7 @@ pub mod comments;
 pub mod dump;
 pub mod geom;
 pub mod marker_sets;
+pub mod output;
 pub(crate) mod par;
 pub mod playback;
 #[doc(hidden)]

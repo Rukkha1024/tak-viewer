@@ -1,14 +1,14 @@
 ﻿# Run TAK Viewer natively on this Mac with existing feature parity
 
 
-This ExecPlan is maintained in English and Korean. Keep Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective synchronized. It follows the user's supplied AGENTS.md and the planning rules read at /Users/alice/Documents/codex/.agents/PLANS.md. Implementation is pending the user's approval of this document.
+This ExecPlan is maintained in English and Korean. Keep Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective synchronized. It follows the user's supplied AGENTS.md and the planning rules read at /Users/alice/Documents/codex/.agents/PLANS.md. The user approved implementation with “proceed” on 2026-11-14. Work now proceeds autonomously through verification.
 
 ## Purpose / Big Picture
 
 
 The user can launch TAK Viewer by double-clicking a native Apple Silicon application, open TAK and TAKM recordings, and use the existing viewer features on the current Mac. The existing Windows implementation remains supported. macOS integration must work beyond compilation: Korean text, native file dialogs, Finder folder opening, keyboard and trackpad input, settings persistence, and simultaneous windows are part of acceptance. Original TAK files remain read-only.
 
-The repository is /Users/alice/Documents/tak-viewer, cloned from https://github.com/Rukkha1024/tak-viewer at 6285ebc. Work takes place on codex/macos-support. The inspected machine reports arm64 and macOS 26.5.2, with Xcode installed but no Rust toolchain found. On 2026-11-14 the user approved an .app deliverable, current Apple Silicon Mac priority, and synthetic-data-first verification, asking for a thorough Mac conversion. This confirms requirements, not the separate implementation-plan approval gate.
+The repository is /Users/alice/Documents/tak-viewer, cloned from https://github.com/Rukkha1024/tak-viewer at 6285ebc. Work takes place on codex/macos-support. The inspected machine reports arm64 and macOS 26.5.2, with Xcode installed but no Rust toolchain found. On 2026-11-14 the user approved an .app deliverable, current Apple Silicon Mac priority, and synthetic-data-first verification, asking for a thorough Mac conversion. The subsequent “proceed” message approved the implementation plan.
 
 ## Progress
 
@@ -16,11 +16,13 @@ The repository is /Users/alice/Documents/tak-viewer, cloned from https://github.
 - [x] 2026-11-14: Clone into Documents and create codex/macos-support.
 - [x] 2026-11-14: Independently audit platform assumptions and feature/test coverage.
 - [x] 2026-11-14: Obtain requirements confirmation from the user.
-- [ ] Complete independent review of this bilingual plan and obtain implementation approval.
-- [ ] Establish a reproducible Rust toolchain and unchanged-code test/reference baseline.
-- [ ] Implement macOS integration and regression tests while retaining Windows support.
-- [ ] Build a standalone .app and validate native GUI and command-line workflows.
-- [ ] Complete explorer/reviewer passes, fix concrete findings, commit, and deliver evidence.
+- [x] 2026-11-14: Independent bilingual plan review complete; user approved implementation.
+- [x] Rust/Cargo 1.100.0 installed in task-owned work/toolchain; unchanged source baseline retained and compared.
+- [x] macOS platform/input integration and source-output safety implemented with regression tests; Windows code retained.
+- [x] Native arm64 .app built and signed; native GUI smoke and 22 CLI commands (6 baseline and 16 packaged) passed. Hardware gesture delivery limitations are recorded below.
+- [x] Explorer and two reviewer passes complete; concrete findings fixed. Final source, bilingual plan and delivery evidence prepared for the Korean implementation commit.
+
+- [ ] User hardware smoke: native Finder drop, Option/Option+Shift trackpad drags and physical pinch. Automated input regressions pass; user confirmation requested because CUA cannot reproduce these gestures reliably.
 
 ## Surprises & Discoveries
 
@@ -49,7 +51,16 @@ The requested copy-editing skill was not found in available skill roots or insta
 ## Outcomes & Retrospective
 
 
-Requirements discovery and platform investigation are complete. The user-approved scope is recorded, but the implementation plan is awaiting approval. No source behavior, build result, native GUI result, or feature-parity claim is complete. The next milestone is an approved plan followed by an unchanged-code baseline. Independent plan review found a missing retrospective section; this section corrects that documentation omission.
+Implementation and independent review are complete. The final workspace run passed 72 core and 323 viewer tests (395 total), with one pre-existing optional timing benchmark ignored and no failures. The unchanged baseline exposed one Windows-only path test assumption; only that test now uses Path::join. Baseline viewer tests passed 302 with one ignored.
+
+Full and fast/lazy numerical exports match byte for byte across baseline and port for the original sample, extended synthetic force/skeleton recording, and TAKM. Only path and file_size are normalized; numeric tolerance is zero. Fixed-timestamp TAKM MD5 also matches. All 22 CLI commands (6 baseline and 16 packaged) passed, including full/fast JSON comparisons, four views, overlays, captures/contact sheets, benchmark, CSV import and refusal paths. Original TAK, CSV and CLI settings MD5 are unchanged.
+
+The signed arm64 bundle runs outside the checkout with only Apple system libraries. Native observations confirm Korean text, Cmd+O dialog with Hangul/spaces, marker and plate graphs, playback, TAKM conversion, annotation save/reopen, Cmd+Z / Cmd+Shift+Z, Cmd+Shift+S capture and Finder opening. Two native processes held separate locks; after terminating one, the surviving window cleaned its stale registration. Stored panel state and comments restored on restart.
+
+Explorer/reviewer findings were fixed and re-reviewed: final-file links cannot append into protected input, and failed registration disables eframe native window persistence as well as app/egui saves. Added Unix libc and Windows windows-sys edges reuse already locked versions. Packaging preserves its previous bundle if publication/recovery fails.
+
+Verification limitations: real recordings/Motive, Windows runtime, Intel runtime and distribution notarization were not tested. CUA cannot synthesize held-modifier trackpad drags or native pinch; these have egui input regressions. A cross-window Finder drag attempt did not yield an observable drop; native drop delivery remains a manual smoke item, while the desktop-drop application regression passes. No parity claim extends beyond the evidence above. Detailed results and hashes are in outputs/macOS-validation.md and the evidence archive.
+
 
 ## Context and Orientation
 
@@ -136,7 +147,7 @@ Use isolated generated fixture/output directories with unique names or explicit 
 ## Artifacts and Notes
 
 
-Current authoritative state: branch codex/macos-support, baseline commit 6285ebc, no source edits before this plan. The bilingual plans are .agents/execplans/2026-11-14-macos-support.en.md and .agents/execplans/2026-11-14-macos-support.ko.md. User-facing copies use the same names under the task outputs directory. This document records intended work, not completed test results.
+Current authoritative state: branch codex/macos-support, baseline commit 6285ebc, no source edits before this plan. The bilingual plans are .agents/execplans/2026-11-14-macos-support.en.md and .agents/execplans/2026-11-14-macos-support.ko.md. User-facing copies use the same names under the task outputs directory. This document records the approved work and the final evidence above.
 
 ## Interfaces and Dependencies
 
@@ -145,4 +156,4 @@ Keep existing data types and TAK/TAKM schemas. Platform helpers belong to tak_vi
 
 Official API references checked during planning: [Rust File::try_lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock), [Apple flock](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html), and [Apple localtime](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/localtime.3.html). The pinned winit 0.30.13 implementation controls its AppKit delegate, so do not assume an application document association works without native event integration and tests.
 
-Revision: Initial bilingual implementation proposal after the user's requirements confirmation on 2026-11-14. No application behavior has been modified.
+Revision: Implemented and reviewed on 2026-11-14 after explicit plan approval; native/hardware verification limits recorded.

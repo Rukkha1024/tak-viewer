@@ -1,14 +1,14 @@
 ﻿# 현재 Mac에서 TAK Viewer의 기존 기능을 동일하게 사용하기
 
 
-이 ExecPlan은 한국어와 영어로 함께 관리합니다. 진행 상태, 발견 사항, 결정 기록, 결과 및 회고를 양쪽 문서에 반영합니다. 사용자가 제공한 AGENTS.md와 /Users/alice/Documents/codex/.agents/PLANS.md의 계획 규칙을 따릅니다. 이 문서의 구현 승인은 아직 받지 않았습니다.
+이 ExecPlan은 한국어와 영어로 함께 관리합니다. 진행 상태, 발견 사항, 결정 기록, 결과 및 회고를 양쪽 문서에 반영합니다. 사용자가 제공한 AGENTS.md와 /Users/alice/Documents/codex/.agents/PLANS.md의 계획 규칙을 따릅니다. 사용자가 2026-11-14 “proceed”로 구현을 승인했습니다. 이제 검증까지 자율적으로 진행합니다.
 
 ## 목적과 완료 모습
 
 
 사용자가 Apple Silicon용 앱을 더블클릭해서 실행하고 TAK·TAKM 파일을 열어 기존 뷰어의 기능을 Mac에서 사용할 수 있도록 합니다. 기존 Windows 지원도 유지합니다. 컴파일뿐 아니라 한글 표시, 파일 선택 창, Finder 폴더 열기, 키보드·트랙패드, 설정 저장, 여러 창의 동시 사용을 검증합니다. 원본 TAK는 읽기만 합니다.
 
-저장소는 /Users/alice/Documents/tak-viewer이며, https://github.com/Rukkha1024/tak-viewer의 6285ebc에서 복제했습니다. 작업 브랜치는 codex/macos-support입니다. 확인한 환경은 arm64, macOS 26.5.2이며 Xcode는 있지만 Rust 도구는 발견되지 않았습니다. 사용자는 2026-11-14에 .app 제공, 현재 Apple Silicon Mac 우선 검증, 합성 데이터 우선 검증에 동의하고 철저한 Mac 전환을 요청했습니다. 요구사항 확인과 이 구현 계획에 대한 승인은 별도 단계입니다.
+저장소는 /Users/alice/Documents/tak-viewer이며, https://github.com/Rukkha1024/tak-viewer의 6285ebc에서 복제했습니다. 작업 브랜치는 codex/macos-support입니다. 확인한 환경은 arm64, macOS 26.5.2이며 Xcode는 있지만 Rust 도구는 발견되지 않았습니다. 사용자는 2026-11-14에 .app 제공, 현재 Apple Silicon Mac 우선 검증, 합성 데이터 우선 검증에 동의하고 철저한 Mac 전환을 요청했습니다. 이후 사용자의 “proceed” 메시지로 구현 계획 승인까지 완료했습니다.
 
 ## 진행 상태
 
@@ -16,11 +16,13 @@
 - [x] 2026-11-14: Documents에 복제하고 codex/macos-support 브랜치 생성.
 - [x] 2026-11-14: 플랫폼 의존성과 기능·검증 범위를 독립적으로 조사.
 - [x] 2026-11-14: 사용자 요구사항 확인 완료.
-- [ ] 한·영 계획을 독립 검토하고 구현 승인 받기.
-- [ ] 재현 가능한 Rust 환경과 변경 전 테스트·기준 출력 확보.
-- [ ] Windows 지원을 유지하며 macOS 처리와 회귀 테스트 구현.
-- [ ] 독립 실행 .app 제작 및 GUI·명령줄 검증.
-- [ ] explorer/reviewer 검토, 발견된 문제 수정, 커밋 및 결과 전달.
+- [x] 2026-11-14: 한·영 계획 독립 검토와 사용자 구현 승인 완료.
+- [x] 작업 전용 work/toolchain에 Rust/Cargo 1.100.0 설치, 변경 전 소스 기준과 비교 완료.
+- [x] Windows 코드를 유지하며 macOS 처리·입력·출력 보호와 회귀 테스트 구현.
+- [x] arm64 .app 빌드·서명, 네이티브 GUI 확인과 CLI 22건(기준 6건·패키지 앱 16건) 검증 완료. 하드웨어 입력 검증 제한은 아래 기록.
+- [x] explorer와 reviewer 2회 검토 및 구체적 문제 수정 완료. 한국어 구현 커밋에 포함할 최종 소스·계획·전달 증거 준비.
+
+- [ ] 사용자 실기 확인: Finder 드롭, Option/Option+Shift 트랙패드 드래그와 물리 핀치. 자동 입력 회귀 검사는 통과했으며 CUA로 재현하기 어려워 사용자에게 확인을 요청했습니다.
 
 ## 발견 사항
 
@@ -49,7 +51,16 @@
 ## 결과 및 회고
 
 
-요구사항 확인과 플랫폼 조사를 마쳤습니다. 사용자가 확인한 범위를 기록했지만 구현 계획 승인은 아직 기다리고 있습니다. 소스 동작 변경, 빌드 결과, 네이티브 GUI 결과, 기능 동등성 검증은 아직 완료되지 않았습니다. 다음 단계는 계획 승인과 변경 전 기준 확보입니다. 독립 계획 검토에서 회고 절 누락을 발견해 이 절을 추가했습니다.
+구현과 독립 검토를 완료했습니다. 최종 통합 검사는 core 72개와 viewer 323개, 합계 395개가 통과했으며 실패는 없습니다. 기존 선택 실행용 시간 측정 테스트 1개는 무시 상태입니다. 변경 전 기준에서 Windows 경로를 가정한 테스트 하나가 실패하여 그 테스트만 Path::join으로 고쳤습니다. 기준 viewer 검사는 302개 통과, 1개 무시였습니다.
+
+기본 샘플·힘판/스켈레톤 합성 자료·TAKM에서 전체 읽기와 빠른/지연 읽기의 수치 출력이 기준과 바이트 단위로 같습니다. 정규화한 필드는 경로와 파일 크기뿐이며 수치 허용오차는 0입니다. 고정 생성 시각 TAKM의 MD5도 같습니다. CLI 22건(기준 6건·패키지 앱 16건)은 full/fast JSON 비교, 네 화면, 겹쳐 보기, 캡처·모아보기, 벤치마크, CSV 가져오기와 저장 거부를 포함해 통과했습니다. 원본 TAK·CSV와 CLI 실행 전후 설정 MD5도 유지됐습니다.
+
+서명한 arm64 앱은 저장소 밖에서 Apple 시스템 라이브러리만으로 실행됩니다. 실제 창에서 한글, 한글·공백 경로의 Cmd+O 대화상자, 마커·힘판 그래프, 재생, TAKM 변환, 주석 저장·재열기, Cmd+Z / Cmd+Shift+Z, Cmd+Shift+S 캡처와 Finder 열기를 확인했습니다. 네이티브 두 프로세스가 별도 잠금을 유지했고, 하나를 종료한 뒤 살아 있는 창이 오래된 등록을 정리했습니다. 다시 실행했을 때 패널 상태와 주석도 복원됐습니다.
+
+독립 검토의 지적을 수정하고 재검토했습니다. 최종 파일 링크를 통한 보호 입력 주석 쓰기를 차단했고, 등록 실패 시 eframe 창 설정도 저장하지 않습니다. Unix libc와 Windows windows-sys는 기존 잠금 버전을 사용합니다. 앱 게시와 복구가 모두 실패하면 이전 앱을 보존하도록 패키징을 보완했습니다.
+
+검증 제한: 실제 촬영 자료·Motive, Windows 실행, Intel 실행, 배포 공증은 확인하지 않았습니다. CUA가 수정키를 누른 트랙패드 드래그·핀치를 합성할 수 없어 해당 처리는 egui 입력 회귀 테스트로 검증했습니다. Finder에서 창 사이로 끌어 놓은 시도는 드롭 결과를 관찰하지 못했으므로 네이티브 드롭 전달은 수동 확인 항목으로 남깁니다. 앱의 데스크톱 드롭 회귀 테스트는 통과합니다. 위 근거를 넘어선 동등성은 주장하지 않습니다. 상세 결과·해시는 outputs/macOS-validation.md와 증거 압축 파일에 기록합니다.
+
 
 ## 코드 위치와 변경 범위
 
@@ -136,7 +147,7 @@ explorer가 최종 변경 경로·테스트를 정리하고 reviewer가 정확�
 ## 결과물과 참고
 
 
-현재 확인된 상태는 codex/macos-support 브랜치, 기준 커밋 6285ebc, 계획 작성 전 소스 변경 없음입니다. 한·영 계획 경로는 .agents/execplans/2026-11-14-macos-support.ko.md와 .agents/execplans/2026-11-14-macos-support.en.md입니다. 사용자용 사본은 outputs에 같은 이름으로 제공합니다. 이 문서는 예정 작업이며 테스트 완료 보고서가 아닙니다.
+현재 확인된 상태는 codex/macos-support 브랜치, 기준 커밋 6285ebc, 계획 작성 전 소스 변경 없음입니다. 한·영 계획 경로는 .agents/execplans/2026-11-14-macos-support.ko.md와 .agents/execplans/2026-11-14-macos-support.en.md입니다. 사용자용 사본은 outputs에 같은 이름으로 제공합니다. 승인된 작업과 위에 기록한 실제 검증 결과를 함께 보관합니다.
 
 ## 인터페이스와 의존성
 
@@ -145,4 +156,4 @@ explorer가 최종 변경 경로·테스트를 정리하고 reviewer가 정확�
 
 계획 중 확인한 공식 API 자료는 [Rust File::try_lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock), [Apple flock](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html), [Apple localtime](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/localtime.3.html)입니다. 고정된 winit 0.30.13 구현이 AppKit delegate를 관리하므로, 파일 연결은 네이티브 이벤트 처리와 테스트 없이 동작한다고 가정하지 않습니다.
 
-개정 기록: 2026-11-14 사용자 요구사항 확인 후 첫 한·영 구현 제안입니다. 앱 동작은 아직 수정하지 않았습니다.
+개정 기록: 2026-11-14 명시적 계획 승인 후 구현·검토 완료. 네이티브 하드웨어 입력 검증 제한을 기록했습니다.

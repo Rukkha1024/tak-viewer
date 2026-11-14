@@ -1,4 +1,4 @@
-//! Stacked X, Y, and Z graph lanes with frame navigation, zoom, and gap marks.
+﻿//! Stacked X, Y, and Z graph lanes with frame navigation, zoom, and gap marks.
 //! Multiple markers share lane colors. Hovering a curve highlights the marker across lanes
 //! and displays its name without changing saved state.
 
@@ -827,10 +827,11 @@ pub fn show(
     let x_of = |f: f64, vr: &ViewRange| plot.left() + ((f - vr.lo) / (vr.hi - vr.lo)) as f32 * plot.width();
     let f_of = |x: f32, vr: &ViewRange| vr.lo + ((x - plot.left()) / plot.width()) as f64 * (vr.hi - vr.lo);
 
-    // Interaction.
+    // Interaction. Either Option gesture pans the graph; it never seeks a frame.
+    let navigation = super::input::primary_navigation(ui, &resp);
     let mut goto = None;
     if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = super::input::zoom_scroll(ui);
         if scroll != 0.0 {
             if let Some(p) = resp.hover_pos() {
                 let center = f_of(p.x, &vr);
@@ -842,7 +843,7 @@ pub fn show(
             }
         }
     }
-    if resp.dragged_by(egui::PointerButton::Middle) {
+    if resp.dragged_by(egui::PointerButton::Middle) || (navigation.is_some() && resp.dragged_by(egui::PointerButton::Primary)) {
         let df = -(resp.drag_delta().x / plot.width()) as f64 * (vr.hi - vr.lo);
         vr.lo += df;
         vr.hi += df;
@@ -856,9 +857,9 @@ pub fn show(
         vr.hi = full.hi;
         vr.lo = (vr.hi - span).max(full.lo);
     }
-    if resp.double_clicked() {
+    if navigation.is_none() && resp.double_clicked() {
         vr = full;
-    } else if resp.clicked_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Primary) {
+    } else if navigation.is_none() && (resp.clicked_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Primary)) {
         if let Some(p) = resp.interact_pointer_pos() {
             goto = Some(f_of(p.x, &vr).round().clamp(first as f64, last as f64) as i64);
         }
@@ -1584,9 +1585,13 @@ mod tests {
         }
 
         fn frame(&mut self, events: Vec<eframe::egui::Event>) -> (Vec<eframe::egui::epaint::ClippedShape>, super::Drew, Option<i64>) {
+            self.frame_modifiers(events, eframe::egui::Modifiers::NONE)
+        }
+
+        fn frame_modifiers(&mut self, events: Vec<eframe::egui::Event>, modifiers: eframe::egui::Modifiers) -> (Vec<eframe::egui::epaint::ClippedShape>, super::Drew, Option<i64>) {
             use super::{show, Look};
             use eframe::egui;
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0))), events, ..Default::default() };
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0))), events, modifiers, ..Default::default() };
             let (lanes, drawn) = (&self.lanes, &mut self.drawn);
             let mut goto = None;
             let out = self.ctx.run(input, |ctx| {
@@ -1609,6 +1614,33 @@ mod tests {
             let m = self.drawn.drew.maps[li].expect("drawn");
             eframe::egui::pos2(m.x(f), m.y(v))
         }
+    }
+
+    #[test]
+    fn graph_pinch_and_option_pan_do_not_seek() {
+        use eframe::egui::{Event, Modifiers, PointerButton, vec2};
+        let mut g = HoverGraph::new(true, false);
+        g.frame(vec![]);
+        let at = g.at(0, 2000.0, 0.0);
+        g.hover(at);
+        let before = g.drawn.drew.maps[0].unwrap();
+        g.frame(vec![Event::Zoom(2.0)]);
+        let zoomed = g.drawn.drew.maps[0].unwrap();
+        assert!(((zoomed.hi - zoomed.lo) - (before.hi - before.lo) / 2.0).abs() < 0.1, "pinch zooms once");
+        let m = Modifiers { alt: true, ..Modifiers::NONE };
+        g.frame_modifiers(vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: m }], m);
+        let (_, _, goto) = g.frame_modifiers(vec![Event::PointerMoved(at + vec2(80.0, 0.0))], m);
+        if cfg!(target_os = "macos") {
+            assert_eq!(goto, None, "Option pans without seeking");
+            assert!(g.drawn.drew.maps[0].unwrap().lo < zoomed.lo);
+        } else {
+            assert!(goto.is_some(), "Alt drag keeps Windows seeking");
+            assert_eq!(g.drawn.drew.maps[0].unwrap().lo, zoomed.lo);
+        }
+        let (_, _, goto) = g.frame(vec![Event::PointerMoved(at + vec2(90.0, 0.0))]);
+        if cfg!(target_os = "macos") { assert_eq!(goto, None, "Option released first still pans"); }
+        let (_, _, goto) = g.frame(vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]);
+        assert_eq!(goto, None);
     }
 
     fn texts(s: &[eframe::egui::epaint::ClippedShape]) -> Vec<String> {

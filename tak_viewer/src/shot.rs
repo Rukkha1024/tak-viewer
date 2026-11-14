@@ -281,16 +281,31 @@ pub fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Vec<u8> {
 }
 
 pub fn save_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> std::io::Result<()> {
-    if tak_core::tak::is_take_path(path) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing to write a .tak path"));
-    }
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&encode_png(width, height, rgba))
+    tak_core::output::write_atomic(path, |file| file.write_all(&encode_png(width, height, rgba)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_safety_png_refuses_takm_and_preserves_ordinary_overwrite() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tak_shot_safety_{}_{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let protected = dir.join("원본 파일.TAKM");
+        std::fs::write(&protected, b"original").unwrap();
+        let refused = save_png(&protected, 1, 1, &[255; 4]);
+        let unchanged = std::fs::read(&protected).unwrap() == b"original";
+        let ordinary = dir.join("결과 파일.png");
+        std::fs::write(&ordinary, b"old").unwrap();
+        save_png(&ordinary, 1, 1, &[255; 4]).unwrap();
+        let png = std::fs::read(&ordinary).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(refused.is_err());
+        assert!(unchanged);
+        assert_eq!(png, encode_png(1, 1, &[255; 4]));
+    }
 
     #[test]
     fn crc_known_value() {

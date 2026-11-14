@@ -2,6 +2,7 @@
 //! TAK and TAKM are read only; the latter reports its file kind.
 
 use std::path::Path;
+use std::io::Write;
 
 use serde_json::{json, Map, Value};
 
@@ -148,6 +149,10 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("refusing to write dump output to a .tak/.takm path: {}", output.display());
         return 2;
     }
+    if matches!((input.canonicalize(), output.canonicalize()), (Ok(source), Ok(target)) if source == target) {
+        eprintln!("refusing to replace the input file with dump output: {}", output.display());
+        return 2;
+    }
     let read = if args[0] == "--dump-fast" { read_fast } else { read_take };
     let take = match read(input) {
         Ok(t) => t,
@@ -163,7 +168,7 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(output, text) {
+    if let Err(e) = crate::output::write_atomic(output, |file| file.write_all(text.as_bytes())) {
         eprintln!("error: cannot write {}: {}", output.display(), e);
         return 1;
     }
@@ -180,4 +185,84 @@ fn read_fast(path: &Path) -> crate::tak::Result<crate::tak::Take> {
         take.warnings.extend(warning);
     }
     Ok(take)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("tak_dump_{tag}_{}_{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("원본 파일.TAK"), crate::sample_tak::sample_tak()).unwrap();
+            Self(dir)
+        }
+        fn source(&self) -> PathBuf { self.0.join("원본 파일.TAK") }
+        fn dump(&self, output: &Path) -> i32 {
+            run(&["--dump".into(), self.source().to_string_lossy().into_owned(), output.to_string_lossy().into_owned()])
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn output_safety_dump_keeps_hard_linked_source_unchanged() {
+        let f = Fixture::new("hardlink");
+        let output = f.0.join("결과 파일.json");
+        std::fs::hard_link(f.source(), &output).unwrap();
+        let before = std::fs::read(f.source()).unwrap();
+        let result = f.dump(&output);
+        #[cfg(unix)]
+        assert_ne!(result, 0);
+        #[cfg(not(unix))]
+        let _ = result;
+        assert_eq!(std::fs::read(f.source()).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_safety_dump_refuses_symlink_without_changing_source() {
+        let f = Fixture::new("symlink");
+        let output = f.0.join("결과 파일.json");
+        std::os::unix::fs::symlink(f.source(), &output).unwrap();
+        let before = std::fs::read(f.source()).unwrap();
+        assert_ne!(f.dump(&output), 0);
+        assert_eq!(std::fs::read(f.source()).unwrap(), before);
+    }
+
+    #[test]
+    fn output_safety_dump_refuses_repository_input() {
+        let f = Fixture::new("input");
+        std::fs::write(f.0.join(".tak-viewer-root"), b"tak-viewer\n").unwrap();
+        std::fs::create_dir(f.0.join("INPUT")).unwrap();
+        let output = f.0.join("INPUT/결과 파일.json");
+        assert_ne!(f.dump(&output), 0);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn output_safety_dump_does_not_replace_its_input_under_a_nonstandard_name() {
+        let f = Fixture::new("same_path");
+        let source = f.0.join("원본 파일.json");
+        let before = std::fs::read(f.source()).unwrap();
+        std::fs::rename(f.source(), &source).unwrap();
+        let path = source.to_string_lossy().into_owned();
+        assert_ne!(run(&["--dump".into(), path.clone(), path]), 0);
+        assert_eq!(std::fs::read(source).unwrap(), before);
+    }
+
+    #[test]
+    fn output_safety_dump_still_replaces_an_ordinary_json() {
+        let f = Fixture::new("overwrite");
+        let output = f.0.join("결과 파일.json");
+        std::fs::write(&output, "old").unwrap();
+        assert_eq!(f.dump(&output), 0);
+        let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(value["frame_rate"], 100.0);
+    }
 }

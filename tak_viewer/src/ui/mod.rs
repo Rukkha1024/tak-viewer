@@ -1,4 +1,4 @@
-//! Everything drawn on screen. Data comes from `tak_core`; these files only draw and handle input.
+﻿//! Everything drawn on screen. Data comes from `tak_core`; these files only draw and handle input.
 //!
 //! - `scene`: 3D viewport (floor, markers, sticks, plates, selection, HUD) and click picking.
 //! - `panels`: Labels, selected marker, its graph pane, devices, timeline, transport bar.
@@ -18,6 +18,7 @@ pub mod dock;
 pub mod explorer;
 pub mod graph;
 pub mod graph_float;
+mod input;
 pub mod open_editors;
 pub mod panels;
 pub mod scene;

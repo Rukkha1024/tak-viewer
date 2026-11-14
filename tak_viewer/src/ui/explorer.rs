@@ -1,4 +1,4 @@
-//! Workspace tree with lazy folder listing, selection, and reveal of the open file.
+﻿//! Workspace tree with lazy folder listing, selection, and reveal of the open file.
 //! A background watcher polls expanded folders and saved-root existence. Changed listings
 //! replace the old ones without resetting folds or scroll. Removing or renaming a saved
 //! folder in the workspace changes its entry, not the directory on disk.
@@ -374,7 +374,7 @@ fn icon_button(ui: &mut Ui, icon: Icon, tip: &str, enabled: bool) -> bool {
         ui.painter().rect_filled(r.shrink(1.0), 4.0, Color32::from_rgba_unmultiplied(0x5a, 0x5d, 0x5e, 0x50));
     }
     draw_icon(ui.painter(), r, icon, if enabled { ICON_FG } else { FG_DIM.gamma_multiply(0.6) });
-    resp.on_hover_text(tip).clicked()
+    resp.on_hover_text(crate::platform::shortcut_text(tip)).clicked()
 }
 
 fn mb(size: u64) -> String {
@@ -657,8 +657,9 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     if let Some(f) = folder {
                         p.with_clip_rect(rect).text(pos2(name_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, f, FontId::proportional(11.5), FG_DIM);
                     }
+                    let multi = crate::platform::shortcut_text("Ctrl+클릭");
                     let resp = resp.on_hover_text(format!(
-                        "{}\n{}\n{}\n\n클릭: 지금 화면에 열기 · Ctrl+클릭: 옆 화면에 열기 (최대 {MAX_VIEWS}개)\n3D 화면으로 끌어다 놓기: 가운데 = 그 화면에 열기 · 가장자리 = 그쪽에 새 화면",
+                        "{}\n{}\n{}\n\n클릭: 지금 화면에 열기 · {multi}: 옆 화면에 열기 (최대 {MAX_VIEWS}개)\n3D 화면으로 끌어다 놓기: 가운데 = 그 화면에 열기 · 가장자리 = 그쪽에 새 화면",
                         mb(file.size),
                         file.path.display(),
                         to_wsl_path(&file.path).unwrap_or_default()
@@ -669,7 +670,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                             action = Some(WsAction::Open(file.path.clone()));
                             ui.close_menu();
                         }
-                        if ui.button("옆 화면에 열기  (Ctrl+클릭)").clicked() {
+                        if ui.button(crate::platform::shortcut_text("옆 화면에 열기  (Ctrl+클릭)")).clicked() {
                             action = Some(WsAction::OpenSide(file.path.clone()));
                             ui.close_menu();
                         }

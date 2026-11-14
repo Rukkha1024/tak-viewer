@@ -369,7 +369,7 @@ pub fn new_dir(base: &Path) -> Result<PathBuf, String> {
 }
 
 /// The wall clock now: [year, month, day, hour, minute, second] in local time and the local
-/// offset from UTC in minutes. Without a local clock (not Windows): UTC and None.
+/// offset from UTC in minutes. Without a supported local clock: UTC and None.
 pub fn local_clock() -> ([i64; 6], Option<i32>) {
     #[cfg(windows)]
     {
@@ -404,8 +404,79 @@ pub fn local_clock() -> ([i64; 6], Option<i32>) {
     }
     #[cfg(not(windows))]
     {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
-        (tak_core::comments::civil_from_unix(secs), None)
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .ok().and_then(|d| i64::try_from(d.as_secs()).ok()).unwrap_or(0);
+        #[cfg(target_os = "macos")]
+        { local_clock_at(secs) }
+        #[cfg(not(target_os = "macos"))]
+        { (tak_core::comments::civil_from_unix(secs), None) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_clock_at(secs: i64) -> ([i64; 6], Option<i32>) {
+    let fallback = || (tak_core::comments::civil_from_unix(secs), None);
+    let Some(time) = libc::time_t::try_from(secs).ok() else { return fallback() };
+    let mut result = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers refer to correctly sized local storage. Read the output only
+    // when localtime_r succeeds; libc provides the current timezone and DST offset.
+    let ptr = unsafe { libc::localtime_r(&time, result.as_mut_ptr()) };
+    if ptr.is_null() { return fallback(); }
+    let result = unsafe { result.assume_init() };
+    let Some(year) = i64::from(result.tm_year).checked_add(1900) else { return fallback() };
+    let Some(month) = i64::from(result.tm_mon).checked_add(1) else { return fallback() };
+    let Ok(offset) = i32::try_from(result.tm_gmtoff / 60) else { return fallback() };
+    ([year, month, i64::from(result.tm_mday), i64::from(result.tm_hour), i64::from(result.tm_min), i64::from(result.tm_sec)], Some(offset))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod local_clock_tests {
+    use super::*;
+
+    #[test]
+    fn dst_and_out_of_range_subprocess() {
+        if std::env::var_os("TAK_CLOCK_DST_CHILD").is_some() {
+            for (civil, offset) in [([2024, 1, 15, 12, 0, 0], -300), ([2024, 7, 15, 12, 0, 0], -240)] {
+                let secs = tak_core::comments::unix_from_civil(civil);
+                assert_eq!(local_clock_at(secs), (tak_core::comments::civil_from_unix(secs + i64::from(offset) * 60), Some(offset)));
+            }
+            assert_eq!(local_clock_at(i64::MAX), (tak_core::comments::civil_from_unix(i64::MAX), None));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "capture::local_clock_tests::dst_and_out_of_range_subprocess", "--nocapture"])
+            .env("TZ", "America/New_York").env("TAK_CLOCK_DST_CHILD", "1").output().unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn local_timezone_subprocess() {
+        if let Ok(zone) = std::env::var("TAK_CLOCK_TEST_ZONE") {
+            let (civil, offset) = local_clock();
+            let expected = match zone.as_str() {
+                "Asia/Seoul" => 540,
+                "Asia/Kathmandu" => 345,
+                "UTC" => 0,
+                _ => unreachable!(),
+            };
+            assert_eq!(offset, Some(expected));
+            let date = std::process::Command::new("/bin/date").arg("+%Y-%m-%d").output().unwrap();
+            assert_eq!(format!("{:04}-{:02}-{:02}", civil[0], civil[1], civil[2]), String::from_utf8(date.stdout).unwrap().trim());
+            // Date rollover, leap day and fractional offsets use deterministic UTC instants.
+            let midnight = tak_core::comments::unix_from_civil([2024, 2, 29, 23, 30, 0]);
+            let (local, fixed_offset) = local_clock_at(midnight);
+            assert_eq!(fixed_offset, Some(expected));
+            assert_eq!(local, tak_core::comments::civil_from_unix(midnight + i64::from(expected) * 60));
+            assert!(!local_stamp().ends_with('Z'));
+            assert!(local_iso_time().ends_with(&format!("+{:02}:{:02}", expected / 60, expected % 60)));
+            return;
+        }
+        for zone in ["Asia/Seoul", "Asia/Kathmandu", "UTC"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "capture::local_clock_tests::local_timezone_subprocess", "--nocapture"])
+                .env("TZ", zone).env("TAK_CLOCK_TEST_ZONE", zone).output().unwrap();
+            assert!(output.status.success(), "{zone}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
     }
 }
 
@@ -578,20 +649,21 @@ pub fn sheet(cells: &[Image], cols: usize, gap: usize) -> Option<Image> {
     Some(Image { w, h, rgba })
 }
 
-/// Compressed PNG (RGB, alpha dropped: screenshots are opaque). Refuses `.tak` paths.
+/// Compressed PNG (RGB, alpha dropped). Protects TAK/TAKM, input folders and aliases.
 pub fn save_png(path: &Path, img: &Image) -> std::io::Result<()> {
-    if tak_core::tak::is_take_path(path) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing to write a .tak path"));
-    }
+    use std::io::Write;
     let rgb: Vec<u8> = img.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, img.w as u32, img.h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    let to_io = |e: png::EncodingError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
-    let mut writer = enc.write_header().map_err(to_io)?;
-    writer.write_image_data(&rgb).map_err(to_io)?;
-    writer.finish().map_err(to_io)
+    tak_core::output::write_atomic(path, |file| {
+        let mut buffer = std::io::BufWriter::new(file);
+        let mut enc = png::Encoder::new(&mut buffer, img.w as u32, img.h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let to_io = |e: png::EncodingError| std::io::Error::other(e.to_string());
+        let mut writer = enc.write_header().map_err(to_io)?;
+        writer.write_image_data(&rgb).map_err(to_io)?;
+        writer.finish().map_err(to_io)?;
+        buffer.flush()
+    })
 }
 
 /// Size and modification time, to show the TAK did not change.
@@ -688,7 +760,7 @@ impl CaptureRun {
             "shots": self.records,
         });
         let json_path = out.join("captures.json");
-        match std::fs::write(&json_path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+        match tak_core::output::write_atomic(&json_path, |file| std::io::Write::write_all(file, serde_json::to_string_pretty(&doc).unwrap_or_default().as_bytes())) {
             Ok(()) => {}
             Err(e) => lines.push(format!("captures.json 저장 실패: {e}")),
         }
@@ -822,5 +894,44 @@ mod tests {
         assert_eq!(&s.rgba[..4], &[10, 20, 30, 255]);
         let sh = sheet(&[s.clone(), s.clone(), s], 2, 1).unwrap();
         assert_eq!((sh.w, sh.h), (2 * 2 + 3, 2 * 2 + 3));
+    }
+}
+
+#[cfg(test)]
+mod output_safety_tests {
+    use super::*;
+
+    #[test]
+    fn capture_png_never_replaces_a_takm() {
+        let dir = std::env::temp_dir().join(format!("tak_capture_protect_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("원본.TAKM");
+        std::fs::write(&path, b"original").unwrap();
+        let image = Image { w: 1, h: 1, rgba: vec![255; 4] };
+        assert!(save_png(&path, &image).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_png_refuses_source_links_and_preserves_regular_output_on_error() {
+        let dir = std::env::temp_dir().join(format!("tak_capture_links_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("원본.tak");
+        std::fs::write(&source, b"original").unwrap();
+        let image = Image { w: 1, h: 1, rgba: vec![255; 4] };
+        for hard in [false, true] {
+            let path = dir.join(if hard { "hard.png" } else { "symbolic.png" });
+            if hard { std::fs::hard_link(&source, &path).unwrap(); }
+            else { std::os::unix::fs::symlink(&source, &path).unwrap(); }
+            assert!(save_png(&path, &image).is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        }
+        let regular = dir.join("normal.png");
+        save_png(&regular, &image).unwrap();
+        assert!(std::fs::read(&regular).unwrap().starts_with(b"\x89PNG"));
+        save_png(&regular, &image).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
