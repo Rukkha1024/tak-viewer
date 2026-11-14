@@ -1,0 +1,1668 @@
+﻿{
+  "measured_at": "2026-11-14T13:28:35.067173+00:00",
+  "scope": "macOS client to Linux workstation using persistent SSH and read-only Python helper; experiment only, no viewer integration",
+  "method": "Two real TAK files; five methods, three rounds per file; rotated order; cold logical client cache per mode; server filesystem cache not flushed. No concurrent bandwidth benchmark.",
+  "timing": "Cumulative stage times include client compound parsing, index discovery (including server work for server_index modes), transfer and payload reconstruction. Connection setup reported separately; viewer decode/render excluded.",
+  "received_byte_metric": "Source range bytes + server-index JSON reply when present; excludes outgoing requests, OK delimiters and SSH framing.",
+  "preview": "Frame IDs [0,120); independent metadata inspection confirms both samples start at0 and100Hz, so first1.2seconds. Late and sparse channels retained with appropriate zero or fewer samples.",
+  "baseline_caveat": "selected_all retains previous reader full mini-stream behavior; staged readers map only needed mini ranges. Differences combine extraction strategies with staging.",
+  "raw_source_file_written_to_mac_by_experiment": false,
+  "validation": {
+    "unit_tests": 9,
+    "unit_test_command": "python3 -B -m unittest discover -s scripts -p 'test_ssh_progressive_experiment.py' -v",
+    "independent_oracle": "existing independent TakContainer + full linear record scan and actual frame filter; no prefix-count shortcut",
+    "checks": [
+      "Whole source MD5",
+      "All cached ranges MD5 vs full source",
+      "Every staged stream MD5 vs full source reconstruction",
+      "Every staged stream MD5 vs independent existing workstation parser and complete linear frame scan",
+      "Sparse/late/boundary/empty frame cases and raw NaN/negative-zero bytes",
+      "Overlap cache: no fetched byte requested again",
+      "Local remote-helper protocol, fragmented mapping and source-change rejection"
+    ]
+  },
+  "reproduce": "python3 -B scripts/03_ssh_progressive_experiment.py --host <ssh-alias> --file <remote-tak-path> --output <report.json>",
+  "observations": [
+    "Sequential client header probes cost about100round trips and can make a small file slower than selected_all.",
+    "Remote index discovery eliminates most round trips without full source transfer.",
+    "Large sample: early preview is materially earlier; small sample: early preview saves little over full nonanalog-first, and adds completion time.",
+    "These two files and this network do not establish a universal optimal threshold."
+  ],
+  "round_trip_probe": {
+    "kind": "empty range request round-trip; persistent SSH; source stat checks included",
+    "measurements_ms": [
+      16.23733300000002,
+      17.38604199999999,
+      18.155875000000044,
+      17.066000000000024,
+      25.75612500000002,
+      22.892500000000037,
+      19.935333,
+      15.370708999999927,
+      17.085125000000033,
+      17.942666000000052,
+      11.910458999999985,
+      11.001916999999972,
+      7.532209000000067,
+      11.171750000000035,
+      6.39962500000002,
+      7.766458999999948,
+      7.446375000000005,
+      11.955041,
+      8.34950000000001,
+      7.730165999999983
+    ],
+    "median_ms": 13.662874999999964,
+    "min_ms": 6.39962500000002,
+    "max_ms": 25.75612500000002,
+    "payload_bytes": 0
+  },
+  "exploratory_probe_trials": [
+    {
+      "probe_bytes": 256,
+      "rounds": 1,
+      "purpose": "Exploratory client-side probe sizing, not a statistically repeated ranking",
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "first_stage_ms": 1485.0442500000001,
+          "complete_ms": 1485.0442500000001,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 1485.0442500000001,
+              "bytes": 15521033,
+              "requests": 7,
+              "ranges": 14
+            }
+          ]
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "first_stage_ms": 1247.970208,
+          "complete_ms": 2429.3125,
+          "index": {
+            "ms": 841.8648750000002,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1247.970208,
+              "bytes": 3982531,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "complete",
+              "ms": 2429.3125,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 200
+            }
+          ]
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "first_stage_ms": 1295.0211669999999,
+          "complete_ms": 2921.0020830000003,
+          "index": {
+            "ms": 1168.4910000000004,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1295.0211669999999,
+              "bytes": 453363,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1747.6181669999996,
+              "bytes": 3982531,
+              "requests": 108,
+              "ranges": 214
+            },
+            {
+              "stage": "complete",
+              "ms": 2921.0020830000003,
+              "bytes": 15471551,
+              "requests": 109,
+              "ranges": 248
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "probe_bytes": 4096,
+      "rounds": 1,
+      "purpose": "Exploratory client-side probe sizing, not a statistically repeated ranking",
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "first_stage_ms": 1500.5877079999998,
+          "complete_ms": 1500.5877079999998,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 1500.5877079999998,
+              "bytes": 15521033,
+              "requests": 7,
+              "ranges": 14
+            }
+          ]
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "first_stage_ms": 1368.0672920000002,
+          "complete_ms": 2452.9136249999997,
+          "index": {
+            "ms": 973.592709,
+            "bytes": 438295,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1368.0672920000002,
+              "bytes": 4113091,
+              "requests": 107,
+              "ranges": 160
+            },
+            {
+              "stage": "complete",
+              "ms": 2452.9136249999997,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 194
+            }
+          ]
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "first_stage_ms": 1041.1114170000008,
+          "complete_ms": 2902.7842920000007,
+          "index": {
+            "ms": 961.2291670000009,
+            "bytes": 438295,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1041.1114170000008,
+              "bytes": 683725,
+              "requests": 106,
+              "ranges": 113
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1387.11625,
+              "bytes": 4113091,
+              "requests": 107,
+              "ranges": 160
+            },
+            {
+              "stage": "complete",
+              "ms": 2902.7842920000007,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 194
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "samples": [
+    {
+      "file_bytes": 34657033,
+      "connection_setup_ms": 284.931791,
+      "config": {
+        "rounds": 3,
+        "session_timeout_seconds": 240,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "probe_bytes": 256,
+        "preview_frame_limit": 120
+      },
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 1529.29825,
+              "bytes": 15521033,
+              "requests": 7,
+              "ranges": 14
+            }
+          ],
+          "first_stage_ms": 1529.29825,
+          "complete_ms": 1529.29825,
+          "cache_payload_bytes": 15521033,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 51.61041700000002,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 871.801834,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1469.571917,
+              "bytes": 3982531,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "complete",
+              "ms": 2772.3410839999997,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 200
+            }
+          ],
+          "first_stage_ms": 1469.571917,
+          "complete_ms": 2772.3410839999997,
+          "cache_payload_bytes": 15471551,
+          "round": 1
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 41.03966700000061,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 839.0203330000006,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 940.9372920000001,
+              "bytes": 453363,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1304.6401670000005,
+              "bytes": 3982531,
+              "requests": 108,
+              "ranges": 214
+            },
+            {
+              "stage": "complete",
+              "ms": 2381.8555000000006,
+              "bytes": 15471551,
+              "requests": 109,
+              "ranges": 248
+            }
+          ],
+          "first_stage_ms": 940.9372920000001,
+          "complete_ms": 2381.8555000000006,
+          "cache_payload_bytes": 15471551,
+          "round": 1
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 47.006582999999935,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 65.10850000000002,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 447.9005410000001,
+              "bytes": 3985200,
+              "requests": 8,
+              "ranges": 15
+            },
+            {
+              "stage": "complete",
+              "ms": 1523.0404160000007,
+              "bytes": 15482924,
+              "requests": 9,
+              "ranges": 16
+            }
+          ],
+          "first_stage_ms": 447.9005410000001,
+          "complete_ms": 1523.0404160000007,
+          "cache_payload_bytes": 15471541,
+          "round": 1
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 54.601165999999424,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 81.75620799999983,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 190.09891600000017,
+              "bytes": 456032,
+              "requests": 9,
+              "ranges": 138
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 597.651625000001,
+              "bytes": 3985200,
+              "requests": 10,
+              "ranges": 186
+            },
+            {
+              "stage": "complete",
+              "ms": 1918.784166,
+              "bytes": 15482924,
+              "requests": 11,
+              "ranges": 187
+            }
+          ],
+          "first_stage_ms": 190.09891600000017,
+          "complete_ms": 1918.784166,
+          "cache_payload_bytes": 15471541,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.88670800000038,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 842.8219160000001,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1257.7137079999989,
+              "bytes": 3982531,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "complete",
+              "ms": 2334.4623329999995,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 200
+            }
+          ],
+          "first_stage_ms": 1257.7137079999989,
+          "complete_ms": 2334.4623329999995,
+          "cache_payload_bytes": 15471551,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 38.610375000001085,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 870.5285420000006,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 963.7761250000008,
+              "bytes": 453363,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1311.8377500000004,
+              "bytes": 3982531,
+              "requests": 108,
+              "ranges": 214
+            },
+            {
+              "stage": "complete",
+              "ms": 2624.4572920000005,
+              "bytes": 15471551,
+              "requests": 109,
+              "ranges": 248
+            }
+          ],
+          "first_stage_ms": 963.7761250000008,
+          "complete_ms": 2624.4572920000005,
+          "cache_payload_bytes": 15471551,
+          "round": 2
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 42.85858399999931,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 59.511209000000065,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 502.2122499999995,
+              "bytes": 3985200,
+              "requests": 8,
+              "ranges": 15
+            },
+            {
+              "stage": "complete",
+              "ms": 1613.3505419999992,
+              "bytes": 15482924,
+              "requests": 9,
+              "ranges": 16
+            }
+          ],
+          "first_stage_ms": 502.2122499999995,
+          "complete_ms": 1613.3505419999992,
+          "cache_payload_bytes": 15471541,
+          "round": 2
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 38.05075000000002,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 56.542833000001735,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 174.5370830000006,
+              "bytes": 456032,
+              "requests": 9,
+              "ranges": 138
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 535.3726250000009,
+              "bytes": 3985200,
+              "requests": 10,
+              "ranges": 186
+            },
+            {
+              "stage": "complete",
+              "ms": 1604.3786660000023,
+              "bytes": 15482924,
+              "requests": 11,
+              "ranges": 187
+            }
+          ],
+          "first_stage_ms": 174.5370830000006,
+          "complete_ms": 1604.3786660000023,
+          "cache_payload_bytes": 15471541,
+          "round": 2
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 1443.1551250000005,
+              "bytes": 15521033,
+              "requests": 7,
+              "ranges": 14
+            }
+          ],
+          "first_stage_ms": 1443.1551250000005,
+          "complete_ms": 1443.1551250000005,
+          "cache_payload_bytes": 15521033,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 42.841707999997425,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 858.3343329999984,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 946.3572499999984,
+              "bytes": 453363,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1412.1132499999974,
+              "bytes": 3982531,
+              "requests": 108,
+              "ranges": 214
+            },
+            {
+              "stage": "complete",
+              "ms": 2526.09,
+              "bytes": 15471551,
+              "requests": 109,
+              "ranges": 248
+            }
+          ],
+          "first_stage_ms": 946.3572499999984,
+          "complete_ms": 2526.09,
+          "cache_payload_bytes": 15471551,
+          "round": 3
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 48.20337499999994,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 65.24950000000018,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 458.02049999999997,
+              "bytes": 3985200,
+              "requests": 8,
+              "ranges": 15
+            },
+            {
+              "stage": "complete",
+              "ms": 1516.4029580000006,
+              "bytes": 15482924,
+              "requests": 9,
+              "ranges": 16
+            }
+          ],
+          "first_stage_ms": 458.02049999999997,
+          "complete_ms": 1516.4029580000006,
+          "cache_payload_bytes": 15471541,
+          "round": 3
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.92570799999862,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 69.49741599999726,
+            "bytes": 110199,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 11383,
+          "index_local_read_bytes": 25354,
+          "index_local_read_ranges": 100,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 172.33324999999766,
+              "bytes": 456032,
+              "requests": 9,
+              "ranges": 138
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 521.9087499999979,
+              "bytes": 3985200,
+              "requests": 10,
+              "ranges": 186
+            },
+            {
+              "stage": "complete",
+              "ms": 1594.457124999998,
+              "bytes": 15482924,
+              "requests": 11,
+              "ranges": 187
+            }
+          ],
+          "first_stage_ms": 172.33324999999766,
+          "complete_ms": 1594.457124999998,
+          "cache_payload_bytes": 15471541,
+          "round": 3
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 1495.085624999998,
+              "bytes": 15521033,
+              "requests": 7,
+              "ranges": 14
+            }
+          ],
+          "first_stage_ms": 1495.085624999998,
+          "complete_ms": 1495.085624999998,
+          "cache_payload_bytes": 15521033,
+          "round": 3
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 46.53591699999993,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 911.1383750000002,
+            "bytes": 122651,
+            "requests": 104,
+            "ranges": 104
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1314.077417,
+              "bytes": 3982531,
+              "requests": 107,
+              "ranges": 166
+            },
+            {
+              "stage": "complete",
+              "ms": 2412.7221249999984,
+              "bytes": 15471551,
+              "requests": 108,
+              "ranges": 200
+            }
+          ],
+          "first_stage_ms": 1314.077417,
+          "complete_ms": 2412.7221249999984,
+          "cache_payload_bytes": 15471551,
+          "round": 3
+        }
+      ],
+      "reference_md5": "231b4559fa67e168bc265b8b5230efc6",
+      "stage_md5_verified": true,
+      "range_md5_verified": true,
+      "stream_bytes": {
+        "Nodes.dat": 237079,
+        "MetaData.dat": 8351,
+        "Channels.dat": 15127305
+      },
+      "channel_records": {
+        "nonanalog": 65,
+        "analog": 34
+      },
+      "limitations": [
+        "Transport and payload reconstruction only; no viewer decode or render",
+        "SSH read-only Python helper; not SFTP",
+        "Received application bytes count source ranges and index JSON replies; outgoing JSON, range acknowledgments and SSH framing excluded",
+        "Server index probes channel headers locally and transfers descriptors only; payload cache starts cold",
+        "Each mode has a cold logical client cache; server filesystem cache may be warm",
+        "Connection setup is separate; cumulative stage timings include bootstrap and index discovery",
+        "Preview is frame IDs [0, limit), assumes strictly increasing unsigned IDs verified against reference",
+        "Selected-all baseline retains existing compound extraction behavior",
+        "Cache payload excludes reconstructed outputs and is not peak process memory"
+      ],
+      "summaries": {
+        "selected_all": {
+          "median_first_stage_ms": 1495.085624999998,
+          "median_complete_ms": 1495.085624999998,
+          "stages": {
+            "complete": {
+              "median_ms": 1495.085624999998,
+              "minimum_ms": 1443.1551250000005,
+              "maximum_ms": 1529.29825,
+              "received_payload_bytes": 15521033,
+              "requests": 7
+            }
+          }
+        },
+        "nonanalog_then_analog": {
+          "median_first_stage_ms": 1314.077417,
+          "median_complete_ms": 2412.7221249999984,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 1314.077417,
+              "minimum_ms": 1257.7137079999989,
+              "maximum_ms": 1469.571917,
+              "received_payload_bytes": 3982531,
+              "requests": 107
+            },
+            "complete": {
+              "median_ms": 2412.7221249999984,
+              "minimum_ms": 2334.4623329999995,
+              "maximum_ms": 2772.3410839999997,
+              "received_payload_bytes": 15471551,
+              "requests": 108
+            }
+          }
+        },
+        "early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 946.3572499999984,
+          "median_complete_ms": 2526.09,
+          "stages": {
+            "early_frames": {
+              "median_ms": 946.3572499999984,
+              "minimum_ms": 940.9372920000001,
+              "maximum_ms": 963.7761250000008,
+              "received_payload_bytes": 453363,
+              "requests": 107
+            },
+            "nonanalog": {
+              "median_ms": 1311.8377500000004,
+              "minimum_ms": 1304.6401670000005,
+              "maximum_ms": 1412.1132499999974,
+              "received_payload_bytes": 3982531,
+              "requests": 108
+            },
+            "complete": {
+              "median_ms": 2526.09,
+              "minimum_ms": 2381.8555000000006,
+              "maximum_ms": 2624.4572920000005,
+              "received_payload_bytes": 15471551,
+              "requests": 109
+            }
+          }
+        },
+        "server_index_nonanalog_then_analog": {
+          "median_first_stage_ms": 458.02049999999997,
+          "median_complete_ms": 1523.0404160000007,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 458.02049999999997,
+              "minimum_ms": 447.9005410000001,
+              "maximum_ms": 502.2122499999995,
+              "received_payload_bytes": 3985200,
+              "requests": 8
+            },
+            "complete": {
+              "median_ms": 1523.0404160000007,
+              "minimum_ms": 1516.4029580000006,
+              "maximum_ms": 1613.3505419999992,
+              "received_payload_bytes": 15482924,
+              "requests": 9
+            }
+          }
+        },
+        "server_index_early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 174.5370830000006,
+          "median_complete_ms": 1604.3786660000023,
+          "stages": {
+            "early_frames": {
+              "median_ms": 174.5370830000006,
+              "minimum_ms": 172.33324999999766,
+              "maximum_ms": 190.09891600000017,
+              "received_payload_bytes": 456032,
+              "requests": 9
+            },
+            "nonanalog": {
+              "median_ms": 535.3726250000009,
+              "minimum_ms": 521.9087499999979,
+              "maximum_ms": 597.651625000001,
+              "received_payload_bytes": 3985200,
+              "requests": 10
+            },
+            "complete": {
+              "median_ms": 1604.3786660000023,
+              "minimum_ms": 1594.457124999998,
+              "maximum_ms": 1918.784166,
+              "received_payload_bytes": 15482924,
+              "requests": 11
+            }
+          }
+        }
+      },
+      "verified_stage_md5": {
+        "complete": {
+          "Nodes.dat": "6bd92d52c9c60173357826d13868254e",
+          "MetaData.dat": "8abe1f2fa5acde884e05fec75ec1e858",
+          "Channels.dat": "4581b6c1a6614fcc3959cfe20539e7ee"
+        },
+        "nonanalog": {
+          "Nodes.dat": "6bd92d52c9c60173357826d13868254e",
+          "MetaData.dat": "8abe1f2fa5acde884e05fec75ec1e858",
+          "Channels.dat": "5ae558dacf93f81ec74938d62d82bc49"
+        },
+        "early_frames": {
+          "Nodes.dat": "6bd92d52c9c60173357826d13868254e",
+          "MetaData.dat": "8abe1f2fa5acde884e05fec75ec1e858",
+          "Channels.dat": "c9bc9ec543676c3894c7d99313e64bd8"
+        }
+      },
+      "independent_reference": {
+        "file_bytes": 34657033,
+        "file_md5": "231b4559fa67e168bc265b8b5230efc6",
+        "full_stream_md5": {
+          "Nodes.dat": "6bd92d52c9c60173357826d13868254e",
+          "Channels.dat": "4581b6c1a6614fcc3959cfe20539e7ee",
+          "MetaData.dat": "8abe1f2fa5acde884e05fec75ec1e858"
+        },
+        "nonanalog_channels_md5": "5ae558dacf93f81ec74938d62d82bc49",
+        "prefix_channels_md5": "c9bc9ec543676c3894c7d99313e64bd8",
+        "analog_channels_md5": "d88d45c2c779ccf28d2fcfe7977610c8",
+        "nonanalog_records": 65,
+        "analog_records": 34,
+        "prefix_samples": 5217,
+        "late_records_with_zero_preview_samples": 15,
+        "prefix_frame_range": [
+          0,
+          120
+        ],
+        "all_nonanalog_frames_strictly_increasing": true
+      },
+      "independent_full_scan_md5_verified": true
+    },
+    {
+      "file_bytes": 4922061,
+      "connection_setup_ms": 263.543542,
+      "config": {
+        "rounds": 3,
+        "session_timeout_seconds": 240,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "probe_bytes": 256,
+        "preview_frame_limit": 120
+      },
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 276.5035,
+              "bytes": 2137293,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 276.5035,
+          "complete_ms": 276.5035,
+          "cache_payload_bytes": 2137293,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 50.61799999999994,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 741.2272080000001,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 826.944875,
+              "bytes": 775137,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "complete",
+              "ms": 963.711042,
+              "bytes": 2112267,
+              "requests": 91,
+              "ranges": 168
+            }
+          ],
+          "first_stage_ms": 826.944875,
+          "complete_ms": 963.711042,
+          "cache_payload_bytes": 2112267,
+          "round": 1
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 49.23187500000004,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 829.1791670000001,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1042.6645839999999,
+              "bytes": 434577,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1089.046709,
+              "bytes": 775137,
+              "requests": 91,
+              "ranges": 179
+            },
+            {
+              "stage": "complete",
+              "ms": 1236.0243750000002,
+              "bytes": 2112267,
+              "requests": 92,
+              "ranges": 213
+            }
+          ],
+          "first_stage_ms": 1042.6645839999999,
+          "complete_ms": 1236.0243750000002,
+          "cache_payload_bytes": 2112267,
+          "round": 1
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 47.19158300000004,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 58.89141600000025,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 149.8743330000001,
+              "bytes": 775563,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 281.34058300000044,
+              "bytes": 2121397,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 149.8743330000001,
+          "complete_ms": 281.34058300000044,
+          "cache_payload_bytes": 2112257,
+          "round": 1
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.65970799999974,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 50.19470799999981,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 139.23191700000004,
+              "bytes": 435003,
+              "requests": 9,
+              "ranges": 97
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 204.27200000000002,
+              "bytes": 775563,
+              "requests": 10,
+              "ranges": 142
+            },
+            {
+              "stage": "complete",
+              "ms": 378.96987499999966,
+              "bytes": 2121397,
+              "requests": 11,
+              "ranges": 143
+            }
+          ],
+          "first_stage_ms": 139.23191700000004,
+          "complete_ms": 378.96987499999966,
+          "cache_payload_bytes": 2112257,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.93837499999998,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 696.5405840000001,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 785.9051250000002,
+              "bytes": 775137,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "complete",
+              "ms": 921.1713750000001,
+              "bytes": 2112267,
+              "requests": 91,
+              "ranges": 168
+            }
+          ],
+          "first_stage_ms": 785.9051250000002,
+          "complete_ms": 921.1713750000001,
+          "cache_payload_bytes": 2112267,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 38.60895800000019,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 708.2956669999998,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 782.832333,
+              "bytes": 434577,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 834.2581249999998,
+              "bytes": 775137,
+              "requests": 91,
+              "ranges": 179
+            },
+            {
+              "stage": "complete",
+              "ms": 995.2210419999998,
+              "bytes": 2112267,
+              "requests": 92,
+              "ranges": 213
+            }
+          ],
+          "first_stage_ms": 782.832333,
+          "complete_ms": 995.2210419999998,
+          "cache_payload_bytes": 2112267,
+          "round": 2
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.91970800000045,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 56.13845800000039,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 144.14541600000064,
+              "bytes": 775563,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 276.58679100000063,
+              "bytes": 2121397,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 144.14541600000064,
+          "complete_ms": 276.58679100000063,
+          "cache_payload_bytes": 2112257,
+          "round": 2
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 43.30708300000019,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 53.26820800000043,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 133.30658300000042,
+              "bytes": 435003,
+              "requests": 9,
+              "ranges": 97
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 177.2714999999998,
+              "bytes": 775563,
+              "requests": 10,
+              "ranges": 142
+            },
+            {
+              "stage": "complete",
+              "ms": 316.97933299999994,
+              "bytes": 2121397,
+              "requests": 11,
+              "ranges": 143
+            }
+          ],
+          "first_stage_ms": 133.30658300000042,
+          "complete_ms": 316.97933299999994,
+          "cache_payload_bytes": 2112257,
+          "round": 2
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 254.343875,
+              "bytes": 2137293,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 254.343875,
+          "complete_ms": 254.343875,
+          "cache_payload_bytes": 2137293,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 43.5589580000002,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 677.6792079999998,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 742.3958329999998,
+              "bytes": 434577,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 789.1849999999998,
+              "bytes": 775137,
+              "requests": 91,
+              "ranges": 179
+            },
+            {
+              "stage": "complete",
+              "ms": 926.0347920000003,
+              "bytes": 2112267,
+              "requests": 92,
+              "ranges": 213
+            }
+          ],
+          "first_stage_ms": 742.3958329999998,
+          "complete_ms": 926.0347920000003,
+          "cache_payload_bytes": 2112267,
+          "round": 3
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.045500000000516,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 55.05341700000077,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 143.08737500000035,
+              "bytes": 775563,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 276.70595799999995,
+              "bytes": 2121397,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 143.08737500000035,
+          "complete_ms": 276.70595799999995,
+          "cache_payload_bytes": 2112257,
+          "round": 3
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 42.34337500000063,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 51.1235000000001,
+            "bytes": 107956,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 9140,
+          "index_local_read_bytes": 21002,
+          "index_local_read_ranges": 86,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 128.85866700000025,
+              "bytes": 435003,
+              "requests": 9,
+              "ranges": 97
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 173.85429200000058,
+              "bytes": 775563,
+              "requests": 10,
+              "ranges": 142
+            },
+            {
+              "stage": "complete",
+              "ms": 310.66233299999976,
+              "bytes": 2121397,
+              "requests": 11,
+              "ranges": 143
+            }
+          ],
+          "first_stage_ms": 128.85866700000025,
+          "complete_ms": 310.66233299999976,
+          "cache_payload_bytes": 2112257,
+          "round": 3
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 250.85975000000005,
+              "bytes": 2137293,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 250.85975000000005,
+          "complete_ms": 250.85975000000005,
+          "cache_payload_bytes": 2137293,
+          "round": 3
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 41.168708999999915,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 829.9977499999995,
+            "bytes": 119249,
+            "requests": 87,
+            "ranges": 87
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 928.7327920000008,
+              "bytes": 775137,
+              "requests": 90,
+              "ranges": 134
+            },
+            {
+              "stage": "complete",
+              "ms": 1069.30175,
+              "bytes": 2112267,
+              "requests": 91,
+              "ranges": 168
+            }
+          ],
+          "first_stage_ms": 928.7327920000008,
+          "complete_ms": 1069.30175,
+          "cache_payload_bytes": 2112267,
+          "round": 3
+        }
+      ],
+      "reference_md5": "403d9152b1b9c165c6bf9655e0853fda",
+      "stage_md5_verified": true,
+      "range_md5_verified": true,
+      "stream_bytes": {
+        "Nodes.dat": 228811,
+        "MetaData.dat": 8307,
+        "Channels.dat": 1776333
+      },
+      "channel_records": {
+        "nonanalog": 48,
+        "analog": 34
+      },
+      "limitations": [
+        "Transport and payload reconstruction only; no viewer decode or render",
+        "SSH read-only Python helper; not SFTP",
+        "Received application bytes count source ranges and index JSON replies; outgoing JSON, range acknowledgments and SSH framing excluded",
+        "Server index probes channel headers locally and transfers descriptors only; payload cache starts cold",
+        "Each mode has a cold logical client cache; server filesystem cache may be warm",
+        "Connection setup is separate; cumulative stage timings include bootstrap and index discovery",
+        "Preview is frame IDs [0, limit), assumes strictly increasing unsigned IDs verified against reference",
+        "Selected-all baseline retains existing compound extraction behavior",
+        "Cache payload excludes reconstructed outputs and is not peak process memory"
+      ],
+      "summaries": {
+        "selected_all": {
+          "median_first_stage_ms": 254.343875,
+          "median_complete_ms": 254.343875,
+          "stages": {
+            "complete": {
+              "median_ms": 254.343875,
+              "minimum_ms": 250.85975000000005,
+              "maximum_ms": 276.5035,
+              "received_payload_bytes": 2137293,
+              "requests": 7
+            }
+          }
+        },
+        "nonanalog_then_analog": {
+          "median_first_stage_ms": 826.944875,
+          "median_complete_ms": 963.711042,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 826.944875,
+              "minimum_ms": 785.9051250000002,
+              "maximum_ms": 928.7327920000008,
+              "received_payload_bytes": 775137,
+              "requests": 90
+            },
+            "complete": {
+              "median_ms": 963.711042,
+              "minimum_ms": 921.1713750000001,
+              "maximum_ms": 1069.30175,
+              "received_payload_bytes": 2112267,
+              "requests": 91
+            }
+          }
+        },
+        "early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 782.832333,
+          "median_complete_ms": 995.2210419999998,
+          "stages": {
+            "early_frames": {
+              "median_ms": 782.832333,
+              "minimum_ms": 742.3958329999998,
+              "maximum_ms": 1042.6645839999999,
+              "received_payload_bytes": 434577,
+              "requests": 90
+            },
+            "nonanalog": {
+              "median_ms": 834.2581249999998,
+              "minimum_ms": 789.1849999999998,
+              "maximum_ms": 1089.046709,
+              "received_payload_bytes": 775137,
+              "requests": 91
+            },
+            "complete": {
+              "median_ms": 995.2210419999998,
+              "minimum_ms": 926.0347920000003,
+              "maximum_ms": 1236.0243750000002,
+              "received_payload_bytes": 2112267,
+              "requests": 92
+            }
+          }
+        },
+        "server_index_nonanalog_then_analog": {
+          "median_first_stage_ms": 144.14541600000064,
+          "median_complete_ms": 276.70595799999995,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 144.14541600000064,
+              "minimum_ms": 143.08737500000035,
+              "maximum_ms": 149.8743330000001,
+              "received_payload_bytes": 775563,
+              "requests": 8
+            },
+            "complete": {
+              "median_ms": 276.70595799999995,
+              "minimum_ms": 276.58679100000063,
+              "maximum_ms": 281.34058300000044,
+              "received_payload_bytes": 2121397,
+              "requests": 9
+            }
+          }
+        },
+        "server_index_early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 133.30658300000042,
+          "median_complete_ms": 316.97933299999994,
+          "stages": {
+            "early_frames": {
+              "median_ms": 133.30658300000042,
+              "minimum_ms": 128.85866700000025,
+              "maximum_ms": 139.23191700000004,
+              "received_payload_bytes": 435003,
+              "requests": 9
+            },
+            "nonanalog": {
+              "median_ms": 177.2714999999998,
+              "minimum_ms": 173.85429200000058,
+              "maximum_ms": 204.27200000000002,
+              "received_payload_bytes": 775563,
+              "requests": 10
+            },
+            "complete": {
+              "median_ms": 316.97933299999994,
+              "minimum_ms": 310.66233299999976,
+              "maximum_ms": 378.96987499999966,
+              "received_payload_bytes": 2121397,
+              "requests": 11
+            }
+          }
+        }
+      },
+      "verified_stage_md5": {
+        "complete": {
+          "Nodes.dat": "37f2005874729c85aa1ffcc24a5f9c5c",
+          "MetaData.dat": "1e2e82e707fe513b5e6e7b6b06401b50",
+          "Channels.dat": "5c5dd350d65aba478843fd3e642e7eef"
+        },
+        "nonanalog": {
+          "Nodes.dat": "37f2005874729c85aa1ffcc24a5f9c5c",
+          "MetaData.dat": "1e2e82e707fe513b5e6e7b6b06401b50",
+          "Channels.dat": "588e8e18440c8773a248991832ec208e"
+        },
+        "early_frames": {
+          "Nodes.dat": "37f2005874729c85aa1ffcc24a5f9c5c",
+          "MetaData.dat": "1e2e82e707fe513b5e6e7b6b06401b50",
+          "Channels.dat": "adbb9dfaa3d93d11d3c17bc8fd50c8c9"
+        }
+      },
+      "independent_reference": {
+        "file_bytes": 4922061,
+        "file_md5": "403d9152b1b9c165c6bf9655e0853fda",
+        "full_stream_md5": {
+          "Nodes.dat": "37f2005874729c85aa1ffcc24a5f9c5c",
+          "Channels.dat": "5c5dd350d65aba478843fd3e642e7eef",
+          "MetaData.dat": "1e2e82e707fe513b5e6e7b6b06401b50"
+        },
+        "nonanalog_channels_md5": "588e8e18440c8773a248991832ec208e",
+        "prefix_channels_md5": "adbb9dfaa3d93d11d3c17bc8fd50c8c9",
+        "analog_channels_md5": "1160e0665307553cc3be27108faa8e8d",
+        "nonanalog_records": 48,
+        "analog_records": 34,
+        "prefix_samples": 5400,
+        "late_records_with_zero_preview_samples": 0,
+        "prefix_frame_range": [
+          0,
+          120
+        ],
+        "all_nonanalog_frames_strictly_increasing": true
+      },
+      "independent_full_scan_md5_verified": true
+    }
+  ]
+}

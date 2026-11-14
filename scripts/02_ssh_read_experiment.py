@@ -62,8 +62,8 @@ with open(sys.argv[1], "rb", buffering=0) as source:
 
 
 class Session:
-    def __init__(self, host, path, config):
-        command = "python3 -u -c " + shlex.quote(REMOTE) + " " + shlex.quote(path)
+    def __init__(self, host, path, config, helper_source=REMOTE):
+        command = "python3 -u -c " + shlex.quote(helper_source) + " " + shlex.quote(path)
         self.process = subprocess.Popen(
             ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
              "-o", "Compression=no", "-o",
