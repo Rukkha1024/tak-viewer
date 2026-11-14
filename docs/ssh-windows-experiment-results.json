@@ -1,0 +1,2389 @@
+﻿{
+  "measured_at": "2026-11-14T13:52:46.497124+00:00",
+  "scope": "macOS client reads native Windows Downloads TAK files over SSH; experimental transport only, not a native Windows viewer run or app integration",
+  "remote_environment": {
+    "platform": "win32",
+    "python_version": "3.13.5",
+    "default_ssh_shell": "cmd.exe",
+    "new_remote_installations": false
+  },
+  "selection": {
+    "discovered_tak_files_in_downloads": 89,
+    "tested_files": 3,
+    "method": "Smallest, median-ranked, largest by byte size; source paths and participant names omitted",
+    "representativeness": "Three size-ranked samples do not validate all89 files or all TAK layouts"
+  },
+  "method": "Five methods times three rounds per file,45 timed runs total. Rotated order, cold logical client cache per mode, server filesystem cache not flushed, no simultaneous bandwidth tests.",
+  "timing": "Cumulative stages include discovery, server work in server_index modes, transfer and payload reconstruction. Connection setup separately reported; viewer decode/render excluded.",
+  "received_byte_metric": "Source range bytes plus indexJSON; excludes outgoing requests, OK delimiters and SSH framing.",
+  "windows_transport": "Short cmd-compatible bootstrap; helper source and Unicode path delivered as first ASCII JSON stdin line; binary stdin/stdout and LF text replies; existing range/index/MD5 protocol retained. No helper file created on server.",
+  "preview": "Actual frame IDs [0,120). Independent metadata checks show StartFrame0 and100Hz for all3 files: first1.2seconds, with sparse/late channels handled.",
+  "raw_source_file_written_to_mac_by_experiment": false,
+  "production_application_changed": false,
+  "validation": {
+    "unit_tests": 13,
+    "unit_test_command": "python3 -B -m unittest discover -s scripts -p 'test_ssh*.py' -v",
+    "actual_windows_smoke": "Unicode/spaced source path opened and exact compound magic fetched",
+    "integrity": "All45 mode runs passed range/staged MD5 checks; each sampled file whole-source MD5 matched. Staged hashes additionally matched independent existing TakContainer and complete linear frame scan executed in Windows memory.",
+    "protocol_tests": "Long helper, Unicode/metacharacter paths via stdin, queued index/range/MD5 framing, CR/LF/Ctrl-Z bytes, unchanged Linux default command, source mutation rejection"
+  },
+  "reproduce": "python3 -B scripts/03_ssh_progressive_experiment.py --host <windows-ssh-alias> --file <remote-tak-path> --config configs/ssh_progressive_windows_experiment.yaml --output <report.json>",
+  "observations": [
+    "Server-side index discovery avoids sequential client round trips on Windows too.",
+    "Largest11.8MBsample has1196nonanalog+28analog records; client marker-first uses1230 requests and takes11.22s median to first data. Server marker-first uses8 requests and takes0.456s.",
+    "For largest sample, early preview0.552s is slower than full nonanalog-first0.456s; fewer received bytes alone do not guarantee earlier readiness.",
+    "Selected-all completes sooner than staged variants for these samples. Server-index staged variants offer earlier partial availability at the cost of later completion; client-index variants do not beat selected-all readiness.",
+    "File size alone cannot choose an optimal strategy. These samples differ from earlier Linux samples, so these results do not isolate operating-system performance."
+  ],
+  "cpu_diagnostic": {
+    "purpose": "Diagnostic CPU profiling with memory-backed transport and local index emulation; excludes real SSH and must not be used as network latency measurement",
+    "samples": [
+      {
+        "mode": "server_index_nonanalog_then_analog",
+        "stages": [
+          {
+            "stage": "nonanalog",
+            "ms": 296.18820899999986,
+            "bytes": 2459019,
+            "requests": 8,
+            "ranges": 8
+          },
+          {
+            "stage": "complete",
+            "ms": 489.95583399999987,
+            "bytes": 6544679,
+            "requests": 9,
+            "ranges": 9
+          }
+        ],
+        "profiled_cpu_emulation_only": true,
+        "functions_by_self_time": [
+          {
+            "function": "pieces",
+            "line": 86,
+            "calls": 6085,
+            "self_seconds": 0.22928381800000003,
+            "cumulative_seconds": 0.443955023
+          },
+          {
+            "function": "<built-in method builtins.max>",
+            "line": 0,
+            "calls": 1048641,
+            "self_seconds": 0.110662329,
+            "cumulative_seconds": 0.11066537100000001
+          },
+          {
+            "function": "<built-in method builtins.min>",
+            "line": 0,
+            "calls": 1029630,
+            "self_seconds": 0.106991633,
+            "cumulative_seconds": 0.106991633
+          },
+          {
+            "function": "many",
+            "line": 34,
+            "calls": 8,
+            "self_seconds": 0.012178811000000001,
+            "cumulative_seconds": 0.022438459
+          },
+          {
+            "function": "payload",
+            "line": 269,
+            "calls": 2,
+            "self_seconds": 0.003747652,
+            "cumulative_seconds": 0.38130587600000004
+          },
+          {
+            "function": "inventory",
+            "line": 180,
+            "calls": 1,
+            "self_seconds": 0.0033782380000000004,
+            "cumulative_seconds": 0.102564916
+          },
+          {
+            "function": "<method 'join' of 'bytes' objects>",
+            "line": 0,
+            "calls": 1235,
+            "self_seconds": 0.0031472740000000003,
+            "cumulative_seconds": 0.005039357
+          },
+          {
+            "function": "<built-in method builtins.len>",
+            "line": 0,
+            "calls": 64283,
+            "self_seconds": 0.002560328,
+            "cumulative_seconds": 0.002560328
+          }
+        ]
+      },
+      {
+        "mode": "server_index_early_frames_then_nonanalog_then_analog",
+        "stages": [
+          {
+            "stage": "early_frames",
+            "ms": 502.5844159999999,
+            "bytes": 1194923,
+            "requests": 9,
+            "ranges": 258
+          },
+          {
+            "stage": "nonanalog",
+            "ms": 850.5430409999999,
+            "bytes": 2459019,
+            "requests": 10,
+            "ranges": 305
+          },
+          {
+            "stage": "complete",
+            "ms": 1229.6000829999998,
+            "bytes": 6544679,
+            "requests": 11,
+            "ranges": 306
+          }
+        ],
+        "profiled_cpu_emulation_only": true,
+        "functions_by_self_time": [
+          {
+            "function": "pieces",
+            "line": 86,
+            "calls": 9673,
+            "self_seconds": 0.35532541700000003,
+            "cumulative_seconds": 0.694185161
+          },
+          {
+            "function": "many",
+            "line": 34,
+            "calls": 10,
+            "self_seconds": 0.305334459,
+            "cumulative_seconds": 0.5067360000000001
+          },
+          {
+            "function": "<built-in method builtins.max>",
+            "line": 0,
+            "calls": 2469543,
+            "self_seconds": 0.255182432,
+            "cumulative_seconds": 0.255182432
+          },
+          {
+            "function": "<built-in method builtins.min>",
+            "line": 0,
+            "calls": 1639090,
+            "self_seconds": 0.170005383,
+            "cumulative_seconds": 0.170005383
+          },
+          {
+            "function": "<built-in method builtins.len>",
+            "line": 0,
+            "calls": 2041024,
+            "self_seconds": 0.07691252600000001,
+            "cumulative_seconds": 0.07691252600000001
+          },
+          {
+            "function": "<genexpr>",
+            "line": 55,
+            "calls": 206725,
+            "self_seconds": 0.025737946,
+            "cumulative_seconds": 0.031245572000000003
+          },
+          {
+            "function": "<built-in method builtins.any>",
+            "line": 0,
+            "calls": 2526,
+            "self_seconds": 0.010566548,
+            "cumulative_seconds": 0.042110907
+          },
+          {
+            "function": "payload",
+            "line": 269,
+            "calls": 3,
+            "self_seconds": 0.005512871,
+            "cumulative_seconds": 1.0383490830000002
+          }
+        ]
+      }
+    ]
+  },
+  "samples": [
+    {
+      "file_bytes": 5570560,
+      "connection_setup_ms": 433.576458,
+      "config": {
+        "remote_platform": "windows",
+        "remote_python": "C:\\Python313\\python.exe",
+        "rounds": 3,
+        "session_timeout_seconds": 240,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "probe_bytes": 256,
+        "preview_frame_limit": 120
+      },
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 317.397583,
+              "bytes": 2818560,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 317.397583,
+          "complete_ms": 317.397583,
+          "cache_payload_bytes": 2818560,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.46404199999998,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1133.461583,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1253.0130829999998,
+              "bytes": 1012636,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "complete",
+              "ms": 1440.510375,
+              "bytes": 2756824,
+              "requests": 146,
+              "ranges": 236
+            }
+          ],
+          "first_stage_ms": 1253.0130829999998,
+          "complete_ms": 1440.510375,
+          "cache_payload_bytes": 2756824,
+          "round": 1
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.104708000000215,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1275.0853330000002,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1357.412708,
+              "bytes": 465916,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1437.4175830000001,
+              "bytes": 1012636,
+              "requests": 146,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 1629.8690000000001,
+              "bytes": 2756824,
+              "requests": 147,
+              "ranges": 290
+            }
+          ],
+          "first_stage_ms": 1357.412708,
+          "complete_ms": 1629.8690000000001,
+          "cache_payload_bytes": 2756824,
+          "round": 1
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 42.55924999999961,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 57.86479099999964,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 166.04858299999935,
+              "bytes": 1020920,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 341.64795799999933,
+              "bytes": 2772276,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 166.04858299999935,
+          "complete_ms": 341.64795799999933,
+          "cache_payload_bytes": 2756814,
+          "round": 1
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.85699999999992,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 51.8363750000006,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 136.29566600000055,
+              "bytes": 474200,
+              "requests": 9,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 209.05195800000075,
+              "bytes": 1020920,
+              "requests": 10,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 392.90800000000024,
+              "bytes": 2772276,
+              "requests": 11,
+              "ranges": 263
+            }
+          ],
+          "first_stage_ms": 136.29566600000055,
+          "complete_ms": 392.90800000000024,
+          "cache_payload_bytes": 2756814,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.70012500000064,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1038.2150000000001,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1159.7860840000003,
+              "bytes": 1012636,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "complete",
+              "ms": 1356.7023750000003,
+              "bytes": 2756824,
+              "requests": 146,
+              "ranges": 236
+            }
+          ],
+          "first_stage_ms": 1159.7860840000003,
+          "complete_ms": 1356.7023750000003,
+          "cache_payload_bytes": 2756824,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.74024999999948,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1057.2586249999993,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1137.3474159999998,
+              "bytes": 465916,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1211.5050409999997,
+              "bytes": 1012636,
+              "requests": 146,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 1404.7057499999999,
+              "bytes": 2756824,
+              "requests": 147,
+              "ranges": 290
+            }
+          ],
+          "first_stage_ms": 1137.3474159999998,
+          "complete_ms": 1404.7057499999999,
+          "cache_payload_bytes": 2756824,
+          "round": 2
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.500334000000414,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 53.646834000000254,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 169.97608399999996,
+              "bytes": 1020920,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 349.9032920000005,
+              "bytes": 2772276,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 169.97608399999996,
+          "complete_ms": 349.9032920000005,
+          "cache_payload_bytes": 2756814,
+          "round": 2
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.66604199999968,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 48.30066700000035,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 131.00845800000016,
+              "bytes": 474200,
+              "requests": 9,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 207.13333299999982,
+              "bytes": 1020920,
+              "requests": 10,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 392.08658299999934,
+              "bytes": 2772276,
+              "requests": 11,
+              "ranges": 263
+            }
+          ],
+          "first_stage_ms": 131.00845800000016,
+          "complete_ms": 392.08658299999934,
+          "cache_payload_bytes": 2756814,
+          "round": 2
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 314.29333400000024,
+              "bytes": 2818560,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 314.29333400000024,
+          "complete_ms": 314.29333400000024,
+          "cache_payload_bytes": 2818560,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.418791999999314,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1133.8888330000004,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1214.1179579999991,
+              "bytes": 465916,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1290.1507080000006,
+              "bytes": 1012636,
+              "requests": 146,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 1472.8556249999992,
+              "bytes": 2756824,
+              "requests": 147,
+              "ranges": 290
+            }
+          ],
+          "first_stage_ms": 1214.1179579999991,
+          "complete_ms": 1472.8556249999992,
+          "cache_payload_bytes": 2756824,
+          "round": 3
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 35.06437499999926,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 45.32008300000001,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 152.0607080000005,
+              "bytes": 1020920,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 324.57041700000036,
+              "bytes": 2772276,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 152.0607080000005,
+          "complete_ms": 324.57041700000036,
+          "cache_payload_bytes": 2756814,
+          "round": 3
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.387040999999456,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 50.0802500000006,
+            "bytes": 114278,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15462,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 144,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 133.98049999999984,
+              "bytes": 474200,
+              "requests": 9,
+              "ranges": 208
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 205.50862500000022,
+              "bytes": 1020920,
+              "requests": 10,
+              "ranges": 262
+            },
+            {
+              "stage": "complete",
+              "ms": 406.9342500000008,
+              "bytes": 2772276,
+              "requests": 11,
+              "ranges": 263
+            }
+          ],
+          "first_stage_ms": 133.98049999999984,
+          "complete_ms": 406.9342500000008,
+          "cache_payload_bytes": 2756814,
+          "round": 3
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 316.92395900000037,
+              "bytes": 2818560,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 316.92395900000037,
+          "complete_ms": 316.92395900000037,
+          "cache_payload_bytes": 2818560,
+          "round": 3
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.12108400000069,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1136.3475000000012,
+            "bytes": 127977,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1278.3304170000013,
+              "bytes": 1012636,
+              "requests": 145,
+              "ranges": 208
+            },
+            {
+              "stage": "complete",
+              "ms": 1476.7317500000008,
+              "bytes": 2756824,
+              "requests": 146,
+              "ranges": 236
+            }
+          ],
+          "first_stage_ms": 1278.3304170000013,
+          "complete_ms": 1476.7317500000008,
+          "cache_payload_bytes": 2756824,
+          "round": 3
+        }
+      ],
+      "reference_md5": "bbd36fb6047ae8582b52ec9d04adb136",
+      "stage_md5_verified": true,
+      "range_md5_verified": true,
+      "stream_bytes": {
+        "Nodes.dat": 232598,
+        "MetaData.dat": 8189,
+        "Channels.dat": 2417221
+      },
+      "channel_records": {
+        "nonanalog": 111,
+        "analog": 28
+      },
+      "limitations": [
+        "Transport and payload reconstruction only; no viewer decode or render",
+        "SSH read-only Python helper; not SFTP",
+        "Received application bytes count source ranges and index JSON replies; outgoing JSON, range acknowledgments and SSH framing excluded",
+        "Server index probes channel headers locally and transfers descriptors only; payload cache starts cold",
+        "Each mode has a cold logical client cache; server filesystem cache may be warm",
+        "Connection setup is separate; cumulative stage timings include bootstrap and index discovery",
+        "Preview is frame IDs [0, limit), assumes strictly increasing unsigned IDs verified against reference",
+        "Selected-all baseline retains existing compound extraction behavior",
+        "Cache payload excludes reconstructed outputs and is not peak process memory"
+      ],
+      "size_rank_sample": "small",
+      "summaries": {
+        "selected_all": {
+          "median_first_stage_ms": 316.92395900000037,
+          "median_complete_ms": 316.92395900000037,
+          "stages": {
+            "complete": {
+              "median_ms": 316.92395900000037,
+              "minimum_ms": 314.29333400000024,
+              "maximum_ms": 317.397583,
+              "received_payload_bytes": 2818560,
+              "requests": 7
+            }
+          }
+        },
+        "nonanalog_then_analog": {
+          "median_first_stage_ms": 1253.0130829999998,
+          "median_complete_ms": 1440.510375,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 1253.0130829999998,
+              "minimum_ms": 1159.7860840000003,
+              "maximum_ms": 1278.3304170000013,
+              "received_payload_bytes": 1012636,
+              "requests": 145
+            },
+            "complete": {
+              "median_ms": 1440.510375,
+              "minimum_ms": 1356.7023750000003,
+              "maximum_ms": 1476.7317500000008,
+              "received_payload_bytes": 2756824,
+              "requests": 146
+            }
+          }
+        },
+        "early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 1214.1179579999991,
+          "median_complete_ms": 1472.8556249999992,
+          "stages": {
+            "early_frames": {
+              "median_ms": 1214.1179579999991,
+              "minimum_ms": 1137.3474159999998,
+              "maximum_ms": 1357.412708,
+              "received_payload_bytes": 465916,
+              "requests": 145
+            },
+            "nonanalog": {
+              "median_ms": 1290.1507080000006,
+              "minimum_ms": 1211.5050409999997,
+              "maximum_ms": 1437.4175830000001,
+              "received_payload_bytes": 1012636,
+              "requests": 146
+            },
+            "complete": {
+              "median_ms": 1472.8556249999992,
+              "minimum_ms": 1404.7057499999999,
+              "maximum_ms": 1629.8690000000001,
+              "received_payload_bytes": 2756824,
+              "requests": 147
+            }
+          }
+        },
+        "server_index_nonanalog_then_analog": {
+          "median_first_stage_ms": 166.04858299999935,
+          "median_complete_ms": 341.64795799999933,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 166.04858299999935,
+              "minimum_ms": 152.0607080000005,
+              "maximum_ms": 169.97608399999996,
+              "received_payload_bytes": 1020920,
+              "requests": 8
+            },
+            "complete": {
+              "median_ms": 341.64795799999933,
+              "minimum_ms": 324.57041700000036,
+              "maximum_ms": 349.9032920000005,
+              "received_payload_bytes": 2772276,
+              "requests": 9
+            }
+          }
+        },
+        "server_index_early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 133.98049999999984,
+          "median_complete_ms": 392.90800000000024,
+          "stages": {
+            "early_frames": {
+              "median_ms": 133.98049999999984,
+              "minimum_ms": 131.00845800000016,
+              "maximum_ms": 136.29566600000055,
+              "received_payload_bytes": 474200,
+              "requests": 9
+            },
+            "nonanalog": {
+              "median_ms": 207.13333299999982,
+              "minimum_ms": 205.50862500000022,
+              "maximum_ms": 209.05195800000075,
+              "received_payload_bytes": 1020920,
+              "requests": 10
+            },
+            "complete": {
+              "median_ms": 392.90800000000024,
+              "minimum_ms": 392.08658299999934,
+              "maximum_ms": 406.9342500000008,
+              "received_payload_bytes": 2772276,
+              "requests": 11
+            }
+          }
+        }
+      },
+      "verified_stage_md5": {
+        "complete": {
+          "Nodes.dat": "784e18cbdd5bd6a94c18a7ce8329bdfd",
+          "MetaData.dat": "026d43a1f60d34cec403ad3cf51ce283",
+          "Channels.dat": "6f58d5a4b74cf9fe2301be0f09a8589f"
+        },
+        "nonanalog": {
+          "Nodes.dat": "784e18cbdd5bd6a94c18a7ce8329bdfd",
+          "MetaData.dat": "026d43a1f60d34cec403ad3cf51ce283",
+          "Channels.dat": "e90dbdb19215291256560bf0e88b441b"
+        },
+        "early_frames": {
+          "Nodes.dat": "784e18cbdd5bd6a94c18a7ce8329bdfd",
+          "MetaData.dat": "026d43a1f60d34cec403ad3cf51ce283",
+          "Channels.dat": "653415ed20154ee8ee1a6fef998f355a"
+        }
+      },
+      "independent_reference": {
+        "file_bytes": 5570560,
+        "file_md5": "bbd36fb6047ae8582b52ec9d04adb136",
+        "metadata": {
+          "StartFrame": "0",
+          "EndFrame": "916",
+          "FrameRate": "100.000000"
+        },
+        "full_stream_md5": {
+          "Nodes.dat": "784e18cbdd5bd6a94c18a7ce8329bdfd",
+          "Channels.dat": "6f58d5a4b74cf9fe2301be0f09a8589f",
+          "MetaData.dat": "026d43a1f60d34cec403ad3cf51ce283"
+        },
+        "nonanalog_channels_md5": "e90dbdb19215291256560bf0e88b441b",
+        "prefix_channels_md5": "653415ed20154ee8ee1a6fef998f355a",
+        "analog_channels_md5": "ff0eca76a02f957bde315d7401323462",
+        "nonanalog_records": 111,
+        "analog_records": 28,
+        "prefix_samples": 5272,
+        "late_records_with_zero_preview_samples": 45,
+        "prefix_frame_range": [
+          0,
+          120
+        ],
+        "all_nonanalog_frames_strictly_increasing": true
+      },
+      "independent_full_scan_md5_verified": true
+    },
+    {
+      "file_bytes": 7667712,
+      "connection_setup_ms": 348.081958,
+      "config": {
+        "remote_platform": "windows",
+        "remote_python": "C:\\Python313\\python.exe",
+        "rounds": 3,
+        "session_timeout_seconds": 240,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "probe_bytes": 256,
+        "preview_frame_limit": 120
+      },
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 413.23974999999996,
+              "bytes": 3965440,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 413.23974999999996,
+          "complete_ms": 413.23974999999996,
+          "cache_payload_bytes": 3965440,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.472750000000055,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1195.4570830000002,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1349.901958,
+              "bytes": 1278060,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "complete",
+              "ms": 1615.16775,
+              "bytes": 3892376,
+              "requests": 146,
+              "ranges": 223
+            }
+          ],
+          "first_stage_ms": 1349.901958,
+          "complete_ms": 1615.16775,
+          "cache_payload_bytes": 3892376,
+          "round": 1
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 41.580249999999985,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1065.7170420000002,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1149.6380420000003,
+              "bytes": 451788,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1257.3327500000003,
+              "bytes": 1278060,
+              "requests": 146,
+              "ranges": 243
+            },
+            {
+              "stage": "complete",
+              "ms": 1521.63825,
+              "bytes": 3892376,
+              "requests": 147,
+              "ranges": 271
+            }
+          ],
+          "first_stage_ms": 1149.6380420000003,
+          "complete_ms": 1521.63825,
+          "cache_payload_bytes": 3892376,
+          "round": 1
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.904291000000256,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 50.832666000000245,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 186.9347079999999,
+              "bytes": 1286409,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 440.93641600000046,
+              "bytes": 3907893,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 186.9347079999999,
+          "complete_ms": 440.93641600000046,
+          "cache_payload_bytes": 3892366,
+          "round": 1
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.14312499999928,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 52.418915999999705,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 141.55841599999962,
+              "bytes": 460137,
+              "requests": 9,
+              "ranges": 210
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 241.786791,
+              "bytes": 1286409,
+              "requests": 10,
+              "ranges": 258
+            },
+            {
+              "stage": "complete",
+              "ms": 499.0821249999993,
+              "bytes": 3907893,
+              "requests": 11,
+              "ranges": 259
+            }
+          ],
+          "first_stage_ms": 141.55841599999962,
+          "complete_ms": 499.0821249999993,
+          "cache_payload_bytes": 3892366,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.60312500000018,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1069.5394580000004,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1238.799416000001,
+              "bytes": 1278060,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "complete",
+              "ms": 1504.9560000000008,
+              "bytes": 3892376,
+              "requests": 146,
+              "ranges": 223
+            }
+          ],
+          "first_stage_ms": 1238.799416000001,
+          "complete_ms": 1504.9560000000008,
+          "cache_payload_bytes": 3892376,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 35.12204200000024,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1278.3607080000002,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1359.7993749999996,
+              "bytes": 451788,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1458.435958,
+              "bytes": 1278060,
+              "requests": 146,
+              "ranges": 243
+            },
+            {
+              "stage": "complete",
+              "ms": 1727.51725,
+              "bytes": 3892376,
+              "requests": 147,
+              "ranges": 271
+            }
+          ],
+          "first_stage_ms": 1359.7993749999996,
+          "complete_ms": 1727.51725,
+          "cache_payload_bytes": 3892376,
+          "round": 2
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 36.66141600000117,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 49.533541000000625,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 186.7507909999997,
+              "bytes": 1286409,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 440.10120799999976,
+              "bytes": 3907893,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 186.7507909999997,
+          "complete_ms": 440.10120799999976,
+          "cache_payload_bytes": 3892366,
+          "round": 2
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 49.26858299999992,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 59.920458000000565,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 150.5478750000009,
+              "bytes": 460137,
+              "requests": 9,
+              "ranges": 210
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 248.79741700000045,
+              "bytes": 1286409,
+              "requests": 10,
+              "ranges": 258
+            },
+            {
+              "stage": "complete",
+              "ms": 520.602792,
+              "bytes": 3907893,
+              "requests": 11,
+              "ranges": 259
+            }
+          ],
+          "first_stage_ms": 150.5478750000009,
+          "complete_ms": 520.602792,
+          "cache_payload_bytes": 3892366,
+          "round": 2
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 402.48529199999973,
+              "bytes": 3965440,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 402.48529199999973,
+          "complete_ms": 402.48529199999973,
+          "cache_payload_bytes": 3965440,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 38.94166699999957,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1095.1226250000002,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 1179.7858329999985,
+              "bytes": 451788,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1284.01925,
+              "bytes": 1278060,
+              "requests": 146,
+              "ranges": 243
+            },
+            {
+              "stage": "complete",
+              "ms": 1555.6667499999985,
+              "bytes": 3892376,
+              "requests": 147,
+              "ranges": 271
+            }
+          ],
+          "first_stage_ms": 1179.7858329999985,
+          "complete_ms": 1555.6667499999985,
+          "cache_payload_bytes": 3892376,
+          "round": 3
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.65629199999954,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 52.103124999998585,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 193.73633299999858,
+              "bytes": 1286409,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 452.2547079999999,
+              "bytes": 3907893,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 193.73633299999858,
+          "complete_ms": 452.2547079999999,
+          "cache_payload_bytes": 3892366,
+          "round": 3
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 47.06620900000047,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 60.1237500000007,
+            "bytes": 114343,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 15527,
+          "index_local_read_bytes": 35270,
+          "index_local_read_ranges": 140,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 148.32166699999937,
+              "bytes": 460137,
+              "requests": 9,
+              "ranges": 210
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 250.6078340000002,
+              "bytes": 1286409,
+              "requests": 10,
+              "ranges": 258
+            },
+            {
+              "stage": "complete",
+              "ms": 522.8444999999997,
+              "bytes": 3907893,
+              "requests": 11,
+              "ranges": 259
+            }
+          ],
+          "first_stage_ms": 148.32166699999937,
+          "complete_ms": 522.8444999999997,
+          "cache_payload_bytes": 3892366,
+          "round": 3
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 416.00604199999935,
+              "bytes": 3965440,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 416.00604199999935,
+          "complete_ms": 416.00604199999935,
+          "cache_payload_bytes": 3965440,
+          "round": 3
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 43.012875000000506,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 1309.861833000001,
+            "bytes": 126459,
+            "requests": 142,
+            "ranges": 142
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 1462.162375,
+              "bytes": 1278060,
+              "requests": 145,
+              "ranges": 195
+            },
+            {
+              "stage": "complete",
+              "ms": 1736.1542080000004,
+              "bytes": 3892376,
+              "requests": 146,
+              "ranges": 223
+            }
+          ],
+          "first_stage_ms": 1462.162375,
+          "complete_ms": 1736.1542080000004,
+          "cache_payload_bytes": 3892376,
+          "round": 3
+        }
+      ],
+      "reference_md5": "e3d69c41517f5bb039c863ba3d4a5539",
+      "stage_md5_verified": true,
+      "range_md5_verified": true,
+      "stream_bytes": {
+        "Nodes.dat": 233302,
+        "MetaData.dat": 8285,
+        "Channels.dat": 3551973
+      },
+      "channel_records": {
+        "nonanalog": 111,
+        "analog": 28
+      },
+      "limitations": [
+        "Transport and payload reconstruction only; no viewer decode or render",
+        "SSH read-only Python helper; not SFTP",
+        "Received application bytes count source ranges and index JSON replies; outgoing JSON, range acknowledgments and SSH framing excluded",
+        "Server index probes channel headers locally and transfers descriptors only; payload cache starts cold",
+        "Each mode has a cold logical client cache; server filesystem cache may be warm",
+        "Connection setup is separate; cumulative stage timings include bootstrap and index discovery",
+        "Preview is frame IDs [0, limit), assumes strictly increasing unsigned IDs verified against reference",
+        "Selected-all baseline retains existing compound extraction behavior",
+        "Cache payload excludes reconstructed outputs and is not peak process memory"
+      ],
+      "size_rank_sample": "middle",
+      "summaries": {
+        "selected_all": {
+          "median_first_stage_ms": 413.23974999999996,
+          "median_complete_ms": 413.23974999999996,
+          "stages": {
+            "complete": {
+              "median_ms": 413.23974999999996,
+              "minimum_ms": 402.48529199999973,
+              "maximum_ms": 416.00604199999935,
+              "received_payload_bytes": 3965440,
+              "requests": 7
+            }
+          }
+        },
+        "nonanalog_then_analog": {
+          "median_first_stage_ms": 1349.901958,
+          "median_complete_ms": 1615.16775,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 1349.901958,
+              "minimum_ms": 1238.799416000001,
+              "maximum_ms": 1462.162375,
+              "received_payload_bytes": 1278060,
+              "requests": 145
+            },
+            "complete": {
+              "median_ms": 1615.16775,
+              "minimum_ms": 1504.9560000000008,
+              "maximum_ms": 1736.1542080000004,
+              "received_payload_bytes": 3892376,
+              "requests": 146
+            }
+          }
+        },
+        "early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 1179.7858329999985,
+          "median_complete_ms": 1555.6667499999985,
+          "stages": {
+            "early_frames": {
+              "median_ms": 1179.7858329999985,
+              "minimum_ms": 1149.6380420000003,
+              "maximum_ms": 1359.7993749999996,
+              "received_payload_bytes": 451788,
+              "requests": 145
+            },
+            "nonanalog": {
+              "median_ms": 1284.01925,
+              "minimum_ms": 1257.3327500000003,
+              "maximum_ms": 1458.435958,
+              "received_payload_bytes": 1278060,
+              "requests": 146
+            },
+            "complete": {
+              "median_ms": 1555.6667499999985,
+              "minimum_ms": 1521.63825,
+              "maximum_ms": 1727.51725,
+              "received_payload_bytes": 3892376,
+              "requests": 147
+            }
+          }
+        },
+        "server_index_nonanalog_then_analog": {
+          "median_first_stage_ms": 186.9347079999999,
+          "median_complete_ms": 440.93641600000046,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 186.9347079999999,
+              "minimum_ms": 186.7507909999997,
+              "maximum_ms": 193.73633299999858,
+              "received_payload_bytes": 1286409,
+              "requests": 8
+            },
+            "complete": {
+              "median_ms": 440.93641600000046,
+              "minimum_ms": 440.10120799999976,
+              "maximum_ms": 452.2547079999999,
+              "received_payload_bytes": 3907893,
+              "requests": 9
+            }
+          }
+        },
+        "server_index_early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 148.32166699999937,
+          "median_complete_ms": 520.602792,
+          "stages": {
+            "early_frames": {
+              "median_ms": 148.32166699999937,
+              "minimum_ms": 141.55841599999962,
+              "maximum_ms": 150.5478750000009,
+              "received_payload_bytes": 460137,
+              "requests": 9
+            },
+            "nonanalog": {
+              "median_ms": 248.79741700000045,
+              "minimum_ms": 241.786791,
+              "maximum_ms": 250.6078340000002,
+              "received_payload_bytes": 1286409,
+              "requests": 10
+            },
+            "complete": {
+              "median_ms": 520.602792,
+              "minimum_ms": 499.0821249999993,
+              "maximum_ms": 522.8444999999997,
+              "received_payload_bytes": 3907893,
+              "requests": 11
+            }
+          }
+        }
+      },
+      "verified_stage_md5": {
+        "complete": {
+          "Nodes.dat": "610576fe0a31c9d1235d4e88f3eb1b45",
+          "MetaData.dat": "616884164cc892f0303749e9f92fd0f6",
+          "Channels.dat": "724cc8489d4c984307aed20d1990f85e"
+        },
+        "nonanalog": {
+          "Nodes.dat": "610576fe0a31c9d1235d4e88f3eb1b45",
+          "MetaData.dat": "616884164cc892f0303749e9f92fd0f6",
+          "Channels.dat": "bb6a9ba945e0a19f9c1a95ad855a8507"
+        },
+        "early_frames": {
+          "Nodes.dat": "610576fe0a31c9d1235d4e88f3eb1b45",
+          "MetaData.dat": "616884164cc892f0303749e9f92fd0f6",
+          "Channels.dat": "fa39560d489e101926509a57d140b94f"
+        }
+      },
+      "independent_reference": {
+        "file_bytes": 7667712,
+        "file_md5": "e3d69c41517f5bb039c863ba3d4a5539",
+        "metadata": {
+          "StartFrame": "0",
+          "EndFrame": "1373",
+          "FrameRate": "100.000000"
+        },
+        "full_stream_md5": {
+          "Nodes.dat": "610576fe0a31c9d1235d4e88f3eb1b45",
+          "Channels.dat": "724cc8489d4c984307aed20d1990f85e",
+          "MetaData.dat": "616884164cc892f0303749e9f92fd0f6"
+        },
+        "nonanalog_channels_md5": "bb6a9ba945e0a19f9c1a95ad855a8507",
+        "prefix_channels_md5": "fa39560d489e101926509a57d140b94f",
+        "analog_channels_md5": "2cccf8bff59ec3c4e610fb693db8b0db",
+        "nonanalog_records": 111,
+        "analog_records": 28,
+        "prefix_samples": 4564,
+        "late_records_with_zero_preview_samples": 60,
+        "prefix_frame_range": [
+          0,
+          120
+        ],
+        "all_nonanalog_frames_strictly_increasing": true
+      },
+      "independent_full_scan_md5_verified": true
+    },
+    {
+      "file_bytes": 11796480,
+      "connection_setup_ms": 401.826167,
+      "config": {
+        "remote_platform": "windows",
+        "remote_python": "C:\\Python313\\python.exe",
+        "rounds": 3,
+        "session_timeout_seconds": 240,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "probe_bytes": 256,
+        "preview_frame_limit": 120
+      },
+      "measurements": [
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 645.2321250000001,
+              "bytes": 6455808,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 645.2321250000001,
+          "complete_ms": 645.2321250000001,
+          "cache_payload_bytes": 6455808,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 39.60308300000004,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 9925.9945,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 11220.353083,
+              "bytes": 2331300,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "complete",
+              "ms": 11963.610915999998,
+              "bytes": 6409792,
+              "requests": 1231,
+              "ranges": 1312
+            }
+          ],
+          "first_stage_ms": 11220.353083,
+          "complete_ms": 11963.610915999998,
+          "cache_payload_bytes": 6409792,
+          "round": 1
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 36.01712500000076,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 10075.895834,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 11103.082334,
+              "bytes": 1067204,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 11896.345917,
+              "bytes": 2331300,
+              "requests": 1231,
+              "ranges": 1331
+            },
+            {
+              "stage": "complete",
+              "ms": 12670.809667,
+              "bytes": 6409792,
+              "requests": 1232,
+              "ranges": 1359
+            }
+          ],
+          "first_stage_ms": 11103.082334,
+          "complete_ms": 12670.809667,
+          "cache_payload_bytes": 6409792,
+          "round": 1
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 52.195125000000786,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 99.06795800000268,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 455.71891600000214,
+              "bytes": 2459019,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 957.9262499999999,
+              "bytes": 6544679,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 455.71891600000214,
+          "complete_ms": 957.9262499999999,
+          "cache_payload_bytes": 6409782,
+          "round": 1
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 40.10899999999751,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 96.01824999999664,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 494.12854199999856,
+              "bytes": 1194923,
+              "requests": 9,
+              "ranges": 258
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 1351.2469999999971,
+              "bytes": 2459019,
+              "requests": 10,
+              "ranges": 305
+            },
+            {
+              "stage": "complete",
+              "ms": 2008.9075419999992,
+              "bytes": 6544679,
+              "requests": 11,
+              "ranges": 306
+            }
+          ],
+          "first_stage_ms": 494.12854199999856,
+          "complete_ms": 2008.9075419999992,
+          "cache_payload_bytes": 6409782,
+          "round": 1
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.20374999999976,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 9892.873583,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 10996.086291999998,
+              "bytes": 2331300,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "complete",
+              "ms": 11751.796791999997,
+              "bytes": 6409792,
+              "requests": 1231,
+              "ranges": 1312
+            }
+          ],
+          "first_stage_ms": 10996.086291999998,
+          "complete_ms": 11751.796791999997,
+          "cache_payload_bytes": 6409792,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.689541999998085,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 9779.387374999998,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 10783.277417000001,
+              "bytes": 1067204,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 11851.918667,
+              "bytes": 2331300,
+              "requests": 1231,
+              "ranges": 1331
+            },
+            {
+              "stage": "complete",
+              "ms": 12628.429083999998,
+              "bytes": 6409792,
+              "requests": 1232,
+              "ranges": 1359
+            }
+          ],
+          "first_stage_ms": 10783.277417000001,
+          "complete_ms": 12628.429083999998,
+          "cache_payload_bytes": 6409792,
+          "round": 2
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 37.23375000000573,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 88.10333400000303,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 441.2780420000004,
+              "bytes": 2459019,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 945.2214169999991,
+              "bytes": 6544679,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 441.2780420000004,
+          "complete_ms": 945.2214169999991,
+          "cache_payload_bytes": 6409782,
+          "round": 2
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 46.87862499999795,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 111.00012499999679,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 552.1363329999999,
+              "bytes": 1194923,
+              "requests": 9,
+              "ranges": 258
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 897.2418330000025,
+              "bytes": 2459019,
+              "requests": 10,
+              "ranges": 305
+            },
+            {
+              "stage": "complete",
+              "ms": 1513.2340830000003,
+              "bytes": 6544679,
+              "requests": 11,
+              "ranges": 306
+            }
+          ],
+          "first_stage_ms": 552.1363329999999,
+          "complete_ms": 1513.2340830000003,
+          "cache_payload_bytes": 6409782,
+          "round": 2
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 662.513416000003,
+              "bytes": 6455808,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 662.513416000003,
+          "complete_ms": 662.513416000003,
+          "cache_payload_bytes": 6455808,
+          "round": 2
+        },
+        {
+          "mode": "early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 44.73762499999623,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 9743.626749999998,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 10290.913792000005,
+              "bytes": 1067204,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 11154.166374999995,
+              "bytes": 2331300,
+              "requests": 1231,
+              "ranges": 1331
+            },
+            {
+              "stage": "complete",
+              "ms": 12239.762250000005,
+              "bytes": 6409792,
+              "requests": 1232,
+              "ranges": 1359
+            }
+          ],
+          "first_stage_ms": 10290.913792000005,
+          "complete_ms": 12239.762250000005,
+          "cache_payload_bytes": 6409792,
+          "round": 3
+        },
+        {
+          "mode": "server_index_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 45.003082999997446,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 104.16704099999663,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 460.55037499999685,
+              "bytes": 2459019,
+              "requests": 8,
+              "ranges": 8
+            },
+            {
+              "stage": "complete",
+              "ms": 1053.3841660000007,
+              "bytes": 6544679,
+              "requests": 9,
+              "ranges": 9
+            }
+          ],
+          "first_stage_ms": 460.55037499999685,
+          "complete_ms": 1053.3841660000007,
+          "cache_payload_bytes": 6409782,
+          "round": 3
+        },
+        {
+          "mode": "server_index_early_frames_then_nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 84.46895899999163,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 168.25070899999162,
+            "bytes": 233713,
+            "requests": 5,
+            "ranges": 4
+          },
+          "index_reply_bytes": 134897,
+          "index_local_read_bytes": 313030,
+          "index_local_read_ranges": 1232,
+          "stages": [
+            {
+              "stage": "early_frames",
+              "ms": 581.6837919999926,
+              "bytes": 1194923,
+              "requests": 9,
+              "ranges": 258
+            },
+            {
+              "stage": "nonanalog",
+              "ms": 938.2971670000018,
+              "bytes": 2459019,
+              "requests": 10,
+              "ranges": 305
+            },
+            {
+              "stage": "complete",
+              "ms": 1565.7357089999948,
+              "bytes": 6544679,
+              "requests": 11,
+              "ranges": 306
+            }
+          ],
+          "first_stage_ms": 581.6837919999926,
+          "complete_ms": 1565.7357089999948,
+          "cache_payload_bytes": 6409782,
+          "round": 3
+        },
+        {
+          "mode": "selected_all",
+          "bootstrap": null,
+          "index": null,
+          "stages": [
+            {
+              "stage": "complete",
+              "ms": 626.7289170000083,
+              "bytes": 6455808,
+              "requests": 7,
+              "ranges": 7
+            }
+          ],
+          "first_stage_ms": 626.7289170000083,
+          "complete_ms": 626.7289170000083,
+          "cache_payload_bytes": 6455808,
+          "round": 3
+        },
+        {
+          "mode": "nonanalog_then_analog",
+          "bootstrap": {
+            "ms": 41.73679199999469,
+            "bytes": 98816,
+            "requests": 4,
+            "ranges": 4
+          },
+          "index": {
+            "ms": 10157.985167000006,
+            "bytes": 208229,
+            "requests": 1227,
+            "ranges": 1227
+          },
+          "stages": [
+            {
+              "stage": "nonanalog",
+              "ms": 11627.205958000004,
+              "bytes": 2331300,
+              "requests": 1230,
+              "ranges": 1284
+            },
+            {
+              "stage": "complete",
+              "ms": 12379.075208000004,
+              "bytes": 6409792,
+              "requests": 1231,
+              "ranges": 1312
+            }
+          ],
+          "first_stage_ms": 11627.205958000004,
+          "complete_ms": 12379.075208000004,
+          "cache_payload_bytes": 6409792,
+          "round": 3
+        }
+      ],
+      "reference_md5": "ce87fa3a2c070b0dc8da213fcabfb868",
+      "stage_md5_verified": true,
+      "range_md5_verified": true,
+      "stream_bytes": {
+        "Nodes.dat": 767680,
+        "MetaData.dat": 8185,
+        "Channels.dat": 5535111
+      },
+      "channel_records": {
+        "nonanalog": 1196,
+        "analog": 28
+      },
+      "limitations": [
+        "Transport and payload reconstruction only; no viewer decode or render",
+        "SSH read-only Python helper; not SFTP",
+        "Received application bytes count source ranges and index JSON replies; outgoing JSON, range acknowledgments and SSH framing excluded",
+        "Server index probes channel headers locally and transfers descriptors only; payload cache starts cold",
+        "Each mode has a cold logical client cache; server filesystem cache may be warm",
+        "Connection setup is separate; cumulative stage timings include bootstrap and index discovery",
+        "Preview is frame IDs [0, limit), assumes strictly increasing unsigned IDs verified against reference",
+        "Selected-all baseline retains existing compound extraction behavior",
+        "Cache payload excludes reconstructed outputs and is not peak process memory"
+      ],
+      "size_rank_sample": "large",
+      "summaries": {
+        "selected_all": {
+          "median_first_stage_ms": 645.2321250000001,
+          "median_complete_ms": 645.2321250000001,
+          "stages": {
+            "complete": {
+              "median_ms": 645.2321250000001,
+              "minimum_ms": 626.7289170000083,
+              "maximum_ms": 662.513416000003,
+              "received_payload_bytes": 6455808,
+              "requests": 7
+            }
+          }
+        },
+        "nonanalog_then_analog": {
+          "median_first_stage_ms": 11220.353083,
+          "median_complete_ms": 11963.610915999998,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 11220.353083,
+              "minimum_ms": 10996.086291999998,
+              "maximum_ms": 11627.205958000004,
+              "received_payload_bytes": 2331300,
+              "requests": 1230
+            },
+            "complete": {
+              "median_ms": 11963.610915999998,
+              "minimum_ms": 11751.796791999997,
+              "maximum_ms": 12379.075208000004,
+              "received_payload_bytes": 6409792,
+              "requests": 1231
+            }
+          }
+        },
+        "early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 10783.277417000001,
+          "median_complete_ms": 12628.429083999998,
+          "stages": {
+            "early_frames": {
+              "median_ms": 10783.277417000001,
+              "minimum_ms": 10290.913792000005,
+              "maximum_ms": 11103.082334,
+              "received_payload_bytes": 1067204,
+              "requests": 1230
+            },
+            "nonanalog": {
+              "median_ms": 11851.918667,
+              "minimum_ms": 11154.166374999995,
+              "maximum_ms": 11896.345917,
+              "received_payload_bytes": 2331300,
+              "requests": 1231
+            },
+            "complete": {
+              "median_ms": 12628.429083999998,
+              "minimum_ms": 12239.762250000005,
+              "maximum_ms": 12670.809667,
+              "received_payload_bytes": 6409792,
+              "requests": 1232
+            }
+          }
+        },
+        "server_index_nonanalog_then_analog": {
+          "median_first_stage_ms": 455.71891600000214,
+          "median_complete_ms": 957.9262499999999,
+          "stages": {
+            "nonanalog": {
+              "median_ms": 455.71891600000214,
+              "minimum_ms": 441.2780420000004,
+              "maximum_ms": 460.55037499999685,
+              "received_payload_bytes": 2459019,
+              "requests": 8
+            },
+            "complete": {
+              "median_ms": 957.9262499999999,
+              "minimum_ms": 945.2214169999991,
+              "maximum_ms": 1053.3841660000007,
+              "received_payload_bytes": 6544679,
+              "requests": 9
+            }
+          }
+        },
+        "server_index_early_frames_then_nonanalog_then_analog": {
+          "median_first_stage_ms": 552.1363329999999,
+          "median_complete_ms": 1565.7357089999948,
+          "stages": {
+            "early_frames": {
+              "median_ms": 552.1363329999999,
+              "minimum_ms": 494.12854199999856,
+              "maximum_ms": 581.6837919999926,
+              "received_payload_bytes": 1194923,
+              "requests": 9
+            },
+            "nonanalog": {
+              "median_ms": 938.2971670000018,
+              "minimum_ms": 897.2418330000025,
+              "maximum_ms": 1351.2469999999971,
+              "received_payload_bytes": 2459019,
+              "requests": 10
+            },
+            "complete": {
+              "median_ms": 1565.7357089999948,
+              "minimum_ms": 1513.2340830000003,
+              "maximum_ms": 2008.9075419999992,
+              "received_payload_bytes": 6544679,
+              "requests": 11
+            }
+          }
+        }
+      },
+      "verified_stage_md5": {
+        "complete": {
+          "Nodes.dat": "e3ff7fd5f6aa8ab68b24f1d1ab54254a",
+          "MetaData.dat": "7e2781aa26b759346bd18c06c646491d",
+          "Channels.dat": "9ab6c90ab9fb84ed11b5a018eb157b45"
+        },
+        "nonanalog": {
+          "Nodes.dat": "e3ff7fd5f6aa8ab68b24f1d1ab54254a",
+          "MetaData.dat": "7e2781aa26b759346bd18c06c646491d",
+          "Channels.dat": "028cf2d019f220de0e799dbe499f76c1"
+        },
+        "early_frames": {
+          "Nodes.dat": "e3ff7fd5f6aa8ab68b24f1d1ab54254a",
+          "MetaData.dat": "7e2781aa26b759346bd18c06c646491d",
+          "Channels.dat": "54aa926b2063ca09d0dda1a79b0ae7e1"
+        }
+      },
+      "independent_reference": {
+        "file_bytes": 11796480,
+        "file_md5": "ce87fa3a2c070b0dc8da213fcabfb868",
+        "metadata": {
+          "StartFrame": "0",
+          "EndFrame": "2142",
+          "FrameRate": "100.000000"
+        },
+        "full_stream_md5": {
+          "Nodes.dat": "e3ff7fd5f6aa8ab68b24f1d1ab54254a",
+          "Channels.dat": "9ab6c90ab9fb84ed11b5a018eb157b45",
+          "MetaData.dat": "7e2781aa26b759346bd18c06c646491d"
+        },
+        "nonanalog_channels_md5": "028cf2d019f220de0e799dbe499f76c1",
+        "prefix_channels_md5": "54aa926b2063ca09d0dda1a79b0ae7e1",
+        "analog_channels_md5": "8b67fe43046e4c923edae59b06c3fee5",
+        "nonanalog_records": 1196,
+        "analog_records": 28,
+        "prefix_samples": 4688,
+        "late_records_with_zero_preview_samples": 83,
+        "prefix_frame_range": [
+          0,
+          120
+        ],
+        "all_nonanalog_frames_strictly_increasing": true
+      },
+      "independent_full_scan_md5_verified": true
+    }
+  ]
+}

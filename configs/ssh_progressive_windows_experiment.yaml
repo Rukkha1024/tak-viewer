@@ -1,0 +1,10 @@
+﻿{
+  "remote_platform": "windows",
+  "remote_python": "C:\\Python313\\python.exe",
+  "rounds": 3,
+  "session_timeout_seconds": 240,
+  "connect_timeout_seconds": 8,
+  "maximum_file_bytes": 268435456,
+  "probe_bytes": 256,
+  "preview_frame_limit": 120
+}

@@ -16,6 +16,17 @@ import threading
 import time
 
 
+WINDOWS_BOOTSTRAP = (
+    "import json,os,sys; "
+    "sys.stdout.reconfigure(newline='\\n'); "
+    "msvcrt=__import__('msvcrt') if os.name=='nt' else None; "
+    "msvcrt.setmode(sys.stdin.fileno(),os.O_BINARY) if msvcrt else None; "
+    "msvcrt.setmode(sys.stdout.fileno(),os.O_BINARY) if msvcrt else None; "
+    "payload=json.loads(sys.stdin.buffer.readline()); "
+    "sys.argv=['ssh_read',payload['path']]; exec(payload['helper_source'])"
+)
+
+
 REMOTE = r'''
 import hashlib, json, os, sys
 with open(sys.argv[1], "rb", buffering=0) as source:
@@ -63,7 +74,18 @@ with open(sys.argv[1], "rb", buffering=0) as source:
 
 class Session:
     def __init__(self, host, path, config, helper_source=REMOTE):
-        command = "python3 -u -c " + shlex.quote(helper_source) + " " + shlex.quote(path)
+        platform = config.get("remote_platform", "linux")
+        if platform not in ("linux", "windows"):
+            raise ValueError("remote_platform must be linux or windows")
+        executable = config.get("remote_python", "python" if platform == "windows" else "python3")
+        if not isinstance(executable, str) or not executable or any(c in executable for c in "\r\n\0"):
+            raise ValueError("Invalid remote_python executable")
+        if platform == "windows":
+            if any(c in executable for c in '&|<>^%!"()'):
+                raise ValueError("Unsafe Windows remote_python executable")
+            command = subprocess.list2cmdline([executable, "-u", "-c", WINDOWS_BOOTSTRAP])
+        else:
+            command = shlex.quote(executable) + " -u -c " + shlex.quote(helper_source) + " " + shlex.quote(path)
         self.process = subprocess.Popen(
             ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
              "-o", "Compression=no", "-o",
@@ -74,6 +96,8 @@ class Session:
         self.timer.daemon = True
         self.timer.start()
         self.bytes = self.requests = self.ranges = 0
+        if platform == "windows":
+            self.send(dict(helper_source=helper_source, path=path))
 
     def send(self, request):
         self.process.stdin.write(json.dumps(request).encode() + b"\n")
