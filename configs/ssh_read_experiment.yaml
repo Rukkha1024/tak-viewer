@@ -1,0 +1,7 @@
+﻿{
+  "rounds": 3,
+  "session_timeout_seconds": 120,
+  "connect_timeout_seconds": 8,
+  "maximum_file_bytes": 268435456,
+  "maximum_merge_gap_bytes": 65536
+}

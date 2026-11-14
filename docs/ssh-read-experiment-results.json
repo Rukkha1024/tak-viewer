@@ -1,0 +1,237 @@
+﻿{
+  "measured_at": "2026-11-14T13:12:12.315513+00:00",
+  "scope": "macOS to Linux over existing SSH configuration; one persistent SSH process per file, Python read-only range helper; no viewer integration or SFTP benchmark",
+  "source_data_saved_on_mac": false,
+  "reference_validation": "Per-range and whole-file MD5; stream MD5 also matched existing workstation src/container.py TakContainer reader. Source paths omitted.",
+  "timing": "All modes extract Nodes.dat, MetaData.dat and complete Channels.dat; connection setup excluded and reported separately. Server filesystem cache not flushed. Alternating full/selected order; three rounds per file.",
+  "samples": [
+    {
+      "file_bytes": 34657033,
+      "connection_setup_ms": 234.623166,
+      "config": {
+        "rounds": 3,
+        "session_timeout_seconds": 120,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "maximum_merge_gap_bytes": 65536
+      },
+      "measurements": [
+        {
+          "round": 1,
+          "mode": "full",
+          "ms": 3145.155791,
+          "bytes": 34657033,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 1,
+          "mode": "selected",
+          "ms": 1469.4617080000003,
+          "bytes": 15783177,
+          "requests": 7,
+          "ranges": 10
+        },
+        {
+          "round": 1,
+          "mode": "memory",
+          "ms": 2.490041000000609,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        },
+        {
+          "round": 2,
+          "mode": "selected",
+          "ms": 1665.2854999999995,
+          "bytes": 15783177,
+          "requests": 7,
+          "ranges": 10
+        },
+        {
+          "round": 2,
+          "mode": "full",
+          "ms": 3337.119624999999,
+          "bytes": 34657033,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 2,
+          "mode": "memory",
+          "ms": 3.2609170000004184,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        },
+        {
+          "round": 3,
+          "mode": "full",
+          "ms": 3167.1735420000005,
+          "bytes": 34657033,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 3,
+          "mode": "selected",
+          "ms": 1456.287875000001,
+          "bytes": 15783177,
+          "requests": 7,
+          "ranges": 10
+        },
+        {
+          "round": 3,
+          "mode": "memory",
+          "ms": 2.853208000001217,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        }
+      ],
+      "stream_bytes": {
+        "Nodes.dat": 237079,
+        "MetaData.dat": 8351,
+        "Channels.dat": 15127305
+      },
+      "cache_payload_bytes": 15521033,
+      "stream_md5": {
+        "Nodes.dat": "6bd92d52c9c60173357826d13868254e",
+        "MetaData.dat": "8abe1f2fa5acde884e05fec75ec1e858",
+        "Channels.dat": "4581b6c1a6614fcc3959cfe20539e7ee"
+      },
+      "range_md5_verified": true,
+      "full_md5_verified": true,
+      "reference_md5": "231b4559fa67e168bc265b8b5230efc6",
+      "limitations": [
+        "Transfer + container extraction, not viewer render time",
+        "Selected Channels.dat includes analog data",
+        "Repeated reads use warm server filesystem caches",
+        "SSH Python helper, not production SFTP",
+        "Cache lifetime is one unchanged open remote file",
+        "Cache payload is not peak process memory",
+        "Memory timings reparse and copy cached ranges"
+      ],
+      "existing_independent_parser_stream_md5_verified": true,
+      "median_ms": {
+        "full": 3167.1735420000005,
+        "selected": 1469.4617080000003,
+        "memory": 2.853208000001217
+      }
+    },
+    {
+      "file_bytes": 4922061,
+      "connection_setup_ms": 244.38025000000002,
+      "config": {
+        "rounds": 3,
+        "session_timeout_seconds": 120,
+        "connect_timeout_seconds": 8,
+        "maximum_file_bytes": 268435456,
+        "maximum_merge_gap_bytes": 65536
+      },
+      "measurements": [
+        {
+          "round": 1,
+          "mode": "full",
+          "ms": 510.41749999999996,
+          "bytes": 4922061,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 1,
+          "mode": "selected",
+          "ms": 256.1075420000001,
+          "bytes": 2137293,
+          "requests": 7,
+          "ranges": 7
+        },
+        {
+          "round": 1,
+          "mode": "memory",
+          "ms": 1.3647500000000257,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        },
+        {
+          "round": 2,
+          "mode": "selected",
+          "ms": 243.80883299999988,
+          "bytes": 2137293,
+          "requests": 7,
+          "ranges": 7
+        },
+        {
+          "round": 2,
+          "mode": "full",
+          "ms": 436.26091599999995,
+          "bytes": 4922061,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 2,
+          "mode": "memory",
+          "ms": 1.342291000000051,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        },
+        {
+          "round": 3,
+          "mode": "full",
+          "ms": 442.0160000000002,
+          "bytes": 4922061,
+          "requests": 1,
+          "ranges": 1
+        },
+        {
+          "round": 3,
+          "mode": "selected",
+          "ms": 249.42212500000016,
+          "bytes": 2137293,
+          "requests": 7,
+          "ranges": 7
+        },
+        {
+          "round": 3,
+          "mode": "memory",
+          "ms": 1.2721670000002128,
+          "bytes": 0,
+          "requests": 0,
+          "ranges": 0
+        }
+      ],
+      "stream_bytes": {
+        "Nodes.dat": 228811,
+        "MetaData.dat": 8307,
+        "Channels.dat": 1776333
+      },
+      "cache_payload_bytes": 2137293,
+      "stream_md5": {
+        "Nodes.dat": "37f2005874729c85aa1ffcc24a5f9c5c",
+        "MetaData.dat": "1e2e82e707fe513b5e6e7b6b06401b50",
+        "Channels.dat": "5c5dd350d65aba478843fd3e642e7eef"
+      },
+      "range_md5_verified": true,
+      "full_md5_verified": true,
+      "reference_md5": "403d9152b1b9c165c6bf9655e0853fda",
+      "limitations": [
+        "Transfer + container extraction, not viewer render time",
+        "Selected Channels.dat includes analog data",
+        "Repeated reads use warm server filesystem caches",
+        "SSH Python helper, not production SFTP",
+        "Cache lifetime is one unchanged open remote file",
+        "Cache payload is not peak process memory",
+        "Memory timings reparse and copy cached ranges"
+      ],
+      "existing_independent_parser_stream_md5_verified": true,
+      "median_ms": {
+        "full": 442.0160000000002,
+        "selected": 249.42212500000016,
+        "memory": 1.342291000000051
+      }
+    }
+  ]
+}
