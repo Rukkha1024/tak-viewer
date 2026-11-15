@@ -1,4 +1,4 @@
-//! Comments pane for the active file. Columns can be sorted; a row click selects the
+﻿//! Comments pane for the active file. Columns can be sorted; a row click selects the
 //! comment and markers without moving playback. Double-clicking `#` seeks to its first
 //! frame. Double-clicking an editable cell starts editing; Enter saves and Escape cancels.
 //! The type selector saves immediately. The app performs writes and records undo actions.
@@ -8,7 +8,7 @@ use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
 use tak_core::comments::{self, Comment, Comments};
 
-/// Height of a row (and of the column names, and of the line at the top).
+/// Minimum row height (also the column names and the line at the top).
 pub const ROW_H: f32 = 22.0;
 const FONT: f32 = 12.5;
 
@@ -582,18 +582,29 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
 
     let rows = order.get(input.list, input.file_id, input.sort);
     ui.spacing_mut().item_spacing.y = 0.0;
-    let mut area = ScrollArea::vertical().id_salt("comment_rows").auto_shrink([false, false]);
-    if let Some(id) = input.scroll_to {
-        if let Some(k) = rows.iter().position(|&i| list[i].id == id) {
-            area = area.vertical_scroll_offset((k as f32 * ROW_H - 3.0 * ROW_H).max(0.0));
-        }
-    }
+    let area = ScrollArea::vertical().id_salt("comment_rows").auto_shrink([false, false]).animated(input.scroll_to.is_none());
     // The Type box whose list is open, if its row is drawn (comment id, box).
     let mut type_anchor: Option<(u64, Rect)> = None;
-    area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
-        for k in range {
+    area.show_viewport(ui, |ui, viewport| {
+        let origin = ui.max_rect().min;
+        let width = ui.available_width();
+        let text_width = (cols(Rect::from_min_size(origin, vec2(width, ROW_H))).text.width() - 12.0).max(1.0);
+        // egui caches these text layouts; use the same galley for measuring and painting.
+        let notes: Vec<_> = rows.iter().map(|&i| {
+            ui.fonts(|f| f.layout(list[i].text.clone(), FontId::proportional(FONT), Color32::PLACEHOLDER, text_width))
+        }).collect();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        offsets.push(0.0);
+        for note in &notes {
+            offsets.push(offsets.last().unwrap() + ROW_H.max(note.size().y + 4.0));
+        }
+        ui.set_height(*offsets.last().unwrap());
+        let first = offsets.partition_point(|&y| y <= viewport.min.y).saturating_sub(1).min(rows.len());
+        let end = offsets.partition_point(|&y| y < viewport.max.y).min(rows.len());
+        for k in first..end {
             let c = &list[rows[k]];
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+            let rect = Rect::from_min_size(origin + vec2(0.0, offsets[k]), vec2(width, offsets[k + 1] - offsets[k]));
+            let resp = ui.interact(rect, ui.id().with(("comment_row", k)), Sense::click());
             let col = cols(rect);
             #[cfg(test)]
             out.rows.push((c.id, rect));
@@ -614,7 +625,7 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
             }
             if here {
                 // The current frame is inside this comment: a thin orange bar only.
-                ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(3.0, ROW_H)), 0.0, theme::COMMENT);
+                ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, theme::COMMENT);
             }
             let text_color = if picked { theme::TAB_TEXT_ACTIVE } else { theme::TEXT };
             cell_text(ui, col.id, &c.id.to_string(), text_color);
@@ -696,7 +707,10 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
                         let dash = pos2((sr.right() + er.left()) / 2.0, col.frames.center().y);
                         ui.painter().text(dash, Align2::CENTER_CENTER, "–", FontId::proportional(FONT), theme::TEXT_DIM);
                         if !c.text.is_empty() {
-                            cell_text(ui, col.text, &c.text, text_color);
+                            ui.painter().with_clip_rect(col.text.intersect(ui.clip_rect())).galley(
+                                pos2(col.text.left() + 6.0, col.text.top() + (rect.height() - notes[k].size().y) / 2.0),
+                                notes[k].clone(), text_color,
+                            );
                         }
                     } else {
                         cell_text(ui, col.frames, &frames_text(c), text_color);
@@ -705,7 +719,10 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
                 _ => {
                     cell_text(ui, col.frames, &frames_text(c), text_color);
                     if !c.text.is_empty() {
-                        cell_text(ui, col.text, &c.text, text_color);
+                        ui.painter().with_clip_rect(col.text.intersect(ui.clip_rect())).galley(
+                            pos2(col.text.left() + 6.0, col.text.top() + (rect.height() - notes[k].size().y) / 2.0),
+                            notes[k].clone(), text_color,
+                        );
                     }
                 }
             }
@@ -742,6 +759,11 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
             } else if resp.clicked() {
                 out.action = Some(ListAction::Select(c.id));
             }
+        }
+        // Explicit navigation wins over an editor's request to keep its caret visible.
+        if let Some(k) = input.scroll_to.and_then(|id| rows.iter().position(|&i| list[i].id == id)) {
+            let target = Rect::from_min_size(origin + vec2(0.0, (offsets[k] - 3.0 * ROW_H).max(0.0)), vec2(width, ROW_H));
+            ui.scroll_to_rect_animation(target, Some(egui::Align::Min), egui::style::ScrollAnimation::none());
         }
     });
     // The type list of the open Type box, on top of the rows (never clipped by their scroll
@@ -873,6 +895,62 @@ mod tests {
             });
         });
         out
+    }
+
+    #[test]
+    fn long_comments_wrap_and_rows_grow_without_overlapping() {
+        let mut list = Comments::default();
+        let long = "A long comment that must wrap within its column. ".repeat(5);
+        for comment in [c(7, &[], 0, 1, &long), c(8, &[], 0, 1, "short")] {
+            list.apply(&comments::Event::of(comments::Kind::Add, &comment, "t".into(), "a|1".into()));
+        }
+        let out = list_frame(&egui::Context::default(), &list, &Ok(()), 0.0, vec![]);
+        let first = out.rows.iter().find(|r| r.0 == 7).unwrap().1;
+        assert!(first.height() > ROW_H * 2.0, "long comment needs multiple lines: {first:?}");
+        let second = out.rows.iter().find(|r| r.0 == 8).expect("next row remains visible").1;
+        assert!(second.top() >= first.bottom(), "rows must not overlap");
+        assert_eq!(second.height(), ROW_H);
+    }
+
+    #[test]
+    fn wrapped_rows_resize_and_scroll_to_a_comment_after_tall_rows() {
+        let ctx = egui::Context::default();
+        let mut list = Comments::default();
+        let long = "Long comment with several words to wrap. ".repeat(5);
+        for id in 1..=100 {
+            list.apply(&comments::Event::of(comments::Kind::Add, &c(id, &[], 0, 1, &long), "t".into(), "a|1".into()));
+        }
+        let (mut order, mut edit) = (Order::default(), None);
+        let mut render = |width: f32, scroll_to, frames_edit: bool| {
+            if frames_edit {
+                edit = Some(Edit::new(0, 1, list.get(1).unwrap(), Field::Frames, Default::default()));
+            }
+            let mut out = ListOut::default();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 400.0))), ..Default::default() };
+            let painted = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = show(ui, ListIn { list: &list, file_id: 1, frame: 0, sort: Sort::default(), write: Ok(()), scroll_to, picked: None, live_markers: None, first: 0, last: 100 }, &mut order, &mut edit);
+                });
+            });
+            let wrapped = painted.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) => text.galley.text() == long && text.galley.rows.len() > 1,
+                _ => false,
+            });
+            (out, wrapped)
+        };
+        let (narrow, wrapped) = render(500.0, None, false);
+        assert!(wrapped, "painted comment must contain multiple lines");
+        let narrow_height = narrow.rows[0].1.height();
+        let (wide, _) = render(900.0, None, false);
+        assert!(wide.rows[0].1.height() < narrow_height, "wider column needs fewer lines");
+        let (editing, wrapped) = render(500.0, None, true);
+        assert!(wrapped, "comment still wraps while Frames is edited");
+        assert_eq!(editing.rows[0].1.height(), narrow_height);
+        render(500.0, Some(100), false);
+        let (scrolled, _) = render(500.0, None, false);
+        let target = scrolled.rows.iter().find(|r| r.0 == 100).expect("target after tall rows is drawn").1;
+        assert!(target.top() >= 0.0 && target.top() < 400.0, "target is in viewport: {target:?}");
+        assert!(scrolled.rows.len() < 10, "only visible rows are drawn");
     }
 
     /// What one click at `at` (at time `t`) asks, and what each click of a double click there
