@@ -3,7 +3,7 @@ use super::*;
 use crate::ui::edit_tools::{self, EditToolsAction, EditToolsState, TrackChoice};
 use crate::ui::labeling::{
     self, AssetChoice, LabelGroup, LabelRow, LabelingAction, LabelingMode, LabelingState,
-    UnlabeledRow,
+    UnlabeledRow, MarkerList, SelectionGesture,
 };
 use std::collections::HashSet;
 use std::sync::{mpsc, Arc};
@@ -153,6 +153,7 @@ enum MarkerJob {
 
 #[derive(Clone)]
 pub(super) enum PendingTransition {
+    EditorBatch,
     Open {
         slot: usize,
         path: PathBuf,
@@ -567,6 +568,7 @@ impl TakViewerApp {
 
     pub(super) fn finish_transition(&mut self, ctx: &egui::Context, transition: PendingTransition) {
         match transition {
+            PendingTransition::EditorBatch => self.advance_editor_batch(ctx),
             PendingTransition::Open { slot, path } => self.open_in(ctx, slot, path),
             PendingTransition::Remote {
                 slot,
@@ -596,6 +598,14 @@ impl TakViewerApp {
         let Some(slot) = self.dirty_prompt.as_ref().map(|prompt| prompt.slot) else {
             return;
         };
+        if self.defer_editor_batch_discard(ctx, slot) { return; }
+        if self.discard_editor_work(ctx, slot) {
+            if let Some(prompt) = self.dirty_prompt.take() { self.finish_transition(ctx, prompt.transition); }
+        }
+    }
+
+    /// Apply a discard only after all batch decisions are complete.
+    pub(super) fn discard_editor_work(&mut self, ctx: &egui::Context, slot: usize) -> bool {
         let document = self.views[slot].document_id();
         for (view, ui) in self.views.iter().zip(&mut self.marker_ui) {
             if view.document_id() == document { ui.discard_work(); }
@@ -611,9 +621,9 @@ impl TakViewerApp {
             if let Some(mut ui) = self.overlay_marker_ui.remove(&document) { ui.discard_work(); drop_later(Some(ui)); }
         }
         let tag = self.views[slot].file_id;
-        let old_waiting = self.comment_waiting.len();
+        let old_waiting: usize = self.comment_waiting.iter().map(|(_, _, events)| events.len()).sum();
         self.comment_waiting.retain(|(id, _, _)| *id != tag);
-        self.comment_outstanding = self.comment_outstanding.saturating_sub(old_waiting - self.comment_waiting.len());
+        self.comment_outstanding = self.comment_outstanding.saturating_sub(old_waiting - self.comment_waiting.iter().map(|(_, _, events)| events.len()).sum::<usize>());
         if let Some(writer) = &self.comment_writer { writer.cancel_tag(tag); }
         self.views[slot].comments.pending = 0;
         self.views[slot].comments.pending_since = None;
@@ -624,6 +634,7 @@ impl TakViewerApp {
             .map(|(_, path, _)| path.clone())
             .collect();
         self.comment_failed.retain(|(id, _, _)| *id != tag);
+        self.comment_batches.retain(|batch| batch.tag != tag);
         if let Some(writer) = &self.comment_writer {
             for path in paths {
                 writer.retry(path);
@@ -638,9 +649,8 @@ impl TakViewerApp {
         };
         if let Err(error) = result {
             self.takm_note = Some((edit_error(error), ctx.input(|i| i.time)));
-        } else if let Some(prompt) = self.dirty_prompt.take() {
-            self.finish_transition(ctx, prompt.transition);
-        }
+            false
+        } else { true }
     }
 
     pub(super) fn dirty_dialog(&mut self, ctx: &egui::Context) {
@@ -712,6 +722,7 @@ impl TakViewerApp {
             2 => self.discard_pending_transition(ctx),
             3 => {
                 self.cancel_dirty_transition(ctx);
+                self.cancel_editor_batch();
             }
             _ => {}
         }
@@ -751,14 +762,12 @@ impl TakViewerApp {
             prompt.started = Instant::now();
         }
         let mut cleared = HashSet::new();
-        for (_, path, event) in retry {
+        for (_, path, _) in &retry {
             if cleared.insert(path.clone()) {
-                if let Some(writer) = &self.comment_writer {
-                    writer.retry(path.clone());
-                }
+                if let Some(writer) = &self.comment_writer { writer.retry(path.clone()); }
             }
-            self.send_comment(ctx, slot, path, event);
         }
+        self.retry_comment_events(ctx, slot, retry);
         self.views[slot].publish_shared_file();
         ctx.request_repaint_after(Duration::from_millis(30));
     }
@@ -840,6 +849,7 @@ impl TakViewerApp {
         }
         for item in self.layout_tabs.closed_items_mut() {
             match item {
+                layout_tabs::ClosedItem::Batch { .. } => unreachable!("closed_items_mut exposes leaves"),
                 layout_tabs::ClosedItem::View { view, .. } => clear(&mut view.view, document),
                 layout_tabs::ClosedItem::Tab(closed) => {
                     if let Some(runtime) = &mut closed.tab.layout { for view in &mut runtime.views { clear(view, document); } }
@@ -865,6 +875,7 @@ impl TakViewerApp {
                 for item in self.layout_tabs.closed_items_mut() {
                     let apply_host = |view: &mut View| { apply(view); if let Some(owner) = view.overlay_owner_mut() { apply(owner); } };
                     match item {
+                        layout_tabs::ClosedItem::Batch { .. } => unreachable!("closed_items_mut exposes leaves"),
                         layout_tabs::ClosedItem::View { view, .. } => apply_host(&mut view.view),
                         layout_tabs::ClosedItem::Tab(closed) => if let Some(runtime) = &mut closed.tab.layout { for view in &mut runtime.views { apply_host(view); } },
                     }
@@ -977,7 +988,7 @@ impl TakViewerApp {
                     }
                     if let Some(reason) = &self.comment_registration_error {
                         self.takm_note = Some((format!("Save · {reason}"), ctx.input(|i| i.time)));
-                        if let Some(prompt) = &mut self.dirty_prompt {
+                        if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                         continue;
@@ -991,7 +1002,7 @@ impl TakViewerApp {
                             "Save · Comment 저장 대기 실패".into(),
                             ctx.input(|i| i.time),
                         ));
-                        if let Some(prompt) = &mut self.dirty_prompt {
+                        if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                         continue;
@@ -1159,13 +1170,13 @@ impl TakViewerApp {
                             "Save · 저장 작업이 중단됐어요.".into(),
                             ctx.input(|i| i.time),
                         ));
-                        if let Some(prompt) = &mut self.dirty_prompt {
+                        if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                     }
                     Ok(SaveMessage::Done(Err(SaveFailure::Other(reason)))) => {
                         self.takm_note = Some((format!("Save · {reason}"), ctx.input(|i| i.time)));
-                        if let Some(prompt) = &mut self.dirty_prompt {
+                        if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                     }
@@ -1175,7 +1186,7 @@ impl TakViewerApp {
                                 destination: Some(path),
                                 close_after,
                             }));
-                        } else if let Some(prompt) = &mut self.dirty_prompt {
+                        } else if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                     }
@@ -1191,7 +1202,7 @@ impl TakViewerApp {
                                 "저장 중 편집 상태가 바뀌어 파일을 닫지 않았어요.".into(),
                                 ctx.input(|i| i.time),
                             ));
-                            if let Some(prompt) = &mut self.dirty_prompt {
+                            if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                                 prompt.saving = false;
                             }
                             continue;
@@ -1212,7 +1223,7 @@ impl TakViewerApp {
                                 format!("Save · {}", edit_error(error)),
                                 ctx.input(|i| i.time),
                             ));
-                            if let Some(prompt) = &mut self.dirty_prompt {
+                            if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                                 prompt.saving = false;
                             }
                             continue;
@@ -1242,10 +1253,10 @@ impl TakViewerApp {
                             ctx.input(|i| i.time),
                         ));
                         if close_after && !self.views[slot].marker_dirty() {
-                            if let Some(prompt) = self.dirty_prompt.take() {
-                                self.finish_transition(ctx, prompt.transition);
+                            if self.dirty_prompt.as_ref().is_some_and(|prompt| prompt.slot == slot) {
+                                if let Some(prompt) = self.dirty_prompt.take() { self.finish_transition(ctx, prompt.transition); }
                             }
-                        } else if let Some(prompt) = &mut self.dirty_prompt {
+                        } else if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
                         }
                     }
@@ -1657,6 +1668,7 @@ impl TakViewerApp {
                 rows.push(LabelRow {
                     key,
                     track_uid: Some(m.uid),
+                    has_samples: m.n_samples > 0,
                     name: m.name.clone(),
                     color: theme::color(m.color),
                     fill_pct: m.fill_pct,
@@ -1749,6 +1761,7 @@ impl TakViewerApp {
             groups[index].labels.push(LabelRow {
                 key: Some(key),
                 track_uid: None,
+                has_samples: false,
                 name,
                 color: theme::TEXT_DIM,
                 fill_pct: 0.0,
@@ -1757,6 +1770,7 @@ impl TakViewerApp {
                 primary: false,
             });
         }
+        ui.labeling.view_slot = slot;
         ui.labeling.assets = assets;
         ui.labeling.filter = view.labels.filter.clone();
         ui.labeling.groups = groups;
@@ -1825,7 +1839,45 @@ impl TakViewerApp {
         }
     }
 
-    fn labeling_action(&mut self, ctx: &egui::Context, slot: usize, action: LabelingAction) {
+    /// Ctrl+A is routed here only when this exact list owns keyboard focus.
+    pub(super) fn labeling_select_all(&mut self, ctx: &egui::Context, slot: usize, list: MarkerList) {
+        self.labeling_action(ctx, slot, LabelingAction::SelectTracks { list, uid: None, gesture: SelectionGesture::All });
+    }
+
+    fn select_labeling_tracks(&mut self, slot: usize, list: MarkerList, uid: Option<tak_core::tak::Uid>, gesture: SelectionGesture) {
+        self.refresh_marker_ui(slot);
+        let order = self.marker_ui[slot].labeling.track_order(list);
+        let view = &mut self.views[slot];
+        let Some(data) = view.data.as_ref() else { return };
+        let current: Vec<_> = view.ordered_selection().iter().filter_map(|&i| data.markers.get(i).map(|m| m.uid)).collect();
+        let Some(selected) = view.labels.list_selection[list.index()].apply(&order, &current, uid, gesture) else { return };
+        let indices: std::collections::HashMap<_, _> = data.markers.iter().enumerate().map(|(i, m)| (m.uid, i)).collect();
+        let selected: Vec<_> = selected.iter().filter_map(|uid| indices.get(uid).copied()).collect();
+        view.edit_selection = None;
+        view.clear_comment_selection();
+        view.selected = selected.iter().copied().collect();
+        view.selection_order = selected;
+        view.primary = view.selection_order.last().copied();
+        view.labels.scroll_to = view.primary;
+    }
+
+    pub(super) fn labeling_action(&mut self, ctx: &egui::Context, slot: usize, action: LabelingAction) {
+        match &action {
+            LabelingAction::SelectTracks { list, uid, gesture } => {
+                self.select_labeling_tracks(slot, *list, *uid, *gesture);
+                return;
+            }
+            // Older callers use additive=true for a modifier click too.
+            LabelingAction::SelectLabel { track_uid, additive: true, .. } => {
+                self.select_labeling_tracks(slot, MarkerList::Named, *track_uid, SelectionGesture::Toggle);
+                return;
+            }
+            LabelingAction::SelectUnlabeled { uid, additive: true } => {
+                self.select_labeling_tracks(slot, MarkerList::Unlabeled, Some(*uid), SelectionGesture::Toggle);
+                return;
+            }
+            _ => {}
+        }
         if let LabelingAction::SetFilter(filter) = action {
             self.views[slot].labels.filter = filter;
             return;
@@ -1873,8 +1925,9 @@ impl TakViewerApp {
             | LabelingAction::SetBackward(_)
             | LabelingAction::SetForward(_)
             | LabelingAction::SetAssetFilter(_) => unreachable!(),
-            LabelingAction::ToggleGroup(_) | LabelingAction::SetFilter(_) => unreachable!(),
+            LabelingAction::ToggleGroup(_) | LabelingAction::SetFilter(_) | LabelingAction::SelectTracks { .. } => unreachable!(),
             LabelingAction::StepLabel { forward } => {
+                view.labels.list_selection[MarkerList::Named.index()].end_range();
                 let keys = visible_labels(ui);
                 let next = match view.armed_label.and_then(|key| keys.iter().position(|k| *k == key)) {
                     Some(i) => {
@@ -1912,10 +1965,13 @@ impl TakViewerApp {
                 track_uid,
                 additive,
             } => {
+                view.labels.list_selection[MarkerList::Named.index()].end_range();
                 view.armed_label = key;
                 if let (Some(uid), Some(data)) = (track_uid, &view.data) {
                     if let Some(index) = data.markers.iter().position(|m| m.uid == uid) {
                         view.select(index, additive);
+                        let order = ui.track_order(MarkerList::Named);
+                        view.labels.list_selection[MarkerList::Named.index()].apply(&order, &[uid], Some(uid), SelectionGesture::Plain);
                     }
                 }
             }
@@ -1926,6 +1982,8 @@ impl TakViewerApp {
                     .and_then(|data| data.markers.iter().position(|m| m.uid == uid))
                 {
                     view.select(index, additive);
+                    let order = ui.track_order(MarkerList::Unlabeled);
+                    view.labels.list_selection[MarkerList::Unlabeled.index()].apply(&order, &[uid], Some(uid), SelectionGesture::Plain);
                 }
             }
             LabelingAction::Unlabel | LabelingAction::RemoveMarker => {}
@@ -2076,7 +2134,7 @@ impl TakViewerApp {
                 matches!(
                     e,
                     egui::Event::Key {
-                        key: Key::D | Key::Q | Key::S | Key::A | Key::C | Key::X | Key::Delete,
+                        key: Key::D | Key::Q | Key::S | Key::A | Key::C | Key::X,
                         pressed: true,
                         ..
                     }
@@ -2087,12 +2145,6 @@ impl TakViewerApp {
         }
         let slot = self.active;
         self.refresh_marker_ui(slot);
-        if exact_key(ctx, Key::Delete, false, false, false) {
-            let comments_focused = self.dock.find_active_focused().is_some_and(|(_, pane)| *pane == Pane::Comments);
-            if !comments_focused && self.views[slot].picked.is_none() {
-                self.delete_selected(ctx, slot);
-            }
-        }
         if exact_key(ctx, Key::D, false, true, false) {
             self.unlabel_selected(ctx, slot);
         }
@@ -2857,13 +2909,108 @@ mod integration_tests {
         app.undo_redo(&ctx, false);
         assert_eq!(app.views[0].ordered_selection(), [1]);
         assert_eq!(app.views[0].primary, Some(1));
-        assert_ne!(app.views[0].armed_label, armed);
+        assert_eq!(app.views[0].armed_label, armed, "modifier selection keeps the QuickLabel target");
         app.undo_redo(&ctx, true);
         assert_eq!(app.views[0].ordered_selection(), [1, 0]);
         assert_eq!(app.views[0].armed_label, armed);
         choose(&mut app, 0, true);
         assert_eq!(app.views[0].ordered_selection(), [1]);
         assert_eq!(app.views[0].primary, Some(1));
+    }
+
+    #[test]
+    fn labeling_modifier_range_keeps_quicklabel_target_and_is_one_selection_undo() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let order = app.marker_ui[0].labeling.track_order(MarkerList::Named);
+        let row = app.marker_ui[0].labeling.groups.iter().flat_map(|g| &g.labels).find(|row| row.track_uid == Some(order[0])).unwrap();
+        app.labeling_action(&ctx, 0, LabelingAction::SelectLabel { key: row.key, track_uid: row.track_uid, additive: false });
+        app.observe(true);
+        let before = app.views[0].selection();
+        let armed = app.views[0].armed_label;
+        let revision = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
+        let count = app.history.undo.len();
+        app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list: MarkerList::Named, uid: order.last().copied(), gesture: SelectionGesture::Range { additive: false } });
+        app.observe(true);
+        assert_eq!(app.history.undo.len(), count + 1, "one range gesture is one undo action");
+        assert_eq!(app.views[0].selected.len(), order.len());
+        let primary = app.views[0].primary.unwrap();
+        assert_eq!(app.views[0].data.as_ref().unwrap().markers[primary].uid, *order.last().unwrap());
+        assert_eq!(app.views[0].armed_label, armed, "modifier selection never arms a new label");
+        assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision(), revision, "selection never applies labeling");
+        let after = app.views[0].selection();
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.views[0].selection(), before, "undo restores anchors and selected tracks together");
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[0].selection(), after);
+    }
+
+    #[test]
+    fn intervening_3d_clicks_end_ctrl_shift_range_even_if_the_selected_set_returns() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let named = app.marker_ui[0].labeling.track_order(MarkerList::Named);
+        app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some(named[0]), gesture: SelectionGesture::Plain });
+        app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some(named[2]), gesture: SelectionGesture::Range { additive: true } });
+        let unlabeled = app.marker_ui[0].labeling.track_order(MarkerList::Unlabeled)[0];
+        let index = app.views[0].data.as_ref().unwrap().markers.iter().position(|m| m.uid == unlabeled).unwrap();
+        app.views[0].select(index, true);
+        app.views[0].select(index, true);
+        app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some(named[1]), gesture: SelectionGesture::Range { additive: true } });
+        assert_eq!(app.views[0].selected.len(), named.len(), "previous completed range is now part of the union baseline");
+        let primary = app.views[0].primary.unwrap();
+        assert_eq!(app.views[0].data.as_ref().unwrap().markers[primary].uid, named[1]);
+    }
+
+    #[test]
+    fn labeling_select_all_is_scoped_to_its_list_and_keeps_only_an_included_primary() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let named = app.marker_ui[0].labeling.track_order(MarkerList::Named);
+        let unlabeled = app.marker_ui[0].labeling.track_order(MarkerList::Unlabeled);
+        assert_eq!(unlabeled.len(), 1);
+        let select = |app: &mut TakViewerApp, list, uid, gesture| {
+            app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list, uid: Some(uid), gesture });
+            app.observe(true);
+        };
+        select(&mut app, MarkerList::Named, named[1], SelectionGesture::Plain);
+        select(&mut app, MarkerList::Unlabeled, unlabeled[0], SelectionGesture::Toggle);
+        assert_eq!(app.views[0].labels.list_selection[0].anchor, Some(named[1]));
+        assert_eq!(app.views[0].labels.list_selection[1].anchor, Some(unlabeled[0]));
+        select(&mut app, MarkerList::Named, named[2], SelectionGesture::Range { additive: false });
+        assert_eq!(app.views[0].selected.len(), 2);
+        app.labeling_select_all(&ctx, 0, MarkerList::Named);
+        let primary_uid = |app: &TakViewerApp| app.views[0].primary.map(|i| app.views[0].data.as_ref().unwrap().markers[i].uid);
+        assert_eq!(primary_uid(&app), Some(named[2]), "included primary stays Pattern target");
+        assert_eq!(app.views[0].selected.len(), named.len());
+        app.labeling_select_all(&ctx, 0, MarkerList::Unlabeled);
+        assert_eq!(primary_uid(&app), Some(unlabeled[0]));
+        assert_eq!(app.views[0].selected.len(), unlabeled.len());
+        app.labeling_select_all(&ctx, 0, MarkerList::Named);
+        assert_eq!(primary_uid(&app), Some(named[0]), "primary outside this list falls back to its first row");
+    }
+
+    #[test]
+    fn labeling_multiselect_excludes_tracks_empty_throughout_the_take_without_changing_plain_click() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let empty = app.marker_ui[0].labeling.track_order(MarkerList::Named)[0];
+        let data = app.views[0].data.as_mut().unwrap();
+        let data = std::sync::Arc::make_mut(data);
+        let index = data.markers.iter().position(|m| m.uid == empty).unwrap();
+        data.markers[index].n_samples = 0;
+        app.refresh_marker_ui(0);
+        let row = app.marker_ui[0].labeling.groups.iter().flat_map(|g| &g.labels).find(|row| row.track_uid == Some(empty)).unwrap();
+        let key = row.key;
+        assert!(!row.has_samples);
+        app.labeling_action(&ctx, 0, LabelingAction::SelectLabel { key, track_uid: Some(empty), additive: false });
+        assert_eq!(app.views[0].primary, Some(index), "plain click retains its established behavior");
+        assert_eq!(app.views[0].armed_label, key);
+        app.labeling_select_all(&ctx, 0, MarkerList::Named);
+        assert!(!app.views[0].selected.contains(&index));
+        let before = app.views[0].selection();
+        app.labeling_action(&ctx, 0, LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some(empty), gesture: SelectionGesture::Toggle });
+        assert_eq!(app.views[0].selection(), before);
     }
 
     #[test]
@@ -3125,6 +3272,96 @@ mod integration_tests {
     }
 
     #[test]
+    fn editor_batch_earlier_save_completion_cannot_resolve_the_next_prompt() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        dock::add_view(&mut app.dock, 1, app.dock_area);
+        let (_unused, rx) = mpsc::channel();
+        app.views[1].show(labeling_data("second.tak"), rx, 11, 1.0, 0.0);
+        app.views[1].comments.failed = Some("second unsaved".into());
+        // A real Save worker can only succeed after loading editable source records.
+        // Supply the same synthetic marker samples as the displayed take before snapshotting.
+        use tak_core::edit::{DocumentInput, RawSample, RawTrack, RecordBytes};
+        let take = &app.views[0].data.as_ref().unwrap().take;
+        let tracks = take.trajectories.iter().map(|track| RawTrack {
+            uid: track.uid,
+            name: track.name.clone(),
+            label: track.parent_uid.zip(track.slot).map(|(parent, slot)| LabelKey { parent, slot }),
+            records: RecordBytes { node: Arc::from([]), translation_header: Arc::from([]), serialization_verified: false },
+            samples: track.frames.iter().zip(&track.xyz).map(|(&frame, &xyz)| RawSample::new(frame, xyz)).collect::<Vec<_>>().into(),
+        }).collect();
+        let prepared = PreparedInput::new(DocumentInput {
+            streams: Arc::from([]), nodes_prefix: Arc::from([]), channels_prefix: Arc::from([]),
+            tracks, labels: Vec::new(), first_frame: take.start_frame as u32, last_frame: take.end_frame as u32,
+        }).unwrap();
+        assert!(prepared.matches_shown_take(take));
+        let snapshot = {
+            let mut document = app.views[0].edit_document.as_ref().unwrap().lock().unwrap();
+            let revision = document.revision();
+            document.install_prepared(revision, prepared).unwrap();
+            document.snapshot()
+        };
+        assert!(snapshot.is_loaded());
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document: snapshot.document_id(), close_after: true, rx, reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        app.select_all_editors();
+        app.close_selected_editors(&ctx);
+        app.discard_pending_transition(&ctx);
+        assert_eq!(app.dirty_prompt.as_ref().unwrap().slot, 1);
+        // The Save outcome is a deterministic worker completion; no file write is done here.
+        let destination = std::env::temp_dir().join(format!("editor_batch_saved_{}.takm", std::process::id()));
+        let mut saved_view = labeling_data(destination.to_str().unwrap());
+        saved_view.edit_revision = Some(snapshot.revision());
+        let saved = Saved {
+            outcome: SaveOutcome { destination: destination.clone(), written_revision: snapshot.revision(), fixed_len: 0, version: FileVersion::capture(&destination).unwrap() },
+            snapshot,
+            view: saved_view,
+            comments: views::CommentsLoad { target: Err("test completion".into()), parsed: None, label: None },
+            deferred_emg: Ok(None),
+            source_stamp: (destination.clone(), 0, None),
+        };
+        tx.send(SaveMessage::Done(Ok(saved))).unwrap_or_else(|_| panic!("save receiver disappeared"));
+        app.poll_marker_saves(&ctx);
+        assert_eq!(app.open_views().len(), 2);
+        assert_eq!(app.dirty_prompt.as_ref().unwrap().slot, 1, "slot 0's completed Save cannot answer slot 1");
+        assert_eq!(app.views[0].path(), Some(destination.as_path()), "{:?}", app.takm_note);
+        app.dirty_prompt = None;
+        app.cancel_editor_batch();
+        assert_eq!(app.views[0].path(), Some(destination.as_path()), "a later Cancel preserves successful Save state");
+        assert_eq!(app.open_views().len(), 2);
+    }
+
+    #[test]
+    fn editor_batch_save_failure_keeps_every_selected_view_open() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        dock::add_view(&mut app.dock, 1, app.dock_area);
+        let (_tx, rx) = mpsc::channel();
+        app.views[1].show(labeling_data("second.tak"), rx, 11, 1.0, 0.0);
+        app.views[1].fresh = false;
+        app.views[1].fit_pending = false;
+        let id = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().id();
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document: id, close_after: true, rx, reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        app.select_all_editors();
+        app.close_selected_editors(&ctx);
+        assert!(matches!(app.dirty_prompt.as_ref().unwrap().transition, PendingTransition::EditorBatch));
+        tx.send(SaveMessage::Done(Err(SaveFailure::Other("batch write failure".into())))).unwrap_or_else(|_| panic!("save receiver disappeared"));
+        app.poll_marker_saves(&ctx);
+        assert_eq!(app.open_views().len(), 2);
+        assert!(!app.marker_saving(0));
+        assert!(!app.dirty_prompt.as_ref().unwrap().saving);
+        assert!(app.takm_note.as_ref().unwrap().0.contains("batch write failure"));
+        assert_eq!(app.editor_selection.selected.len(), 2);
+    }
+
+    #[test]
     fn last_close_waits_for_save_completion_and_failure_keeps_the_view_open() {
         let ctx = egui::Context::default();
         let mut app = labeling_app(&ctx);
@@ -3272,7 +3509,19 @@ mod integration_tests {
         }
         fn press(ctx: &egui::Context, app: &mut TakViewerApp, modifiers: Modifiers) {
             let event = egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers };
-            let _ = ctx.run(egui::RawInput { events: vec![event], ..Default::default() }, |ctx| app.handle_keys(ctx, 0.0));
+            let target = if app.dock.find_active_focused().is_some_and(|(_, pane)| *pane == Pane::Comments) {
+                key_focus::Target::Comments
+            } else { key_focus::Target::Markers(app.active) };
+            let at = egui::pos2(20.0, 20.0);
+            let events = vec![egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers }, event];
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(dock::NOMINAL_AREA), events, ..Default::default() }, |ctx| {
+                key_focus::begin_frame(ctx, app.hold.is_some() || app.comment_edit.is_some(), target);
+                app.handle_keys(ctx, 0.0);
+                egui::CentralPanel::default().show(ctx, |ui| key_focus::region(ui, ui.available_rect_before_wrap(), target));
+                key_focus::finish_frame(ctx);
+                app.marker_focus_keys(ctx);
+            });
         }
         let ctx = egui::Context::default();
         let mut selected_comment = app(&ctx);
@@ -3406,6 +3655,48 @@ mod integration_tests {
         view.focus_selected();
         assert!((view.cam.pivot.x - 5.0).abs() < 1e-4);
         assert!(view.cam.distance > 5.0);
+    }
+
+    #[test]
+    fn delete_focus_ctrl_a_then_delete_in_one_frame_queues_the_expanded_named_selection() {
+        fn frame(ctx: &egui::Context, app: &mut TakViewerApp, events: Vec<egui::Event>) -> egui::FullOutput {
+            ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                egui::vec2(1600.0, 960.0))), focused: true, events, ..Default::default() }, |ctx| app.frame(ctx))
+        }
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let mut take = views::sample_take("combined-list-keys.tak", &["A", "B", "U1", "U2"]);
+        for (index, track) in take.trajectories[..2].iter_mut().enumerate() {
+            track.kind = MarkerKind::OtherParent;
+            track.parent_uid = Some([7; 16]);
+            track.slot = Some(index as i32 + 1);
+        }
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(tak_core::view_data::ViewData::build(take), rx, 10, 1.0, 0.0);
+        let mut out = frame(&ctx, &mut app, vec![]);
+        for _ in 0..3 { out = frame(&ctx, &mut app, vec![]); }
+        let at = out.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "A" => Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        }).expect("named list row A");
+        let button = |pressed| egui::Event::PointerButton { pos: at,
+            button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at)]);
+        frame(&ctx, &mut app, vec![button(true)]);
+        frame(&ctx, &mut app, vec![button(false)]);
+        assert_eq!(app.views[0].selected.len(), 1);
+        let control = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        frame(&ctx, &mut app, vec![key(Key::A, control), key(Key::Delete, Modifiers::NONE)]);
+        let expected = std::collections::BTreeSet::from([[1; 16], [2; 16]]);
+        assert_eq!(app.views[0].edit_selection_state().selected, expected);
+        match &app.marker_ui[0].job {
+            Some(MarkerJob::Prepare { command: MarkerCommand::Delete(request), .. }) => {
+                assert_eq!(request.selection.selected, expected,
+                    "Delete must capture the Ctrl+A selection from this same App frame");
+            }
+            _ => panic!("Delete was not queued: {:?}", app.takm_note),
+        }
     }
 
 }

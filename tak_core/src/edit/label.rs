@@ -1736,19 +1736,9 @@ mod tests {
     }
     #[test]
     fn creation_stream_reader_handles_tak_and_takm_without_touching_sources() {
-        struct TempDir(PathBuf);
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = TempDir(std::env::temp_dir().join(format!(
-            "tak_w2_2a_streams_{}_{}",
-            std::process::id(),
-            NEXT_UID.fetch_add(1, Ordering::Relaxed)
-        )));
-        std::fs::create_dir(&dir.0).unwrap();
-        let tak = dir.0.join("fixture.tak");
+        let _directory = crate::test_support::TempDir::new("tak_w2_2a_streams");
+        let dir = _directory.to_path_buf();
+        let tak = dir.join("fixture.tak");
         let bytes = crate::sample_tak::sample_tak();
         std::fs::write(&tak, &bytes).unwrap();
         let converted = crate::takm::convert(&tak, None).unwrap();

@@ -156,9 +156,13 @@ class IdentityRegressionTests(unittest.TestCase):
 
 class HelperTests(unittest.TestCase):
     def setUp(self):
-        directory = Path(os.environ.get("TAK_SSH_TEST_DIR", HELPER.parent / ".test-data"))
-        directory.mkdir(parents=True, exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=directory)
+        directory = os.environ.get("TAK_SSH_TEST_DIR")
+        if directory:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="tak_ssh_py_", dir=directory)
+        self.addCleanup(self.temp.cleanup)
+        self.process = None
+        self.addCleanup(self.stop)
         self.directory = Path(self.temp.name)
         self.path = self.directory / "한글 경로.tak"
         self.marker = channel("Marker", [0, 9, 120])
@@ -166,16 +170,18 @@ class HelperTests(unittest.TestCase):
         self.streams = {"Nodes.dat": b"nodes", "MetaData.dat": b"metadata",
                         "Channels.dat": channels([self.analog, self.marker])}
         self.path.write_bytes(compound(self.streams))
-        self.process = None
-
-    def tearDown(self):
+    def stop(self):
         if self.process:
-            self.process.stdin.close()
-            self.process.wait(timeout=5)
-            self.assertEqual(self.process.stderr.read(), b"")
-            self.process.stdout.close()
-            self.process.stderr.close()
-        self.temp.cleanup()
+            try:
+                self.process.stdin.close()
+                self.process.wait(timeout=5)
+                self.assertEqual(self.process.stderr.read(), b"")
+            finally:
+                if self.process.poll() is None:
+                    self.process.kill()
+                    self.process.wait()
+                self.process.stdout.close()
+                self.process.stderr.close()
 
     def start(self):
         if not self.process:

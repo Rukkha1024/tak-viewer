@@ -36,6 +36,30 @@ pub enum ClosedItem<L, V> {
         index: usize,
         view: V,
     },
+    /// One gesture; nested runtimes remain available to ordinary undo and worker handoff.
+    Batch { id: u64, items: Vec<ClosedItem<L, V>> },
+}
+
+impl<L, V> ClosedItem<L, V> {
+    fn refers_to_tab(&self, id: TabId) -> bool {
+        match self {
+            Self::Tab(tab) => tab.tab.id == id,
+            Self::View { tab_id, .. } => *tab_id == id,
+            Self::Batch { items, .. } => items.iter().any(|item| item.refers_to_tab(id)),
+        }
+    }
+    fn leaves(&self) -> Box<dyn DoubleEndedIterator<Item = &Self> + '_> {
+        match self {
+            Self::Batch { items, .. } => Box::new(items.iter().flat_map(Self::leaves)),
+            _ => Box::new(std::iter::once(self)),
+        }
+    }
+    fn leaves_mut(&mut self) -> Box<dyn DoubleEndedIterator<Item = &mut Self> + '_> {
+        match self {
+            Self::Batch { items, .. } => Box::new(items.iter_mut().flat_map(Self::leaves_mut)),
+            _ => Box::new(std::iter::once(self)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +88,7 @@ pub struct TabModel<L, V = ()> {
     active: Option<TabId>,
     next_id: TabId,
     closed: VecDeque<ClosedItem<L, V>>,
+    recording_batch: bool,
     /// Payload changes are events. The app indexes these layouts once, never by a frame scan.
     dirty_payloads: BTreeSet<TabId>,
     payload_versions: HashMap<TabId, u64>,
@@ -77,6 +102,7 @@ impl<L, V> Default for TabModel<L, V> {
             active: None,
             next_id: 1,
             closed: VecDeque::new(),
+            recording_batch: false,
             dirty_payloads: BTreeSet::new(),
             payload_versions: HashMap::new(),
             payload_clock: 0,
@@ -207,6 +233,7 @@ impl<L, V> TabModel<L, V> {
             let remembered = self.closed.iter().any(|item| match item {
                 ClosedItem::Tab(tab) => tab.tab.id == id,
                 ClosedItem::View { tab_id, .. } => *tab_id == id,
+                ClosedItem::Batch { items, .. } => items.iter().any(|item| item.refers_to_tab(id)),
             });
             if !live && !remembered {
                 return id;
@@ -295,7 +322,7 @@ impl<L, V> TabModel<L, V> {
     #[must_use = "release an evicted layout/view away from the UI thread"]
     pub fn remember_closed(&mut self, item: ClosedItem<L, V>) -> Option<ClosedItem<L, V>> {
         self.closed.push_back(item);
-        if self.closed.len() > MAX_CLOSED {
+        if !self.recording_batch && self.closed.len() > MAX_CLOSED {
             self.closed.pop_front()
         } else {
             None
@@ -326,50 +353,65 @@ impl<L, V> TabModel<L, V> {
         self.closed.back()
     }
 
-    /// Inspect oldest to newest without taking ownership (for undo/redo identity lookup).
+    /// Leaf runtimes, oldest to newest. Batches remain one top-level recent entry.
     pub fn closed_items(&self) -> impl DoubleEndedIterator<Item = &ClosedItem<L, V>> {
-        self.closed.iter()
+        self.closed.iter().flat_map(ClosedItem::leaves)
     }
 
-    /// Retained clean views may supply their original document when their file is opened
-    /// again, preserving the application's undo history without another data copy.
     pub fn closed_items_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut ClosedItem<L, V>> {
-        self.closed.iter_mut()
+        self.closed.iter_mut().flat_map(ClosedItem::leaves_mut)
     }
 
     pub fn has_closed_tab(&self, id: TabId) -> bool {
-        self.closed
-            .iter()
-            .any(|item| matches!(item, ClosedItem::Tab(closed) if closed.tab.id == id))
+        self.closed_items().any(|item| matches!(item, ClosedItem::Tab(closed) if closed.tab.id == id))
     }
 
-    /// Take one specific tab for the app's general undo/redo, leaving unrelated close
-    /// history in its original order. The most recent match wins if a caller stores two.
     pub fn take_closed_tab(&mut self, id: TabId) -> Option<ClosedTab<L>> {
-        match self.take_closed_where(
-            |item| matches!(item, ClosedItem::Tab(closed) if closed.tab.id == id),
-        )? {
+        match self.take_closed_where(|item| matches!(item, ClosedItem::Tab(closed) if closed.tab.id == id))? {
             ClosedItem::Tab(tab) => Some(tab),
-            ClosedItem::View { .. } => unreachable!("predicate only matches tabs"),
+            _ => unreachable!("predicate only matches tabs"),
         }
     }
 
     pub fn has_closed_view(&self, tab_id: TabId, index: usize) -> bool {
-        self.closed.iter().any(|item| matches!(item, ClosedItem::View { tab_id: owner, index: slot, .. } if *owner == tab_id && *slot == index))
+        self.closed_items().any(|item| matches!(item, ClosedItem::View { tab_id: owner, index: slot, .. } if *owner == tab_id && *slot == index))
     }
 
-    /// View-slot keys select the newest matching close. If `V` carries a more specific
-    /// identity, use `take_closed_where` to select that exact view instead.
     pub fn take_closed_view(&mut self, tab_id: TabId, index: usize) -> Option<ClosedItem<L, V>> {
         self.take_closed_where(|item| matches!(item, ClosedItem::View { tab_id: owner, index: slot, .. } if *owner == tab_id && *slot == index))
     }
 
-    pub fn take_closed_where(
-        &mut self,
-        mut matches: impl FnMut(&ClosedItem<L, V>) -> bool,
-    ) -> Option<ClosedItem<L, V>> {
-        let index = self.closed.iter().rposition(&mut matches)?;
-        self.closed.remove(index)
+    pub fn take_closed_where(&mut self, mut matches: impl FnMut(&ClosedItem<L, V>) -> bool) -> Option<ClosedItem<L, V>> {
+        fn take<L, V>(items: &mut Vec<ClosedItem<L, V>>, matches: &mut impl FnMut(&ClosedItem<L, V>) -> bool) -> Option<ClosedItem<L, V>> {
+            for index in (0..items.len()).rev() {
+                if matches(&items[index]) { return Some(items.remove(index)); }
+                if let ClosedItem::Batch { items: nested, .. } = &mut items[index] {
+                    if let Some(found) = take(nested, matches) {
+                        if nested.is_empty() { items.remove(index); }
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        for index in (0..self.closed.len()).rev() {
+            if matches(&self.closed[index]) { return self.closed.remove(index); }
+            if let ClosedItem::Batch { items, .. } = &mut self.closed[index] {
+                if let Some(found) = take(items, &mut matches) {
+                    if items.is_empty() { self.closed.remove(index); }
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Coalesce newly closed runtimes without evicting an older recent entry mid-gesture.
+    pub fn take_recent_items(&mut self) -> VecDeque<ClosedItem<L, V>> { self.recording_batch = true; std::mem::take(&mut self.closed) }
+    pub fn put_recent_items(&mut self, items: VecDeque<ClosedItem<L, V>>) { self.closed = items; self.recording_batch = false; }
+
+    pub(super) fn recent_batch_ids(&self) -> BTreeSet<u64> {
+        self.closed.iter().filter_map(|item| match item { ClosedItem::Batch { id, .. } => Some(*id), _ => None }).collect()
     }
 
     pub fn closed_len(&self) -> usize {

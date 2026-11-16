@@ -503,6 +503,9 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
     let edge = Stroke::new(1.0_f32, Color32::from_white_alpha(if hot { 120 } else { 60 }));
 
     if open {
+        if matches!(kind, Kind::Plate { .. }) {
+            crate::app::key_focus::region(ui, rect.intersect(clip), crate::app::key_focus::Target::Blocked);
+        }
         let lane_h = (rect.height() - graph::NAV_H) / g.lanes.len().max(1) as f32;
         let alpha = (f32::from(opacity.min(100)) * 2.55).round() as u8;
         let look = Look {
@@ -527,6 +530,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
 
     // Name tag: the handle. The same tag on the open graph and when folded.
     let tag_rect = Rect::from_min_size(tag_min, vec2(if hot { full_w } else { plain_w }, TAG_H));
+    crate::app::key_focus::region(ui, tag_rect, crate::app::key_focus::Target::Blocked);
     let handle = Rect::from_min_size(tag_min, vec2(plain_w, TAG_H));
     let tag = ui.interact(handle, id.with("tag"), Sense::click_and_drag()).on_hover_cursor(CursorIcon::Grab);
     // The corner keeps its distance to the mouse from where the tag was pressed.
@@ -609,6 +613,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
 
     if open {
         for (name, r, edges, cursor) in handles {
+            crate::app::key_focus::region(ui, clear_of(r, view_tag).intersect(clip), crate::app::key_focus::Target::Blocked);
             let resp = ui.interact(clear_of(r, view_tag), id.with(name), Sense::drag()).on_hover_cursor(cursor);
             if resp.dragged() {
                 ui.ctx().set_cursor_icon(cursor);

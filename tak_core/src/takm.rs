@@ -357,6 +357,8 @@ pub fn canonical_target(path: &Path) -> io::Result<PathBuf> {
 /// The stable lock file is intentionally retained: removing it can split waiting processes
 /// across different inodes. Its key is the canonical destination, shared by app instances.
 pub(crate) fn coordination_root() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(root) = crate::test_support::coordination_root_override() { return root; }
     #[cfg(unix)]
     { PathBuf::from("/tmp") }
     #[cfg(windows)]
@@ -685,6 +687,9 @@ pub fn append_events(path: &Path, events: &[comments::Event]) -> Result<()> {
 
 /// Compare the view's base under the same lock as the append. Cancellation is checked after
 /// lock acquisition, so a discarded write waiting on a lock cannot later alter the file.
+/// Every event is preflighted against the staged tail before the first write; a conflict or
+/// validation error leaves the file byte-for-byte unchanged. A write/flush error can still
+/// leave a prefix, so retry the same operation tokens rather than making replacement events.
 pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Option<CommentConflict>> {
     append_events_guarded_stamped(path, events, cancelled).map(|(conflict, _)| conflict)
 }
@@ -709,6 +714,8 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
     let before = file.metadata()?;
     let before = (target.clone(), before.len(), before.modified().ok());
     let (_, mut tail) = tail_bytes(&file)?;
+    let original = comments::parse(&String::from_utf8_lossy(&tail)).comments();
+    let mut pending = Vec::new();
     for event in events {
         if event.operation.as_ref().is_some_and(|id| comments::parse(&String::from_utf8_lossy(&tail))
             .events.iter().any(|old| old.operation.as_ref() == Some(id))) {
@@ -718,7 +725,7 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
             let live = comments::parse(&String::from_utf8_lossy(&tail)).comments();
             let latest = live.get(event.id).cloned();
             if live.id_is_ambiguous(event.id) || latest.as_ref() != Some(expected) {
-                return Ok((Some(CommentConflict { id: event.id, latest }), None));
+                return Ok((Some(CommentConflict { id: event.id, latest: original.get(event.id).cloned() }), None));
             }
         }
         let encoded = comments::encode(event);
@@ -745,9 +752,11 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
             out.extend_from_slice(bytes);
         }
         if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
-        file.write_all(&out)?;
         tail.extend_from_slice(&out);
+        pending.extend_from_slice(&out);
     }
+    if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
+    file.write_all(&pending)?;
     file.flush()?;
     let after = file.metadata()?;
     let after = (target, after.len(), after.modified().ok());
@@ -785,18 +794,10 @@ mod tests {
     use crate::sample_tak::sample_tak;
 
 
-    struct TempDir(PathBuf);
+    struct TempDir(crate::test_support::TempDir);
     impl TempDir {
         fn new(tag: &str) -> TempDir {
-            let d = std::env::temp_dir().join(format!("takm_test_{}_{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            TempDir(d)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            TempDir(crate::test_support::TempDir::new(&format!("takm_test_{tag}")))
         }
     }
 

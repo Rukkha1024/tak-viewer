@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "tak_core"
-version = "0.32.10"
+version = "0.32.11"
 dependencies = [
  "memchr",
  "roxmltree",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "tak_viewer"
-version = "0.32.10"
+version = "0.32.11"
 dependencies = [
  "eframe",
  "egui_dock",

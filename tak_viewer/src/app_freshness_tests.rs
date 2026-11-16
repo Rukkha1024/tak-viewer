@@ -72,7 +72,8 @@ mod freshness_tests {
 
     #[test]
     fn fresh_open_reads_external_marker_and_comment_changes_then_reconciles_closed_aliases() {
-        let dir = comment_dir("fresh_external_changes");
+        let _dir_guard = comment_dir("fresh_external_changes");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("changed.takm");
         make_takm(&path);
         add_disk_comment(&path, 1, "before");
@@ -107,12 +108,12 @@ mod freshness_tests {
         assert_eq!(app.views[0].comments.list.len(), 2);
         assert!(app.views[0].loading.is_none(), "retained reopen stays instant");
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unchanged_fresh_open_preserves_saved_edit_identity_and_undo_patch() {
-        let dir = comment_dir("fresh_unchanged_undo");
+        let _dir_guard = comment_dir("fresh_unchanged_undo");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("unchanged.takm");
         make_takm(&path);
         let ctx = egui::Context::default();
@@ -129,12 +130,12 @@ mod freshness_tests {
         assert!(app.views[0].data.as_ref().unwrap().markers[0].present(0));
         assert!(app.views[0].marker_dirty(), "undoing a saved edit must mark the same document dirty");
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn in_app_comment_append_preserves_marker_document_and_saved_edit_undo() {
-        let dir = comment_dir("fresh_own_comment_undo");
+        let _dir_guard = comment_dir("fresh_own_comment_undo");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("own_comment.takm");
         make_takm(&path);
         let ctx = egui::Context::default();
@@ -157,12 +158,12 @@ mod freshness_tests {
         app.views[0].apply_marker_patch(&patch, false).unwrap();
         assert!(app.views[0].marker_dirty());
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn external_change_before_own_comment_cannot_certify_the_old_marker_document() {
-        let dir = comment_dir("fresh_external_before_own_comment");
+        let _dir_guard = comment_dir("fresh_external_before_own_comment");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("external_then_own.takm");
         make_takm(&path);
         let ctx = egui::Context::default();
@@ -183,14 +184,14 @@ mod freshness_tests {
         assert_ne!(app.views[0].document_id(), old);
         assert_eq!(app.views[0].comments.list.len(), 2);
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn alias_paths_share_worker_stamps_and_keep_document_after_own_comments() {
         for relative in [false, true] {
-            let dir = comment_dir(&format!("fresh_alias_{relative}"));
+            let _dir_guard = comment_dir(&format!("fresh_alias_{relative}"));
+            let dir = _dir_guard.to_path_buf();
             let path = dir.join("source.takm");
             let alias = dir.join("alias.takm");
             make_takm(&path);
@@ -223,13 +224,13 @@ mod freshness_tests {
             app.views[0].publish_edited_view(edited).unwrap();
             assert!(!app.views[0].data.as_ref().unwrap().markers[0].present(0));
             drop(app);
-            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
     #[test]
     fn portable_parent_path_alias_keeps_source_stamp_after_own_comment() {
-        let dir = comment_dir("fresh_portable_alias");
+        let _dir_guard = comment_dir("fresh_portable_alias");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("source.takm");
         let component = dir.join("spelling");
         std::fs::create_dir(&component).unwrap();
@@ -255,13 +256,13 @@ mod freshness_tests {
         app.views[0].publish_edited_view(edited).unwrap();
         assert!(!app.views[0].data.as_ref().unwrap().markers[0].present(0));
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn evicted_history_fallback_verifies_source_before_restoring_edit_document() {
         for mode in ["unchanged", "changed", "invalid"] {
-            let dir = comment_dir(&format!("fresh_evicted_{mode}"));
+            let _dir_guard = comment_dir(&format!("fresh_evicted_{mode}"));
+            let dir = _dir_guard.to_path_buf();
             let path = dir.join("evicted.takm");
             make_takm(&path);
             let ctx = egui::Context::default();
@@ -309,13 +310,13 @@ mod freshness_tests {
                 }
             }
             drop(app);
-            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
     #[test]
     fn fresh_open_in_hidden_tab_reads_new_comments_and_duplicate_views_share_it() {
-        let dir = comment_dir("fresh_hidden");
+        let _dir_guard = comment_dir("fresh_hidden");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("hidden.takm");
         make_takm(&path);
         let ctx = egui::Context::default();
@@ -344,12 +345,12 @@ mod freshness_tests {
         assert!(Arc::ptr_eq(&session, app.views[0].edit_document.as_ref().unwrap()));
         assert_eq!(app.views[0].comments.list.get(5).unwrap().text, "new while closed");
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn fresh_overlay_reads_external_change_and_restored_history_joins_it() {
-        let dir = comment_dir("fresh_overlay");
+        let _dir_guard = comment_dir("fresh_overlay");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("overlay.takm");
         let host = dir.join("host.takm");
         make_takm(&path);
@@ -372,7 +373,6 @@ mod freshness_tests {
         assert_eq!(app.views[0].comments.list.get(8).unwrap().text, "overlay changed");
         assert!(app.views[0].loading.is_none());
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

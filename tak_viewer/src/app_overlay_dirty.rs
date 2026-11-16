@@ -22,6 +22,10 @@ pub(super) struct OverlayDirty {
     complete: bool,
 }
 
+impl LayoutRestoreFile {
+    pub(super) fn view(&self) -> &View { &self.view }
+}
+
 impl TakViewerApp {
     pub(super) fn with_overlay_owner<R>(&mut self, ctx: &egui::Context, slot: usize, run: impl FnOnce(&mut Self) -> R) -> Option<R> {
         let mut overlay = self.views.get_mut(slot)?.overlay.take()?;
@@ -62,6 +66,7 @@ impl TakViewerApp {
     pub(super) fn cancel_overlay_dirty_bridge(&mut self, _ctx: &egui::Context) { self.overlay_dirty = None; }
 
     pub(super) fn cancel_dirty_transition(&mut self, ctx: &egui::Context) {
+        self.cancel_editor_batch();
         self.dirty_prompt = None;
         self.cancel_overlay_dirty_bridge(ctx);
         if !self.overlay_owner_scope { self.restore_tab_close_origin(); }
@@ -69,7 +74,7 @@ impl TakViewerApp {
 
     pub(super) fn guard_overlay_exit(&mut self, slot: usize) -> bool { self.guard_overlay_dirty(slot, PendingTransition::Exit) }
 
-    fn guard_overlay_dirty(&mut self, slot: usize, transition: PendingTransition) -> bool {
+    pub(super) fn guard_overlay_dirty(&mut self, slot: usize, transition: PendingTransition) -> bool {
         let ctx = egui::Context::default();
         self.overlay_dirty = Some(OverlayDirty { slot, transition, complete: false });
         let dirty = self.with_overlay_owner(&ctx, slot, |app| app.guard_primary_dirty(slot, PendingTransition::OverlayBridgeComplete)).unwrap_or(false);

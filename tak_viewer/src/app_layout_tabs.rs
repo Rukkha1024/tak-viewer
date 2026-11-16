@@ -108,7 +108,7 @@ impl TakViewerApp {
         false
     }
 
-    fn allow_open_files(&mut self, paths: &[PathBuf], exclude_active_slot: Option<usize>) -> bool {
+    pub(super) fn allow_open_files(&mut self, paths: &[PathBuf], exclude_active_slot: Option<usize>) -> bool {
         let mut files = self.open_file_identities(exclude_active_slot);
         files.extend(paths.iter().map(|path| self.admit_identity(path)));
         if files.len() <= MAX_OPEN_FILES { return true; }
@@ -125,9 +125,66 @@ impl TakViewerApp {
             })
     }
 
+    /// Read-only lookup in the same source order as `find_shared_file`. A source with no
+    /// wrapper yet still exposes its document identity without allocating or publishing.
+    fn retained_adoption_ready(&self, retained: &View, path: &Path) -> Option<bool> {
+        let wanted = self.known_identity(path);
+        let live = || self.views.iter().chain(self.layout_tabs.tabs().iter()
+            .filter_map(|tab| tab.layout.as_ref()).flat_map(|runtime| runtime.views.iter()));
+        for source in live() {
+            if source.shared_target().is_some_and(|p| Self::bound_primary_identity(source, &p) == wanted)
+                && source.waiting_shared_path().is_none() {
+                if let Some(ready) = retained.can_adopt_from_view(source) { return Some(ready); }
+            }
+        }
+        for host in live() {
+            if host.overlay_shared_target().is_some_and(|p| Self::bound_overlay_identity(host, &p) == wanted) {
+                if let Some(owner) = host.overlay_owner() {
+                    if let Some(ready) = retained.can_adopt_from_view(owner) { return Some(ready); }
+                }
+            }
+        }
+        if self.restoring_layout {
+            for held in &self.layout_restore_files {
+                let source = held.view();
+                if source.shared_target().is_some_and(|p| Self::same_local_path(&p, path)) {
+                    if let Some(ready) = retained.can_adopt_from_view(source) { return Some(ready); }
+                }
+                if source.overlay_path().is_some_and(|p| Self::same_local_path(p, path)) {
+                    if let Some(owner) = source.overlay_owner() {
+                        if let Some(ready) = retained.can_adopt_from_view(owner) { return Some(ready); }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check every adoption before a batch removes any retained runtime from history.
+    pub(super) fn retained_view_ready(&self, view: &View) -> bool {
+        if view.waiting_shared_path().is_none() {
+            if let Some(path) = view.shared_target() {
+                if let Some(ready) = self.retained_adoption_ready(view, &path) {
+                    if !ready { return false; }
+                } else if self.file_is_loading_elsewhere(&path, usize::MAX) { return false; }
+            }
+        }
+        if let Some(path) = view.overlay_shared_target() {
+            let Some(owner) = view.overlay_owner() else { return false; };
+            if let Some(ready) = self.retained_adoption_ready(owner, &path) {
+                if !ready { return false; }
+            } else if self.file_is_loading_elsewhere(&path, usize::MAX) { return false; }
+        }
+        true
+    }
+
     /// A file may have been opened afresh after this view was closed. Reuse that live
     /// document instead of resurrecting a second independent document for the same path.
     fn reconcile_retained_view(&mut self, view: &mut View) -> bool {
+        if !self.retained_view_ready(view) {
+            self.notice = Some("닫은 화면이나 겹쳐 본 파일의 작업이 아직 끝나지 않았어요. 읽기·편집·저장이 끝난 뒤 다시 열어 주세요.".into());
+            return false;
+        }
         if view.waiting_shared_path().is_none() {
             if let Some(path) = view.shared_target() {
                 if let Some(shared) = self.find_shared_file(&path, usize::MAX) {
@@ -306,6 +363,7 @@ impl TakViewerApp {
                     }
                     if let Some(candidate) = closed.view.overlay_owner().and_then(candidate) { return Some(candidate); }
                 }
+                ClosedItem::Batch { .. } => unreachable!("closed_items_mut exposes leaves"),
                 ClosedItem::Tab(closed) => {
                     let Some(runtime) = &mut closed.tab.layout else { continue };
                     for (slot, view) in runtime.views.iter().enumerate() {
@@ -342,6 +400,7 @@ impl TakViewerApp {
             };
             match item {
                 ClosedItem::View { view: closed, .. } => transfer(&mut closed.view),
+                ClosedItem::Batch { .. } => unreachable!("closed_items_mut exposes leaves"),
                 ClosedItem::Tab(closed) => {
                     if let Some(runtime) = &mut closed.tab.layout { for view in &mut runtime.views { transfer(view); } }
                 }
@@ -380,6 +439,7 @@ impl TakViewerApp {
                     if !closed.marker_ui.has_pending_work() { reconcile(&mut closed.view); }
                     if let Some(owner) = closed.view.overlay_owner_mut() { reconcile(owner); }
                 }
+                ClosedItem::Batch { .. } => unreachable!("closed_items_mut exposes leaves"),
                 ClosedItem::Tab(closed) => {
                     if let Some(runtime) = &mut closed.tab.layout {
                         for (slot, view) in runtime.views.iter_mut().enumerate() {
@@ -887,7 +947,10 @@ impl TakViewerApp {
         }
     }
 
-    pub(super) fn reopen_layout_item(&mut self) {
+    pub(super) fn reopen_layout_item(&mut self) { self.reopen_layout_item_with_context(&egui::Context::default()); }
+
+    pub(super) fn reopen_layout_item_with_context(&mut self, ctx: &egui::Context) {
+        if matches!(self.layout_tabs.last_closed(), Some(ClosedItem::Batch { .. })) { self.reopen_editor_batch(ctx); return; }
         enum Item { Tab(TabId), View(TabId, Vec<PathBuf>) }
         let Some(item) = self.layout_tabs.last_closed().map(|item| match item {
             ClosedItem::Tab(closed) => Item::Tab(closed.tab.id),
@@ -898,6 +961,7 @@ impl TakViewerApp {
                 if let Some(load) = &view.view.overlay_load { paths.push(load.path.clone()); }
                 Item::View(*tab_id, paths)
             },
+            ClosedItem::Batch { .. } => unreachable!("batch dispatched above"),
         }) else { return };
         match item {
             Item::Tab(id) => {

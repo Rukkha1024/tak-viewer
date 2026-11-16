@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+test-support = []
+
 # 화면 라이브러리(eframe/egui)를 넣지 않아요. 넣으면 백엔드와 화면의 경계가 깨져요.
 [dependencies]
 serde_json = "1"

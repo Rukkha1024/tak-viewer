@@ -3,15 +3,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    struct Fixture(std::path::PathBuf);
+    struct Fixture(std::path::PathBuf, crate::test_support::TempDir);
     impl Fixture {
         fn new(takm: bool) -> Self {
-            let directory = std::env::var_os("TAK_SSH_TEST_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".ssh-test-data")
-                });
-            std::fs::create_dir_all(&directory).unwrap();
+            let directory = if let Some(parent) = std::env::var_os("TAK_SSH_TEST_DIR") {
+                let parent = std::path::PathBuf::from(parent);
+                std::fs::create_dir_all(&parent).unwrap();
+                crate::test_support::TempDir::new_in(&parent, "tak_ssh")
+            } else {
+                crate::test_support::TempDir::new("tak_ssh")
+            };
             let p = directory.join(format!(
                 "ssh_한글_{}_{}.{}",
                 std::process::id(),
@@ -26,12 +27,7 @@ mod tests {
             } else {
                 std::fs::write(&p, data).unwrap();
             }
-            Self(p)
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            Self(p, directory)
         }
     }
     fn session() -> RemoteSession {

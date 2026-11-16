@@ -423,14 +423,13 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    struct Fixture { dir: PathBuf, tak: PathBuf, doc: EditDocument }
+    struct Fixture { tak: PathBuf, doc: EditDocument, dir: crate::test_support::TempDir }
     impl Fixture {
         fn new(name: &str) -> Self {
             Self::from_bytes(name, &crate::sample_tak::sample_tak())
         }
         fn from_bytes(name: &str, bytes: &[u8]) -> Self {
-            let dir = std::env::temp_dir().join(format!("tak_2c_{name}_{}_{}", std::process::id(), TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::TempDir::new(&format!("tak_2c_{name}"));
             let tak = dir.join("test.tak");
             std::fs::write(&tak, bytes).unwrap();
             let (input, _) = PreparedInput::read_from_path(&tak).unwrap();
@@ -456,7 +455,6 @@ mod tests {
             patch
         }
     }
-    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
     fn event(id: u64, file: String) -> comments::Event {
         comments::Event { time: "2026-01-01T00:00:00+00:00".into(), kind: comments::Kind::Add, id,
             markers: vec!["M".into()], start: 1, end: 2, comment_type: String::new(), text: format!("event {id}"),
@@ -865,10 +863,10 @@ mod tests {
         let mut f = Fixture::new("process_lock");
         let (out, _) = saved(&mut f);
         let guard = takm::lock_path(&out).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::test_support::ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("edit::save::tests::lock_covers_another_process")
             .env("TAK_2C_CHILD_APPEND", &out).stdout(std::process::Stdio::null())
-            .spawn().unwrap();
+            .spawn().unwrap());
         std::thread::sleep(Duration::from_millis(150));
         assert!(child.try_wait().unwrap().is_none(), "child did not wait for the lock");
         drop(guard);
@@ -966,10 +964,10 @@ mod tests {
         let output = f.dir.join("save_as.takm");
         let signal = f.dir.join("queued");
         let lock = takm::lock_path(&source).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::test_support::ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("edit::save::tests::save_as_drains_another_process_comment_queued_before_its_file_lock")
             .env("TAK_2C_CHILD_QUEUED", &source).env("TAK_2C_CHILD_SIGNAL", &signal)
-            .stdout(std::process::Stdio::null()).spawn().unwrap();
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while !signal.exists() { assert!(std::time::Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
         let req = f.request(&source, &output);
@@ -1003,11 +1001,11 @@ mod tests {
         let output = f.dir.join("save_as.takm");
         let paused = f.dir.join("paused"); let release = f.dir.join("release"); let queued = f.dir.join("queued");
         let lock = takm::lock_path(&source).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::test_support::ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("edit::save::tests::shared_barrier_drains_events_queued_during_an_idle_poll")
             .env("TAK_2C_IDLE_CHILD", &source).env("TAK_2C_TIMEOUT_PAUSED", &paused)
             .env("TAK_2C_TIMEOUT_RELEASE", &release).env("TAK_2C_CHILD_SIGNAL", &queued)
-            .stdout(std::process::Stdio::null()).spawn().unwrap();
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while !queued.exists() { assert!(std::time::Instant::now() < deadline); std::thread::sleep(Duration::from_millis(5)); }
         let req = f.request(&source, &output);
@@ -1034,10 +1032,10 @@ mod tests {
         let output = f.dir.join("save_as.takm");
         let signal = f.dir.join("queued");
         let lock = takm::lock_path(&source).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::test_support::ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("edit::save::tests::save_as_drains_another_process_comment_queued_before_its_file_lock")
             .env("TAK_2C_CHILD_QUEUED", &source).env("TAK_2C_CHILD_SIGNAL", &signal)
-            .stdout(std::process::Stdio::null()).spawn().unwrap();
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while !signal.exists() { assert!(std::time::Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
         let req = f.request(&source, &output);

@@ -164,6 +164,7 @@ impl CommentsLoad {
 pub enum Change {
     Added(comments::Comment),
     Deleted(comments::Comment),
+    DeletedMany(Vec<comments::Comment>),
     Edited { before: comments::Comment, after: comments::Comment },
 }
 
@@ -175,6 +176,8 @@ pub struct Selection {
     pub order: Vec<usize>,
     pub primary: Option<usize>,
     pub comment: Option<u64>,
+    pub comments: crate::comment_selection::CommentSelection,
+    pub list_anchors: [panels::ListSelectionState; 2],
     pub armed_label: Option<LabelKey>,
 }
 
@@ -419,6 +422,8 @@ pub struct View {
     pub restore_edit_selection: Option<EditSelection>,
     /// Selected Comment restored with a reversible close/open, after its markers arrive.
     pub restore_picked: Option<Option<u64>>,
+    pub restore_comment_selection: Option<crate::comment_selection::CommentSelection>,
+    pub restore_list_anchors: Option<[panels::ListSelectionState; 2]>,
     /// Latest desired marker revision; older worker results must not be published.
     pub edit_refresh: Option<Revision>,
     pub edit_selection: Option<EditSelection>,
@@ -447,6 +452,8 @@ pub struct View {
     /// its row has boxes for its frames and note. Cleared when it is deleted, with Esc, when the
     /// marker selection becomes empty, or when another file is shown here.
     pub picked: Option<u64>,
+    pub comment_selection: crate::comment_selection::CommentSelection,
+    pub comment_marker_draft: bool,
     /// The chosen force plate (at most one per view): its graph (Fx … Mz, the lanes chosen for
     /// this view slot) floats over this 3D. Chosen by a click on the plate in the 3D or
     /// "3D 위로" in the devices pane; markers stay selected.
@@ -536,6 +543,8 @@ impl Default for View {
             restore_edit_document: None,
             restore_edit_selection: None,
             restore_picked: None,
+            restore_comment_selection: None,
+            restore_list_anchors: None,
             edit_refresh: None,
             edit_selection: None,
             armed_label: None,
@@ -553,6 +562,8 @@ impl Default for View {
             selection_order: Vec::new(),
             primary: None,
             picked: None,
+            comment_selection: Default::default(),
+            comment_marker_draft: false,
             plate: None,
             range: None,
             comments: CommentState::default(),
@@ -748,20 +759,40 @@ impl View {
     /// False leaves the view untouched: an independent unsaved document or unfinished open
     /// cannot be discarded by a layout restore. App-owned marker/save jobs are guarded by
     /// the controller before calling this method.
+    /// The same readiness test used by adoption, without changing this retained view.
+    pub fn can_adopt_shared_preserving_state(&self, shared: &SharedFile) -> bool {
+        let (document, path) = {
+            let Ok(state) = shared.0.lock() else { return false };
+            (state.document.clone(), state.data.take.path.clone())
+        };
+        self.can_adopt_document(&document, &path)
+    }
+
+    /// Read-only counterpart of `source.shared_file()` followed by the adoption check.
+    /// A single-view source need not allocate or install a shared wrapper for preflight.
+    pub fn can_adopt_from_view(&self, source: &View) -> Option<bool> {
+        if source.loading.is_some() || source.remote_loading.is_some() || source.waiting_shared.is_some() { return None; }
+        if let Some(shared) = &source.shared_file { return Some(self.can_adopt_shared_preserving_state(shared)); }
+        Some(self.can_adopt_document(source.edit_document.as_ref()?, &source.data.as_ref()?.take.path))
+    }
+
+    fn can_adopt_document(&self, document: &EditSession, path: &Path) -> bool {
+        if self.edit_document.as_ref().is_some_and(|own| Arc::ptr_eq(own, document)) { return true; }
+        self.loading.is_none() && self.remote_loading.is_none() && self.waiting_shared.is_none()
+            && !self.marker_dirty() && self.comments.pending == 0 && self.comments.failed.is_none()
+            && self.path().is_some_and(|own| same_file_path(own, path))
+    }
+
     pub fn adopt_shared_preserving_state(&mut self, shared: SharedFile, now: f64) -> bool {
         let (data, document, stamp, comments, generation) = {
             let Ok(state) = shared.0.lock() else { return false };
             (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
         };
+        if !self.can_adopt_document(&document, &data.take.path) { return false; }
         if self.edit_document.as_ref().is_some_and(|own| Arc::ptr_eq(own, &document)) {
             self.sync_shared_file(&shared);
             return true;
         }
-        if self.loading.is_some() || self.remote_loading.is_some() || self.waiting_shared.is_some()
-            || self.marker_dirty() || self.comments.pending > 0
-            || self.comments.failed.is_some() { return false; }
-        let Some(path) = self.path() else { return false };
-        if !same_file_path(path, &data.take.path) { return false; }
         let selection = self.uid_selection();
         let frame = self.pb.frame;
         let plate_name = self.plate.and_then(|index| self.data.as_ref()?.plates.get(index).map(|plate| plate.name.clone()));
@@ -832,7 +863,14 @@ impl View {
             self.install_shared_data(data);
         }
         comments.install(&mut self.comments);
-        if self.picked.is_some_and(|id| self.comments.list.get(id).is_none()) { self.picked = None; }
+        let ids: Vec<_> = self.comments.list.list().iter().map(|comment| comment.id).collect();
+        self.comment_selection.prune(&ids);
+        if self.picked.is_some_and(|id| !ids.contains(&id)) {
+            let selection = self.comment_selection.clone();
+            self.picked = selection.representative;
+            if let Some(id) = self.picked { self.select_comment(id); }
+            self.comment_selection = selection;
+        }
         self.source_stamp = stamp;
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
         drop_later(self.shared_file.replace(shared.clone()));
@@ -1183,6 +1221,8 @@ impl View {
         drop_later(self.restore_edit_document.take());
         self.restore_edit_selection = None;
         self.restore_picked = None;
+        self.restore_comment_selection = None;
+        self.restore_list_anchors = None;
         let (tx, rx) = channel();
         let (comments_tx, comments_rx) = channel();
         let (lazy_tx, lazy_rx) = channel();
@@ -1295,6 +1335,8 @@ impl View {
         drop_later(self.restore_edit_document.take());
         self.restore_edit_selection = None;
         self.restore_picked = None;
+        self.restore_comment_selection = None;
+        self.restore_list_anchors = None;
         self.remote_loading = None;
         drop_later(self.loading.take());
         drop_later(self.analog_rx.take());
@@ -1368,6 +1410,9 @@ impl View {
         self.selection_order.clear();
         self.primary = None;
         self.picked = self.restore_picked.take().flatten();
+        self.comment_selection = self.restore_comment_selection.take().unwrap_or_default();
+        if self.comment_selection.len() == 0 { if let Some(id) = self.picked { self.comment_selection.single(id); } }
+        self.comment_marker_draft = false;
         self.plate = None;
         self.range = None;
         // Its own comments come from the loading thread (`poll_comments`).
@@ -1390,6 +1435,7 @@ impl View {
         self.devices.reset_graphs();
         drop_later(Some(std::mem::take(&mut self.plate_lanes)));
         self.labels.reset(&data, file_id);
+        if let Some(anchors) = self.restore_list_anchors.take() { self.labels.list_selection = anchors; }
         let old = self.data.replace(data);
         match self.restore.take() {
             Some(spot) => self.apply_spot(&spot, now),
@@ -1678,6 +1724,7 @@ impl View {
         let found: Vec<usize> = c.markers.iter().filter_map(|n| d.markers.iter().position(|m| &m.name == n)).collect();
         let (start, markerless) = (c.start, c.markers.is_empty());
         self.picked = Some(id);
+        self.comment_selection.single(id);
         if !markerless {
             self.edit_selection = None;
             self.selected = found.iter().copied().collect();
@@ -1787,7 +1834,11 @@ impl View {
         let folds = self.data.as_ref().map(|old| panels::fold_keys(old, &self.labels.collapsed)).unwrap_or_default();
         let old_groups: std::collections::HashSet<_> = self.data.as_ref().map(|old| (0..old.groups.len())
             .map(|i| panels::FoldKey::group(old, i)).collect()).unwrap_or_default();
+        let mut anchors = self.labels.list_selection.clone();
+        let eligible = data.markers.iter().filter(|marker| marker.n_samples > 0).map(|marker| marker.uid).collect();
+        for state in &mut anchors { state.retain(&eligible); }
         self.labels.reset(&data, self.file_id);
+        self.labels.list_selection = anchors;
         self.labels.filter = filter;
         let new_defaults: Vec<_> = self.labels.collapsed.iter().copied()
             .filter(|&i| !old_groups.contains(&panels::FoldKey::group(&data, i))).collect();
@@ -1798,7 +1849,12 @@ impl View {
         drop_later(Some(std::mem::take(&mut self.lanes)));
         drop_later(Some(std::mem::take(&mut self.heat)));
         drop_later(self.data.replace(data));
+        let comments = self.comment_selection.clone();
+        let picked = self.picked;
         self.apply_uid_selection(&selection);
+        // Data publication remaps marker UIDs; it is not a user's new marker pick.
+        self.comment_selection = comments;
+        self.picked = picked;
         self.plate = self.plate.filter(|&plate| self.data.as_ref()
             .is_some_and(|data| data.analog_pending || plate < data.plates.len()));
         if self.data.as_ref().is_some_and(|data| data.edit_revision == self.edit_refresh) {
@@ -1824,6 +1880,8 @@ impl View {
     }
 
     pub fn select(&mut self, marker: usize, additive: bool) {
+        for selection in &mut self.labels.list_selection { selection.end_range(); }
+        self.clear_comment_selection();
         self.edit_selection = None;
         self.normalize_selection();
         if additive {
@@ -1845,6 +1903,8 @@ impl View {
     /// Box selection: replace the selection, or add to it with Ctrl. An empty box without
     /// Ctrl clears the selection (like a click on empty space).
     pub fn select_many(&mut self, mut markers: Vec<usize>, primary: Option<usize>, additive: bool) {
+        for selection in &mut self.labels.list_selection { selection.end_range(); }
+        self.clear_comment_selection();
         self.edit_selection = None;
         if !additive {
             self.clear_selection();
@@ -1865,7 +1925,16 @@ impl View {
         self.labels.scroll_to = self.primary;
     }
 
+    pub fn clear_comment_selection(&mut self) {
+        if !self.comment_marker_draft {
+            self.picked = None;
+            self.comment_selection.clear();
+        }
+    }
+
     pub fn clear_selection(&mut self) {
+        for selection in &mut self.labels.list_selection { selection.end_range(); }
+        self.clear_comment_selection();
         self.edit_selection = None;
         self.selected.clear();
         self.selection_order.clear();
@@ -1874,7 +1943,7 @@ impl View {
 
     /// The selection now (markers and the selected comment).
     pub fn selection(&self) -> Selection {
-        Selection { selected: self.selected.clone(), order: self.ordered_selection(), primary: self.primary, comment: self.picked, armed_label: self.armed_label }
+        Selection { selected: self.selected.clone(), order: self.ordered_selection(), primary: self.primary, comment: self.picked, comments: self.comment_selection.clone(), list_anchors: self.labels.list_selection.clone(), armed_label: self.armed_label }
     }
 
     /// Put a selection back (undo / redo) the way a click leaves it: Labels scrolls to the
@@ -1885,6 +1954,8 @@ impl View {
         self.selection_order = s.order;
         self.primary = s.primary;
         self.picked = s.comment;
+        self.comment_selection = s.comments;
+        self.labels.list_selection = s.list_anchors;
         self.armed_label = s.armed_label;
         self.normalize_selection();
         self.labels.scroll_to = self.primary;
@@ -2039,6 +2110,7 @@ pub(crate) fn sample_take(path: &str, names: &[&str]) -> tak_core::tak::Take {
 
 #[cfg(test)]
 mod tests {
+    include!("views_merge_tests.rs");
     use super::*;
 
     fn selection_view() -> View {
@@ -2180,9 +2252,12 @@ mod tests {
         retained.pb.set_frame(6, 0.0);
         retained.cam.yaw = 1.25;
         retained.range = Some((2, 8));
-        retained.picked = Some(91);
         retained.select(2, false);
         retained.select(0, true);
+        let comment = comments::Comment { id: 91, markers: vec![], start: 2, end: 8, comment_type: String::new(), text: "retained".into() };
+        let event = comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new());
+        retained.comments.list.apply(&event);
+        retained.select_comment(91);
         let selected = retained.edit_selection_state();
         retained.remote = Some(crate::ssh::RemoteLocation { host: "readonly-server".into(), path: "selection.tak".into() });
         retained.remote_warning = Some("read only".into());
@@ -2191,6 +2266,7 @@ mod tests {
         let overlay = retained.overlay.as_ref().unwrap().data.clone();
         let previous_document = retained.document_id();
         let mut fresh = selection_view();
+        fresh.comments.list.apply(&event);
         let mut fresh_take = sample_take("selection.tak", &["A", "B", "C", "D"]);
         fresh_take.trajectories.rotate_left(1);
         fresh.data = Some(Arc::new(ViewData::build(fresh_take)));
@@ -2876,7 +2952,8 @@ mod tests {
         assert!(v.comments.list.is_empty() && v.comments.target.is_none());
         // A TAK: no Comments, its CSV is not read; a `.takm`: its tail, the place comments are
         // written to, a CSV next to it ignored.
-        let dir = std::env::temp_dir().join(format!("tak_viewer_comment_load_{}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_viewer_comment_load");
+        let dir = _temp.join(format!("tak_viewer_comment_load_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("x.tak"), tak_core::sample_tak::sample_tak()).unwrap();

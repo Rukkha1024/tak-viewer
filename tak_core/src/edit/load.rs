@@ -77,7 +77,8 @@ mod tests {
 
     #[test]
     fn edit_preparation_leaves_plate_and_emg_samples_unopened_for_tak_and_takm() {
-        let dir = std::env::temp_dir().join(format!("tak_edit_opaque_analog_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_edit_opaque_analog");
+        let dir = _temp.join(format!("tak_edit_opaque_analog_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tak_path = dir.join("mixed.tak");
         std::fs::write(&tak_path, crate::sample_tak::sample_tak_with_devices()).unwrap();
@@ -101,7 +102,8 @@ mod tests {
 
     #[test]
     fn source_loader_keeps_raw_samples_and_installs_without_sharing_view_data() {
-        let path = std::env::temp_dir().join(format!("tak_phase01_loader_{}.tak", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_phase01_loader");
+        let path = _temp.join(format!("tak_phase01_loader_{}.tak", std::process::id()));
         std::fs::write(&path, crate::sample_tak::sample_tak()).unwrap();
         let (wrong_input, _) = PreparedInput::read_from_path(&path).unwrap();
         let mut wrong_document = super::super::EditDocument::unloaded(path.with_extension("other.tak"));

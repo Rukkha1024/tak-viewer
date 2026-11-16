@@ -242,7 +242,25 @@ impl TakViewerApp {
         if self.dirty_prompt.is_some() {
             return;
         }
+        let plain = matches!(&a, EditorAction::Activate(..) | EditorAction::ToggleShown(..));
+        let before = self.editor_selection.clone();
+        self.observe(true);
+        let pushed = self.history.pushed;
+        match &a {
+            EditorAction::Activate(tab, slot) | EditorAction::ToggleShown(tab, slot, _) => {
+                let rows = self.editor_rows();
+                let overlay = matches!(&a, EditorAction::ToggleShown(_, _, 1));
+                if let Some(id) = rows.iter().find(|id| id.tab_id == *tab && id.slot == *slot && id.overlay == overlay).cloned() {
+                    self.editor_selection.click(&rows, id, false, false);
+                }
+            }
+            _ => {}
+        }
         match a {
+            EditorAction::Select { id, ctrl, shift } => {
+                let rows = self.editor_rows();
+                self.editor_selection.click(&rows, id, ctrl, shift);
+            }
             EditorAction::Activate(tab, k) => {
                 self.activate_editor_view(tab, k);
             }
@@ -271,6 +289,40 @@ impl TakViewerApp {
                 self.overlay_note = Some((why, ctx.input(|i| i.time)));
             }
         }
+        self.editor_selection.retain(&self.editor_rows());
+        self.observe(true);
+        if plain { self.absorb_plain_editor_selection(); }
+        else { self.record_editor_selection(before, pushed); }
+    }
+
+    pub(super) fn editor_rows(&self) -> Vec<crate::ui::open_editors::EditorRowId> {
+        let order = dock::views_reading_order(&self.dock).into_iter().map(usize::from).collect::<Vec<_>>();
+        crate::ui::open_editors::displayed_rows(&self.editor_groups(&order))
+    }
+
+    pub(super) fn select_all_editors(&mut self) {
+        self.observe(true);
+        let pushed = self.history.pushed;
+        let before = self.editor_selection.clone();
+        self.editor_selection.all(&self.editor_rows());
+        self.record_editor_selection(before, pushed);
+    }
+
+    pub(super) fn clear_editor_selection(&mut self) {
+        self.observe(true);
+        let pushed = self.history.pushed;
+        let before = self.editor_selection.clone();
+        self.editor_selection.clear();
+        self.record_editor_selection(before, pushed);
+    }
+
+    /// Dispatch only after every panel has registered this frame's click target.
+    pub(super) fn editor_list_keys(&mut self, ctx: &egui::Context) {
+        if key_focus::target(ctx) != key_focus::Target::Editors || key_focus::keys_blocked(ctx)
+            || self.typing(ctx) || self.capture.is_some() || self.hold.is_some() || self.comment_edit.is_some() || self.dirty_prompt.is_some() { return; }
+        if exact_key(ctx, Key::A, true, false, false) { self.select_all_editors(); }
+        if exact_key(ctx, Key::Escape, false, false, false) { self.clear_editor_selection(); }
+        if exact_key(ctx, Key::Delete, false, false, false) { self.close_selected_editors(ctx); }
     }
 
     /// A queued click owns a stable tab id, so moving or closing another tab cannot redirect

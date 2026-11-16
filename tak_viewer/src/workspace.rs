@@ -747,7 +747,8 @@ mod tests {
 
     #[test]
     fn a_folder_on_disk_lists_tak_and_takm_side_by_side_with_their_sizes() {
-        let dir = std::env::temp_dir().join(format!("tak_viewer_ws_takm_{}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_viewer_ws_takm");
+        let dir = _temp.join(format!("tak_viewer_ws_takm_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         for (name, len) in [("a.tak", 3), ("a.takm", 5), ("B.TAKM", 2), ("notes.txt", 1), ("a.takm.part", 1)] {
@@ -879,11 +880,8 @@ mod tests {
     // ───────────── Folder watcher ─────────────
 
     /// A fresh, empty temp folder for one test.
-    fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tak_viewer_watch_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn temp(name: &str) -> tak_core::test_support::TempDir {
+        tak_core::test_support::TempDir::new(&format!("tak_viewer_watch_{name}"))
     }
 
     fn touch(p: &Path) {
@@ -910,7 +908,8 @@ mod tests {
 
     #[test]
     fn watcher_follows_take_files_in_an_expanded_folder_and_ignores_other_files() {
-        let dir = temp("files");
+        let _dir_guard = temp("files");
+        let dir = _dir_guard.to_path_buf();
         touch(&dir.join("a.takm"));
         let mut w = watcher(&[dir.clone()], &[dir.clone()]);
         assert!(round(&mut w).is_empty(), "nothing changed = nothing sent");
@@ -937,7 +936,8 @@ mod tests {
 
     #[test]
     fn watcher_new_subfolder_appears_and_a_removed_expanded_one_is_reported_gone() {
-        let root = temp("subdirs");
+        let _root_guard = temp("subdirs");
+        let root = _root_guard.to_path_buf();
         let sub = root.join("old_place");
         std::fs::create_dir_all(&sub).unwrap();
         touch(&sub.join("s.takm"));
@@ -961,10 +961,12 @@ mod tests {
 
     #[test]
     fn watcher_reads_only_the_folders_it_was_given_and_only_checks_saved_folders_exist() {
-        let root = temp("reads");
+        let _root_guard = temp("reads");
+        let root = _root_guard.to_path_buf();
         let closed = root.join("closed");
         std::fs::create_dir_all(&closed).unwrap();
-        let other_root = temp("reads_other");
+        let _other_root_guard = temp("reads_other");
+        let other_root = _other_root_guard.to_path_buf();
         let mut w = watcher(&[root.clone()], &[root.clone(), other_root.clone()]);
         let (mut read, mut checked) = (Vec::new(), Vec::new());
         for _ in 0..3 {
@@ -988,7 +990,8 @@ mod tests {
 
     #[test]
     fn watcher_marks_a_removed_saved_folder_missing_and_normal_again_when_back() {
-        let root = temp("missing_root");
+        let _root_guard = temp("missing_root");
+        let root = _root_guard.to_path_buf();
         touch(&root.join("a.tak"));
         let mut w = watcher(&[root.clone()], &[root.clone()]);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1026,7 +1029,8 @@ mod tests {
 
     #[test]
     fn running_watcher_sends_changes_by_itself_and_asks_for_a_repaint_only_then() {
-        let root = temp("thread");
+        let _root_guard = temp("thread");
+        let root = _root_guard.to_path_buf();
         let mut ws = listed(&root);
         ws.start_watch_every(Duration::from_millis(20));
         ws.watch(&[root.clone()]);
@@ -1047,7 +1051,8 @@ mod tests {
 
     #[test]
     fn minimized_window_stops_rounds_and_showing_it_runs_one_at_once() {
-        let root = temp("minimized");
+        let _root_guard = temp("minimized");
+        let root = _root_guard.to_path_buf();
         let mut ws = listed(&root);
         ws.start_watch_every(Duration::from_millis(20));
         ws.watch(&[root.clone()]);
@@ -1112,7 +1117,8 @@ mod tests {
     #[ignore]
     fn watch_round_timing() {
         let share = PathBuf::from(r"\\wsl.localhost\Ubuntu\home\user\workspace\example\ws-watch\tak_viewer\src");
-        let local = temp("timing");
+        let _local_guard = temp("timing");
+        let local = _local_guard.to_path_buf();
         for k in 0..40 {
             touch(&local.join(format!("f{k:02}.takm")));
             touch(&local.join(format!("f{k:02}.json")));

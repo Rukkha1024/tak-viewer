@@ -25,7 +25,8 @@ fn layout_tabs_keep_independent_layouts_and_share_the_same_loaded_file() {
 #[test]
 fn layout_tabs_explorer_open_in_new_tab_is_one_undoable_action() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("layout_open_new_tab");
+    let _dir_guard = comment_dir("layout_open_new_tab");
+    let dir = _dir_guard.to_path_buf();
     let files = take_files(&dir, &["new_tab.tak"]);
     let mut app = one_view(&ctx);
     app.hold_loads = true;
@@ -44,7 +45,6 @@ fn layout_tabs_explorer_open_in_new_tab_is_one_undoable_action() {
     app.undo_redo(&ctx, true);
     assert_eq!(app.layout_tabs.active_id(), Some(second));
     assert_eq!(app.views[0].target(), Some(files[0].as_path()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -184,7 +184,8 @@ fn layout_tabs_cap_and_share_checks_reuse_bound_identities() {
 #[test]
 fn layout_tabs_new_open_rechecks_retargeted_symlink() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("layout_retargeted_symlink");
+    let _dir_guard = comment_dir("layout_retargeted_symlink");
+    let dir = _dir_guard.to_path_buf();
     let first = dir.join("first.tak");
     let second = dir.join("second.tak");
     let alias = dir.join("alias.tak");
@@ -204,7 +205,6 @@ fn layout_tabs_new_open_rechecks_retargeted_symlink() {
     assert!(app.views[0].loading.is_some(), "a changed symlink needs its own reader");
     assert!(app.views[0].waiting_shared_path().is_none());
     assert_eq!(app.open_file_identities(None).len(), 2);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -334,7 +334,8 @@ fn layout_tabs_restored_view_and_tab_reclaim_a_closed_owners_refreshed_emg_reade
         for target_overlay in [false, true] {
             for source_overlay in [false, true] {
                 let ctx = egui::Context::default();
-                let dir = comment_dir(&format!("closed_emg_{tab}_{target_overlay}_{source_overlay}"));
+                let _dir_guard = comment_dir(&format!("closed_emg_{tab}_{target_overlay}_{source_overlay}"));
+                let dir = _dir_guard.to_path_buf();
                 let path = dir.join("deferred.takm");
                 write_emg(&path, 0, &[1.0, 2.0, 3.0]);
                 let old_offset = tak_core::takm::read_index_path(&path).unwrap().unique("Channels.dat").unwrap().offset;
@@ -408,7 +409,6 @@ fn layout_tabs_restored_view_and_tab_reclaim_a_closed_owners_refreshed_emg_reade
                 }).unwrap();
                 let source = if source_overlay { closed_source.overlay_owner().unwrap() } else { closed_source };
                 assert!(!source.owns_shared_file_work(), "the closed owner must surrender its only reader");
-                let _ = std::fs::remove_dir_all(dir);
             }
         }
     }
@@ -417,7 +417,8 @@ fn layout_tabs_restored_view_and_tab_reclaim_a_closed_owners_refreshed_emg_reade
 #[test]
 fn layout_tabs_open_from_zero_tabs_undoes_in_one_step() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("layout_open_after_empty");
+    let _dir_guard = comment_dir("layout_open_after_empty");
+    let dir = _dir_guard.to_path_buf();
     let files = take_files(&dir, &["new_after_empty.tak"]);
     let mut app = one_view(&ctx);
     let first = app.layout_tabs.active_id().unwrap();
@@ -433,7 +434,6 @@ fn layout_tabs_open_from_zero_tabs_undoes_in_one_step() {
     app.undo_redo(&ctx, true);
     assert_eq!(app.layout_tabs.tabs().len(), 1);
     assert_eq!(app.views[0].target(), Some(files[0].as_path()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -458,7 +458,8 @@ fn layout_tabs_failed_shared_open_releases_every_waiter() {
 #[test]
 fn layout_tabs_saved_names_layouts_and_independent_spots_return() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("layout_tabs_persist");
+    let _dir_guard = comment_dir("layout_tabs_persist");
+    let dir = _dir_guard.to_path_buf();
     let paths = take_files(&dir, &["same.takm", "other.takm"]);
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     let (_tx, rx) = std::sync::mpsc::channel();
@@ -484,7 +485,6 @@ fn layout_tabs_saved_names_layouts_and_independent_spots_return() {
     assert_eq!(restored.open_views(), vec![0]);
     assert_eq!(restored.views[0].target(), Some(paths[0].as_path()));
     assert_eq!(restored.views[0].restore.as_ref().map(|spot| spot.frame), Some(3));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Optional real-file, headless captures used to compare the three approved mockups.

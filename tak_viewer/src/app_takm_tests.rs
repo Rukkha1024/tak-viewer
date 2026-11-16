@@ -50,11 +50,8 @@ fn dirtify(view: &mut View) {
     document.apply(&patch, true).unwrap();
 }
 
-fn fixture(name: &str) -> PathBuf {
-    let unique = std::thread::current().name().unwrap_or("takm").replace(':', "_");
-    let path = std::env::temp_dir().join(format!("takm_batch_{}_{}_{}", std::process::id(), unique, name));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+fn fixture(name: &str) -> tak_core::test_support::TempDir {
+    tak_core::test_support::TempDir::new(&format!("takm_batch_{name}"))
 }
 
 #[test]
@@ -217,7 +214,8 @@ fn undo_last_dirty_destination_prompts_once_cancel_keeps_batch_and_discard_allow
 #[test]
 fn actual_file_dirty_source_is_refused_before_creating_any_raw_sibling() {
     let ctx = egui::Context::default();
-    let dir = fixture("dirty_source");
+    let _dir_guard = fixture("dirty_source");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     let bytes = tak_core::sample_tak::sample_tak();
     std::fs::write(&source, &bytes).unwrap();
@@ -238,13 +236,13 @@ fn actual_file_dirty_source_is_refused_before_creating_any_raw_sibling() {
     assert!(app.views[0].marker_dirty());
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
     assert!(app.takm_note.as_ref().unwrap().0.contains("Ctrl+S"));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn actual_file_conversion_stages_then_switches_all_occurrences_and_undo_redo_once() {
     let ctx = egui::Context::default();
-    let dir = fixture("convert");
+    let _dir_guard = fixture("convert");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     let bytes = tak_core::sample_tak::sample_tak();
     std::fs::write(&source, &bytes).unwrap();
@@ -272,13 +270,13 @@ fn actual_file_conversion_stages_then_switches_all_occurrences_and_undo_redo_onc
     assert_eq!(app.views[0].path(), Some(output.as_path()));
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
     assert!(output.exists(), "undo never deletes created files");
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn failed_destination_read_keeps_every_primary_overlay_and_history_unchanged() {
     let ctx = egui::Context::default();
-    let dir = fixture("failed");
+    let _dir_guard = fixture("failed");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     let output = dir.join("source.takm");
     std::fs::write(&output, b"invalid TAKM").unwrap();
@@ -297,7 +295,6 @@ fn failed_destination_read_keeps_every_primary_overlay_and_history_unchanged() {
     assert!(app.views[0].overlay_load.is_some());
     sender.send(crate::views::LoadMsg::Markers(Err("preserved".into()))).unwrap();
     assert!(app.takm_note.as_ref().unwrap().0.contains("화면은 그대로"));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -430,7 +427,8 @@ fn deferred_emg_owner_survives_conversion_undo_redo_in_an_unchanged_original_ove
 #[test]
 fn closing_the_source_while_conversion_waits_never_reopens_an_existing_destination() {
     let ctx = egui::Context::default();
-    let dir = fixture("cancel_closed");
+    let _dir_guard = fixture("cancel_closed");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     std::fs::write(&source, tak_core::sample_tak::sample_tak()).unwrap();
     let converted = takm::convert(&source, None).unwrap();
@@ -448,7 +446,6 @@ fn closing_the_source_while_conversion_waits_never_reopens_an_existing_destinati
     assert!(app.open_views().is_empty());
     assert_eq!(app.history.undo.len(), count);
     assert_eq!(std::fs::read(&converted.out).unwrap(), before);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -480,7 +477,8 @@ fn destination_already_loading_in_a_hidden_tab_is_joined_after_its_one_reader_ar
 #[test]
 fn strict_cap_refuses_new_takm_while_twelve_sources_are_still_displayed() {
     let ctx = egui::Context::default();
-    let dir = fixture("strict_cap");
+    let _dir_guard = fixture("strict_cap");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     let bytes = tak_core::sample_tak::sample_tak();
     std::fs::write(&source, &bytes).unwrap();
@@ -500,7 +498,6 @@ fn strict_cap_refuses_new_takm_while_twelve_sources_are_still_displayed() {
     assert_eq!(app.history.undo.len(), count);
     assert_eq!(app.views[0].path(), Some(source.as_path()));
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -538,7 +535,8 @@ fn canceling_hidden_batch_dirty_prompt_restores_the_original_active_tab() {
 #[test]
 fn canonical_source_alias_is_checked_for_dirty_edits_before_conversion_worker_writes() {
     let ctx = egui::Context::default();
-    let dir = fixture("alias_dirty");
+    let _dir_guard = fixture("alias_dirty");
+    let dir = _dir_guard.to_path_buf();
     let source = dir.join("source.tak");
     let alias = dir.join("alias.tak");
     std::fs::write(&source, tak_core::sample_tak::sample_tak()).unwrap();
@@ -552,14 +550,14 @@ fn canonical_source_alias_is_checked_for_dirty_edits_before_conversion_worker_wr
     assert!(!alias.with_extension("takm").exists());
     assert!(app.views[0].marker_dirty());
     assert!(app.takm_note.as_ref().unwrap().0.contains("Ctrl+S"));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[cfg(unix)]
 #[test]
 fn existing_destination_alias_at_twelve_sources_reuses_the_open_document() {
     let ctx = egui::Context::default();
-    let dir = fixture("alias_at_cap");
+    let _dir_guard = fixture("alias_at_cap");
+    let dir = _dir_guard.to_path_buf();
     let actual = dir.join("actual");
     let alias = dir.join("alias");
     std::fs::create_dir_all(&actual).unwrap();
@@ -588,5 +586,4 @@ fn existing_destination_alias_at_twelve_sources_reuses_the_open_document() {
     assert_eq!(app.history.undo.len(), count + 1);
     assert_eq!(std::fs::read(&output).unwrap(), original_output);
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
-    std::fs::remove_dir_all(dir).unwrap();
 }

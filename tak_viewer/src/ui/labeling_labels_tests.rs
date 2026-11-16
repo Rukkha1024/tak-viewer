@@ -1,5 +1,5 @@
     use super::*;
-    use crate::ui::panels::{Action, LabelsState};
+    use crate::ui::panels::{LabelsState, ListSelectionState};
     use std::collections::BTreeSet;
     use tak_core::tak::MarkerKind;
     use tak_core::view_data::{GroupKind, ViewData};
@@ -17,7 +17,7 @@
                 collapsed: st.collapsed.contains(&gi),
                 labels: group.members.iter().map(|&i| {
                     let m = &data.markers[i];
-                    LabelRow { key: None, track_uid: Some(m.uid), name: m.name.clone(), color: theme::color(m.color), fill_pct: m.fill_pct, present: m.present(frame), selected: selected.contains(&i), primary: primary == Some(i) }
+                    LabelRow { key: None, track_uid: Some(m.uid), has_samples: m.n_samples > 0, name: m.name.clone(), color: theme::color(m.color), fill_pct: m.fill_pct, present: m.present(frame), selected: selected.contains(&i), primary: primary == Some(i) }
                 }).collect(),
             }).collect(),
             scroll_to_track: st.scroll_to.map(|i| data.markers[i].uid),
@@ -126,7 +126,7 @@
             Self { ctx: egui::Context::default(), data, state, selected: BTreeSet::new(), primary: None, frame: 0, width: 380.0, height: 220.0, spacing: 3.0 }
         }
 
-        fn draw(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) -> (egui::FullOutput, Option<Action>) {
+        fn draw(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) -> (egui::FullOutput, Option<LabelingAction>) {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(self.width + 16.0, (self.height + 400.0).min(700.0)))),
                 focused: true, modifiers, events, ..Default::default()
@@ -141,9 +141,8 @@
                     let result = show(ui, &state);
                     self.state.scroll_to = None;
                     action = match result {
-                        Some(LabelingAction::SelectLabel { track_uid: Some(uid), additive, .. }) => self.data.markers.iter().position(|m| m.uid == uid).map(|marker| Action::Select { marker, additive }),
                         Some(LabelingAction::ToggleGroup(id)) => { if !self.state.collapsed.remove(&(id as usize)) { self.state.collapsed.insert(id as usize); } None },
-                        _ => None,
+                        other => other,
                     };
                 });
             });
@@ -154,7 +153,7 @@
             self.draw(egui::Modifiers::NONE, vec![]).0
         }
 
-        fn click(&mut self, at: egui::Pos2, modifiers: egui::Modifiers) -> Option<Action> {
+        fn click(&mut self, at: egui::Pos2, modifiers: egui::Modifiers) -> Option<LabelingAction> {
             let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers };
             self.draw(modifiers, vec![egui::Event::PointerMoved(at)]);
             self.draw(modifiers, vec![button(true)]);
@@ -223,25 +222,41 @@
     }
 
     #[test]
-    fn right_column_click_ctrl_command_and_shift_use_the_existing_selection_actions() {
+    fn right_column_click_ctrl_command_and_shift_keep_full_column_order_and_endpoint_target() {
         let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
         let painted = texts(&p.idle());
         let mut v = crate::views::View::default();
         let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
         let command = egui::Modifiers { command: true, ..Default::default() };
         let shift = egui::Modifiers { shift: true, ..Default::default() };
-        for (name, modifiers, want, additive, selection) in [
-            ("M3", egui::Modifiers::NONE, 3, false, vec![3]),
-            ("M0", ctrl, 0, true, vec![0, 3]),
-            ("M3", ctrl, 3, true, vec![0]),
-            ("M4", command, 4, true, vec![0, 4]),
-            ("M3", shift, 3, false, vec![3]),
+        for (name, modifiers, want, selection) in [
+            ("M3", egui::Modifiers::NONE, 3, vec![3]),
+            ("M0", ctrl, 0, vec![0, 3]),
+            ("M3", ctrl, 3, vec![0]),
+            ("M4", command, 4, vec![0, 4]),
+            ("M1", shift, 1, vec![1, 2, 3, 4]),
         ] {
-            let action = p.click(at(&painted, name).rect.center(), modifiers);
-            let Some(Action::Select { marker, additive: got }) = action else { panic!("{name} did not select a marker") };
-            assert_eq!((marker, got), (want, additive));
-            v.select(marker, got);
+            let action = p.click(at(&painted, name).rect.center(), modifiers).expect("row selection");
+            let state = pane_state(&p.data, &p.state, &p.selected, p.primary, p.frame);
+            let order = state.track_order(MarkerList::Named);
+            let current: Vec<_> = v.ordered_selection().iter().map(|&i| p.data.markers[i].uid).collect();
+            let gesture = match action {
+                LabelingAction::SelectLabel { track_uid: Some(uid), additive: false, .. } => {
+                    assert_eq!(uid, p.data.markers[want].uid);
+                    SelectionGesture::Plain
+                }
+                LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some(uid), gesture } => {
+                    assert_eq!(uid, p.data.markers[want].uid);
+                    gesture
+                }
+                other => panic!("unexpected {other:?}"),
+            };
+            let selected = p.state.list_selection[0].apply(&order, &current, Some(p.data.markers[want].uid), gesture).unwrap();
+            v.selection_order = selected.iter().map(|uid| p.data.markers.iter().position(|m| m.uid == *uid).unwrap()).collect();
+            v.selected = v.selection_order.iter().copied().collect();
+            v.primary = v.selection_order.last().copied();
             assert_eq!(v.selected.iter().copied().collect::<Vec<_>>(), selection);
+            if modifiers.shift { assert_eq!(v.primary, Some(want), "range endpoint is Pattern target"); }
             p.selected = v.selected.clone();
             p.primary = v.primary;
         }
@@ -358,4 +373,98 @@
         let absent = texts(&p.idle());
         assert_eq!(at(&absent, "M0").color, theme::LABEL_ABSENT);
         assert_eq!(at(&absent, "M2").color, theme::LABEL_ABSENT);
+    }
+
+    fn ids(values: &[u8]) -> Vec<tak_core::tak::Uid> { values.iter().map(|&v| [v; 16]).collect() }
+
+    #[test]
+    fn full_selection_order_includes_search_asset_and_fold_hidden_rows_but_excludes_empty_tracks() {
+        let d = data(&[&["M0", "M1", "M2"], &["M3", "M4"]]);
+        let mut st = LabelsState::default();
+        st.collapsed.insert(1);
+        let mut pane = pane_state(&d, &st, &BTreeSet::new(), None, 0);
+        pane.filter = "M0".into();
+        pane.groups[0].asset_uid = Some([7; 16]);
+        pane.groups[1].asset_uid = Some([8; 16]);
+        pane.asset_filter = Some([7; 16]);
+        pane.groups[0].labels[1].has_samples = false;
+        pane.groups[0].labels[2].present = false; // Absent now, sampled elsewhere: eligible.
+        pane.groups[1].labels[1].track_uid = None;
+        let order = pane.track_order(MarkerList::Named);
+        assert_eq!(order, [d.markers[0].uid, d.markers[2].uid, d.markers[3].uid]);
+        let mut selection = ListSelectionState::default();
+        let picked = selection.apply(&order, &[], Some(order[0]), SelectionGesture::Plain).unwrap();
+        assert_eq!(selection.apply(&order, &picked, Some(order[2]), SelectionGesture::Range { additive: false }), Some(order.clone()));
+        let before = selection.clone();
+        assert!(selection.apply(&order, &picked, Some(d.markers[1].uid), SelectionGesture::Toggle).is_none());
+        assert_eq!(selection, before, "empty tracks cannot change anchors or selection");
+    }
+
+    #[test]
+    fn range_shrinks_reverses_and_ctrl_shift_preserves_only_the_original_union() {
+        let order = ids(&[0, 1, 2, 3, 4, 5]);
+        let mut selection = ListSelectionState::default();
+        let picked = selection.apply(&order, &ids(&[9]), Some(order[2]), SelectionGesture::Toggle).unwrap();
+        let wide = selection.apply(&order, &picked, Some(order[5]), SelectionGesture::Range { additive: true }).unwrap();
+        assert_eq!(wide, ids(&[9, 2, 3, 4, 5]));
+        let small = selection.apply(&order, &wide, Some(order[3]), SelectionGesture::Range { additive: true }).unwrap();
+        assert_eq!(small, ids(&[9, 2, 3]), "old temporary rows disappear");
+        let reverse = selection.apply(&order, &small, Some(order[0]), SelectionGesture::Range { additive: true }).unwrap();
+        assert_eq!(reverse, ids(&[9, 2, 1, 0]));
+        let plain_range = selection.apply(&order, &reverse, Some(order[4]), SelectionGesture::Range { additive: false }).unwrap();
+        assert_eq!(plain_range, ids(&[2, 3, 4]));
+        let shrunk = selection.apply(&order, &plain_range, Some(order[1]), SelectionGesture::Range { additive: false }).unwrap();
+        assert_eq!(shrunk, ids(&[2, 1]));
+    }
+
+    #[test]
+    fn separate_list_anchors_survive_other_list_gestures_and_external_selection_restarts_union() {
+        let order = ids(&[0, 1, 2, 3]);
+        let unlabeled = ids(&[10, 11, 12]);
+        let mut anchors: [ListSelectionState; 2] = Default::default();
+        let picked = anchors[0].apply(&order, &[], Some(order[1]), SelectionGesture::Plain).unwrap();
+        let picked = anchors[1].apply(&unlabeled, &picked, Some(unlabeled[2]), SelectionGesture::Toggle).unwrap();
+        let ranged = anchors[0].apply(&order, &picked, Some(order[3]), SelectionGesture::Range { additive: false }).unwrap();
+        assert_eq!(ranged, ids(&[1, 2, 3]));
+        assert_eq!(anchors[1].anchor, Some(unlabeled[2]));
+        let ranged = anchors[1].apply(&unlabeled, &ranged, Some(unlabeled[0]), SelectionGesture::Range { additive: false }).unwrap();
+        assert_eq!(ranged, ids(&[11, 12, 10]));
+        let _ = anchors[0].apply(&order, &ranged, Some(order[3]), SelectionGesture::Range { additive: true });
+        let externally_picked = ids(&[8]);
+        let next = anchors[0].apply(&order, &externally_picked, Some(order[2]), SelectionGesture::Range { additive: true }).unwrap();
+        assert_eq!(next, ids(&[8, 1, 2]));
+    }
+
+    #[test]
+    fn select_all_keeps_included_primary_otherwise_uses_first_in_list_order() {
+        let order = ids(&[4, 1, 3, 0]);
+        let mut selection = ListSelectionState::default();
+        let all = selection.apply(&order, &ids(&[7, 1]), None, SelectionGesture::All).unwrap();
+        assert_eq!(all, ids(&[4, 3, 0, 1]));
+        assert_eq!(selection.anchor, Some([1; 16]));
+        let all = selection.apply(&order, &ids(&[1, 7]), None, SelectionGesture::All).unwrap();
+        assert_eq!(all, ids(&[1, 3, 0, 4]));
+        assert_eq!(selection.anchor, Some([4; 16]));
+        assert_eq!(selection.apply(&[], &all, None, SelectionGesture::All), Some(vec![]));
+        assert_eq!(selection.anchor, None);
+    }
+
+    #[test]
+    fn pinned_selection_summary_counts_hidden_rows_and_names_the_hidden_target() {
+        let d = data(&[&["M0", "M1", "M2"], &["M3", "M4", "M5"]]);
+        let mut st = LabelsState::default();
+        st.collapsed.insert(1);
+        let selected = (0..6).collect();
+        let pane = pane_state(&d, &st, &selected, Some(4), 0);
+        assert_eq!(pane.selection_summary(), ("6 selected (3 hidden)".into(), "Pattern target: M4".into()));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(380.0, 280.0))), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { show(ui, &pane); });
+        });
+        let painted = texts(&output);
+        for name in ["6 selected (3 hidden)", "Pattern target: M4"] {
+            let label = at(&painted, name);
+            assert!(label.clip.contains_rect(label.rect));
+            assert!(label.rect.top() < at(&painted, "QuickLabel Mode  D").rect.top());
+        }
     }

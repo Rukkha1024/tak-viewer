@@ -659,19 +659,24 @@ pub struct Done {
     pub event: Event,
     pub result: Result<(), String>,
     pub conflict: Option<crate::takm::CommentConflict>,
+    /// Persisted comments reread off the UI thread after a multi-event conflict. All affected
+    /// completions share one snapshot; a missing row is absent here even after a partial retry.
+    /// None on non-conflicts, single-event conflicts, or a failed reload (reported in result).
+    pub batch_latest: Option<std::sync::Arc<Comments>>,
     pub cancelled: bool,
     pub source_stamp: Option<crate::takm::CommentWriteStamp>,
 }
 
 enum Job {
-    Event { tag: usize, path: PathBuf, event: Event, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool> },
+    Events { tag: usize, path: PathBuf, events: Vec<Event>, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool> },
     Retry(PathBuf),
     Barrier(Sender<Result<(), String>>),
 }
 
 /// One thread that appends events in the order they were sent (`append`, or
 /// `takm::append_events` for a `.takm`), so the drawing
-/// thread never touches the disk. `wake` runs after each write (the viewer asks for a repaint).
+/// thread never touches the disk. A batch uses one guarded append and produces one `Done`
+/// per event in submission order. `wake` runs once per batch (the viewer asks for a repaint).
 pub struct Writer {
     tx: Option<Sender<Job>>,
     done: Receiver<Done>,
@@ -725,8 +730,8 @@ impl Writer {
                         break;
                     }
                 };
-                let (tag, path, event, cancelled) = match job {
-                    Job::Event { tag, path, event, cancelled } => (tag, path, event, cancelled),
+                let (tag, path, events, cancelled) = match job {
+                    Job::Events { tag, path, events, cancelled } => (tag, path, events, cancelled),
                     Job::Barrier(done) => {
                         let result = if let Some(e) = &registration_error { Err(e.clone()) }
                                      else { failed.values().next().cloned().map_or(Ok(()), Err) };
@@ -739,33 +744,56 @@ impl Writer {
                         continue;
                     }
                 };
+                if events.is_empty() { continue; }
                 // The writer must register successfully before any Comment can be appended.
-                let one = std::slice::from_ref(&event);
                 let key = crate::takm::path_lock_key(&path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
                 let mut conflict = None;
                 let mut source_stamp = None;
-                let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                let mut result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     Err("Comment write cancelled".into())
                 } else if let Some(e) = &registration_error {
                     Err(e.clone())
                 } else if let Some(reason) = failed.get(&key) {
                     Err(reason.clone())
                 } else if crate::takm::is_takm_path(&path) {
-                    match crate::takm::append_events_guarded_stamped(&path, one, Some(&cancelled)) {
+                    match crate::takm::append_events_guarded_stamped(&path, &events, Some(&cancelled)) {
                         Ok((Some(found), _)) => { conflict = Some(found); Err("Comment changed in another window".into()) }
                         Ok((None, stamp)) => { source_stamp = stamp; Ok(()) },
                         Err(e) => Err(e.to_string()),
                     }
                 } else {
-                    append(&path, one).map_err(|e| e.to_string())
+                    append(&path, &events).map_err(|e| e.to_string())
                 };
+                let mut batch_latest = None;
+                let mut conflict_reload_failed = false;
+                if let Some(found) = conflict.as_mut().filter(|_| events.len() > 1) {
+                    // An earlier failed attempt can have left a complete prefix. Reload actual
+                    // persisted rows rather than assuming every optimistic change was refused.
+                    let latest = (|| -> Result<Comments, String> {
+                        let target = crate::takm::canonical_target(&path).map_err(|e| e.to_string())?;
+                        let _lock = crate::takm::lock_path(&target).map_err(|e| e.to_string())?;
+                        Ok(crate::takm::read_comments(&target).map_err(|e| e.to_string())?.comments())
+                    })();
+                    match latest {
+                        Ok(latest) => {
+                            found.latest = latest.get(found.id).cloned();
+                            batch_latest = Some(std::sync::Arc::new(latest));
+                        }
+                        Err(reason) => {
+                            conflict_reload_failed = true;
+                            result = Err(format!("Comment changed in another window; 저장된 Comment를 다시 읽지 못했어요: {reason}"));
+                        }
+                    }
+                }
                 let was_cancelled = cancelled.load(std::sync::atomic::Ordering::Acquire);
-                if conflict.is_none() && !was_cancelled {
+                if (conflict.is_none() || conflict_reload_failed) && !was_cancelled {
                     if let Err(reason) = &result {
                         failed.entry(key).or_insert_with(|| format!("{}: {reason}", path.display()));
                     }
                 }
-                let _ = done_tx.send(Done { tag, path, event, result, conflict, cancelled: was_cancelled, source_stamp });
+                for event in events {
+                    let _ = done_tx.send(Done { tag, path: path.clone(), event, result: result.clone(), conflict: conflict.clone(), batch_latest: batch_latest.clone(), cancelled: was_cancelled, source_stamp: source_stamp.clone() });
+                }
                 wake();
             }
         });
@@ -773,15 +801,27 @@ impl Writer {
     }
 
     /// Queue one event for `path`. False when the thread is gone.
-    pub fn send(&self, tag: usize, path: PathBuf, mut event: Event) -> bool {
-        if event.operation.is_none() { event.operation = Some(new_operation_token()); }
+    pub fn send(&self, tag: usize, path: PathBuf, event: Event) -> bool {
+        self.send_batch(tag, path, vec![event])
+    }
+
+    /// Queue one logical write. Existing operation tokens are retained for idempotent retries;
+    /// missing tokens are assigned before submission and returned in each event's `Done`.
+    /// For TAKM, validation/conflict checks cover the whole batch before any bytes are written.
+    /// I/O errors can leave a written prefix: every event reports the error, and the path stays
+    /// failed until `retry`. Resubmit the same events/tokens to skip completed lines and repair
+    /// a partial last line. An empty batch is a no-op with no completions. False if stopped.
+    pub fn send_batch(&self, tag: usize, path: PathBuf, mut events: Vec<Event>) -> bool {
+        for event in &mut events {
+            if event.operation.is_none() { event.operation = Some(new_operation_token()); }
+        }
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Ok(mut all) = self.cancellations.lock() {
             let entries = all.entry(tag).or_default();
             entries.retain(|old| old.strong_count() > 0);
             entries.push(std::sync::Arc::downgrade(&cancelled));
         }
-        self.tx.as_ref().is_some_and(|tx| tx.send(Job::Event { tag, path, event, cancelled }).is_ok())
+        self.tx.as_ref().is_some_and(|tx| tx.send(Job::Events { tag, path, events, cancelled }).is_ok())
     }
 
     /// Do not wait for a locked disk; queued work checks cancellation before writing.
@@ -1026,11 +1066,8 @@ mod tests {
     }
 
     /// A fresh folder under the system temp folder (outside the repository).
-    fn temp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tak_comments_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn temp_dir(name: &str) -> crate::test_support::TempDir {
+        crate::test_support::TempDir::new(&format!("tak_comments_{name}"))
     }
 
     #[test]
@@ -1237,7 +1274,8 @@ mod tests {
             assert!(!crate::tak::is_take_path(&p(s)), "{s}");
         }
         // A .tak target is refused, also by `append`, which then creates nothing.
-        let dir = temp_dir("refuse");
+        let _dir_guard = temp_dir("refuse");
+        let dir = _dir_guard.to_path_buf();
         let tak = dir.join("x.TAK");
         assert!(check_target(&tak).is_err());
         assert!(append(&tak, &[ev(Kind::Add, 1, &["M"], 0, 0)]).is_err());
@@ -1245,12 +1283,12 @@ mod tests {
         assert!(check_target(&dir.join("x.comments.csv")).is_ok(), "outside any repository");
         let native_take = if cfg!(windows) { Path::new(r"C:\d\a.tak") } else { Path::new("/d/a.tak") };
         assert_eq!(file_label(native_take, 33_121_234), "a.tak|33121234");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn nothing_is_written_inside_the_repository_input_folder() {
-        let root = temp_dir("repo");
+        let _root_guard = temp_dir("repo");
+        let root = _root_guard.to_path_buf();
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::create_dir_all(root.join("experiments").join("x")).unwrap();
@@ -1265,12 +1303,12 @@ mod tests {
         assert!(check_target(&path_for(&root.join("experiments").join("x").join("a.tak"))).is_ok());
         assert!(!crate::tak::in_repo_input(&root.join("inputs").join("a.csv"), &root));
         assert!(crate::tak::in_repo_input(&root.join("INPUT"), &root), "any case (Windows)");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn appending_keeps_earlier_bytes_and_reading_back_gives_the_same_comments() {
-        let dir = temp_dir("append");
+        let _dir_guard = temp_dir("append");
+        let dir = _dir_guard.to_path_buf();
         let csv = path_for(&dir.join("a.tak"));
         assert!(read(&csv).unwrap().is_none(), "no file yet");
         let events = [ev(Kind::Add, 1, &["LKNE", "RKNE"], 10, 20), ev(Kind::Add, 2, &["M"], 5, 5), ev(Kind::Delete, 1, &["LKNE", "RKNE"], 10, 20)];
@@ -1300,12 +1338,12 @@ mod tests {
         let p = read(&csv).unwrap().unwrap();
         assert_eq!(p.events.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 2, 1, 4], "the cut line is skipped, the new one is read");
         assert_eq!((p.skipped, p.cut), (1, false));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_writer_thread_appends_in_order_and_reports_failures() {
-        let dir = temp_dir("writer");
+        let _dir_guard = temp_dir("writer");
+        let dir = _dir_guard.to_path_buf();
         let csv = path_for(&dir.join("a.tak"));
         let w = Writer::spawn(Box::new(|| {}));
         for id in 1..=5 {
@@ -1326,12 +1364,264 @@ mod tests {
         let ids: Vec<u64> = read(&csv).unwrap().unwrap().events.iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5], "in the order sent");
         drop(w);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_batch_add_delete_and_retry_keep_tokens_and_complete_each_event() {
+        let _dir_guard = temp_dir("batch_retry");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let writer = Writer::spawn(Box::new(move || { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }));
+        let adds: Vec<_> = (1..=3).map(|id| ev(Kind::Add, id, &["M"], id as i64, id as i64)).collect();
+        assert!(writer.send_batch(7, path.clone(), adds));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 3);
+        assert!(done.iter().all(|d| d.tag == 7 && d.path == path && d.result.is_ok() && d.conflict.is_none() && !d.cancelled));
+        let adds: Vec<_> = done.into_iter().map(|d| d.event).collect();
+        assert_eq!(adds.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(adds.iter().all(|e| e.operation.is_some()));
+        let tokens: std::collections::HashSet<_> = adds.iter().map(|e| e.operation.clone().unwrap()).collect();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(crate::takm::read_comments(&path).unwrap().events, adds);
+        let before_retry = std::fs::read(&path).unwrap();
+        assert!(writer.send_batch(7, path.clone(), adds.clone()));
+        writer.drain().unwrap();
+        assert_eq!(writer.poll().into_iter().map(|d| { assert!(d.result.is_ok()); d.event }).collect::<Vec<_>>(), adds);
+        assert_eq!(std::fs::read(&path).unwrap(), before_retry, "retry of completed tokens is a byte-exact no-op");
+
+        let live = crate::takm::read_comments(&path).unwrap().comments();
+        let deletes: Vec<_> = live.list().iter().map(|c| {
+            let mut event = Event::of(Kind::Delete, c, "t".into(), "a.takm".into());
+            event.expected = Some(c.clone());
+            event
+        }).collect();
+        assert!(writer.send_batch(7, path.clone(), deletes.clone()));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), deletes.len());
+        assert!(done.iter().all(|d| d.result.is_ok()));
+        assert_eq!(done.into_iter().map(|d| d.event).collect::<Vec<_>>(), deletes);
+        assert!(crate::takm::read_comments(&path).unwrap().comments().is_empty());
+        let before_retry = std::fs::read(&path).unwrap();
+        assert!(writer.send_batch(7, path.clone(), deletes));
+        writer.drain().unwrap();
+        assert_eq!(writer.poll().len(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), before_retry, "completed deletes skip even though their expected rows no longer exist");
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 4, "one repaint per logical batch");
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_preflights_late_conflicts_without_writing_a_prefix() {
+        let _dir_guard = temp_dir("batch_conflict");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        crate::takm::append_events(&path, &[ev(Kind::Add, 1, &["A"], 0, 1), ev(Kind::Add, 2, &["B"], 2, 3)]).unwrap();
+        let base = crate::takm::read_comments(&path).unwrap().comments();
+        let mut latest = base.get(2).unwrap().clone();
+        latest.text = "changed elsewhere".into();
+        crate::takm::append_events(&path, &[Event::of(Kind::Edit, &latest, "t".into(), "a".into())]).unwrap();
+        let deletes: Vec<_> = base.list().iter().map(|c| {
+            let mut event = Event::of(Kind::Delete, c, "t".into(), "a".into());
+            event.expected = Some(c.clone());
+            event
+        }).collect();
+        let before = std::fs::read(&path).unwrap();
+        let writer = Writer::spawn(Box::new(|| {}));
+        assert!(writer.send_batch(9, path.clone(), deletes.clone()));
+        writer.drain().unwrap(); // A conflict does not poison the save barrier.
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        for (d, event) in done.iter().zip(&deletes) {
+            assert_eq!(d.event, *event);
+            assert_eq!((d.tag, &d.path, d.cancelled), (9, &path, false));
+            assert!(d.result.is_err());
+            let conflict = d.conflict.as_ref().unwrap();
+            assert_eq!(conflict.id, 2, "all completions identify the actual conflicting row");
+            assert_eq!(conflict.latest.as_ref(), Some(&latest));
+            let snapshot = d.batch_latest.as_ref().unwrap();
+            assert_eq!(snapshot.get(1), base.get(1));
+            assert_eq!(snapshot.get(2), Some(&latest));
+        }
+        assert!(std::sync::Arc::ptr_eq(done[0].batch_latest.as_ref().unwrap(), done[1].batch_latest.as_ref().unwrap()), "one shared snapshot per batch");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the valid first delete must not reach disk");
+        let live = crate::takm::read_comments(&path).unwrap().comments();
+        assert_eq!(live.get(1), base.get(1));
+        assert_eq!(live.get(2), Some(&latest));
+        assert!(writer.send(9, path.clone(), ev(Kind::Add, 3, &["C"], 4, 5)));
+        writer.drain().unwrap();
+        assert!(writer.poll().iter().all(|d| d.result.is_ok()), "conflict leaves the path available");
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_conflict_returns_persisted_state_instead_of_an_unwritten_prefix() {
+        let _dir_guard = temp_dir("batch_staged_conflict");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        crate::takm::append_events(&path, &[ev(Kind::Add, 1, &["A"], 0, 1)]).unwrap();
+        let base = crate::takm::read_comments(&path).unwrap().comments().get(1).unwrap().clone();
+        let mut changed = base.clone();
+        changed.text = "not persisted".into();
+        let mut first = Event::of(Kind::Edit, &changed, "t".into(), "a".into());
+        first.expected = Some(base.clone());
+        let mut stale = Event::of(Kind::Delete, &base, "t".into(), "a".into());
+        stale.expected = Some(base.clone());
+        let before = std::fs::read(&path).unwrap();
+        let writer = Writer::spawn(Box::new(|| {}));
+        assert!(writer.send_batch(2, path.clone(), vec![first, stale]));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| d.result.is_err() && d.conflict.as_ref().is_some_and(|c| c.id == 1 && c.latest.as_ref() == Some(&base))));
+        assert!(done.iter().all(|d| d.batch_latest.as_ref().unwrap().get(1) == Some(&base)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_replays_a_completed_prefix_and_repairs_a_partial_last_line() {
+        let _dir_guard = temp_dir("batch_partial");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        let events: Vec<_> = (1..=3).map(|id| {
+            let mut event = ev(Kind::Add, id, &["M"], 1, 2);
+            event.operation = Some(format!("batch-operation-{id}"));
+            event.text = "a, b".into();
+            event
+        }).collect();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(encode(&events[0]).as_bytes()).unwrap();
+        let partial = encode(&events[1]);
+        file.write_all(&partial.as_bytes()[..partial.find("a, b").unwrap() + 2]).unwrap();
+        drop(file);
+        let writer = Writer::spawn(Box::new(|| {}));
+        assert!(writer.send_batch(5, path.clone(), events.clone()));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 3);
+        assert!(done.iter().all(|d| d.result.is_ok()));
+        let parsed = crate::takm::read_comments(&path).unwrap();
+        assert_eq!(parsed.events, events);
+        assert_eq!((parsed.skipped, parsed.cut), (0, false));
+        assert_eq!(parsed.comments().len(), 3);
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_retry_conflict_snapshot_includes_an_already_persisted_delete() {
+        let _dir_guard = temp_dir("batch_partial_conflict");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        crate::takm::append_events(&path, &[ev(Kind::Add, 1, &["A"], 0, 1), ev(Kind::Add, 2, &["B"], 2, 3)]).unwrap();
+        let base = crate::takm::read_comments(&path).unwrap().comments();
+        let deletes: Vec<_> = base.list().iter().map(|c| {
+            let mut event = Event::of(Kind::Delete, c, "t".into(), "a".into());
+            event.expected = Some(c.clone());
+            event
+        }).collect();
+        // A previous I/O failure completed the first line; another window then edited row 2.
+        crate::takm::append_events(&path, &deletes[..1]).unwrap();
+        let mut latest = base.get(2).unwrap().clone();
+        latest.text = "edited before retry".into();
+        crate::takm::append_events(&path, &[Event::of(Kind::Edit, &latest, "t".into(), "a".into())]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let writer = Writer::spawn(Box::new(|| {}));
+        assert!(writer.send_batch(3, path.clone(), deletes.clone()));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        for (d, event) in done.iter().zip(&deletes) {
+            assert_eq!(d.event, *event);
+            assert!(d.result.is_err());
+            let conflict = d.conflict.as_ref().unwrap();
+            assert_eq!((conflict.id, conflict.latest.as_ref()), (2, Some(&latest)));
+            let snapshot = d.batch_latest.as_ref().unwrap();
+            assert!(snapshot.get(1).is_none(), "the first delete was persisted before this retry");
+            assert_eq!(snapshot.get(2), Some(&latest));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "retry conflict writes no additional bytes");
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_failure_completes_all_events_and_holds_the_barrier_until_retry() {
+        let _dir_guard = temp_dir("batch_failed");
+        let dir = _dir_guard.to_path_buf();
+        let folder = dir.join("missing");
+        let path = folder.join("a.takm");
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let contents = std::fs::read(crate::takm::convert(&source, None).unwrap().out).unwrap();
+        let writer = Writer::spawn(Box::new(|| {}));
+        let events = vec![ev(Kind::Add, 1, &["A"], 0, 1), ev(Kind::Add, 2, &["B"], 2, 3)];
+        assert!(writer.send_batch(4, path.clone(), events));
+        assert!(writer.drain().is_err());
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| d.tag == 4 && d.path == path && d.result.is_err() && d.conflict.is_none() && !d.cancelled));
+        assert_eq!(done[0].result, done[1].result);
+        let events: Vec<_> = done.into_iter().map(|d| d.event).collect();
+        assert!(events.iter().all(|event| event.operation.is_some()), "failed events retain their retry tokens");
+        assert!(!path.exists());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(writer.send_batch(4, path.clone(), events.clone()));
+        assert!(writer.drain().is_err(), "a repaired target alone cannot clear the failed path");
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| d.result.is_err()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(writer.retry(path.clone()));
+        assert!(writer.send_batch(4, path.clone(), events.clone()));
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| d.result.is_ok()));
+        assert_eq!(crate::takm::read_comments(&path).unwrap().events, events);
+        drop(writer);
+    }
+
+    #[test]
+    fn writer_batch_cancelled_behind_lock_reports_each_event_and_writes_nothing() {
+        let _dir_guard = temp_dir("batch_cancelled");
+        let dir = _dir_guard.to_path_buf();
+        let source = dir.join("a.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        let before = std::fs::read(&path).unwrap();
+        let writer = Writer::spawn(Box::new(|| {}));
+        writer.drain().unwrap();
+        let lock = crate::takm::lock_path(&path).unwrap();
+        assert!(writer.send_batch(7, path.clone(), vec![ev(Kind::Add, 1, &["A"], 0, 1), ev(Kind::Add, 2, &["B"], 2, 3)]));
+        writer.cancel_tag(7);
+        drop(lock);
+        writer.drain().unwrap();
+        let done = writer.poll();
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| d.cancelled && d.result.is_err() && d.conflict.is_none()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(writer);
     }
 
     #[test]
     fn two_writers_reserve_distinct_ids_and_edit_delete_one_comment() {
-        let dir = temp_dir("unique_writers");
+        let _dir_guard = temp_dir("unique_writers");
+        let dir = _dir_guard.to_path_buf();
         let source = dir.join("input.tak");
         std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
         let path = crate::takm::convert(&source, None).unwrap().out;
@@ -1364,7 +1654,6 @@ mod tests {
         let after = crate::takm::read_comments(&path).unwrap().comments();
         assert!(after.get(ids[0]).is_none());
         assert_eq!(after.get(ids[1]).unwrap().markers, vec!["B"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1379,15 +1668,16 @@ mod tests {
             std::fs::write(result, id.to_string()).unwrap();
             return;
         }
-        let dir = temp_dir("unique_processes");
+        let _dir_guard = temp_dir("unique_processes");
+        let dir = _dir_guard.to_path_buf();
         let source = dir.join("input.tak");
         std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
         let path = crate::takm::convert(&source, None).unwrap().out;
         let result = dir.join("child_id");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::test_support::ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact").arg("comments::tests::comment_id_reservations_are_shared_between_processes")
             .env("TAK_4B_CHILD_COMMENT_PATH", &path).env("TAK_4B_CHILD_COMMENT_RESULT", &result)
-            .stdout(std::process::Stdio::null()).spawn().unwrap();
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
         let id = *reserve_takm_ids(&path, 1).unwrap().start();
         let writer = Writer::spawn(Box::new(|| {}));
         assert!(writer.send(0, path.clone(), ev(Kind::Add, id, &["parent"], 0, 0)));
@@ -1399,7 +1689,6 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live.get(id).unwrap().markers, vec!["parent"]);
         assert_eq!(live.get(other).unwrap().markers, vec!["child"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

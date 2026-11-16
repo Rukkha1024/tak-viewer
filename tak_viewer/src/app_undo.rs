@@ -22,6 +22,8 @@ struct FileBase {
     primary: Option<usize>,
     /// The selected comment (v0.17.1).
     picked: Option<u64>,
+    comments: crate::comment_selection::CommentSelection,
+    list_anchors: [panels::ListSelectionState; 2],
     armed_label: Option<LabelKey>,
     range: Range,
     plate: Option<usize>,
@@ -41,6 +43,8 @@ impl FileBase {
             order: v.ordered_selection(),
             primary: v.primary,
             picked: v.picked,
+            comments: v.comment_selection.clone(),
+            list_anchors: v.labels.list_selection.clone(),
             armed_label: v.armed_label,
             range: v.range,
             plate: v.plate,
@@ -66,6 +70,8 @@ pub(super) struct LayoutSnap {
     /// Each layout owns its viewing position; later opens must not replace it in file memory.
     spots: [Option<Spot>; MAX_VIEWS],
     picked: [Option<u64>; MAX_VIEWS],
+    comments: [crate::comment_selection::CommentSelection; MAX_VIEWS],
+    list_anchors: [[panels::ListSelectionState; 2]; MAX_VIEWS],
     /// Keep editable state across reversible layout changes without sharing ViewData.
     documents: [Option<crate::views::EditSession>; MAX_VIEWS],
     /// Kept with the document even after heavy close-history runtimes are evicted.
@@ -80,6 +86,41 @@ pub(super) struct LayoutSnap {
     /// markers were shown there ([own file, overlay]; both true without an overlay).
     overlays: [Option<PathBuf>; MAX_VIEWS],
     shown: [[bool; 2]; MAX_VIEWS],
+    /// List selection travels with the existing layout action; plain row activation does
+    /// not gain a separate undo step.
+    editor_selection: crate::ui::open_editors::EditorSelection,
+}
+
+#[derive(Clone)]
+pub(super) struct EditorBatchArchive {
+    pub(super) id: u64,
+    open: Vec<Box<TabSnapshot>>,
+    closed: Vec<Box<TabSnapshot>>,
+    selection: crate::ui::open_editors::EditorSelection,
+    open_active: Option<u64>,
+    closed_active: Option<u64>,
+    pub(super) rows: Vec<crate::ui::open_editors::EditorRowId>,
+}
+
+impl EditorBatchArchive {
+    pub(super) fn new(id: u64, open: Vec<Box<TabSnapshot>>, closed: Vec<Box<TabSnapshot>>,
+        selection: crate::ui::open_editors::EditorSelection, open_active: Option<u64>, closed_active: Option<u64>,
+        rows: Vec<crate::ui::open_editors::EditorRowId>) -> Self {
+        Self { id, open, closed, selection, open_active, closed_active, rows }
+    }
+    pub(super) fn rebind(&mut self, old: &Path, new: &Path) {
+        for tab in self.open.iter_mut().chain(&mut self.closed) {
+            let snap = &mut tab.layout;
+            snap.editor_selection.rebind(old, new);
+            for slot in 0..MAX_VIEWS {
+                if snap.files[slot].as_deref() == Some(old) { snap.files[slot] = Some(new.into()); }
+                if snap.overlays[slot].as_deref() == Some(old) { snap.overlays[slot] = Some(new.into()); }
+                if let Some(spot) = &mut snap.spots[slot] { if Path::new(&spot.path) == old { spot.path = new.to_string_lossy().into_owned(); } }
+            }
+        }
+        self.selection.rebind(old, new);
+        for row in &mut self.rows { if row.path == old { row.path = new.into(); } }
+    }
 }
 
 /// Independent of the 20-item reopen menu: app undo keeps the small restore state for
@@ -215,6 +256,8 @@ pub(super) enum Part {
     /// One atomic primary-file conversion across active and hidden layout tabs.
     TakmSwitch { batch: takm_save::SharedBatch },
     Options { tab: Option<layout_tabs::TabId>, before: Box<Options>, after: Box<Options> },
+    EditorBatch { archive: Arc<EditorBatchArchive>, close_after: bool },
+    EditorSelection { before: crate::ui::open_editors::EditorSelection, after: crate::ui::open_editors::EditorSelection },
     Folders { before: Box<Folders>, after: Box<Folders> },
     /// How the COMMENTS pane is sorted (v0.17.0; not saved in the settings).
     Sort { before: comment_list::Sort, after: comment_list::Sort },
@@ -339,7 +382,7 @@ pub(super) struct History {
     pub(super) note: Option<(String, f64)>,
     /// The newest action may still take a following frame / camera move (false after an undo
     /// or redo).
-    merge_open: bool,
+    pub(super) merge_open: bool,
     /// How many new actions were pushed so far (a merge into the newest one does not count):
     /// tells whether the newest action is the one a COMMENTS row click made (v0.27.3).
     pub(super) pushed: u64,
@@ -358,11 +401,13 @@ impl History {
     pub(super) fn forget_comment(&mut self, path: &Path, id: u64) {
         for stack in [&mut self.undo, &mut self.redo] {
             for action in stack.iter_mut() {
+                if action.iter().any(|part| matches!(part.inner(), Part::Comment { file, change: Change::DeletedMany(items), .. } if file == path && items.iter().any(|c| c.id == id))) { action.clear(); continue; }
                 action.retain(|part| match part {
                     part if matches!(part.inner(), Part::Comment { file, .. } if file == path) => {
                         let Part::Comment { change, .. } = part.inner() else { unreachable!() };
                         let comment = match change {
                             Change::Added(c) | Change::Deleted(c) => c,
+                            Change::DeletedMany(items) => { return !items.iter().any(|c| c.id == id); },
                             Change::Edited { before, .. } => before,
                         };
                         comment.id != id
@@ -457,6 +502,8 @@ impl History {
             Part::MarkerEdit { .. } => "MarkerEdit",
             Part::Layout { .. } => "Layout",
             Part::TakmSwitch { .. } => "TakmSwitch",
+            Part::EditorSelection { .. } => "EditorSelection",
+            Part::EditorBatch { .. } => "EditorBatch",
             Part::Options { .. } => "Options",
             Part::Folders { .. } => "Folders",
             Part::Sort { .. } => "Sort",
@@ -498,6 +545,7 @@ fn comment_kind(change: &Change, redo: bool) -> (EventKind, &Comment) {
         (Change::Added(c), false) | (Change::Deleted(c), true) => (EventKind::Delete, c),
         (Change::Deleted(c), false) | (Change::Added(c), true) => (EventKind::Add, c),
         (Change::Edited { before, after }, redo) => (EventKind::Edit, pick(redo, before, after)),
+        (Change::DeletedMany(items), redo) => (if redo { EventKind::Delete } else { EventKind::Add }, &items[0]),
     }
 }
 
@@ -533,7 +581,10 @@ impl TakViewerApp {
 
     /// A save changes the path associated with the same editable document, not its history.
     pub(super) fn rebind_saved_history(&mut self, old: &Path, new: &Path, document: DocumentId) {
+        self.editor_selection.rebind(old, new);
+        self.editor_batch.rebind(old, new);
         fn layout(snap: &mut LayoutSnap, old: &Path, new: &Path, id: DocumentId) {
+            snap.editor_selection.rebind(old, new);
             for k in 0..MAX_VIEWS {
                 if snap.overlays[k].as_deref() == Some(old) { snap.overlays[k] = Some(new.to_path_buf()); }
                 let same = snap.documents[k].as_ref().is_some_and(|s| s.lock().ok().is_some_and(|d| d.id() == id));
@@ -556,6 +607,8 @@ impl TakViewerApp {
                     }
                     Part::Layout { before, after } => { layout(before, old, new, document); layout(after, old, new, document); }
                     Part::TabLifecycle { snapshot, .. } => layout(&mut snapshot.layout, old, new, document),
+                    Part::EditorSelection { before, after } => { before.rebind(old, new); after.rebind(old, new); }
+                    Part::EditorBatch { archive, .. } => Arc::make_mut(archive).rebind(old, new),
                     _ => {}
                 }
             }
@@ -583,6 +636,8 @@ impl TakViewerApp {
             file_ids: std::array::from_fn(|k| self.views[k].file_id),
             spots: std::array::from_fn(|k| layout_spot(&self.views[k])),
             picked: std::array::from_fn(|k| if pending_view(&self.views[k]) { self.views[k].restore_picked.unwrap_or(None) } else { self.views[k].picked }),
+            comments: std::array::from_fn(|k| self.views[k].restore_comment_selection.clone().unwrap_or_else(|| self.views[k].comment_selection.clone())),
+            list_anchors: std::array::from_fn(|k| self.views[k].restore_list_anchors.clone().unwrap_or_else(|| self.views[k].labels.list_selection.clone())),
             documents: std::array::from_fn(|k| layout_document(&self.views[k])),
             source_stamps: std::array::from_fn(|k| layout_source_stamp(&self.views[k])),
             edit_selections: std::array::from_fn(|k| layout_edit_selection(&self.views[k])),
@@ -590,7 +645,252 @@ impl TakViewerApp {
             active: self.active,
             overlays: std::array::from_fn(|k| layout_overlay(&self.views[k]).map(Path::to_path_buf)),
             shown: std::array::from_fn(|k| self.views[k].shown),
+            editor_selection: self.editor_selection.clone(),
         }
+    }
+
+    /// Explicit list gestures share any layout action (plain overlay row click) in this gesture.
+    pub(super) fn record_editor_selection(&mut self, before: crate::ui::open_editors::EditorSelection, pushed: u64) {
+        if let Some(base) = &mut self.history.base { base.layout.editor_selection = self.editor_selection.clone(); }
+        if self.no_persist || before == self.editor_selection { return; }
+        // The layout already contains both sides of this list selection.
+        if self.history.pushed > pushed && self.history.undo.last().is_some_and(|action| action.iter().any(|part| matches!(part, Part::Layout { .. }))) { return; }
+        let part = Part::EditorSelection { before, after: self.editor_selection.clone() };
+        if self.history.pushed > pushed {
+            if let Some(action) = self.history.undo.last_mut() { action.push(part); }
+        } else { self.history.push(vec![part]); }
+    }
+
+    /// Plain activation keeps its historical undo behavior while remembering the selected
+    /// row for a later close and for any existing layout action.
+    pub(super) fn absorb_plain_editor_selection(&mut self) {
+        if let Some(base) = &mut self.history.base { base.layout.editor_selection = self.editor_selection.clone(); }
+    }
+
+    pub(super) fn editor_layout_snapshot(&self) -> Box<LayoutSnap> {
+        Box::new(self.layout_now(std::array::from_fn(|slot| self.views[slot].range)))
+    }
+
+    /// Only explicit gestures traverse affected hidden runtimes; idle frames keep the tab cache.
+    pub(super) fn editor_batch_snapshot(&mut self, tabs: &BTreeSet<u64>) -> Vec<Box<TabSnapshot>> {
+        let original = self.layout_tabs.active_id();
+        let mut snapshots = Vec::new();
+        for &tab in tabs {
+            if self.layout_tabs.tab(tab).is_none() { continue; }
+            if self.layout_tabs.active_id() != Some(tab) { self.switch_layout_tab_internal(tab); self.observe(false); }
+            if let Some(snapshot) = self.tab_undo_snapshot(tab) { snapshots.push(snapshot); }
+        }
+        if let Some(tab) = original { if self.layout_tabs.active_id() != Some(tab) { self.switch_layout_tab_internal(tab); self.observe(false); } }
+        snapshots.sort_by_key(|tab| tab.index);
+        snapshots
+    }
+
+    pub(super) fn prune_editor_batch_archives(&mut self) {
+        let mut retained = self.layout_tabs.recent_batch_ids();
+        for action in self.history.undo.iter().chain(&self.history.redo) {
+            for part in action {
+                if let Part::EditorBatch { archive, .. } = part.inner() { retained.insert(archive.id); }
+            }
+        }
+        let gone: Vec<_> = self.editor_batch.archives.keys().filter(|id| !retained.contains(id)).copied().collect();
+        for id in gone { drop_later(self.editor_batch.archives.remove(&id)); }
+    }
+
+    pub(super) fn push_editor_batch_history(&mut self, archive: Arc<EditorBatchArchive>, close_after: bool) {
+        self.history.push(vec![Part::EditorBatch { archive, close_after }]);
+        self.history.merge_open = false;
+        self.prune_editor_batch_archives();
+    }
+
+    pub(super) fn editor_batch_replay_id(&self, redo: bool) -> Option<u64> {
+        (if redo { self.history.redo.last() } else { self.history.undo.last() }).and_then(|action| match action.as_slice() {
+            [Part::EditorBatch { archive, .. }] => Some(archive.id), _ => None,
+        })
+    }
+
+    pub(super) fn finish_editor_batch_replay(&mut self, redo: bool) {
+        let action = if redo { self.history.redo.pop() } else { self.history.undo.pop() };
+        if let Some(action) = action {
+            let active = action.iter().find_map(|part| match part {
+                Part::EditorBatch { archive, close_after } => if redo == *close_after { archive.closed_active } else { archive.open_active },
+                _ => None,
+            });
+            if let Some(tab) = active.filter(|tab| self.layout_tabs.tab(*tab).is_some()) { self.switch_layout_tab_internal(tab); }
+            if redo { self.history.undo.push(action); } else { self.history.redo.push(action); }
+        }
+        self.history.merge_open = false;
+        self.observe(false);
+    }
+
+    /// Check the exact retained runtimes native restore will consume, without taking any
+    /// leaf out of its recent batch. A later refusal must not split the batch or open an
+    /// earlier tab. Native marker/save ownership and adoption checks stay authoritative.
+    fn editor_batch_restore_ready(&self, desired: &[TabSnapshot]) -> bool {
+        for snapshot in desired {
+            let Some(tab) = snapshot.layout.tab else { continue };
+            let live = self.layout_tabs.tab(tab);
+            let effective_views = if live.is_some() {
+                if self.layout_tabs.active_id() == Some(tab) { Some(&self.views) }
+                else { live.and_then(|tab| tab.layout.as_ref()).map(|runtime| &runtime.views) }
+            } else {
+                let retained = self.layout_tabs.closed_items().rev().find_map(|item| match item {
+                    layout_tabs::ClosedItem::Tab(closed) if closed.tab.id == tab => Some(closed),
+                    _ => None,
+                });
+                if let Some(runtime) = retained.and_then(|closed| closed.tab.layout.as_ref()) {
+                    if runtime.views.iter().enumerate().any(|(slot, view)|
+                        runtime.marker_ui[slot].has_pending_work() || !self.retained_view_ready(view)) {
+                        return false;
+                    }
+                    Some(&runtime.views)
+                } else { None }
+            };
+            for slot in 0..MAX_VIEWS {
+                let Some(path) = snapshot.layout.files[slot].as_deref() else { continue };
+                // restore_layout keeps an occurrence already present at this destination.
+                if effective_views.is_some_and(|views| views[slot].target() == Some(path)) { continue; }
+                let retained = self.layout_tabs.closed_items().rev().find_map(|item| match item {
+                    layout_tabs::ClosedItem::View { tab_id, index, view }
+                        if *tab_id == tab && *index == slot && view.view.file_id == snapshot.layout.file_ids[slot]
+                            && view.view.target() == Some(path) => Some(view),
+                    _ => None,
+                });
+                if retained.is_some_and(|closed| closed.marker_ui.has_pending_work()
+                    || !self.retained_view_ready(&closed.view)) { return false; }
+            }
+        }
+        true
+    }
+
+    /// Restore occurrences, never deduplicate by file path. A recent reopen may merge into
+    /// free slots; ordinary undo uses the same preflight before any layout is changed.
+    pub(super) fn restore_editor_batch(&mut self, ctx: &egui::Context, archive: &EditorBatchArchive, record: bool) -> bool {
+        let origin = self.layout_tabs.active_id();
+        let tabs: BTreeSet<_> = archive.open.iter().filter_map(|tab| tab.layout.tab).collect();
+        let closed_before = self.editor_batch_snapshot(&tabs);
+        let mut desired = Vec::new();
+        let mut remap = BTreeMap::new();
+        let mut paths = Vec::new();
+        for original in &archive.open {
+            let Some(tab) = original.layout.tab else { continue };
+            let prior = archive.closed.iter().find(|state| state.layout.tab == Some(tab));
+            let live = closed_before.iter().find(|state| state.layout.tab == Some(tab));
+            let exact = match (prior, live) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.layout.files == b.layout.files && a.layout.overlays == b.layout.overlays && a.layout.file_ids == b.layout.file_ids && a.layout.shape == b.layout.shape,
+                _ => false,
+            };
+            let mut wanted = if exact || live.is_none() { (**original).clone() } else { (**live.unwrap()).clone() };
+            if !exact && live.is_some() {
+                let mut used: BTreeSet<_> = dock::views(&wanted.layout.dock).into_iter().map(usize::from).collect();
+                for old in 0..MAX_VIEWS {
+                    let removed = prior.map_or(true, |after| original.layout.files[old] != after.layout.files[old] || original.layout.file_ids[old] != after.layout.file_ids[old]);
+                    if !removed || original.layout.files[old].is_none() { continue; }
+                    let Some(slot) = (!used.contains(&old)).then_some(old).or_else(|| (0..MAX_VIEWS).find(|slot| !used.contains(slot))) else {
+                        self.notice = Some("화면이 가득 차서 닫은 파일 묶음을 다시 열 수 없어요.".into());
+                        if let Some(tab) = origin { self.switch_layout_tab_internal(tab); self.observe(false); }
+                        return false;
+                    };
+                    used.insert(slot);
+                    remap.insert((tab, old), slot);
+                    wanted.layout.files[slot] = original.layout.files[old].clone();
+                    wanted.layout.file_ids[slot] = original.layout.file_ids[old];
+                    wanted.layout.spots[slot] = original.layout.spots[old].clone();
+                    wanted.layout.picked[slot] = original.layout.picked[old];
+                    wanted.layout.comments[slot] = original.layout.comments[old].clone();
+                    wanted.layout.list_anchors[slot] = original.layout.list_anchors[old].clone();
+                    wanted.layout.documents[slot] = original.layout.documents[old].clone();
+                    wanted.layout.source_stamps[slot] = original.layout.source_stamps[old].clone();
+                    wanted.layout.edit_selections[slot] = original.layout.edit_selections[old].clone();
+                    wanted.layout.ranges[slot] = original.layout.ranges[old];
+                    wanted.layout.overlays[slot] = original.layout.overlays[old].clone();
+                    wanted.layout.shown[slot] = original.layout.shown[old];
+                    dock::add_view(&mut wanted.layout.dock, slot as u8, self.dock_area);
+                }
+                for old in 0..MAX_VIEWS {
+                    if remap.contains_key(&(tab, old)) { continue; }
+                    if prior.is_some_and(|after| original.layout.overlays[old] == after.layout.overlays[old]) { continue; }
+                    let Some(overlay) = &original.layout.overlays[old] else { continue };
+                    let Some(slot) = wanted.layout.files.iter().enumerate().position(|(slot, path)| path == &original.layout.files[old] && wanted.layout.file_ids[slot] == original.layout.file_ids[old]) else {
+                        self.notice = Some("얹은 파일의 기본 화면을 먼저 다시 열어 주세요.".into()); return false;
+                    };
+                    if wanted.layout.overlays[slot].as_ref().is_some_and(|path| path != overlay) {
+                        self.notice = Some("다른 파일이 이미 얹혀 있어 닫은 파일 묶음을 다시 열 수 없어요.".into()); return false;
+                    }
+                    wanted.layout.overlays[slot] = Some(overlay.clone());
+                    wanted.layout.shown[slot] = original.layout.shown[old];
+                    remap.insert((tab, old), slot);
+                }
+            } else { for slot in 0..MAX_VIEWS { remap.insert((tab, slot), slot); } }
+            paths.extend(wanted.layout.files.iter().chain(&wanted.layout.overlays).flatten().cloned());
+            if !self.layout_tabs.has_closed_tab(tab) && !self.layout_snapshot_available(&wanted.layout) {
+                self.notice = Some("닫은 파일을 찾을 수 없어 다시 열지 못했어요.".into()); return false;
+            }
+            desired.push(wanted);
+        }
+        if !self.editor_batch_restore_ready(&desired) {
+            self.notice = Some("닫은 파일 묶음의 읽기·편집·저장이 아직 끝나지 않았어요. 작업을 마친 뒤 다시 열어 주세요.".into());
+            return false;
+        }
+        if !self.allow_open_files(&paths, None) { return false; }
+        self.observe(true);
+        let saved_undo = std::mem::take(&mut self.history.undo);
+        let saved_redo = std::mem::take(&mut self.history.redo);
+        let saved_pushed = self.history.pushed;
+        let applied = (|| {
+        let mut restored_positions = Vec::new();
+        for wanted in &desired {
+            let tab = wanted.layout.tab.expect("batch tab");
+            if self.layout_tabs.tab(tab).is_none() {
+                if self.layout_tabs.has_closed_tab(tab) {
+                    if !self.restore_closed_tab_internal(tab) { return false; }
+                } else if !self.create_layout_tab_for_undo(tab, &wanted.name, wanted.index, &paths) { return false; }
+                restored_positions.push((tab, wanted.index));
+            }
+            if self.layout_tabs.active_id() != Some(tab) { self.switch_layout_tab_internal(tab); self.observe(false); }
+            self.settings.graph_boxes = wanted.graph_boxes.clone();
+            self.settings.plate_boxes = wanted.plate_boxes.clone();
+            self.settings.plate_channels = wanted.plate_channels.clone();
+            // Side panels are app-wide. A recent reopen restores only this tab's editor
+            // layout, retaining shared pane changes made after the batch was closed.
+            let mut target = wanted.layout.clone();
+            let editor = dock::editor_layout(&target.dock);
+            target.dock = self.dock.clone();
+            dock::set_editor_layout(&mut target.dock, &editor);
+            target.hidden = self.hidden.clone();
+            self.restoring_layout = true;
+            self.restore_layout(ctx, &target);
+            self.restoring_layout = false;
+            self.observe(false);
+        }
+        // Native close indices shift during the gesture. Wait until every missing tab
+        // exists before restoring saved positions, so move_tab never clamps an index to an
+        // incomplete strip. Already-live tabs retain their relative order.
+        restored_positions.sort_by_key(|&(_, index)| index);
+        for (tab, index) in restored_positions { self.layout_tabs.move_tab(tab, index); }
+        true
+        })();
+        drop_later(Some(std::mem::replace(&mut self.history.undo, saved_undo)));
+        drop_later(Some(std::mem::replace(&mut self.history.redo, saved_redo)));
+        self.history.pushed = saved_pushed;
+        self.history.merge_open = false;
+        if !applied { self.observe(false); return false; }
+        let mut selection = archive.selection.clone();
+        selection.remap_occurrences(&remap);
+        self.editor_selection = selection.clone();
+        drop_later(self.layout_tabs.take_closed_where(|item| matches!(item, layout_tabs::ClosedItem::Batch { id, .. } if *id == archive.id)));
+        if let Some(tab) = archive.open_active.filter(|tab| self.layout_tabs.tab(*tab).is_some()).or(origin) {
+            self.switch_layout_tab_internal(tab);
+        }
+        self.observe(false);
+        if record && !self.no_persist {
+            let open = self.editor_batch_snapshot(&tabs);
+            let mut rows = archive.rows.clone();
+            for row in &mut rows { if let Some(slot) = remap.get(&(row.tab_id, row.slot)) { row.slot = *slot; } }
+            let reopened = Arc::new(EditorBatchArchive::new(archive.id, open, closed_before, selection, self.layout_tabs.active_id(), origin, rows));
+            self.push_editor_batch_history(reopened, false);
+        }
+        true
     }
 
     /// Closing a playing view keeps the exact last displayed frame too. Snapshot only small
@@ -600,6 +900,8 @@ impl TakViewerApp {
         if let Some(base) = self.history.base.as_mut().filter(|b| b.layout.files[slot].as_deref() == v.target()) {
             base.layout.spots[slot] = layout_spot(v);
             base.layout.picked[slot] = if pending_view(v) { v.restore_picked.unwrap_or(None) } else { v.picked };
+            base.layout.comments[slot] = v.restore_comment_selection.clone().unwrap_or_else(|| v.comment_selection.clone());
+            base.layout.list_anchors[slot] = v.restore_list_anchors.clone().unwrap_or_else(|| v.labels.list_selection.clone());
             base.layout.documents[slot] = layout_document(v);
             base.layout.source_stamps[slot] = layout_source_stamp(v);
             base.layout.edit_selections[slot] = layout_edit_selection(v);
@@ -721,10 +1023,12 @@ impl TakViewerApp {
             // (one action with the comment) or Esc (put back), so it is not compared meanwhile.
             let drafting = marker_edit == Some((k, v.file_id));
             let order = v.ordered_selection();
-            if !drafting && (v.selected != b.selected || order != b.order || v.primary != b.primary || v.picked != b.picked || v.armed_label != b.armed_label) {
-                let before = Selection { selected: std::mem::replace(&mut b.selected, v.selected.clone()), order: std::mem::replace(&mut b.order, order), primary: b.primary, comment: b.picked, armed_label: b.armed_label };
+            if !drafting && (v.selected != b.selected || order != b.order || v.primary != b.primary || v.picked != b.picked || v.comment_selection != b.comments || v.labels.list_selection != b.list_anchors || v.armed_label != b.armed_label) {
+                let before = Selection { selected: std::mem::replace(&mut b.selected, v.selected.clone()), order: std::mem::replace(&mut b.order, order), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label };
                 b.primary = v.primary;
                 b.picked = v.picked;
+                b.comments = v.comment_selection.clone();
+                b.list_anchors = v.labels.list_selection.clone();
                 b.armed_label = v.armed_label;
                 parts.push(Part::Selection { file: b.file.clone(), before, after: v.selection() });
                 if base.layout.files[k].as_deref() == v.path() { base.layout.edit_selections[k] = Some(v.edit_selection_state()); }
@@ -835,9 +1139,11 @@ impl TakViewerApp {
                 parts.push(Part::Frame { file: file.clone(), before: b.frame, after: v.pb.frame });
                 b.frame = v.pb.frame;
             }
-            let before = Selection { selected: b.selected.clone(), order: b.order.clone(), primary: b.primary, comment: b.picked, armed_label: b.armed_label };
+            let before = Selection { selected: b.selected.clone(), order: b.order.clone(), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label };
             if before != now {
                 (b.selected, b.order, b.primary, b.picked, b.armed_label) = (now.selected.clone(), now.order.clone(), now.primary, now.comment, now.armed_label);
+                b.comments = now.comments.clone();
+                b.list_anchors = now.list_anchors.clone();
                 parts.push(Part::Selection { file, before, after: now });
             }
         }
@@ -910,6 +1216,8 @@ impl TakViewerApp {
         if let Some(Some(part)) = h.undo.pop().map(|mut a| a.pop()) {
             if let Part::Selection { before, .. } = part.inner() {
                 (b.selected, b.order, b.primary, b.picked, b.armed_label) = (before.selected.clone(), before.order.clone(), before.primary, before.comment, before.armed_label);
+                b.comments = before.comments.clone();
+                b.list_anchors = before.list_anchors.clone();
             }
         }
     }
@@ -1051,6 +1359,10 @@ impl TakViewerApp {
                     Some(Ok(_)) if self.no_persist => return Ready::Gone,
                     Some(Ok(_)) => {}
                 }
+                if let Change::DeletedMany(items) = change {
+                    if items.iter().any(|c| v.comments.list.get(c.id).is_some() != redo) { return Ready::Gone; }
+                    continue;
+                }
                 let (kind, c) = comment_kind(change, redo);
                 let ok = match comment_now(change, redo) {
                     Some(now) => v.comments.list.get(c.id) == Some(now),
@@ -1078,6 +1390,15 @@ impl TakViewerApp {
         self.stop_history_playback();
         self.observe(true);
         self.history.merge_open = false;
+        let batch = (if redo { self.history.redo.last() } else { self.history.undo.last() }).and_then(|action| match action.as_slice() {
+            [Part::EditorBatch { archive, close_after }] => Some((archive.clone(), *close_after)), _ => None,
+        });
+        if let Some((archive, close_after)) = batch {
+            if redo == close_after {
+                self.begin_editor_batch(ctx, archive.rows.iter().cloned().collect(), Some(redo));
+            } else if self.restore_editor_batch(ctx, &archive, false) { self.finish_editor_batch_replay(redo); }
+            return;
+        }
         let now = ctx.input(|i| i.time);
         let word = if redo { "Redo" } else { "Undo" };
         let mut skipped = 0;
@@ -1270,6 +1591,10 @@ impl TakViewerApp {
                 self.restoring_layout = false;
                 return words;
             }
+            Part::EditorSelection { before, after } => {
+                self.editor_selection = if redo { after.clone() } else { before.clone() };
+                return format!("열린 파일 선택 {}개", self.editor_selection.selected.len());
+            }
             Part::Options { before, after, .. } => {
                 let (from, to) = if redo { (before, after) } else { (after, before) };
                 let s = &mut self.settings;
@@ -1282,7 +1607,7 @@ impl TakViewerApp {
                 return from.words(to);
             }
             Part::Sort { before, after } => {
-                self.comment_sort = pick(redo, *before, *after);
+                self.set_comment_sort(pick(redo, *before, *after));
                 return self.comment_sort.words();
             }
             Part::Folders { before, after } => {
@@ -1349,6 +1674,11 @@ impl TakViewerApp {
                 "Device channel".into()
             }
             Part::Comment { change, cleared, .. } => {
+                if let Change::DeletedMany(items) = change {
+                    let kind = if redo { EventKind::Delete } else { EventKind::Add };
+                    self.write_comment_batch(ctx, k, kind, items);
+                    return format!("{} Comments {}", items.len(), if redo { "removed" } else { "restored" });
+                }
                 let (kind, c) = comment_kind(change, redo);
                 let c = c.clone();
                 self.write_change(ctx, k, kind, &c);
@@ -1381,7 +1711,7 @@ impl TakViewerApp {
                     Err(_) => "Marker edit failed".into(),
                 }
             }
-            Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
+            Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
             | Part::TabSwitch { .. } | Part::TabRename { .. } | Part::TabMove { .. }
             | Part::TabLifecycle { .. } | Part::View { .. } => String::new(),
         }
@@ -1454,6 +1784,7 @@ impl TakViewerApp {
                 }
             }
         }
+        self.editor_selection = snap.editor_selection.clone();
         self.dock = snap.dock.clone();
         dock::place_windows(&mut self.dock);
         self.hidden = snap.hidden.clone();
@@ -1492,6 +1823,8 @@ impl TakViewerApp {
                         }
                         view.range = snap.ranges[k];
                         view.picked = snap.picked[k];
+                        view.comment_selection = snap.comments[k].clone();
+                        view.labels.list_selection = snap.list_anchors[k].clone();
                         if let (Some(selection), Some(data)) = (&snap.edit_selections[k], &view.data) {
                             let find = |uid: &[u8; 16]| data.markers.iter().position(|marker| marker.uid == *uid);
                             let visible = Selection {
@@ -1499,6 +1832,8 @@ impl TakViewerApp {
                                 order: selection.order.iter().filter_map(find).collect(),
                                 primary: selection.primary.as_ref().and_then(find),
                                 comment: snap.picked[k],
+                                comments: snap.comments[k].clone(),
+                                list_anchors: snap.list_anchors[k].clone(),
                                 armed_label: selection.armed_label,
                             };
                             view.set_selection(visible);
@@ -1509,10 +1844,14 @@ impl TakViewerApp {
                         view.restore = None;
                         view.restore_range = None;
                         view.restore_picked = None;
+                        view.restore_comment_selection = None;
+                        view.restore_list_anchors = None;
                     } else {
                         self.views[k].restore = snap.spots[k].clone().or_else(|| self.views[k].restore.take());
                         self.views[k].restore_range = Some(snap.ranges[k]);
                         self.views[k].restore_picked = Some(snap.picked[k]);
+                        self.views[k].restore_comment_selection = Some(snap.comments[k].clone());
+                        self.views[k].restore_list_anchors = Some(snap.list_anchors[k].clone());
                     }
                 }
             }
@@ -1846,7 +2185,8 @@ mod marker_edit_tests {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
         let first = app.layout_tabs.active_id().unwrap();
-        let path = std::env::temp_dir().join(format!("tak_undo_evicted_tab_{}.tak", std::process::id()));
+        let temp_guard = tak_core::test_support::TempDir::new("tak_undo_evicted_tab");
+        let path = temp_guard.join("fixture.tak");
         std::fs::write(&path, b"fixture").unwrap();
         let text = path.to_string_lossy().into_owned();
         show(&mut app, 0, &text, 1);
@@ -1908,7 +2248,8 @@ mod marker_edit_tests {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
         let first = app.layout_tabs.active_id().unwrap();
-        let path = std::env::temp_dir().join(format!("tak_undo_capped_tab_{}.tak", std::process::id()));
+        let temp_guard = tak_core::test_support::TempDir::new("tak_undo_capped_tab");
+        let path = temp_guard.join("fixture.tak");
         std::fs::write(&path, b"fixture").unwrap();
         show(&mut app, 0, &path.to_string_lossy(), 1);
         let anchor = another_tab(&mut app);
@@ -2200,7 +2541,8 @@ mod marker_edit_tests {
     fn close_history_eviction_rebinds_reloaded_view_ids_for_later_undo_redo_cycles() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
-        let path = std::env::temp_dir().join(format!("tak_undo_evicted_view_{}.tak", std::process::id()));
+        let temp_guard = tak_core::test_support::TempDir::new("tak_undo_evicted_view");
+        let path = temp_guard.join("fixture.tak");
         std::fs::write(&path, b"fixture").unwrap();
         let text = path.to_string_lossy().into_owned();
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);

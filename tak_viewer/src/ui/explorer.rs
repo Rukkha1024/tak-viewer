@@ -890,11 +890,8 @@ mod tests {
 
     // ───────────── Following the disk (folder watcher) ─────────────
 
-    fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tak_viewer_explorer_watch_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn temp(name: &str) -> tak_core::test_support::TempDir {
+        tak_core::test_support::TempDir::new(&format!("tak_viewer_explorer_watch_{name}"))
     }
 
     fn touch(p: &Path) {
@@ -939,7 +936,8 @@ mod tests {
     #[test]
     fn tree_follows_the_disk_in_place_and_forgets_a_vanished_expanded_folder() {
         // The reported case: an expanded folder's .takm files move into new subject folders.
-        let root = temp("regroup");
+        let _root_guard = temp("regroup");
+        let root = _root_guard.to_path_buf();
         let trial = root.join("trials");
         std::fs::create_dir_all(&trial).unwrap();
         touch(&trial.join("S01_001.takm"));
@@ -981,7 +979,8 @@ mod tests {
 
     #[test]
     fn expanding_and_collapsing_changes_what_the_next_round_reads() {
-        let root = temp("folds");
+        let _root_guard = temp("folds");
+        let root = _root_guard.to_path_buf();
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let mut st = ExplorerState::default();
@@ -1024,7 +1023,8 @@ mod tests {
 
     #[test]
     fn a_saved_folder_gone_from_disk_stays_dim_with_a_note_and_comes_back_by_itself() {
-        let root = temp("gone_root");
+        let _root_guard = temp("gone_root");
+        let root = _root_guard.to_path_buf();
         touch(&root.join("a.tak"));
         let mut st = ExplorerState::default();
         let mut ws = watched(&root, &mut st);

@@ -265,9 +265,10 @@ fn hidden_work_explicit_shared_emg_wakes_only_hidden_owner_including_late_subscr
     for late_subscription in [false, true] {
         for overlay_owner in [false, true] {
             let ctx = egui::Context::default();
-            let dir = comment_dir(&format!(
+            let _dir_guard = comment_dir(&format!(
                 "hidden_work_emg_{late_subscription}_{overlay_owner}"
             ));
+            let dir = _dir_guard.to_path_buf();
             let path = dir.join("emg.takm");
             hidden_work_write_emg(&path, 0, &[1.0, 2.0, 3.0]);
             let fast = tak_core::tak::fast_read::read_take_fast(&path, false).unwrap();
@@ -381,7 +382,6 @@ fn hidden_work_explicit_shared_emg_wakes_only_hidden_owner_including_late_subscr
                 app.hidden_work.visits.is_empty(),
                 "completed EMG kept hidden work alive"
             );
-            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

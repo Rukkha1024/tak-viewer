@@ -237,6 +237,7 @@ pub enum ListAction {
     /// Select this comment (a single click on its row, v0.27.3): it becomes the selected comment
     /// and its markers are selected; the frame and playback stay.
     Select(u64),
+    MultiSelect { id: u64, ctrl: bool, shift: bool },
     Goto(u64),
     Delete(u64),
     Sort(SortKey),
@@ -320,6 +321,7 @@ pub struct ListIn<'a> {
     pub scroll_to: Option<u64>,
     /// The selected comment (`View::picked`).
     pub picked: Option<u64>,
+    pub selection: &'a crate::comment_selection::CommentSelection,
     /// During a marker edit: the names now selected in the view (shown in its Markers cell).
     pub live_markers: Option<String>,
     /// The file's first and last frame (a dragged frame box stays inside).
@@ -548,6 +550,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     let mut out = ListOut { drawn: true, ..ListOut::default() };
     // The pane: the type list stays inside it.
     let room = ui.max_rect().intersect(ui.clip_rect());
+    ui.label(RichText::new(format!("{} selected · Shift/Ctrl click · Ctrl+A · Delete", input.selection.len())).size(11.0).color(theme::TEXT_DIM));
     let list = input.list.list();
     if list.is_empty() {
         ui.add_space(8.0);
@@ -604,7 +607,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             out.rows.push((c.id, rect));
             let picked = input.picked == Some(c.id);
             let here = c.start <= input.frame && input.frame <= c.end;
-            let bg = if picked {
+            let bg = if picked || input.selection.contains(c.id) {
                 theme::PICKED_ROW
             } else if resp.hovered() {
                 Color32::from_rgb(0x3a, 0x3a, 0x3a)
@@ -730,7 +733,10 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             ui.painter().line_segment([x.right_top(), x.left_bottom()], stroke);
             // The Type box over the row (only where comments can be written).
             let tb = writable.then(|| ui.interact(tbox, ui.id().with(("comment_type_box", k)), Sense::click()));
-            if dr.clicked() && writable {
+            let modifiers = ui.input(|i| i.modifiers);
+            if (modifiers.ctrl || modifiers.command || modifiers.shift) && (resp.clicked() || dr.clicked() || tb.as_ref().is_some_and(|t| t.clicked())) {
+                out.action = Some(ListAction::MultiSelect { id: c.id, ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift });
+            } else if dr.clicked() && writable {
                 out.action = Some(ListAction::Delete(c.id));
             } else if let Some(tb) = tb.filter(|t| t.clicked()) {
                 out.action = Some(ListAction::TypeBox(c.id, tb.double_clicked()));
@@ -873,7 +879,7 @@ mod tests {
         let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 400.0))), time: Some(t), events, ..Default::default() };
         let _ = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let input = ListIn { list, file_id: 1, frame: 0, sort: Sort::default(), write: write.clone(), scroll_to: None, picked: None, live_markers: None, first: 0, last: 100 };
+                let input = ListIn { list, file_id: 1, frame: 0, sort: Sort::default(), write: write.clone(), scroll_to: None, picked: None, selection: &crate::comment_selection::CommentSelection::default(), live_markers: None, first: 0, last: 100 };
                 out = show(ui, input, &mut order, &mut edit);
             });
         });

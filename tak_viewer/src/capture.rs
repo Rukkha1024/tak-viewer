@@ -754,7 +754,8 @@ mod tests {
 
     #[test]
     fn input_folder_is_refused() {
-        let root = std::env::temp_dir().join(format!("tak_capture_test_{}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_capture_test");
+        let root = _temp.join(format!("tak_capture_test_{}", std::process::id()));
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "x").unwrap();
@@ -798,7 +799,8 @@ mod tests {
 
     #[test]
     fn two_captures_in_the_same_second_get_their_own_folders() {
-        let root = std::env::temp_dir().join(format!("tak_capture_new_dir_{}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_capture_new_dir");
+        let root = _temp.join(format!("tak_capture_new_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let base = root.join("tak_captures").join("20261110-010203_a");
         assert_eq!(new_dir(&base).unwrap(), base, "first run: the plain name (parents made)");

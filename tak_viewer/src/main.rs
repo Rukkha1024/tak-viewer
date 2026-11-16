@@ -25,6 +25,7 @@ mod app;
 mod bench_load;
 mod bench_timing;
 mod camera;
+mod comment_selection;
 mod capture;
 mod headless;
 mod instances;

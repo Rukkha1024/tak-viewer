@@ -4,7 +4,8 @@
 fn last_close_all_three_entry_points_restore_the_whole_view_with_one_undo() {
     for entry in ["key", "tab", "editors"] {
         let ctx = egui::Context::default();
-        let dir = comment_dir(&format!("last_close_{entry}"));
+        let _dir_guard = comment_dir(&format!("last_close_{entry}"));
+        let dir = _dir_guard.to_path_buf();
         let (mut app, files) = editors_app(&ctx, &dir);
         app.close_view(1);
         app.views[0].pb.set_frame(6, 0.0);
@@ -56,14 +57,14 @@ fn last_close_all_three_entry_points_restore_the_whole_view_with_one_undo() {
         redo_key(&ctx, &mut app);
         assert!(app.open_views().is_empty());
         assert_eq!(steps(&app, 0), (before + 1, 0));
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
 #[test]
 fn last_close_snapshot_survives_later_file_memory_changes() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_snapshot");
+    let _dir_guard = comment_dir("last_close_snapshot");
+    let dir = _dir_guard.to_path_buf();
     let (mut app, _) = editors_app(&ctx, &dir);
     app.close_view(1);
     app.views[0].pb.set_frame(3, 0.0);
@@ -77,13 +78,13 @@ fn last_close_snapshot_survives_later_file_memory_changes() {
     assert!(app.views[0].loading.is_none() && app.views[0].overlay_load.is_none());
     assert_eq!(app.views[0].pb.frame, 3);
     assert_eq!(app.views[0].primary, Some(1));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn last_close_repeated_live_restore_keeps_document_range_overlay_and_selection() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_pending_undo");
+    let _dir_guard = comment_dir("last_close_pending_undo");
+    let dir = _dir_guard.to_path_buf();
     let (mut app, files) = editors_app(&ctx, &dir);
     app.close_view(1);
     app.views[0].pb.set_frame(6, 0.0);
@@ -110,13 +111,13 @@ fn last_close_repeated_live_restore_keeps_document_range_overlay_and_selection()
     assert_eq!(app.views[0].primary, Some(1));
     assert_eq!(app.views[0].range, Some((2, 7)));
     assert_eq!(app.views[0].shown, [false, true]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn last_close_incoming_file_uses_its_pending_spot_instead_of_the_displayed_file() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_incoming");
+    let _dir_guard = comment_dir("last_close_incoming");
+    let dir = _dir_guard.to_path_buf();
     let path = dir.join("incoming.tak");
     std::fs::write(&path, b"held test file").unwrap();
     let mut app = one_view(&ctx);
@@ -145,13 +146,13 @@ fn last_close_incoming_file_uses_its_pending_spot_instead_of_the_displayed_file(
     assert_eq!(app.views[0].pb.frame, 8);
     assert_eq!(app.views[0].primary, Some(1));
     assert_eq!(app.views[0].range, None);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn last_close_undo_restores_the_selected_comment_and_its_markers() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_picked");
+    let _dir_guard = comment_dir("last_close_picked");
+    let dir = _dir_guard.to_path_buf();
     two_comments_on_disk(&dir);
     let mut app = comment_app(&ctx, &dir, false);
     app.hold_loads = true;
@@ -168,7 +169,6 @@ fn last_close_undo_restores_the_selected_comment_and_its_markers() {
     assert!(app.views[0].loading.is_none());
     assert!(app.views[0].comments.list.get(2).is_some());
     assert_eq!(app.views[0].selection(), selected);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -245,7 +245,8 @@ fn last_close_empty_editor_opens_explorer_click_path_dialog_and_recent_menu() {
     use crate::workspace::{Listing, WsFile};
     for route in ["explorer", "path", "recent"] {
         let ctx = egui::Context::default();
-        let dir = comment_dir(&format!("last_close_open_{route}"));
+        let _dir_guard = comment_dir(&format!("last_close_open_{route}"));
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("open.takm");
         std::fs::write(&path, b"held test file").unwrap();
         let mut app = one_view(&ctx);
@@ -285,14 +286,14 @@ fn last_close_empty_editor_opens_explorer_click_path_dialog_and_recent_menu() {
         assert_eq!(shared_panes.map(|pane| dock::has(&app.dock, pane)), visibility, "{route}: shared pane visibility");
         assert_eq!(app.hidden, hidden, "{route}: shared hidden sides");
         assert!(dock::has(&app.dock, Pane::LayoutTabs));
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
 #[test]
 fn last_close_fresh_open_preserves_graph_and_undo_redo_keep_it_one_action() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_graph_default");
+    let _dir_guard = comment_dir("last_close_graph_default");
+    let dir = _dir_guard.to_path_buf();
     let path = dir.join("new.tak");
     std::fs::write(&path, b"held test file").unwrap();
     let mut app = one_view(&ctx);
@@ -317,13 +318,13 @@ fn last_close_fresh_open_preserves_graph_and_undo_redo_keep_it_one_action() {
     assert_eq!(app.open_views(), vec![0]);
     assert!(!app.settings.graph_float);
     assert!(dock::has(&app.dock, Pane::Graph));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn last_close_during_quiet_overlay_replacement_preserves_the_incoming_overlay() {
     let ctx = egui::Context::default();
-    let dir = comment_dir("last_close_pending_overlay");
+    let _dir_guard = comment_dir("last_close_pending_overlay");
+    let dir = _dir_guard.to_path_buf();
     let (mut app, files) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak"]);
     lay_over(&ctx, &mut app, &files[1]);
     overlay_arrive(&ctx, &mut app, 0);
@@ -338,7 +339,6 @@ fn last_close_during_quiet_overlay_replacement_preserves_the_incoming_overlay() 
     assert!(app.views[0].loading.is_none(), "the primary data remains live while its pending overlay is restored");
     overlay_arrive(&ctx, &mut app, 0);
     assert_eq!(app.views[0].overlay_path(), Some(files[1].as_path()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -393,7 +393,8 @@ fn close_wait_until(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(
 fn last_close_save_button_saves_marker_edits_and_failed_save_keeps_the_view_open() {
     for fail in [false, true] {
         let ctx = egui::Context::default();
-        let dir = comment_dir(&format!("last_close_save_{fail}"));
+        let _dir_guard = comment_dir(&format!("last_close_save_{fail}"));
+        let dir = _dir_guard.to_path_buf();
         let source = dir.join("source.takm");
         make_takm(&source);
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
@@ -422,6 +423,5 @@ fn last_close_save_button_saves_marker_edits_and_failed_save_keeps_the_view_open
             document.install_prepared(document.revision(), prepared).unwrap();
             assert!(!document.snapshot().tracks().any(|track| track.name == "LKNE" && track.samples.iter().any(|sample| sample.frame() == 10)), "the saved marker sample is removed");
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

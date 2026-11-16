@@ -82,15 +82,14 @@ pub fn no_desktop() -> bool {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tak_viewer_instances_{tag}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        d
+    fn temp_dir(tag: &str) -> tak_core::test_support::TempDir {
+        tak_core::test_support::TempDir::new(&format!("tak_viewer_instances_{tag}"))
     }
 
     #[test]
     fn a_crashed_window_entry_is_cleaned_and_not_counted() {
-        let dir = temp_dir("stale");
+        let _dir_guard = temp_dir("stale");
+        let dir = _dir_guard.to_path_buf();
         let me = register_as(&dir, "1.lock").expect("register");
         fs::write(dir.join("2.lock"), b"").unwrap(); // left behind, nobody holds it
         fs::write(dir.join("notes.txt"), b"x").unwrap(); // not an entry, left alone
@@ -105,7 +104,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn two_open_windows_see_each_other_until_one_closes() {
-        let dir = temp_dir("two");
+        let _dir_guard = temp_dir("two");
+        let dir = _dir_guard.to_path_buf();
         let a = register_as(&dir, "1.lock").expect("register a");
         let b = register_as(&dir, "2.lock").expect("register b");
         assert!(a.others_alive());

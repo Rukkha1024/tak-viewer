@@ -1045,7 +1045,8 @@ mod tests {
             let off = (s as usize + 1) * ss;
             file_bytes[off..off + piece.len()].copy_from_slice(piece);
         }
-        let dir = std::env::temp_dir().join(format!("tak_fast_read_test_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_fast_read_test");
+        let dir = _temp.join(format!("tak_fast_read_test_{}", std::process::id()));
         std::fs::write(&dir, &file_bytes).unwrap();
         let file = File::open(&dir).unwrap();
         let m = map(chain, stream.len() as u64);
@@ -1115,7 +1116,8 @@ mod tests {
         for r in &recs {
             stream.extend(r);
         }
-        let path = std::env::temp_dir().join(format!("tak_selective_interleave_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_selective_interleave");
+        let path = _temp.join(format!("tak_selective_interleave_{}", std::process::id()));
         std::fs::write(&path, &stream).unwrap();
         let file = File::open(&path).unwrap();
         let trace = read_trace::start(&file);
@@ -1364,7 +1366,8 @@ mod tests {
     #[test]
     fn post_save_metadata_refresh_skips_marker_plate_and_emg_sample_bytes() {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!("tak_refresh_metadata_{}.takm", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_refresh_metadata");
+        let path = _temp.join(format!("tak_refresh_metadata_{}.takm", std::process::id()));
         let nodes = refresh_nodes();
         let channels = refresh_channels(6000);
         let index = write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Channels.dat", &channels)]);
@@ -1392,7 +1395,8 @@ mod tests {
 
     #[test]
     fn post_save_refresh_rebuilds_stream_and_record_positions_after_takm_rewrite() {
-        let path = std::env::temp_dir().join(format!("tak_refresh_rewrite_{}.takm", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_refresh_rewrite");
+        let path = _temp.join(format!("tak_refresh_rewrite_{}.takm", std::process::id()));
         let nodes = refresh_nodes();
         let before = refresh_channels(1);
         write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Channels.dat", &before)]);
@@ -1424,7 +1428,8 @@ mod tests {
 
     #[test]
     fn post_save_refresh_rejects_ambiguous_layout_without_reading_samples_or_fallback() {
-        let path = std::env::temp_dir().join(format!("tak_refresh_ambiguous_{}.takm", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_refresh_ambiguous");
+        let path = _temp.join(format!("tak_refresh_ambiguous_{}.takm", std::process::id()));
         let channels = two_device_stream();
         let nodes = refresh_nodes();
         for (case, streams) in [
@@ -1447,7 +1452,8 @@ mod tests {
 
     #[test]
     fn post_save_refresh_returns_none_for_forceplate_only_and_requires_takm() {
-        let path = std::env::temp_dir().join(format!("tak_refresh_plate_only_{}.takm", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_refresh_plate_only");
+        let path = _temp.join(format!("tak_refresh_plate_only_{}.takm", std::process::id()));
         let nodes = device_node([1; 16], 2, "plate");
         let mut channels = CHANNELS_HEADER.to_vec();
         channels.extend(1u32.to_le_bytes());
@@ -1467,7 +1473,8 @@ mod tests {
     #[test]
     fn unknown_structure_runs_existing_full_analog_fallback() {
         let stream = two_device_stream();
-        let path = std::env::temp_dir().join(format!("tak_unknown_analog_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_unknown_analog");
+        let path = _temp.join(format!("tak_unknown_analog_{}", std::process::id()));
         std::fs::write(&path, &stream).unwrap();
         let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
         let job = test_job(&path, map, &[], false);
@@ -1485,7 +1492,8 @@ mod tests {
     fn deferred_read_rejects_changed_tak_and_accepts_only_takm_tail_growth() {
         use std::io::Write;
         let stream = two_device_stream();
-        let path = std::env::temp_dir().join(format!("tak_lazy_unchanged_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_lazy_unchanged");
+        let path = _temp.join(format!("tak_lazy_unchanged_{}", std::process::id()));
         std::fs::write(&path, &stream).unwrap();
         let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
         let mut nodes = device_node([1; 16], 2, "plate");
@@ -1509,7 +1517,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("tak_selective_takm_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_selective_takm");
+        let dir = _temp.join(format!("tak_selective_takm_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let converted = crate::takm::convert(&path, Some(&dir)).unwrap();
         let _ = converted;
@@ -1545,7 +1554,8 @@ mod tests {
     }
     #[test]
     fn read_trace_keeps_equal_size_distinct_files_separate() {
-        let dir = std::env::temp_dir().join(format!("tak_read_identity_{}",std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_read_identity");
+        let dir = _temp.join(format!("tak_read_identity_{}",std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let first = dir.join("a"); let second = dir.join("b");
         std::fs::write(&first, [1u8; 23]).unwrap();
@@ -1572,7 +1582,8 @@ mod tests {
             stream.extend(2u32.to_le_bytes());
             stream.extend(record("Vector3fChannel", "Translation", 3, 5000));
             stream.extend(with_uid(record("FloatChannel", property, 1, 4), uid));
-            let path = std::env::temp_dir().join(format!("tak_renamed_device_{}_{}", std::process::id(), kind));
+            let _temp = crate::test_support::TempDir::new("tak_renamed_device");
+            let path = _temp.join(format!("tak_renamed_device_{}_{}", std::process::id(), kind));
             std::fs::write(&path,&stream).unwrap();
             let file = File::open(&path).unwrap();
             let trace = read_trace::start(&file);
@@ -1600,7 +1611,8 @@ mod tests {
     #[test]
     fn invalid_device_registry_aborts_before_channel_payload_reads() {
         let stream=two_device_stream();
-        let path=std::env::temp_dir().join(format!("tak_invalid_device_registry_{}",std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_invalid_device_registry");
+        let path = _temp.join(format!("tak_invalid_device_registry_{}",std::process::id()));
         std::fs::write(&path,&stream).unwrap();
         let file=File::open(&path).unwrap();
         let trace=read_trace::start(&file);
@@ -1640,7 +1652,8 @@ mod tests {
         let second_frame = inventory[1].data_start + 8;
         // Duplicate the second device's frame 0. The first device remains valid.
         stream[second_frame..second_frame + 4].copy_from_slice(&0u32.to_le_bytes());
-        let path = std::env::temp_dir().join(format!("tak_selective_decode_error_{}", std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_selective_decode_error");
+        let path = _temp.join(format!("tak_selective_decode_error_{}", std::process::id()));
         std::fs::write(&path, &stream).unwrap();
         let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
         let mut nodes = device_node([1;16], 2, "plate");
@@ -1664,7 +1677,8 @@ mod tests {
         let mut stream=CHANNELS_HEADER.to_vec();
         stream.extend((records.len() as u32).to_le_bytes());
         for r in records {stream.extend(r);}
-        let path=std::env::temp_dir().join(format!("tak_counted_tail_{}_{}",std::process::id(),tag));
+        let _temp = crate::test_support::TempDir::new("tak_counted_tail");
+        let path = _temp.join(format!("tak_counted_tail_{}_{}",std::process::id(),tag));
         std::fs::write(&path,&stream).unwrap();
         let file=File::open(&path).unwrap();
         let trace=read_trace::start(&file);
@@ -1751,7 +1765,8 @@ mod tests {
         let mut stream=CHANNELS_HEADER.to_vec();
         stream.extend((recs.len() as u32).to_le_bytes());
         for r in recs {stream.extend(r);}
-        let path=std::env::temp_dir().join(format!("tak_minimum_header_{}",std::process::id()));
+        let _temp = crate::test_support::TempDir::new("tak_minimum_header");
+        let path = _temp.join(format!("tak_minimum_header_{}",std::process::id()));
         std::fs::write(&path,&stream).unwrap();
         let file=File::open(&path).unwrap();
         let trace=read_trace::start(&file);
@@ -1777,7 +1792,8 @@ mod tests {
             let mut stream=CHANNELS_HEADER.to_vec();
             stream.extend(1u32.to_le_bytes());
             stream.extend(bytes);
-            let path=std::env::temp_dir().join(format!("tak_bad_minimum_header_{}_{}",std::process::id(),tag));
+            let _temp = crate::test_support::TempDir::new("tak_bad_minimum_header");
+            let path = _temp.join(format!("tak_bad_minimum_header_{}_{}",std::process::id(),tag));
             std::fs::write(&path,&stream).unwrap();
             let file=File::open(&path).unwrap();
             let map=StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};

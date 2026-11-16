@@ -2,6 +2,7 @@
 
 use super::panels::{gaps_text, label_cell, label_columns, label_row_pairs};
 use super::theme;
+pub use super::panels::{MarkerList, SelectionGesture};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Ui};
 use tak_core::edit::LabelKey;
 use tak_core::tak::{uid_hex, Uid};
@@ -26,6 +27,8 @@ pub struct LabelRow {
     pub key: Option<LabelKey>,
     /// None means a declared label has no trajectory yet.
     pub track_uid: Option<Uid>,
+    /// Eligibility for multiselect: at least one sample anywhere in this take.
+    pub has_samples: bool,
     pub name: String,
     pub color: Color32,
     pub fill_pct: f32,
@@ -58,6 +61,8 @@ pub struct UnlabeledRow {
 
 #[derive(Clone, Debug)]
 pub struct LabelingState {
+    /// Owning 3D slot, used only to route clicks and keys to the correct list.
+    pub view_slot: usize,
     /// View-only search; the owning view keeps it alongside the shared group folds.
     pub filter: String,
     pub mode: LabelingMode,
@@ -81,6 +86,7 @@ pub struct LabelingState {
 impl Default for LabelingState {
     fn default() -> Self {
         Self {
+            view_slot: 0,
             filter: String::new(),
             mode: LabelingMode::QuickLabel,
             increment: true,
@@ -120,11 +126,41 @@ pub enum LabelingAction {
         uid: Uid,
         additive: bool,
     },
+    /// Selection only: never arms or applies a QuickLabel target.
+    SelectTracks { list: MarkerList, uid: Option<Uid>, gesture: SelectionGesture },
     Unlabel,
     RemoveMarker,
 }
 
 impl LabelingState {
+    pub(crate) fn track_order(&self, list: MarkerList) -> Vec<Uid> {
+        match list {
+            MarkerList::Named => self.groups.iter().flat_map(|group| &group.labels)
+                .filter(|row| row.has_samples).filter_map(|row| row.track_uid).collect(),
+            MarkerList::Unlabeled => self.unlabeled.iter().map(|row| row.uid).collect(),
+        }
+    }
+
+    fn selection_summary(&self) -> (String, String) {
+        let selected: std::collections::HashSet<_> = self.groups.iter().flat_map(|g| &g.labels)
+            .filter(|row| row.selected).filter_map(|row| row.track_uid)
+            .chain(self.unlabeled.iter().filter(|row| row.selected).map(|row| row.uid)).collect();
+        let mut visible = std::collections::HashSet::new();
+        for row in list_rows(self, 1) {
+            if let ListRow::Labels(group, index, _) = row {
+                if let Some(uid) = self.groups[group].labels[index].track_uid { visible.insert(uid); }
+            }
+        }
+        let needle = self.filter.trim().to_lowercase();
+        visible.extend(self.unlabeled.iter().filter(|row| needle.is_empty() || row.name.to_lowercase().contains(&needle)).map(|row| row.uid));
+        let hidden = selected.difference(&visible).count();
+        let target = self.groups.iter().flat_map(|g| &g.labels).find(|row| row.primary && row.selected)
+            .map(|row| row.name.as_str())
+            .or_else(|| self.unlabeled.iter().find(|row| row.primary && row.selected).map(|row| row.name.as_str()))
+            .unwrap_or("—");
+        (format!("{} selected ({} hidden)", selected.len(), hidden), format!("Pattern target: {target}"))
+    }
+
     pub fn unlabel_reason(&self) -> Option<&str> {
         if let Some(reason) = self.blocked_reason.as_deref() {
             return Some(reason);
@@ -295,9 +331,20 @@ fn draw_headers(ui: &Ui, rect: Rect, count: usize) {
     }
 }
 
+fn modifier_gesture(modifiers: egui::Modifiers) -> Option<SelectionGesture> {
+    let additive = modifiers.ctrl || modifiers.command;
+    if modifiers.shift { Some(SelectionGesture::Range { additive }) }
+    else if additive { Some(SelectionGesture::Toggle) }
+    else if modifiers.any() { Some(SelectionGesture::Plain) }
+    else { None }
+}
+
 /// Draw the pane and return at most one user action. The caller applies selection and edits.
 pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
     let mut action = None;
+    let (count, target) = state.selection_summary();
+    ui.label(RichText::new(count).size(11.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new(target).size(11.0).color(theme::TEXT_DIM));
     let panel_height = ui.available_height();
     egui::ScrollArea::vertical()
         .id_salt("labeling_pane")
@@ -510,16 +557,15 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                     resp.hovered(),
                                     (first + offset) % 2 == 1,
                                 );
-                                let additive =
-                                    ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                                let gesture = ui.input(|i| modifier_gesture(i.modifiers));
                                 if resp.clicked() || (resp.secondary_clicked() && !row.selected) {
-                                    action = Some(LabelingAction::SelectLabel {
-                                        key: row.key,
-                                        track_uid: row.track_uid,
-                                        additive: resp.clicked() && additive,
+                                    action = Some(if let Some(gesture) = gesture {
+                                        LabelingAction::SelectTracks { list: MarkerList::Named, uid: row.track_uid, gesture }
+                                    } else {
+                                        LabelingAction::SelectLabel { key: row.key, track_uid: row.track_uid, additive: false }
                                     });
                                 }
-                                resp.context_menu(|ui| {
+                                if gesture.is_none() { resp.context_menu(|ui| {
                                     if ui.add_enabled(row.track_uid.is_some() && state.blocked_reason.is_none(), egui::Button::new("Remove Marker")).clicked() {
                                         action = Some(LabelingAction::RemoveMarker);
                                         ui.close_menu();
@@ -544,7 +590,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                             RichText::new(why).size(11.0).color(theme::TEXT_DIM),
                                         );
                                     }
-                                });
+                                }); }
                             }
                             if count == 2 {
                                 ui.painter().line_segment(
@@ -559,12 +605,14 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                     }
                 }
             });
+            crate::app::key_focus::region(ui, list.inner_rect, crate::app::key_focus::Target::NamedMarkers(state.view_slot));
             draw_headers(
                 ui,
                 Rect::from_min_max(header.min, pos2(list.inner_rect.right(), header.bottom())),
                 count,
             );
             let (rect, _) = ui.allocate_exact_size(legend.size(), Sense::hover());
+            crate::app::key_focus::region(ui, rect, crate::app::key_focus::Target::Blocked);
             ui.painter().galley(rect.min, legend, theme::TEXT_DIM);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Unlabeled Markers").strong());
@@ -579,7 +627,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             if let Some(index) = state.scroll_to_track.and_then(|uid| unlabeled.iter().position(|&i| state.unlabeled[i].uid == uid)) {
                 unlabeled_scroll = unlabeled_scroll.vertical_scroll_offset(((index as f32 - 3.0) * pitch).max(0.0));
             }
-            unlabeled_scroll.show_rows(ui, ROW_H, unlabeled.len(), |ui, visible| {
+            let unlabeled_list = unlabeled_scroll.show_rows(ui, ROW_H, unlabeled.len(), |ui, visible| {
                     let first = visible.start;
                     for (offset, &index) in unlabeled[visible].iter().enumerate() {
                         let row = &state.unlabeled[index];
@@ -603,21 +651,23 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                             resp.hovered(),
                             (first + offset) % 2 == 1,
                         );
+                        let gesture = ui.input(|i| modifier_gesture(i.modifiers));
                         if resp.clicked() || (resp.secondary_clicked() && !row.selected) {
-                            let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                            action = Some(LabelingAction::SelectUnlabeled {
-                                uid: row.uid,
-                                additive: resp.clicked() && additive,
+                            action = Some(if let Some(gesture) = gesture {
+                                LabelingAction::SelectTracks { list: MarkerList::Unlabeled, uid: Some(row.uid), gesture }
+                            } else {
+                                LabelingAction::SelectUnlabeled { uid: row.uid, additive: false }
                             });
                         }
-                        resp.context_menu(|ui| {
+                        if gesture.is_none() { resp.context_menu(|ui| {
                             if ui.add_enabled(state.blocked_reason.is_none(), egui::Button::new("Remove Marker")).clicked() {
                                 action = Some(LabelingAction::RemoveMarker);
                                 ui.close_menu();
                             }
-                        });
+                        }); }
                     }
                 });
+            crate::app::key_focus::region(ui, unlabeled_list.inner_rect, crate::app::key_focus::Target::UnlabeledMarkers(state.view_slot));
         });
     action
 }
@@ -634,6 +684,7 @@ mod tests {
                 slot: index as i32 + 1,
             }),
             track_uid: Some([index; 16]),
+            has_samples: true,
             name: format!("L{index:02}"),
             color: theme::ACCENT,
             fill_pct: 90.0,
@@ -969,10 +1020,8 @@ mod tests {
         };
         assert_eq!(
             click(&ctx, &st, "L03", ctrl, PointerButton::Primary),
-            Some(LabelingAction::SelectLabel {
-                key: st.groups[0].labels[3].key,
-                track_uid: Some([3; 16]),
-                additive: true
+            Some(LabelingAction::SelectTracks {
+                list: MarkerList::Named, uid: Some([3; 16]), gesture: SelectionGesture::Toggle
             })
         );
         assert_eq!(
@@ -1005,6 +1054,24 @@ mod tests {
             click(&ctx, &st, "Back", Modifiers::NONE, PointerButton::Primary),
             None
         );
+    }
+
+    #[test]
+    fn every_modifier_row_click_is_selection_only_in_quicklabel_mode() {
+        let ctx = egui::Context::default();
+        let mut st = state(5);
+        assert_eq!(st.mode, LabelingMode::QuickLabel);
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        let shift = Modifiers { shift: true, ..Default::default() };
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        let alt = Modifiers { alt: true, ..Default::default() };
+        for (modifiers, gesture) in [(ctrl, SelectionGesture::Toggle), (shift, SelectionGesture::Range { additive: false }), (ctrl_shift, SelectionGesture::Range { additive: true }), (alt, SelectionGesture::Plain)] {
+            assert_eq!(click(&ctx, &st, "L03", modifiers, PointerButton::Primary), Some(LabelingAction::SelectTracks { list: MarkerList::Named, uid: Some([3; 16]), gesture }));
+            assert_eq!(click(&ctx, &st, "Unlabeled 99", modifiers, PointerButton::Primary), Some(LabelingAction::SelectTracks { list: MarkerList::Unlabeled, uid: Some([99; 16]), gesture }));
+        }
+        st.groups[0].labels[3].track_uid = None;
+        st.groups[0].labels[3].has_samples = false;
+        assert_eq!(click(&ctx, &st, "L03", shift, PointerButton::Primary), Some(LabelingAction::SelectTracks { list: MarkerList::Named, uid: None, gesture: SelectionGesture::Range { additive: false } }));
     }
 
     #[test]

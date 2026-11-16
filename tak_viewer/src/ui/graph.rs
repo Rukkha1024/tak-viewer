@@ -1228,6 +1228,13 @@ fn show_inner(
     // Keep its allocation, interaction state and legend's key boundary, but do not build
     // thinned curves, meshes, text or decorations that the retained pass may replace.
     if ui.is_sizing_pass() || !ui.is_visible() || ui.ctx().will_discard() {
+        let with_legend = cache.as_ref().is_some_and(|drawn|
+            drawn.pair.as_ref().is_some_and(|pair| !pair.lanes.is_empty())
+                || drawn.more_pairs.iter().any(|lanes| !lanes.is_empty()));
+        if with_legend && !lanes.is_empty() {
+            let rect = legend_rect(Rect::from_min_size(plot.min, vec2(plot.width(), lane_h)));
+            crate::app::key_focus::region(ui, rect, crate::app::key_focus::Target::Blocked);
+        }
         return goto;
     }
 
@@ -1455,7 +1462,8 @@ fn show_inner(
     }
     // Plan step 9: which line is which file, over everything (only with the dashed curves).
     if with_legend && !lanes.is_empty() {
-        legend(&painter, Rect::from_min_size(plot.min, vec2(plot.width(), lane_h)), [show_first, show_second]);
+        let legend_rect = legend(&painter, Rect::from_min_size(plot.min, vec2(plot.width(), lane_h)), [show_first, show_second]);
+        crate::app::key_focus::region(ui, legend_rect, crate::app::key_focus::Target::Blocked);
     }
     // v0.29.0: the hovered marker's name next to the pointer, plain small text (no box: the
     // user's edit of mockup ①), `· 2` for the laid-over file's curve; inside the lanes.
@@ -1577,6 +1585,7 @@ mod tests {
         }
 
         fn render(&mut self, events: Vec<eframe::egui::Event>) -> (Vec<(eframe::egui::Rect, eframe::egui::Mesh)>, eframe::egui::ColorImage) {
+            use crate::app::key_focus::{self, Target};
             use eframe::egui;
             let ctx = self.ctx.clone();
             let input = egui::RawInput {
@@ -1586,6 +1595,7 @@ mod tests {
             super::start_frame(self.pass, None);
             self.pass += 1;
             let out = ctx.run(input, |ctx| {
+                key_focus::begin_frame(ctx, false, Target::Markers(0));
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect = egui::Rect::from_min_max(ui.max_rect().min + self.offset, ui.max_rect().max);
                     let mut builder = egui::UiBuilder::new().max_rect(rect);
@@ -1595,6 +1605,7 @@ mod tests {
                     child.set_clip_rect(ui.clip_rect().intersect(self.clip.unwrap_or(ui.clip_rect())));
                     if !self.enabled { child.disable(); }
                     child.set_opacity(self.opacity);
+                    key_focus::region(&child, rect, Target::Markers(0));
                     if self.discard_first && ctx.output(|output| output.num_completed_passes) == 0 {
                         ctx.request_discard("graph test discarded measurement pass");
                         assert!(ctx.will_discard());
@@ -1613,6 +1624,7 @@ mod tests {
                         assert!(atlas.ptr_eq(&self.drawn.decorations.atlas));
                     }
                 });
+                key_focus::finish_frame(ctx);
             });
             super::end_frame();
             self.textures.set(&out.textures_delta);
@@ -1865,6 +1877,41 @@ mod tests {
         assert_eq!(multipass.allocated, ordinary.allocated);
         assert_eq!(a.0, b.0);
         assert_eq!(a.1.pixels, b.1.pixels);
+    }
+
+    #[test]
+    fn cached_decorations_keep_legend_focus_regions_and_hidden_legend_does_not_leak() {
+        use crate::app::key_focus::{self, Target};
+        use eframe::egui::{self, pos2};
+        let mut graph = DecorationGraph::new(false);
+        graph.render(vec![]); graph.render(vec![]);
+        let builds = graph.drawn.decorations.builds;
+        let lane = graph.drawn.decorations.lanes[0].as_ref().unwrap().key.geometry.rect;
+        let click = |pos| vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ];
+        let legend = pos2(lane.right() - 10.0, lane.top() + 5.0);
+        graph.render(click(legend));
+        assert_eq!(key_focus::target(&graph.ctx), Target::Blocked);
+        assert_eq!(graph.drawn.decorations.builds, builds, "a cache hit must still register the legend's focus region");
+        graph.invisible = true;
+        graph.render(click(legend));
+        assert_eq!(graph.skipped_passes, 1);
+        assert_eq!(key_focus::target(&graph.ctx), Target::Blocked,
+            "skipping invisible rendering must retain the legend's keyboard boundary");
+        graph.render(click(lane.center()));
+        assert_eq!(key_focus::target(&graph.ctx), Target::Markers(0));
+        graph.drawn.set_pair(None); graph.drawn.set_more_pairs(vec![]);
+        graph.render(vec![]);
+        graph.render(click(legend));
+        assert_eq!(key_focus::target(&graph.ctx), Target::Markers(0), "a removed legend must leave no stale blocked region");
+        graph.invisible = false;
+        graph.render(vec![]);
+        graph.render(click(lane.center()));
+        assert!(graph.goto.is_some(), "the retained visible graph still handles frame clicks");
+        assert_eq!(key_focus::target(&graph.ctx), Target::Markers(0));
     }
 
     #[test]

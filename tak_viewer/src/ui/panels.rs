@@ -49,9 +49,122 @@ pub(crate) fn gaps_text(fill_pct: f32) -> String {
 
 #[derive(Default)]
 pub struct LabelsState {
+    pub(crate) list_selection: [ListSelectionState; 2],
     pub filter: String,
     pub collapsed: HashSet<usize>,
     pub scroll_to: Option<usize>,
+}
+
+/// The two marker lists share selected tracks, but each owns its range anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerList { Named, Unlabeled }
+
+impl MarkerList {
+    pub(crate) fn index(self) -> usize { match self { Self::Named => 0, Self::Unlabeled => 1 } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionGesture {
+    Plain,
+    Toggle,
+    Range { additive: bool },
+    All,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListSelectionState {
+    pub(crate) anchor: Option<tak_core::tak::Uid>,
+    range: Option<ListRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListRange {
+    additive: bool,
+    base: Vec<tak_core::tak::Uid>,
+    expected: Vec<tak_core::tak::Uid>,
+}
+
+impl ListSelectionState {
+    pub(crate) fn end_range(&mut self) { self.range = None; }
+
+    pub(crate) fn retain(&mut self, eligible: &HashSet<tak_core::tak::Uid>) {
+        self.anchor = self.anchor.filter(|uid| eligible.contains(uid));
+        if let Some(range) = &mut self.range {
+            range.base.retain(|uid| eligible.contains(uid));
+            range.expected.retain(|uid| eligible.contains(uid));
+        }
+    }
+
+    /// Return shared selection in pick order, with the gesture's target last. `order` is the
+    /// complete eligible list, independent of search, folds, current frame, or viewport.
+    pub(crate) fn apply(
+        &mut self,
+        order: &[tak_core::tak::Uid],
+        current: &[tak_core::tak::Uid],
+        clicked: Option<tak_core::tak::Uid>,
+        gesture: SelectionGesture,
+    ) -> Option<Vec<tak_core::tak::Uid>> {
+        if gesture == SelectionGesture::All {
+            let primary = current.last().copied().filter(|uid| order.contains(uid))
+                .or_else(|| order.first().copied());
+            let mut selected = order.to_vec();
+            if let Some(primary) = primary {
+                selected.retain(|uid| *uid != primary);
+                selected.push(primary);
+            }
+            self.anchor = primary;
+            self.range = None;
+            return Some(selected);
+        }
+        let clicked = clicked.filter(|uid| order.contains(uid))?;
+        let mut selected = match gesture {
+            SelectionGesture::Plain => {
+                self.anchor = Some(clicked);
+                self.range = None;
+                vec![clicked]
+            }
+            SelectionGesture::Toggle => {
+                self.range = None;
+                let mut selected = current.to_vec();
+                if selected.contains(&clicked) {
+                    selected.retain(|uid| *uid != clicked);
+                    if self.anchor == Some(clicked) {
+                        self.anchor = selected.iter().rev().copied().find(|uid| order.contains(uid));
+                    }
+                } else {
+                    selected.push(clicked);
+                    self.anchor = Some(clicked);
+                }
+                selected
+            }
+            SelectionGesture::Range { additive } => {
+                let anchor = self.anchor.filter(|uid| order.contains(uid)).unwrap_or(clicked);
+                self.anchor = Some(anchor);
+                let range = self.range.get_or_insert_with(|| ListRange {
+                    additive, base: current.to_vec(), expected: current.to_vec(),
+                });
+                // An intervening 3D selection or a different gesture starts a fresh union.
+                if range.additive != additive || range.expected != current {
+                    *range = ListRange { additive, base: current.to_vec(), expected: current.to_vec() };
+                }
+                let a = order.iter().position(|uid| *uid == anchor).unwrap();
+                let b = order.iter().position(|uid| *uid == clicked).unwrap();
+                let mut selected = if additive { range.base.clone() } else { Vec::new() };
+                for uid in &order[a.min(b)..=a.max(b)] {
+                    if !selected.contains(uid) { selected.push(*uid); }
+                }
+                selected.retain(|uid| *uid != clicked);
+                selected.push(clicked);
+                range.expected = selected.clone();
+                selected
+            }
+            SelectionGesture::All => unreachable!(),
+        };
+        // The input is already unique in normal use; keep stale/rebuilt snapshots harmless.
+        let mut seen = HashSet::new();
+        selected.retain(|uid| seen.insert(*uid));
+        Some(selected)
+    }
 }
 
 pub(crate) fn declared_group_id(parent: &tak_core::tak::Uid) -> usize {
@@ -106,6 +219,7 @@ impl LabelsState {
         self.collapsed.clear();
         self.filter.clear();
         self.scroll_to = None;
+        self.list_selection = Default::default();
         for (gi, g) in data.groups.iter().enumerate() {
             if g.kind == GroupKind::Unlabeled {
                 self.collapsed.insert(gi);
@@ -605,7 +719,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
     let goto = graph::show_select(ui, Id::new(("sel_graph", file_id)), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection);
     let mut over = false;
     let keys = graph_keys(data, markers, frame);
-    ui.horizontal(|ui| {
+    let footer = ui.horizontal(|ui| {
         over = over_3d_button(ui);
         let color = if m.present(frame) { theme::LABEL_TRACKED } else { theme::LABEL_UNTRACKED };
         if keys.is_empty() {
@@ -623,6 +737,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
         }
         ui.label(RichText::new("· 선 위에 마우스 = 마커 이름 · 클릭 = 프레임 이동 · 드래그 = 구간 선택 · 휠 = 확대 · 가운데 드래그 = 옆으로 · 더블클릭 = 전체 · 아래 빨간 칸 = 빈 구간").small().color(theme::TEXT_DIM));
     });
+    crate::app::key_focus::region(ui, footer.response.rect, crate::app::key_focus::Target::Blocked);
     if over {
         return Some(Action::GraphOver3d);
     }

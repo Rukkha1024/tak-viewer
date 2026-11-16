@@ -3,6 +3,7 @@ use super::explorer::{chevron, file_icon, ACTIVE_SEL_BG, BUTTON_BG, FG, FG_DIM, 
 use super::{scene, theme};
 use eframe::egui::{self, pos2, text::LayoutJob, vec2, Align2, Color32, FontId, Rect, ScrollArea, Sense, Stroke, Ui};
 use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 
 const HEADER_H: f32 = 22.0;
 const GROUP_H: f32 = 20.0;
@@ -53,8 +54,96 @@ pub struct Group {
     pub entries: Vec<Entry>,
 }
 
+/// Occurrence identity: a path alone cannot distinguish duplicate views or tabs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EditorRowId {
+    pub tab_id: u64,
+    pub slot: usize,
+    pub overlay: bool,
+    pub path: PathBuf,
+}
+
+impl Group {
+    pub fn row_id(&self, index: usize) -> EditorRowId {
+        EditorRowId { tab_id: self.tab_id, slot: self.slot, overlay: index != 0, path: self.entries[index].path.clone() }
+    }
+}
+
+/// The range basis is frozen for a Ctrl+Shift sequence, so shrinking the range removes
+/// only the previous temporary range, preserving the selections made before it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditorSelection {
+    pub selected: BTreeSet<EditorRowId>,
+    pub anchor: Option<EditorRowId>,
+    range_basis: Option<BTreeSet<EditorRowId>>,
+}
+
+impl EditorSelection {
+    pub fn click(&mut self, rows: &[EditorRowId], id: EditorRowId, ctrl: bool, shift: bool) {
+        let Some(end) = rows.iter().position(|row| row == &id) else { return };
+        self.retain(rows);
+        if shift {
+            if let Some(start) = self.anchor.as_ref().and_then(|anchor| rows.iter().position(|row| row == anchor)) {
+                if !ctrl { self.range_basis = None; }
+                let mut chosen = if ctrl { self.range_basis.get_or_insert_with(|| self.selected.clone()).clone() } else { BTreeSet::new() };
+                chosen.extend(rows[start.min(end)..=start.max(end)].iter().cloned());
+                self.selected = chosen;
+                return;
+            }
+        }
+        self.range_basis = None;
+        if ctrl {
+            if !self.selected.remove(&id) { self.selected.insert(id.clone()); }
+            self.anchor = if self.selected.contains(&id) { Some(id) } else { self.selected.iter().next().cloned() };
+        } else {
+            self.selected = BTreeSet::from([id.clone()]);
+            self.anchor = Some(id);
+        }
+    }
+
+    pub fn all(&mut self, rows: &[EditorRowId]) {
+        self.selected = rows.iter().cloned().collect();
+        if !self.anchor.as_ref().is_some_and(|id| self.selected.contains(id)) { self.anchor = rows.first().cloned(); }
+        self.range_basis = None;
+    }
+
+    pub fn clear(&mut self) { *self = Self::default(); }
+
+    pub fn retain(&mut self, rows: &[EditorRowId]) {
+        self.selected.retain(|id| rows.contains(id));
+        if !self.anchor.as_ref().is_some_and(|id| rows.contains(id)) { self.anchor = self.selected.iter().next().cloned(); }
+        if let Some(basis) = &mut self.range_basis { basis.retain(|id| rows.contains(id)); }
+    }
+
+    pub fn remap_occurrences(&mut self, remap: &std::collections::BTreeMap<(u64, usize), usize>) {
+        let update = |id: &EditorRowId| { let mut id = id.clone(); if let Some(slot) = remap.get(&(id.tab_id, id.slot)) { id.slot = *slot; } id };
+        self.selected = self.selected.iter().map(update).collect();
+        self.anchor = self.anchor.as_ref().map(update);
+        self.range_basis = self.range_basis.as_ref().map(|basis| basis.iter().map(update).collect());
+    }
+
+    pub fn remap_slots(&mut self, remap: &std::collections::BTreeMap<usize, usize>) {
+        let update = |id: &EditorRowId| { let mut id = id.clone(); if let Some(slot) = remap.get(&id.slot) { id.slot = *slot; } id };
+        self.selected = self.selected.iter().map(update).collect();
+        self.anchor = self.anchor.as_ref().map(update);
+        self.range_basis = self.range_basis.as_ref().map(|basis| basis.iter().map(update).collect());
+    }
+
+    pub fn rebind(&mut self, old: &Path, new: &Path) {
+        let update = |id: &EditorRowId| { let mut id = id.clone(); if id.path == old { id.path = new.to_path_buf(); } id };
+        self.selected = self.selected.iter().map(update).collect();
+        self.anchor = self.anchor.as_ref().map(update);
+        self.range_basis = self.range_basis.as_ref().map(|basis| basis.iter().map(update).collect());
+    }
+}
+
+pub fn displayed_rows(groups: &[Group]) -> Vec<EditorRowId> {
+    groups.iter().flat_map(|group| (0..group.entries.len()).map(|index| group.row_id(index))).collect()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum EditorAction {
+    Select { id: EditorRowId, ctrl: bool, shift: bool },
     /// Make this view the active one (row click of a view with no file laid over it).
     Activate(u64, usize),
     /// Row click of a view with a file laid over it: as a click on that file's name tag
@@ -155,7 +244,7 @@ pub fn fit(name: &str, suffix: &str, folder_w: f32, avail: f32, width: impl Fn(&
 
 /// The section: header, then the groups (or the empty line). Drawn at the top of the Explorer
 /// pane; it paints the whole pane's background (the WORKSPACE part paints its own again).
-pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool) -> Option<EditorAction> {
+pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool, selection: &EditorSelection) -> Option<EditorAction> {
     let mut action = None;
     ui.painter().rect_filled(ui.max_rect(), 0.0, SIDEBAR_BG);
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -165,9 +254,11 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool) 
     if hresp.clicked() {
         *collapsed = !*collapsed;
     }
-    if *collapsed {
-        return None;
+    for text in [format!("선택 {}개 · Ctrl/Shift로 여러 개", selection.selected.len()), "Ctrl+A 모두 · Delete 닫기 · Esc 해제".to_owned()] {
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+        ui.painter().with_clip_rect(r.intersect(ui.clip_rect())).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(11.0), FG_DIM);
     }
+    if *collapsed { return None; }
     if groups.is_empty() {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
         ui.painter().with_clip_rect(r).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, EMPTY, FontId::proportional(12.0), FG_DIM);
@@ -179,7 +270,7 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool) 
         for g in groups {
             group_header(ui, g);
             for (j, e) in g.entries.iter().enumerate() {
-                if let Some(a) = row(ui, g, j, e, ws_full) {
+                if let Some(a) = row(ui, g, j, e, ws_full, selection) {
                     action = Some(a);
                 }
             }
@@ -198,9 +289,9 @@ fn group_header(ui: &mut Ui, group: &Group) {
     }
 }
 
-fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<EditorAction> {
+fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &EditorSelection) -> Option<EditorAction> {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    let selected = g.active && j == 0;
+    let selected = selection.selected.contains(&g.row_id(j));
     let cy = rect.center().y;
     // × and `폴더 추가` are registered after the row, so they get their clicks.
     let x_rect = Rect::from_center_size(pos2(rect.left() + CLOSE_X, cy), vec2(20.0, 20.0));
@@ -276,6 +367,10 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<Edi
     let text_clip = Rect::from_min_max(rect.min, pos2(right.max(rect.left() + NAME_X), rect.max.y)).intersect(ui.clip_rect());
     p.with_clip_rect(text_clip).galley(pos2(rect.left() + NAME_X, cy - galley.size().y / 2.0), galley, FG);
 
+    let modifiers = ui.input(|input| input.modifiers);
+    if (modifiers.ctrl || modifiers.command || modifiers.shift) && (resp.clicked() || x_resp.clicked() || button.as_ref().is_some_and(|(_, _, response)| response.clicked())) {
+        return Some(EditorAction::Select { id: g.row_id(j), ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift });
+    }
     if x_resp.clicked() {
         return Some(if j == 0 { EditorAction::Close(g.tab_id, g.slot) } else { EditorAction::OverlayOff(g.tab_id, g.slot) });
     }
@@ -297,6 +392,67 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<Edi
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn show(ui: &mut Ui, groups: &[Group], full: bool, collapsed: &mut bool) -> Option<EditorAction> {
+        super::show(ui, groups, full, collapsed, &EditorSelection::default())
+    }
+
+    #[test]
+    fn displayed_range_shrinks_and_ctrl_shift_preserves_only_the_initial_basis() {
+        let groups = sample();
+        let rows = displayed_rows(&groups);
+        let mut selected = EditorSelection::default();
+        selected.click(&rows, rows[0].clone(), false, false);
+        selected.click(&rows, rows[2].clone(), false, true);
+        assert_eq!(selected.selected.len(), 3);
+        selected.click(&rows, rows[1].clone(), false, true);
+        assert_eq!(selected.selected, rows[..2].iter().cloned().collect());
+        selected.click(&rows, rows[2].clone(), true, false);
+        selected.click(&rows, rows[0].clone(), true, true);
+        assert_eq!(selected.selected.len(), 3);
+        selected.click(&rows, rows[2].clone(), true, true);
+        assert_eq!(selected.selected.len(), 3, "the prior manually selected rows remain");
+        selected.clear();
+        selected.click(&rows, rows[0].clone(), false, true);
+        assert_eq!(selected.selected.len(), 1, "Shift without an anchor is a plain selection");
+    }
+
+    #[test]
+    fn occurrence_identity_stale_rows_and_saved_path_rebinding_do_not_select_another_file() {
+        let mut rows = displayed_rows(&sample());
+        rows[2].path = rows[0].path.clone();
+        let mut selected = EditorSelection::default();
+        selected.click(&rows, rows[0].clone(), true, false);
+        selected.click(&rows, rows[2].clone(), true, false);
+        assert_eq!(selected.selected.len(), 2, "same path in different slots remains separate");
+        let mut hidden_tab = rows[0].clone(); hidden_tab.tab_id = 8;
+        rows.push(hidden_tab.clone());
+        selected.click(&rows, hidden_tab, true, false);
+        assert_eq!(selected.selected.len(), 3);
+        let old = rows[0].path.clone();
+        selected.rebind(&old, Path::new("saved.takm"));
+        assert!(selected.selected.iter().all(|id| id.path == Path::new("saved.takm")));
+        selected.retain(&rows);
+        assert!(selected.selected.is_empty(), "a reused slot or stale path cannot stay selected");
+    }
+
+    #[test]
+    fn selection_count_and_shortcuts_are_visible_even_while_folded() {
+        let ctx = egui::Context::default();
+        let groups = sample();
+        let mut selection = EditorSelection::default();
+        selection.all(&displayed_rows(&groups));
+        let mut collapsed = true;
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { super::show(ui, &groups, false, &mut collapsed, &selection); });
+        });
+        fn all_text(shape: &egui::Shape, text: &mut String) {
+            match shape { egui::Shape::Text(s) => text.push_str(s.galley.text()), egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| all_text(s, text)), _ => {} }
+        }
+        let mut text = String::new();
+        out.shapes.iter().for_each(|shape| all_text(&shape.shape, &mut text));
+        assert!(text.contains("선택 3개"));
+        assert!(text.contains("Delete 닫기 · Esc 해제"));
+    }
 
     fn entry(path: &str, mark: Option<usize>, outside: bool) -> Entry {
         let path = PathBuf::from(path);
@@ -345,6 +501,7 @@ mod tests {
         }
         let mut found = vec![];
         out.shapes.iter().for_each(|s| walk(&s.shape, &mut found));
+        found.retain(|(_, text, _)| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두"));
         found.sort_by(|a, b| (a.0.center().y.round(), a.0.left()).partial_cmp(&(b.0.center().y.round(), b.0.left())).unwrap());
         found
     }

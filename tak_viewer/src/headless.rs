@@ -301,7 +301,8 @@ mod tests {
     #[test]
     fn emg_benchmark_returns_nonzero_for_a_real_marker_only_file() {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("tak_bench_emg_no_deferred_{}_{nonce}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_bench_emg_no_deferred");
+        let dir = _temp.join(format!("tak_bench_emg_no_deferred_{}_{nonce}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("markers_only.tak");
         std::fs::write(&path, tak_core::sample_tak::sample_tak()).unwrap();

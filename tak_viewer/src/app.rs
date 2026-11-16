@@ -17,6 +17,9 @@ use crate::ui::scene::{self, SceneOptions};
 use crate::ui::theme;
 use crate::views::{self, Change, Loaded, Spot, View, MAX_VIEWS};
 
+#[path = "app_key_focus.rs"]
+pub(crate) mod key_focus;
+
 #[path = "app_undo.rs"]
 mod undo;
 use undo::History;
@@ -28,6 +31,10 @@ mod overlay_dirty;
 mod takm_save;
 #[path = "app_editors.rs"]
 mod editors;
+#[path = "app_comment_multi.rs"]
+mod comment_multi;
+#[path = "app_editor_batch.rs"]
+mod editor_batch;
 #[path = "app_ssh.rs"]
 mod remote_ui;
 #[path = "app_marker_edit.rs"]
@@ -456,8 +463,11 @@ pub struct TakViewerApp {
     comment_writer: Option<comments::Writer>,
     comment_registration: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     comment_registration_error: Option<String>,
-    comment_waiting: Vec<(usize, PathBuf, Event)>,
+    comment_waiting: Vec<(usize, PathBuf, Vec<Event>)>,
     comment_failed: Vec<(usize, PathBuf, Event)>,
+    comment_batches: Vec<comment_multi::PendingBatch>,
+    editor_selection: crate::ui::open_editors::EditorSelection,
+    editor_batch: editor_batch::EditorBatchState,
     comment_outstanding: usize,
     exit_waiting_comments: bool,
     /// A playback bar's comment request this frame: (view, what), applied after drawing.
@@ -652,6 +662,9 @@ impl TakViewerApp {
             comment_registration_error: None,
             comment_waiting: Vec::new(),
             comment_failed: Vec::new(),
+            comment_batches: Vec::new(),
+            editor_selection: Default::default(),
+            editor_batch: Default::default(),
             comment_outstanding: 0,
             exit_waiting_comments: false,
             deck_action: None,
@@ -1748,6 +1761,7 @@ impl TakViewerApp {
         let cleared = self.views[slot].range.take();
         // The new comment is the selected one (v0.17.1), in the same action.
         self.views[slot].picked = Some(c.id);
+        self.views[slot].comment_selection.single(c.id);
         self.comment_scroll = Some((self.views[slot].file_id, c.id));
         // The type strip for it (step 5; only here, where it was written).
         let file_id = self.views[slot].file_id;
@@ -1849,6 +1863,9 @@ impl TakViewerApp {
         // What changed so far is recorded first (the first click of the double click).
         let e = comment_list::Edit::new(slot, v.file_id, c, field, v.selection());
         self.observe(true);
+        self.views[slot].comment_selection.single(id);
+        self.views[slot].picked = Some(id);
+        self.views[slot].comment_marker_draft = field == Field::Markers;
         self.comment_edit = Some(e);
     }
 
@@ -1858,6 +1875,7 @@ impl TakViewerApp {
     fn cancel_comment_edit(&mut self) {
         let Some(e) = self.comment_edit.take() else { return };
         let v = &mut self.views[e.slot];
+        v.comment_marker_draft = false;
         if e.field == Field::Markers && v.file_id == e.file_id && v.data.is_some() {
             v.set_selection(e.before);
         }
@@ -1919,6 +1937,7 @@ impl TakViewerApp {
         // `push_comment` takes it into the edit's action.
         self.observe(true);
         self.comment_edit = None;
+        self.views[e.slot].comment_marker_draft = false;
         let v = &self.views[e.slot];
         let Some(c) = v.comments.list.get(e.id).cloned().filter(|_| v.file_id == e.file_id) else { return };
         if c != e.base {
@@ -2015,23 +2034,7 @@ impl TakViewerApp {
     /// Right click on a block: a delete line (with the comment's fields, for people reading the
     /// file) is appended, the block goes, Ctrl+Z can bring it back; a note in the status bar.
     fn delete_comment(&mut self, ctx: &egui::Context, slot: usize, id: u64) {
-        let Some(c) = self.views[slot].comments.list.get(id).cloned() else { return };
-        if self.comment_target(slot).is_none() {
-            return;
-        }
-        // An edit going on ends first (Esc), so its draft selection is not part of the delete.
-        self.cancel_comment_edit();
-        self.observe(true);
-        if !self.write_change(ctx, slot, EventKind::Delete, &c) {
-            return;
-        }
-        // It is not the selected comment any more (v0.17.1), in the same action.
-        let v = &mut self.views[slot];
-        if v.picked == Some(id) {
-            v.picked = None;
-        }
-        self.push_comment(slot, Change::Deleted(c), None);
-        self.history.note = Some((format!("Comment {id} deleted · Ctrl+Z"), ctx.input(|i| i.time)));
+        self.delete_comments(ctx, slot, &[id], true);
     }
 
     /// `M` held (v0.15.0), run every frame before the other keys. Cancels first (the window lost
@@ -2123,7 +2126,7 @@ impl TakViewerApp {
             self.views[slot].comments.failed = Some(reason);
             self.comment_failed.push((tag, path, event));
         } else if self.comment_registration.is_some() {
-            self.comment_waiting.push((tag, path, event));
+            self.comment_waiting.push((tag, path, vec![event]));
             self.views[slot].comments.pending_since.get_or_insert_with(Instant::now);
             self.views[slot].comments.pending += 1;
             self.comment_outstanding += 1;
@@ -2194,16 +2197,16 @@ impl TakViewerApp {
                     self.comment_registration = None;
                     let status = result.unwrap_or_else(|_| Err("Comment 저장 준비가 중단됐어요.".into()));
                     if let Err(reason) = status { self.comment_registration_error = Some(reason); }
-                    for (tag, path, event) in std::mem::take(&mut self.comment_waiting) {
-                        let submitted = self.comment_registration_error.is_none() && self.comment_writer.as_ref().is_some_and(|w| w.send(tag, path.clone(), event.clone()));
+                    for (tag, path, events) in std::mem::take(&mut self.comment_waiting) {
+                        let submitted = self.comment_registration_error.is_none() && self.comment_writer.as_ref().is_some_and(|w| w.send_batch(tag, path.clone(), events.clone()));
                         if !submitted {
-                            self.comment_failed.push((tag, path, event));
-                            self.comment_outstanding = self.comment_outstanding.saturating_sub(1);
+                            self.comment_failed.extend(events.iter().cloned().map(|event| (tag, path.clone(), event)));
+                            self.comment_outstanding = self.comment_outstanding.saturating_sub(events.len());
                             let hidden = self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()).flat_map(|runtime| runtime.views.iter_mut());
                             for host in self.views.iter_mut().chain(hidden) {
                                 let view = if host.file_id == tag { host } else if let Some(owner) = host.overlay_owner_mut().filter(|owner| owner.file_id == tag) { owner } else { continue };
                                 view.sync_shared();
-                                view.comments.pending = view.comments.pending.saturating_sub(1);
+                                view.comments.pending = view.comments.pending.saturating_sub(events.len());
                                 if view.comments.pending == 0 { view.comments.pending_since = None; }
                                 view.comments.failed = Some(self.comment_registration_error.clone().unwrap_or_else(|| "Comment 저장이 중단됐어요.".into()));
                                 view.publish_shared_file();
@@ -2217,6 +2220,7 @@ impl TakViewerApp {
         let done = w.poll();
         let now = ctx.input(|i| i.time);
         for d in done {
+            self.finish_comment_batch_event(&d);
             self.comment_outstanding = self.comment_outstanding.saturating_sub(1);
             if d.result.is_err() && d.conflict.is_none() && !d.cancelled {
                 self.comment_failed.push((d.tag, d.path.clone(), d.event.clone()));
@@ -2233,8 +2237,12 @@ impl TakViewerApp {
                 if d.cancelled { v.publish_shared_file(); continue; }
                 if let Some(conflict) = &d.conflict {
                     v.comments.list.reload_one(conflict.id, conflict.latest.clone());
-                    if conflict.latest.is_none() && v.picked == Some(conflict.id) { v.picked = None; }
-                    let message = format!("Comment {} changed in another window · reloaded", conflict.id);
+                    if conflict.latest.is_none() {
+                        let ids: Vec<_> = v.comments.list.list().iter().map(|c| c.id).collect();
+                        v.comment_selection.remove(conflict.id, &ids);
+                        v.picked = v.comment_selection.representative;
+                    }
+                    let message = d.result.as_ref().err().filter(|reason| reason.contains("저장된 Comment를 다시 읽지 못")).cloned().unwrap_or_else(|| format!("Comment {} changed in another window · reloaded", conflict.id));
                     self.history.note = Some((message.clone(), now));
                     self.notice = Some(message);
                     v.publish_shared_file();
@@ -2326,7 +2334,7 @@ impl TakViewerApp {
         // During a marker edit its cell shows the selection now.
         let live_markers = (self.marker_edit() == Some((slot, v.file_id))).then(|| v.selected_names().join(", "));
         let (first, last) = (v.pb.first, v.pb.last);
-        let input = comment_list::ListIn { list: &v.comments.list, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, live_markers, first, last };
+        let input = comment_list::ListIn { list: &v.comments.list, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, selection: &v.comment_selection, live_markers, first, last };
         let show = if v.remote.is_some() { comment_list::show_remote } else { comment_list::show };
         let mut out = show(ui, input, &mut self.comment_order, &mut self.comment_edit);
         #[cfg(test)]
@@ -2383,6 +2391,10 @@ impl TakViewerApp {
         let editing = self.comment_edit.as_ref().map(|e| e.id);
         match out.action {
             Some(ListAction::Select(id) | ListAction::Goto(id)) if editing == Some(id) => {}
+            Some(ListAction::MultiSelect { id, ctrl, shift }) => {
+                self.cancel_comment_edit();
+                self.comment_gesture(slot, id, ctrl, shift);
+            }
             Some(ListAction::Select(id)) => {
                 self.cancel_comment_edit();
                 self.select_row(slot, id);
@@ -2398,7 +2410,7 @@ impl TakViewerApp {
                 self.views[slot].goto_comment(id, now);
             }
             Some(ListAction::Delete(id)) => self.delete_comment(ctx, slot, id),
-            Some(ListAction::Sort(key)) => self.comment_sort = self.comment_sort.clicked(key),
+            Some(ListAction::Sort(key)) => self.set_comment_sort(self.comment_sort.clicked(key)),
             Some(ListAction::Edit(id, field)) if editing != Some(id) => {
                 if slot == self.active {
                     self.start_comment_edit(id, field);
@@ -2480,7 +2492,6 @@ impl TakViewerApp {
             self.save_markers(ctx, self.active, false, false);
         }
         self.marker_keys(ctx);
-        let renaming = self.explorer.is_renaming(ctx.cumulative_pass_nr());
         // `T` (step 5): the selected comment's next type. A real press only (an auto-repeat
         // of a held T is used up and does nothing more).
         let t = ctx.input_mut(|i| {
@@ -2566,21 +2577,6 @@ impl TakViewerApp {
         for (key, which) in [(Key::Num1, 0), (Key::Num2, 1)] {
             if pressed(key) && v.overlay.is_some() {
                 v.shown[which] = !v.shown[which];
-            }
-        }
-        // Esc while a saved-folder name is being edited only cancels that edit; while a list
-        // is open (e.g. a plate graph's "줄" list) it only closes the list. Else it clears the
-        // frame range first, and the marker selection only when there is no range. (While M is
-        // held, `handle_hold` has already used the Esc up to cancel.)
-        let popup = ctx.memory(|m| m.any_popup_open());
-        // (An edit of the COMMENTS pane took its Esc already, `comment_edit_keys`.) The selected
-        // comment is let go with the marker selection (v0.17.1).
-        if !renaming && !popup && pressed(Key::Escape) {
-            if v.range.is_some() {
-                v.range = None;
-            } else {
-                v.clear_selection();
-                v.picked = None;
             }
         }
         if no_gap {
@@ -2975,6 +2971,8 @@ impl TakViewerApp {
             tag_size = tag_size.max(t.area().max - rect.min);
             name_tag = if name_tag.is_positive() { name_tag.union(t.area()) } else { t.area() };
         }
+        key_focus::region(ui, row, key_focus::Target::Markers(slot));
+        key_focus::region(ui, name_tag, key_focus::Target::Blocked);
         let chosen = several && slot == self.active && !capturing;
         let hud = match &self.capture {
             Some(c) if slot == self.active => c.hud_label(),
@@ -3255,9 +3253,14 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         let app = &mut *self.app;
-        // Floating dock windows have independent UIs; the central panel's disabled state does
-        // not reach them while a dirty-file decision is pending.
         if app.dirty_prompt.is_some() { ui.disable(); }
+        let key_target = match *tab {
+            Pane::View(slot) => key_focus::Target::Markers(usize::from(slot)),
+            Pane::Graph => key_focus::Target::Markers(app.active),
+            Pane::Comments => key_focus::Target::Comments,
+            _ => key_focus::Target::Blocked,
+        };
+        key_focus::region(ui, ui.available_rect_before_wrap(), key_target);
         if self.open.is_empty() && !matches!(tab, Pane::Empty | Pane::LayoutTabs | Pane::Explorer) {
             crate::ui::empty::panel(ui, *tab);
             return;
@@ -3291,9 +3294,14 @@ impl egui_dock::TabViewer for Tabs<'_> {
             }
             Pane::Explorer => {
                 // OPEN EDITORS on top (`ui/open_editors.rs`), the WORKSPACE tree under it.
-                let groups = app.editor_groups(&self.order);                if let Some(a) = crate::ui::open_editors::show(ui, &groups, app.workspace.is_full(), &mut app.explorer.editors_collapsed) {
+                let groups = app.editor_groups(&self.order);
+                app.editor_selection.retain(&crate::ui::open_editors::displayed_rows(&groups));
+                let editors_min = ui.cursor().min;
+                if let Some(a) = crate::ui::open_editors::show(ui, &groups, app.workspace.is_full(), &mut app.explorer.editors_collapsed, &app.editor_selection) {
                     self.ed_action = Some(a);
                 }
+                let editors_rect = egui::Rect::from_min_max(editors_min, egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
+                key_focus::region(ui, editors_rect, key_focus::Target::Editors);
                 let current = app.view().target().map(Path::to_path_buf);
                 // Other open files: the other views' files and every laid-over file.
                 let mut others: Vec<PathBuf> = self
@@ -3450,6 +3458,18 @@ impl Drop for GraphFrame {
 impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        for (slot, view) in self.views.iter_mut().enumerate() {
+            view.comment_marker_draft = self.comment_edit.as_ref().is_some_and(|edit|
+                edit.field == Field::Markers && edit.slot == slot && edit.file_id == view.file_id);
+        }
+        let initial_focus = match self.dock.find_active_focused().map(|(_, pane)| *pane) {
+            Some(Pane::View(slot)) => key_focus::Target::Markers(usize::from(slot)),
+            Some(Pane::Graph) => key_focus::Target::Markers(self.active),
+            Some(Pane::Comments) => key_focus::Target::Comments,
+            _ => key_focus::Target::Blocked,
+        };
+        key_focus::begin_frame(ctx, self.capture.is_some() || self.dirty_prompt.is_some()
+            || self.hold.is_some() || self.comment_edit.is_some() || self.layout_strip.is_renaming(), initial_focus);
         let now = ctx.input(|i| i.time);
         self.layout_time = now;
         if !self.no_persist && !self.exit_approved && ctx.input(|i| i.viewport().close_requested()) {
@@ -3500,7 +3520,7 @@ impl TakViewerApp {
             self.open_path_dialog();
         }
         let tab_keys = global_keys && self.capture.is_none();
-        if tab_keys && exact_key(ctx, Key::T, true, true, false) { self.reopen_layout_item(); }
+        if tab_keys && exact_key(ctx, Key::T, true, true, false) { self.reopen_layout_item_with_context(ctx); }
         if tab_keys && exact_key(ctx, Key::T, true, false, false) { self.new_layout_tab(); }
         if tab_keys && (exact_key(ctx, Key::Tab, true, true, false) || exact_key(ctx, Key::PageUp, true, false, false)) {
             self.step_layout_tab(-1);
@@ -3635,6 +3655,7 @@ impl TakViewerApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(rect.width());
                     ui.set_max_width(rect.width());
+                    key_focus::region(ui, rect, key_focus::Target::Blocked);
                     ui.add_enabled_ui(self.dirty_prompt.is_none(), |ui| self.layout_strip.show(ui, &self.layout_tabs)).inner
                 }).inner;
             for action in actions { self.layout_strip_action(ctx, action); }
@@ -3907,6 +3928,11 @@ impl TakViewerApp {
             });
             self.show_help = open;
         }
+        // Current click geometry and higher-priority widgets settle before destructive keys.
+        key_focus::finish_frame(ctx);
+        self.comment_list_keys(ctx);
+        self.editor_list_keys(ctx);
+        self.marker_focus_keys(ctx);
         // Last: what a person changed this frame becomes an undo action (`app_undo.rs`).
         self.graph_in_one_place();
         self.observe_frame(ctx);
@@ -4120,6 +4146,8 @@ mod tests {
     use super::*;
     use eframe::{App, Storage};
 
+    include!("app_key_focus_tests.rs");
+    include!("app_merge_tests.rs");
     include!("app_graph_selection_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
@@ -5565,7 +5593,8 @@ mod tests {
     #[test]
     fn ctrl_w_close_and_undo_restore_the_view_spot_range_and_overlay_as_one_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("ctrl_w_undo");
+        let _dir_guard = comment_dir("ctrl_w_undo");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, files) = editors_app(&ctx, &dir);
         app.activate(0);
         app.views[0].pb.set_frame(6, 0.0);
@@ -5610,7 +5639,6 @@ mod tests {
         redo_key(&ctx, &mut app);
         assert_eq!(app.open_views(), vec![1]);
         assert_eq!(app.file_count(), 1);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5845,27 +5873,24 @@ mod tests {
         assert!(app.views[0].selected.is_empty());
     }
 
+    include!("app_comment_multi_tests.rs");
+
     // ───────────── Comments (v0.14.0) ─────────────
 
     /// A fresh folder under the system temp folder (outside the repository) for comment files.
-    fn comment_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tak_viewer_comments_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn comment_dir(name: &str) -> tak_core::test_support::TempDir {
+        tak_core::test_support::TempDir::new(&format!("tak_viewer_comments_{name}"))
     }
 
     /// Bytes of a `.takm` made from `tak_core`'s sample TAK (made once per test run).
     fn fixture_takm() -> &'static [u8] {
         static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         BYTES.get_or_init(|| {
-            let d = std::env::temp_dir().join(format!("tak_viewer_fixture_takm_{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
+            let _temp = tak_core::test_support::TempDir::new("tak_viewer_fixture_takm");
+            let d = _temp.to_path_buf();
             std::fs::write(d.join("fixture.tak"), tak_core::sample_tak::sample_tak()).unwrap();
             let made = tak_core::takm::convert(&d.join("fixture.tak"), None).unwrap();
             let bytes = std::fs::read(made.out).unwrap();
-            let _ = std::fs::remove_dir_all(&d);
             bytes
         })
     }
@@ -5975,7 +6000,8 @@ mod tests {
     #[test]
     fn failed_comments_block_every_close_path_and_retry_in_order() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("failed_retry_close");
+        let _dir_guard = comment_dir("failed_retry_close");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let path = dir.join("a.takm");
         let original = std::fs::read(&path).unwrap();
@@ -6013,13 +6039,13 @@ mod tests {
         assert!(app.comment_failed.is_empty());
         let parsed = tak_core::takm::read_comments(&path).unwrap();
         assert_eq!(parsed.events.iter().map(|e| e.markers.clone()).collect::<Vec<_>>(), vec![vec!["M"], vec!["N"]]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn pending_comments_block_tab_close_replacement_and_exit() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("pending_comment_close");
+        let _dir_guard = comment_dir("pending_comment_close");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].comments.pending = 1;
         app.close_view(0);
@@ -6034,13 +6060,13 @@ mod tests {
         assert!(!app.exit_approved);
         app.dirty_prompt = None;
         app.views[0].comments.pending = 0;
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn failed_comment_can_be_discarded_after_write_finishes() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("failed_comment_discard");
+        let _dir_guard = comment_dir("failed_comment_discard");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let path = dir.join("a.takm");
         let original = std::fs::read(&path).unwrap();
@@ -6055,13 +6081,13 @@ mod tests {
         assert!(app.views[0].data.is_none());
         assert!(app.comment_failed.is_empty());
         assert!(tak_core::takm::read_comments(&path).unwrap().events.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn failed_id_reservation_can_retry_on_create_and_visible_retry() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("id_reservation_retry");
+        let _dir_guard = comment_dir("id_reservation_retry");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         for use_create in [true, false] {
             app.views[0].comments.id_pool = None;
@@ -6088,7 +6114,8 @@ mod tests {
     #[test]
     fn stale_other_window_edit_and_delete_reload_the_latest_comment() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("stale_window_reload");
+        let _dir_guard = comment_dir("stale_window_reload");
+        let dir = _dir_guard.to_path_buf();
         let mut a = comment_app(&ctx, &dir, false);
         a.add_comment(&ctx, 0, vec!["M".into()], 1, 1);
         until_saved(&ctx, &mut a);
@@ -6118,7 +6145,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::fs::OpenOptions;
         let ctx = egui::Context::default();
-        let dir = comment_dir("held_lock_discard");
+        let _dir_guard = comment_dir("held_lock_discard");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.ensure_comment_writer(&ctx);
         for _ in 0..2000 {
@@ -6130,7 +6158,7 @@ mod tests {
         let path = dir.join("a.takm");
         let canonical = std::fs::canonicalize(&path).unwrap();
         let key = format!("{:x}", Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
-        let lock = OpenOptions::new().read(true).write(true).open(format!("/tmp/.tak_viewer_{key}.lock")).unwrap();
+        let lock = OpenOptions::new().read(true).write(true).open(tak_core::test_support::coordination_root().join(format!(".tak_viewer_{key}.lock"))).unwrap();
         lock.lock().unwrap();
         app.add_comment(&ctx, 0, vec![], 1, 1);
         assert_eq!(app.views[0].comments.pending, 1);
@@ -6168,7 +6196,8 @@ mod tests {
     #[test]
     fn legacy_duplicate_ids_are_read_but_not_edited_ambiguously() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("legacy_duplicate");
+        let _dir_guard = comment_dir("legacy_duplicate");
+        let dir = _dir_guard.to_path_buf();
         let path = dir.join("a.takm");
         let a = Comment { id: 1, markers: vec!["M".into()], start: 0, end: 0, comment_type: String::new(), text: String::new() };
         let b = Comment { markers: vec!["N".into()], ..a.clone() };
@@ -6178,7 +6207,6 @@ mod tests {
         assert!(!app.set_comment_type(&ctx, 0, 1, "Jitter"));
         assert_eq!(app.views[0].comments.list.len(), 2);
         assert!(app.notice.as_deref().is_some_and(|text| text.contains("duplicate Comment IDs")));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn file_events(dir: &Path) -> Vec<comments::Event> {
@@ -6192,7 +6220,8 @@ mod tests {
     #[test]
     fn m_saves_the_selected_markers_and_the_range_then_clears_the_range() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("m_key");
+        let _dir_guard = comment_dir("m_key");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         assert!(no_events(&dir.join("a.takm")), "no file before the first comment");
         // (Since v0.15.2 M without a selection makes a comment too: see
@@ -6224,13 +6253,13 @@ mod tests {
         assert!(t.len() == 25 && t[10] == b'T' && (t[19] == b'+' || t[19] == b'-') && t[22] == b':', "local time with offset: {}", ev[0].time);
         let (status, _, warn) = app.comment_status(0, ctx.input(|i| i.time)).unwrap();
         assert_eq!((status.as_str(), warn), ("Comments 2 · saved", false));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_comment_button_makes_a_comment_with_or_without_a_selection() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("button");
+        let _dir_guard = comment_dir("button");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let out = frame_with(&ctx, &mut app, vec![]);
         let button = text_rects(&out, "Comment");
@@ -6250,13 +6279,13 @@ mod tests {
         assert_eq!(made, vec![(vec![], 0), (vec!["N".to_owned()], 6)]);
         until_saved(&ctx, &mut app);
         assert_eq!(file_events(&dir).len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn comments_without_a_marker_are_made_shown_by_number_keep_the_selection_on_click_and_undo() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("no_marker");
+        let _dir_guard = comment_dir("no_marker");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let comment = |app: &TakViewerApp, id| app.views[0].comments.list.get(id).map(|c| (c.markers.clone(), c.start, c.end));
         // Short M: the current frame.
@@ -6295,9 +6324,10 @@ mod tests {
         click_at(&ctx, &mut app, bar.band(4.5) - egui::vec2(0.0, 2.5));
         assert_eq!((app.views[0].pb.frame, sel(&app), steps(&app, 0)), (2, (vec![1], Some(1)), (before.0 + 1, 0)));
         undo_key(&ctx, &mut app);
-        // (Since v0.17.1 the click also selects comment 2; undone, comment 3, made last, is the
-        // selected one again.)
-        assert_eq!((app.views[0].pb.frame, note(&app).as_str()), (5, "Undo · Frame 5 · Comment 3 selected"));
+        // The direct marker pick cleared the prior Comment selection. Undo the band click
+        // restores that marker-only selection together with its frame.
+        assert_eq!((app.views[0].pb.frame, note(&app).as_str()), (5, "Undo · Frame 5 · Comment deselected"));
+        assert_eq!(app.views[0].picked, None);
         // Undo / redo / right-click delete as for any comment.
         undo_key(&ctx, &mut app);
         assert_eq!((comment(&app, 3), app.views[0].range, note(&app)), (None, Some((6, 8)), "Undo · Comment 3 removed".to_owned()));
@@ -6309,13 +6339,13 @@ mod tests {
         undo_key(&ctx, &mut app);
         assert_eq!(comment(&app, 2), Some((vec![], 2, 5)));
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_narrow_bar_has_comment_in_its_more_menu() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("narrow");
+        let _dir_guard = comment_dir("narrow");
+        let dir = _dir_guard.to_path_buf();
         let mut app = two_views(&ctx);
         let tak = dir.join("a.takm");
         let (_tx, rx) = std::sync::mpsc::channel();
@@ -6332,13 +6362,13 @@ mod tests {
         assert_eq!(app.views[1].comments.list.len(), 1);
         until_saved(&ctx, &mut app);
         assert_eq!(file_events(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn takes_under_the_repository_input_folder_get_no_comment_file() {
         let ctx = egui::Context::default();
-        let root = comment_dir("input_repo");
+        let _root_guard = comment_dir("input_repo");
+        let root = _root_guard.to_path_buf();
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "x").unwrap();
@@ -6355,7 +6385,6 @@ mod tests {
         assert!(app.views[0].comments.list.is_empty(), "neither the button nor M");
         assert!(no_events(&root.join("input").join("raw").join("a.takm")));
         assert!(app.comment_writer.is_none(), "nothing was sent to be written");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `<dir>/a.comments.csv` with comment 1 (N, M; frames 3–6) and comment 2 (M; frame 8),
@@ -6383,7 +6412,8 @@ mod tests {
     #[test]
     fn a_click_on_a_block_goes_there_and_a_drag_from_it_picks_a_range() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("block_click");
+        let _dir_guard = comment_dir("block_click");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comment_app(&ctx, &dir, false);
         assert_eq!(ids(&app), vec![1, 2]);
@@ -6405,7 +6435,6 @@ mod tests {
         assert_eq!(app.views[0].range, None);
         // The file was only read.
         assert_eq!(file_events(&dir).len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Right click at `at` (move there, press, let go, one more frame); returns that frame.
@@ -6420,7 +6449,8 @@ mod tests {
     #[test]
     fn a_right_click_on_a_block_deletes_it_at_once_the_one_in_the_row_under_the_pointer() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("delete");
+        let _dir_guard = comment_dir("delete");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         // Comment 3 (frames 4–5) overlaps comment 1 (3–6): since step 6 they share the band's
         // height, 1 in the upper row, 3 in the lower one.
@@ -6449,13 +6479,13 @@ mod tests {
         // Read again (the file opened later): still only comment 2, and the next id is 4.
         let again = comment_app(&ctx, &dir, false);
         assert_eq!((ids(&again), again.views[0].comments.list.next_id()), (vec![2], 4));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn overlapping_blocks_have_rows_and_a_click_or_right_click_hits_the_one_in_its_row() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("band_rows");
+        let _dir_guard = comment_dir("band_rows");
+        let dir = _dir_guard.to_path_buf();
         // Three comments over frames 3–6: three rows (by start frame), 10/3 pt each.
         comments_on_disk(&dir, &[(1, &["M"], 1, 8), (2, &["N"], 2, 7), (3, &[], 3, 6)]);
         let mut app = comment_app(&ctx, &dir, false);
@@ -6481,14 +6511,14 @@ mod tests {
         right_click_at(&ctx, &mut app, bar.band(4.5));
         assert!(ids(&app).is_empty());
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_marker_graph_shows_the_comments_of_its_marker_and_follows_add_edit_delete_and_undo() {
         use crate::ui::graph::{SPAN_FILL, SPAN_FILL_PICKED};
         let ctx = egui::Context::default();
-        let dir = comment_dir("graph_spans");
+        let _dir_guard = comment_dir("graph_spans");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let m = app.views[0].data.as_ref().unwrap().markers.iter().position(|x| x.name == "M").unwrap();
         app.views[0].select(m, false);
@@ -6528,7 +6558,6 @@ mod tests {
         assert_eq!(ids(&app), vec![1, 9]);
         assert_eq!(bands(&ctx, &mut app), (0, 0));
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Comment while watching: M held (v0.15.0) ─────────────
@@ -6572,7 +6601,8 @@ mod tests {
     #[test]
     fn holding_m_while_the_frame_moves_saves_that_range_with_the_markers_selected_at_key_down() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("hold");
+        let _dir_guard = comment_dir("hold");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].select(0, false);
         app.views[0].select(1, true);
@@ -6615,13 +6645,13 @@ mod tests {
         let ev = file_events(&dir);
         assert_eq!(ev.iter().map(|e| (e.kind, e.id, e.start, e.end)).collect::<Vec<_>>(), vec![(comments::Kind::Add, 1, 2, 7), (comments::Kind::Add, 2, 2, 6)]);
         assert_eq!(ev[1].markers, vec!["N".to_owned()]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn auto_repeat_while_m_is_down_neither_starts_nor_ends_anything() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("repeat");
+        let _dir_guard = comment_dir("repeat");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].select(0, false);
         app.views[0].pb.set_frame(2, 0.0);
@@ -6641,13 +6671,13 @@ mod tests {
         key_up(&ctx, &mut app, Key::M);
         assert_eq!(spans(&app), vec![(1, 2, 5), (2, 5, 5)]);
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_short_press_is_the_v0_14_comment_and_a_held_range_beats_a_picked_one() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("short");
+        let _dir_guard = comment_dir("short");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].select(0, false);
         // Down and up at the same frame (in two frames): no range = that frame.
@@ -6674,13 +6704,13 @@ mod tests {
         assert_eq!(app.views[0].range, None, "the earlier range is dropped");
         until_saved(&ctx, &mut app);
         assert_eq!(file_events(&dir).len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_wrap_past_the_last_frame_closes_the_held_range_there_and_the_later_release_adds_nothing() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("wrap");
+        let _dir_guard = comment_dir("wrap");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].select(0, false);
         app.views[0].pb.set_frame(6, 0.0);
@@ -6712,13 +6742,13 @@ mod tests {
         assert_eq!(spans(&app).len(), 2);
         until_saved(&ctx, &mut app);
         assert_eq!(file_events(&dir).len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn esc_focus_loss_another_view_or_another_file_cancel_a_hold() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("cancel");
+        let _dir_guard = comment_dir("cancel");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.views[0].select(0, false);
         let start = |app: &mut TakViewerApp| {
@@ -6767,13 +6797,13 @@ mod tests {
         assert!(app.hold.is_none() && app.views[0].comments.list.is_empty());
         assert!(app.comment_writer.is_none(), "nothing was ever sent");
         assert!(no_events(&dir.join("a.takm")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn m_does_nothing_in_a_text_field_or_in_a_command_run() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("hold_none");
+        let _dir_guard = comment_dir("hold_none");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         // (Since v0.15.2 no marker selected is no reason any more: `comments_without_a_marker_…`.)
         // A text field has the keyboard (path dialog): M is a letter there.
@@ -6801,7 +6831,6 @@ mod tests {
         assert_eq!(ids(&app), vec![1, 2]);
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Undo / redo (v0.15.0) ─────────────
@@ -6821,7 +6850,8 @@ mod tests {
     #[test]
     fn ctrl_z_and_ctrl_y_undo_and_redo_adds_and_deletes_by_appending_lines() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo");
+        let _dir_guard = comment_dir("undo");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let undo = |app: &mut TakViewerApp| run_frame(&ctx, app, &[(ctrl(), Key::Z)]);
         let redo = |app: &mut TakViewerApp| run_frame(&ctx, app, &[(ctrl(), Key::Y)]);
@@ -6907,13 +6937,13 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(text_rects(&out, &note(&app)).len(), 1, "{} painted", note(&app));
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn one_history_for_the_app_kept_with_a_new_file_and_off_while_m_is_held_or_typing() {
         let ctx = egui::Context::default();
-        let (dir_a, dir_b) = (comment_dir("undo_a"), comment_dir("undo_b"));
+        let (_dir_a_guard, _dir_b_guard) = (comment_dir("undo_a"), comment_dir("undo_b"));
+        let (dir_a, dir_b) = (_dir_a_guard.to_path_buf(), _dir_b_guard.to_path_buf());
         let mut app = comment_app(&ctx, &dir_a, false);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         let tak_b = dir_b.join("a.takm");
@@ -6971,8 +7001,6 @@ mod tests {
         assert_eq!(steps(&app, 0), (0, 0));
         assert_eq!(note(&app), "Undo · 2 skipped");
         assert_eq!(tail_read(&dir_a.join("a.takm")).unwrap().unwrap().comments().len(), 2, "a.tak's comments stay");
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     // ───────────── Undo / redo of the range and the selection too (v0.15.1) ─────────────
@@ -7138,7 +7166,8 @@ mod tests {
     #[test]
     fn select_range_add_and_delete_go_back_and_forward_in_order_by_appending_lines() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_mixed");
+        let _dir_guard = comment_dir("undo_mixed");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let bar = Bar::of(&app, 0);
         let state = |app: &TakViewerApp| (sel(app).0, app.views[0].range, ids(app));
@@ -7177,14 +7206,14 @@ mod tests {
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["add", "delete", "add", "delete", "add", "delete"]);
         assert!(ev.iter().all(|e| (e.id, e.markers.clone(), e.start, e.end) == (1, vec!["N".to_owned()], 2, 7)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_block_click_is_one_action_with_its_frame_move_and_selection() {
         // v0.15.1 left the frame move out; since v0.16.0 every frame move is undone too.
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_block");
+        let _dir_guard = comment_dir("undo_block");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comment_app(&ctx, &dir, false);
         let bar = Bar::of(&app, 0);
@@ -7198,7 +7227,6 @@ mod tests {
         click_at(&ctx, &mut app, bar.band(4.6));
         assert_eq!(steps(&app, 0), (1, 0));
         assert_eq!(file_events(&dir).len(), 2, "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7268,7 +7296,8 @@ mod tests {
     #[test]
     fn selection_and_range_undo_work_where_comments_cannot_be_written() {
         let ctx = egui::Context::default();
-        let root = comment_dir("undo_input_repo");
+        let _root_guard = comment_dir("undo_input_repo");
+        let root = _root_guard.to_path_buf();
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "x").unwrap();
@@ -7293,13 +7322,13 @@ mod tests {
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].range, steps(&app, 0)), (None, (1, 1)), "the comment step went, the range step was undone");
         assert!(app.views[0].comments.list.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn no_undo_while_m_is_held_or_a_text_field_has_the_keys_and_ctrl_shift_z_does_nothing() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_off");
+        let _dir_guard = comment_dir("undo_off");
+        let dir = _dir_guard.to_path_buf();
         // Marker M has no frames 4–6: Z / Shift+Z jump to that gap.
         let mut take = views::sample_take(dir.join("a.takm").to_str().unwrap(), &["M", "N"]);
         let t = &mut take.trajectories[0];
@@ -7355,7 +7384,6 @@ mod tests {
         undo_key(&ctx, &mut app);
         assert_eq!((ids(&app), app.views[0].range), (vec![], Some((8, 8))), "the add undone, its range back");
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
 
@@ -7423,12 +7451,12 @@ mod tests {
         let opacity = app.settings.graph_opacity;
         round_trip(&ctx, &mut app, "graph opacity", |_, a| a.settings.graph_opacity = 40, |a| a.settings.graph_opacity, &format!("Undo · Opacity {opacity}%"));
         round_trip(&ctx, &mut app, "layout (Ctrl+B)", |c, a| run_frame(c, a, &[(ctrl(), Key::B)]), |a| (dock::shape(&a.dock), a.hidden.clone()), "Undo · Layout");
-        let dir = comment_dir("undo_folder");
+        let _dir_guard = comment_dir("undo_folder");
+        let dir = _dir_guard.to_path_buf();
         round_trip(&ctx, &mut app, "saved folder", |_, a| { a.open_workspace(dir.clone()); }, |a| a.workspace.roots().to_vec(), "Undo · ");
         assert!(note(&app).ends_with("Folders"), "{}", note(&app));
         // Each was one action of its own: these 12 and nothing else.
         assert_eq!(steps(&app, 0), (n0 + 12, 0), "{:?}", app.history.kinds());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7562,7 +7590,8 @@ mod tests {
     #[test]
     fn arrive_waits_for_comments_after_the_staged_markers_are_already_visible() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("staged_comments_arrive");
+        let _dir_guard = comment_dir("staged_comments_arrive");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         let path = dir.join("a.takm");
@@ -7580,7 +7609,6 @@ mod tests {
         assert_eq!(ids(&app), vec![1, 2]);
         assert!(app.views[0].comments_rx.is_none());
         drop(app);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Files that exist (`not a take`: the tests hand the view a sample instead, `arrive`). A
@@ -7603,7 +7631,8 @@ mod tests {
     #[test]
     fn undoing_an_open_shows_the_file_before_again_and_its_actions_come_back_once_it_is_read() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_open");
+        let _dir_guard = comment_dir("undo_open");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let f = take_files(&dir, &["a.takm", "b.takm"]);
         let (a, b) = (f[0].clone(), f[1].clone());
@@ -7666,13 +7695,13 @@ mod tests {
         until_saved(&ctx, &mut app);
         let kinds: Vec<String> = file_events(&dir).iter().map(|e| format!("{} {}", e.kind.as_str(), e.id)).collect();
         assert_eq!(kinds, vec!["add 1", "add 2", "add 3", "delete 3", "add 3"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_action_on_a_file_that_is_gone_is_dropped_and_the_same_key_goes_on() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_gone");
+        let _dir_guard = comment_dir("undo_gone");
+        let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
@@ -7691,13 +7720,13 @@ mod tests {
         undo_key(&ctx, &mut app);
         assert_eq!((note(&app).as_str(), steps(&app, 0)), ("Undo · Close b.tak · 2 skipped", (0, 1)));
         assert_eq!(app.views[0].target(), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn undo_and_redo_keep_four_views_at_most_and_share_repeated_files() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_views");
+        let _dir_guard = comment_dir("undo_views");
+        let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak", "c.tak", "d.tak", "e.tak"]);
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
@@ -7749,13 +7778,13 @@ mod tests {
         }
         let again: Vec<Option<PathBuf>> = (0..MAX_VIEWS).map(|k| app.views[k].target().map(Path::to_path_buf)).collect();
         assert_eq!((again, steps(&app, 0)), (end, (n, 0)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn command_runs_record_no_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("undo_command_run");
+        let _dir_guard = comment_dir("undo_command_run");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, true);
         for _ in 0..3 {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowRight)]);
@@ -7767,7 +7796,6 @@ mod tests {
         assert_eq!(steps(&app, 0), (0, 0));
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].pb.frame, sel(&app).0, app.views[0].range), (3, vec![1], Some((3, 3))), "nothing undone");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7820,7 +7848,8 @@ mod tests {
     #[test]
     fn quick_label_defers_real_scene_clicks_to_comment_marker_edit_and_held_m() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("quick_comment_click");
+        let _dir_guard = comment_dir("quick_comment_click");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comments_tab_app(&ctx, &dir, false);
         app.add_comment(&ctx, 0, vec!["M".into()], 0, 0);
         until_saved(&ctx, &mut app);
@@ -7842,7 +7871,6 @@ mod tests {
         assert!(!app.marker_job_running(0));
         key_up(&ctx, &mut app, Key::M);
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `comments_tab_app` with these marker names.
@@ -7962,7 +7990,8 @@ mod tests {
     #[test]
     fn the_comments_tab_lists_sorts_goes_to_and_deletes_like_the_band() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_list");
+        let _dir_guard = comment_dir("tab_list");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comments_tab_app(&ctx, &dir, false);
         assert_eq!(shown_ids(&ctx, &mut app), vec![1, 2], "first: # from the small end");
@@ -7992,7 +8021,8 @@ mod tests {
         let n = app.history.undo.len();
         let number = comment_list::id_point(row_of(&ctx, &mut app, 1));
         double_click(&ctx, &mut app, number);
-        let mut band = comment_app(&ctx, &comment_dir("tab_list_band"), false);
+        let _band_guard = comment_dir("tab_list_band");
+        let mut band = comment_app(&ctx, &_band_guard, false);
         band.views[0].comments.list = app.views[0].comments.list.clone();
         band.quiet();
         let bar = Bar::of(&band, 0);
@@ -8017,13 +8047,13 @@ mod tests {
         until_saved(&ctx, &mut app);
         let kinds: Vec<String> = file_events(&dir).iter().map(|e| format!("{} {}", e.kind.as_str(), e.id)).collect();
         assert_eq!(kinds, vec!["add 1", "add 2", "delete 2", "add 2"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_row_click_selects_without_moving_or_pausing_and_only_a_double_click_on_the_number_goes_there() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_row_dbl");
+        let _dir_guard = comment_dir("tab_row_dbl");
+        let dir = _dir_guard.to_path_buf();
         let mut app = long_tab_app(&ctx, &dir);
         let play = |ctx: &egui::Context, app: &mut TakViewerApp| {
             let now = ctx.input(|i| i.time);
@@ -8090,13 +8120,13 @@ mod tests {
         // The line at the top says what `#` does.
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(text_rects(&out, "Comment 1 선택됨 · # 두 번 = 첫 프레임 · 칸 두 번 = 고치기").len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn identical_comments_are_selected_one_by_one_and_the_selected_row_stands_out() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_twins");
+        let _dir_guard = comment_dir("tab_twins");
+        let dir = _dir_guard.to_path_buf();
         // Two comments with the same markers and frames (the user's case).
         comments_on_disk(&dir, &[(1, &["M"], 2, 5), (2, &["M"], 2, 5)]);
         let mut app = comments_tab_app(&ctx, &dir, false);
@@ -8141,13 +8171,13 @@ mod tests {
         app.views[0].show(views::sample_data(dir.join("b.tak").to_str().unwrap(), &["M"]), rx, 77, 1.0, 0.0);
         assert_eq!(picked(&app), None);
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_double_click_on_markers_edits_them_and_enter_saves_one_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_markers");
+        let _dir_guard = comment_dir("tab_markers");
+        let dir = _dir_guard.to_path_buf();
         comments_on_disk(&dir, &[(1, &["M", "N", "O"], 2, 5), (2, &["N"], 7, 8)]);
         let mut app = tab_app_named(&ctx, &dir, false, &["M", "N", "O"]);
         let place = place_of(&app, Pane::Comments);
@@ -8217,13 +8247,13 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Enter)]);
         assert!(comment(&app, 2).markers.is_empty());
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn esc_cancels_an_edit_and_leaves_nothing_to_undo_and_the_selection_never_edits_by_itself() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_esc");
+        let _dir_guard = comment_dir("tab_esc");
+        let dir = _dir_guard.to_path_buf();
         comments_on_disk(&dir, &[(1, &["M", "N", "O"], 2, 5), (2, &["N"], 7, 8)]);
         let mut app = tab_app_named(&ctx, &dir, false, &["M", "N", "O"]);
         // Outside an edit, marker selection changes (Labels, 3D, Esc) never change a comment,
@@ -8270,20 +8300,25 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowRight)]);
         assert_eq!(app.views[0].pb.frame, f + 1);
         assert!(app.comment_edit.is_some());
-        // Then the Esc order: the edit, the range, the selection with the selected comment.
+        // Comments focus: cancel the edit first, then clear Comment/marker selection while
+        // keeping the frame range. Switching to 3D restores the normal range-first Esc.
         for _ in 0..3 {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         }
-        assert_eq!((app.comment_edit.is_none(), app.views[0].range, sel(&app), picked(&app)), (true, None, (vec![], None), None));
+        assert_eq!((app.comment_edit.is_none(), app.views[0].range, sel(&app), picked(&app)), (true, Some((1, 2)), (vec![], None), None));
+        let empty = empty_3d(&app);
+        tap(&ctx, &mut app, empty);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
+        assert_eq!(app.views[0].range, None);
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn another_row_the_tab_going_away_or_a_new_file_cancel_an_edit() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_cancel");
+        let _dir_guard = comment_dir("tab_cancel");
+        let dir = _dir_guard.to_path_buf();
         comments_on_disk(&dir, &[(1, &["M", "N", "O"], 2, 5), (2, &["N"], 7, 8)]);
         let mut app = tab_app_named(&ctx, &dir, false, &["M", "N", "O"]);
         let [markers, ..] = cells_of(&ctx, &mut app, 1);
@@ -8320,13 +8355,13 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.comment_edit.is_none());
         assert_eq!(line_count(&dir), 2, "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn typed_frames_are_saved_exactly_clamped_and_swapped_and_the_sort_follows() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_frames");
+        let _dir_guard = comment_dir("tab_frames");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let h = header(&ctx, &mut app, "Frames");
@@ -8372,7 +8407,6 @@ mod tests {
         file_matches_memory(&ctx, &mut app, &dir);
         let ev = file_events(&dir);
         assert!(ev[2..].iter().all(|e| e.kind == comments::Kind::Edit && e.markers == vec!["N", "GONE", "M"]), "the markers as they were");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── dragging a frame number ("hot text", v0.17.3) ─────────────
@@ -8456,7 +8490,8 @@ mod tests {
     #[test]
     fn a_dragged_frame_box_moves_its_number_and_the_view_and_enter_saves_it_as_one_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_scrub");
+        let _dir_guard = comment_dir("tab_scrub");
+        let dir = _dir_guard.to_path_buf();
         let mut app = long_tab_app(&ctx, &dir);
         let up = egui::vec2(0.0, -1.0);
         // Double click Frames: the edit; the view stays at 1500 (v0.27.3: only `#` goes there).
@@ -8515,13 +8550,13 @@ mod tests {
         assert_eq!((comment(&app, 1).start, comment(&app, 1).end, app.views[0].pb.frame), (990, 1305, 1310));
         until_saved(&ctx, &mut app);
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_dragged_frame_box_stops_at_the_file_ends_and_at_the_other_box_and_esc_puts_all_back() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_scrub_ends");
+        let _dir_guard = comment_dir("tab_scrub_ends");
+        let dir = _dir_guard.to_path_buf();
         let mut app = long_tab_app(&ctx, &dir);
         let (up, right) = (egui::vec2(0.0, -1.0), egui::vec2(1.0, 0.0));
         let [_, frames, _, _] = cells_of(&ctx, &mut app, 1);
@@ -8564,13 +8599,13 @@ mod tests {
         assert_eq!((picked(&app), sel(&app)), (Some(1), (vec![0], Some(0))));
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].pb.frame, picked(&app), sel(&app)), (1500, None, (vec![], None)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_playback_bars_frame_box_drags_the_frame_as_one_action_and_still_types() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("bar_scrub");
+        let _dir_guard = comment_dir("bar_scrub");
+        let dir = _dir_guard.to_path_buf();
         let mut app = long_tab_app(&ctx, &dir);
         let (up, right) = (egui::vec2(0.0, -1.0), egui::vec2(1.0, 0.0));
         let hot = || ctx.read_response(panels::frame_box_id(0).with("hot")).expect("the frame box is drawn").rect;
@@ -8620,13 +8655,13 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         frame_with(&ctx, &mut app, vec![]);
         assert_eq!(app.views[0].pb.frame, 2345, "Esc: never mind");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_note_is_written_after_a_double_click_saved_with_enter_and_undone_with_another_line() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_note");
+        let _dir_guard = comment_dir("tab_note");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let text = |app: &TakViewerApp, id| app.views[0].comments.list.get(id).unwrap().text.clone();
@@ -8680,16 +8715,17 @@ mod tests {
         let lines: Vec<(String, String)> = file_events(&dir).iter().map(|e| (format!("{} {}", e.kind.as_str(), e.id), e.text.clone())).collect();
         let want = |k: &str, t: &str| (k.to_owned(), t.to_owned());
         assert_eq!(lines, vec![want("add 1", ""), want("add 2", ""), want("edit 1", "교정, \"swap\" next"), want("edit 1", ""), want("edit 1", "교정, \"swap\" next")]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn nothing_is_editable_where_comments_cannot_be_written_and_the_reason_is_shown() {
         let ctx = egui::Context::default();
         // A command run, and a file in the repository's input/ folder.
-        let dir = comment_dir("tab_off");
+        let _dir_guard = comment_dir("tab_off");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
-        let root = comment_dir("tab_off_repo");
+        let _root_guard = comment_dir("tab_off_repo");
+        let root = _root_guard.to_path_buf();
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "x").unwrap();
@@ -8719,14 +8755,13 @@ mod tests {
             assert!(app.comment_writer.is_none());
             assert_eq!(std::fs::read(folder.join("a.takm")).unwrap(), before, "nothing written");
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn the_tab_has_no_hover_texts_and_fits_a_narrow_place() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_narrow");
+        let _dir_guard = comment_dir("tab_narrow");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comments_tab_app(&ctx, &dir, false);
         // Under the mouse on every cell and column name: no tooltip is shown.
@@ -8783,13 +8818,13 @@ mod tests {
         let room = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 300.0));
         let at = comment_list::list_place(tbox.translate(egui::vec2(0.0, 100.0)), size, room);
         assert!(room.contains_rect(at) && size.x <= 200.0, "the list fits a 380 pt pane: {at:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_new_comment_scrolls_into_the_long_list_and_only_rows_on_screen_are_drawn() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_long");
+        let _dir_guard = comment_dir("tab_long");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comments_tab_app(&ctx, &dir, false);
         assert!(text_rects(&frame_with(&ctx, &mut app, vec![]), "아직 Comment가 없어요. M을 누르면 생겨요.").len() == 1, "empty: one line");
         // 2,000 comments in memory (as if read from the file).
@@ -8824,7 +8859,6 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         assert!(text_rects(&out, "2001").iter().any(|t| place.contains(t.center())), "scrolled to the new comment");
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Comment types (Comment plan step 5) ─────────────
@@ -8867,8 +8901,12 @@ mod tests {
     #[test]
     fn a_type_strip_follows_each_new_comment_a_click_sets_the_type_and_the_next_action_closes_it() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("strip");
+        let _dir_guard = comment_dir("strip");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
+        // Select before creating the Comment: later direct marker picks now clear its
+        // representative, while this test needs T to keep targeting the new Comment.
+        app.views[0].select(0, false);
         let button_before = comment_button_at(&ctx, &mut app);
         let scene_before = app.views[0].scene_rect;
         // M short: comment 1, its strip with the three full names, over the 3D right above the
@@ -8896,8 +8934,8 @@ mod tests {
             frame_with(&ctx, &mut app, vec![]);
         }
         app.views[0].pb.playing = false;
-        // (A marker selected meanwhile: a click on the strip must not reach the 3D under it.)
-        app.views[0].select(0, false);
+        // A click on the strip must not reach the selected marker in the 3D under it.
+        assert_eq!(app.views[0].selected, BTreeSet::from([0]));
         app.quiet();
         assert_eq!(strip_for(&app), Some(1), "still open");
         // T (the keyboard path, the new comment is the selected one): the next type, the strip
@@ -8961,13 +8999,13 @@ mod tests {
         assert_eq!(strip_for(&app), None);
         assert!(file_events(&dir).iter().all(|e| e.kind != comments::Kind::Edit || e.id == 1), "only comment 1 got a type");
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn no_type_strip_where_comments_cannot_be_written_and_a_picture_strip_writes_nothing() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("strip_off");
+        let _dir_guard = comment_dir("strip_off");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 3, "")]);
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         // A command run: M and the button make nothing, so no strip.
@@ -8987,13 +9025,13 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         assert_eq!(type_of(&app, 1), "");
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before, "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn t_cycles_the_selected_comments_type_and_presses_in_a_row_are_one_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("t_key");
+        let _dir_guard = comment_dir("t_key");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 2, ""), (2, 7, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         // Nothing selected: T does nothing.
@@ -9072,7 +9110,6 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         assert_eq!(type_of(&app, 2), "Needs visual check");
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
 
@@ -9108,7 +9145,8 @@ mod tests {
     #[test]
     fn every_row_has_a_type_box_and_one_click_opens_the_list_under_it() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tab_type");
+        let _dir_guard = comment_dir("tab_type");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "Marker swap"), (5, 5, "Later kind")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let place = place_of(&app, Pane::Comments);
@@ -9182,13 +9220,13 @@ mod tests {
         }
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), lines, "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_click_on_an_item_saves_at_once_and_ctrl_z_takes_it_back() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("type_pick");
+        let _dir_guard = comment_dir("type_pick");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let f0 = app.views[0].pb.frame;
@@ -9235,13 +9273,13 @@ mod tests {
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 4), "Jitter");
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn up_down_and_enter_pick_with_the_keys_and_esc_closes_without_change() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("type_keys");
+        let _dir_guard = comment_dir("type_keys");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 1, ""), (2, 2, "Needs visual check"), (3, 3, "Later kind")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         open_type_list(&ctx, &mut app, 2);
@@ -9286,13 +9324,13 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowUp)]);
         assert_ne!(app.views[0].pb.frame, f);
         file_matches_memory(&ctx, &mut app, &dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_click_or_the_wheel_outside_the_list_closes_it_and_still_does_its_job() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("type_outside");
+        let _dir_guard = comment_dir("type_outside");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 1, ""), (2, 2, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let lines = line_count(&dir);
@@ -9322,13 +9360,13 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         until_saved(&ctx, &mut app);
         assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), (String::new(), String::new(), lines), "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_list_of_the_last_row_on_screen_opens_upward_inside_the_tab() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("type_last_row");
+        let _dir_guard = comment_dir("type_last_row");
+        let dir = _dir_guard.to_path_buf();
         let list: Vec<(u64, i64, &str)> = (1..=60u64).map(|k| (k, (k % 10) as i64, ["", "Jitter", "Marker swap", "Needs visual check"][k as usize % 4])).collect();
         typed_on_disk(&dir, &list);
         let mut app = comments_tab_app(&ctx, &dir, false);
@@ -9357,13 +9395,13 @@ mod tests {
         let at = item_at(&ctx, &mut app, "Jitter");
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, id), "Jitter");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn where_comments_cannot_be_written_the_boxes_are_dim_and_a_click_is_a_row_click() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("type_off");
+        let _dir_guard = comment_dir("type_off");
+        let dir = _dir_guard.to_path_buf();
         typed_on_disk(&dir, &[(1, 3, "Jitter"), (2, 5, "")]);
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         let mut app = comments_tab_app(&ctx, &dir, true);
@@ -9392,7 +9430,6 @@ mod tests {
         assert_eq!(type_of(&app, 1), "Jitter");
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before, "nothing written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9432,7 +9469,8 @@ mod tests {
     #[test]
     fn command_runs_read_comment_files_but_never_write_them() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("command_run");
+        let _dir_guard = comment_dir("command_run");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         let mut app = comment_app(&ctx, &dir, true);
@@ -9448,13 +9486,13 @@ mod tests {
         // A screenshot run is a command run too.
         let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_status_bar_counts_comments_and_says_when_a_save_failed() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("status");
+        let _dir_guard = comment_dir("status");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comment_app(&ctx, &dir, false);
         let now = || ctx.input(|i| i.time);
@@ -9479,13 +9517,13 @@ mod tests {
         // While the comment file is read there is no item yet.
         app.views[0].comments.target = None;
         assert!(app.comment_status(0, now()).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_block_layout_is_made_again_only_when_the_comments_change() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("layout");
+        let _dir_guard = comment_dir("layout");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         let mut app = comment_app(&ctx, &dir, false);
         let builds = app.views[0].comments.blocks.builds;
@@ -9500,7 +9538,6 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::M)]);
         until_saved(&ctx, &mut app);
         assert_eq!(app.views[0].comments.blocks.builds, builds + 1, "a new comment: once more");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Center of a painted text inside `area`.
@@ -9573,10 +9610,8 @@ mod tests {
     /// A folder (not under any repo's `input/`) with a TAK, its `.takm`, another `.takm` in
     /// capitals and files the viewer does not open. Contents are not real takes: the tests hand
     /// the view a sample (`takm_arrive`).
-    fn takm_dir(name: &str) -> (PathBuf, Vec<PathBuf>) {
-        let dir = std::env::temp_dir().join(format!("tak_viewer_takm_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn takm_dir(name: &str) -> (tak_core::test_support::TempDir, Vec<PathBuf>) {
+        let dir = tak_core::test_support::TempDir::new(&format!("tak_viewer_takm_{name}"));
         let f = take_files(&dir, &["a.tak", "a.takm", "b.TAKM", "notes.md", "a.takm.part"]);
         (dir, f)
     }
@@ -9606,7 +9641,8 @@ mod tests {
     #[test]
     fn the_explorer_lists_takm_next_to_tak_opens_it_by_click_and_page_keys_step_over_both() {
         let ctx = egui::Context::default();
-        let (dir, f) = takm_dir("explorer");
+        let (_dir_guard, f) = takm_dir("explorer");
+        let dir = _dir_guard.to_path_buf();
         let (tak, takm, big) = (f[0].clone(), f[1].clone(), f[2].clone());
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
@@ -9649,13 +9685,13 @@ mod tests {
         assert_eq!((app.views[0].path(), app.views[1].path()), (Some(takm.as_path()), Some(takm.as_path())));
         assert_eq!(app.views[0].document_id(), app.views[1].document_id());
         assert!(std::sync::Arc::ptr_eq(app.views[0].data.as_ref().unwrap(), app.views[1].data.as_ref().unwrap()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_takm_dropped_from_the_desktop_opens_and_its_tak_beside_it() {
         let ctx = egui::Context::default();
-        let (dir, f) = takm_dir("drop");
+        let (_dir_guard, f) = takm_dir("drop");
+        let dir = _dir_guard.to_path_buf();
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
         frame_with(&ctx, &mut app, vec![]);
@@ -9665,13 +9701,13 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert_eq!(app.open_views(), vec![0, 1]);
         assert_eq!((app.views[0].target(), app.views[1].target()), (Some(f[1].as_path()), Some(f[0].as_path())), "first dropped: the .takm, next to it the .tak");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_takm_lays_over_its_tak_and_a_tak_over_a_takm() {
         let ctx = egui::Context::default();
-        let (dir, f) = takm_dir("overlay");
+        let (_dir_guard, f) = takm_dir("overlay");
+        let dir = _dir_guard.to_path_buf();
         let (tak, takm) = (f[0].clone(), f[1].clone());
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
@@ -9689,12 +9725,12 @@ mod tests {
         lay_over(&ctx, &mut app, &tak);
         overlay_arrive(&ctx, &mut app, 0);
         assert_eq!((app.views[0].path(), app.views[0].overlay_path()), (Some(f[2].as_path()), Some(tak.as_path())));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn saved_views_and_spots_of_takm_files_come_back() {
-        let (dir, f) = takm_dir("restore");
+        let (_dir_guard, f) = takm_dir("restore");
+        let dir = _dir_guard.to_path_buf();
         let (tak, takm) = (f[0].clone(), f[1].clone());
         let mut layout = dock::default_layout();
         dock::add_view(&mut layout, 1, dock::NOMINAL_AREA);
@@ -9725,7 +9761,6 @@ mod tests {
         assert_eq!(app.views[1].restore.as_ref(), Some(&spot), "the .takm goes back to its remembered spot");
         assert!(app.views[0].restore.is_none(), "the TAK has its own spot (none here)");
         assert_eq!(app.active, 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9823,7 +9858,8 @@ mod tests {
 
     #[test]
     fn saved_views_open_again_and_missing_files_leave_no_empty_view() {
-        let dir = std::env::temp_dir().join(format!("tak_viewer_views_{}", std::process::id()));
+        let _temp = tak_core::test_support::TempDir::new("tak_viewer_views");
+        let dir = _temp.to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a.takm"), dir.join("b.tak"));
         std::fs::write(&a, b"not a take").unwrap();
@@ -9845,7 +9881,6 @@ mod tests {
         assert_eq!(app.views[0].target(), Some(a.as_path()));
         assert_eq!(app.views[3].target(), Some(b.as_path()));
         assert_eq!(app.active, 0, "the active view's file was gone");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9886,10 +9921,12 @@ mod tests {
         found
     }
 
+    include!("app_editor_batch_tests.rs");
+
     fn editor_lines(ctx: &egui::Context, app: &mut TakViewerApp) -> Vec<String> {
         let explorer = place_of(app, Pane::Explorer);
         let out = frame_with(ctx, app, vec![]);
-        editor_texts(&out, explorer).into_iter().map(|t| t.1).collect()
+        editor_texts(&out, explorer).into_iter().map(|t| t.1).filter(|text| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두")).collect()
     }
 
     /// Where an OPEN EDITORS text is (its middle).
@@ -9919,7 +9956,8 @@ mod tests {
     fn open_editors_lists_every_open_file_by_view_with_the_laid_over_ones() {
         use crate::ui::open_editors::{ADD_FOLDER, CHOSEN, CHOSEN_VIEW};
         let ctx = egui::Context::default();
-        let dir = comment_dir("editors_list");
+        let _dir_guard = comment_dir("editors_list");
+        let dir = _dir_guard.to_path_buf();
         // The long temp folder name does not fit beside the name and `폴더 추가`, so the row
         // leaves it out (v0.27.1: the folder goes first, the name stays whole).
         let row = |name: &str| name.to_owned();
@@ -9964,14 +10002,14 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         let hidden = editor_texts(&out, explorer).into_iter().find(|x| x.1 == row("b.tak · 숨김")).expect("b listed as hidden");
         assert_ne!(hidden.2, color(&row("a.tak")), "dim");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn open_editors_row_chooses_its_view_and_x_closes_or_takes_off_and_undo_brings_each_back() {
         use crate::ui::open_editors::EMPTY;
         let ctx = egui::Context::default();
-        let dir = comment_dir("editors_x");
+        let _dir_guard = comment_dir("editors_x");
+        let dir = _dir_guard.to_path_buf();
         // (The long temp folder name is left out of the row: no room beside `폴더 추가`.)
         let row = |name: &str| name.to_owned();
         let (mut app, f) = editors_app(&ctx, &dir);
@@ -10014,7 +10052,6 @@ mod tests {
         assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (0)", EMPTY]);
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].target(), app.views[0].overlay_target()), (Some(f[0].as_path()), Some(f[1].as_path())), "{}", note(&app));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10022,7 +10059,8 @@ mod tests {
         // Two same apps (view 0 = a.tak with b.tak laid over it, view 1 = c.tak, the active
         // one): one clicks OPEN EDITORS rows, the other the name tags in the 3D view.
         let (ctx, ctx2) = (egui::Context::default(), egui::Context::default());
-        let (dir, dir2) = (comment_dir("editors_hide"), comment_dir("editors_hide_tag"));
+        let (_dir_guard, _dir2_guard) = (comment_dir("editors_hide"), comment_dir("editors_hide_tag"));
+        let (dir, dir2) = (_dir_guard.to_path_buf(), _dir2_guard.to_path_buf());
         let (mut by_row, _) = editors_app(&ctx, &dir);
         let (mut by_tag, _) = editors_app(&ctx2, &dir2);
         by_row.quiet();
@@ -10083,15 +10121,14 @@ mod tests {
         let at = editor_at(&ctx, &mut by_row, "d.tak");
         click_at(&ctx, &mut by_row, at);
         assert_eq!((by_row.active, by_row.views[1].shown, steps(&by_row, 0).0), (1, [true, false], k.0 + 2));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
     fn open_editors_add_folder_only_outside_workspace_adds_it_with_undo_and_says_why_when_full() {
         use crate::ui::open_editors::{ADD_FOLDER, DIM};
         let ctx = egui::Context::default();
-        let dir = comment_dir("editors_add");
+        let _dir_guard = comment_dir("editors_add");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak"]);
         app.quiet();
         assert!(editor_lines(&ctx, &mut app).contains(&ADD_FOLDER.to_owned()));
@@ -10127,14 +10164,14 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(text_rects(&out, &why).len(), 1, "in the status bar");
         assert_eq!(app.views[0].target(), Some(f[0].as_path()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn folding_open_editors_is_one_action_that_undo_unfolds() {
         use crate::ui::open_editors::{ADD_FOLDER, CHOSEN_VIEW};
         let ctx = egui::Context::default();
-        let dir = comment_dir("editors_fold");
+        let _dir_guard = comment_dir("editors_fold");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, _) = overlay_app(&ctx, &dir, &["a.tak"]);
         app.quiet();
         let shown = editor_lines(&ctx, &mut app);
@@ -10157,7 +10194,6 @@ mod tests {
         assert!(app.explorer.editors_collapsed);
         assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (1)"]);
         assert_eq!(steps(&app, 0), (before + 1, 0));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Plan step 7: a second file laid over a 3D view ─────────────
@@ -10243,7 +10279,8 @@ mod tests {
     #[test]
     fn the_explorer_lays_a_file_over_the_active_view_as_white_rings_that_follow_its_frame() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_on");
+        let _dir_guard = comment_dir("overlay_on");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak"]);
         let before = app.history.kinds();
         lay_over(&ctx, &mut app, &f[1]);
@@ -10282,13 +10319,13 @@ mod tests {
         assert_eq!((app.views[0].overlay_target(), note(&app).as_str()), (Some(f[1].as_path()), "Redo · Overlay b.tak"));
         overlay_arrive(&ctx, &mut app, 0);
         assert_eq!((app.views[0].overlay_path(), steps(&app, 0)), (Some(f[1].as_path()), (kinds.len(), 1)), "its arrival is no action");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_file_of_another_frame_count_or_rate_is_refused_with_both_numbers() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_refused");
+        let _dir_guard = comment_dir("overlay_refused");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak"]);
         let before = app.history.kinds();
         lay_over(&ctx, &mut app, &f[1]);
@@ -10304,13 +10341,13 @@ mod tests {
         assert_eq!(app.overlay_note.clone().unwrap().0, "얹을 수 없어요: 프레임 속도가 달라요 (a.tak 100 Hz, c.tak 120 Hz)");
         assert_eq!(app.history.kinds(), before, "a refused file is no action");
         assert_eq!(app.file_count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn repeated_views_and_overlays_share_one_document_and_self_overlay_is_refused() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_twice");
+        let _dir_guard = comment_dir("overlay_twice");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak"]);
         app.open_side(&ctx, f[1].clone());
         frame_with(&ctx, &mut app, vec![]);
@@ -10353,13 +10390,13 @@ mod tests {
         assert!(app.views[3].loading.is_none());
         assert!(std::sync::Arc::ptr_eq(&primary_data, app.views[3].data.as_ref().unwrap()));
         assert!(std::sync::Arc::ptr_eq(&primary_document, app.views[3].edit_document.as_ref().unwrap()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn four_views_with_overlays_obey_the_app_wide_twelve_distinct_file_limit() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_four");
+        let _dir_guard = comment_dir("overlay_four");
+        let dir = _dir_guard.to_path_buf();
         let names: Vec<String> = (0..13).map(|i| format!("source_{i}.tak")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let (mut app, f) = overlay_app(&ctx, &dir, &names);
@@ -10416,13 +10453,13 @@ mod tests {
         assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
         assert_eq!(app.file_count(), 8, "refused opens leave existing views and overlays intact");
         assert!(std::sync::Arc::ptr_eq(&overlay_data, &app.views[0].overlay.as_ref().unwrap().data));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn name_tags_and_keys_1_2_hide_and_show_each_file_and_each_is_one_action() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_tags");
+        let _dir_guard = comment_dir("overlay_tags");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak"]);
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive(&ctx, &mut app, 0);
@@ -10468,13 +10505,13 @@ mod tests {
         let k = steps(&app, 0).0;
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Num1)]);
         assert_eq!((app.views[0].shown, steps(&app, 0).0), ([true, true], k));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_x_on_tag_2_and_the_explorer_take_it_off_and_undo_puts_it_back_as_it_was() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_off");
+        let _dir_guard = comment_dir("overlay_off");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak"]);
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive(&ctx, &mut app, 0);
@@ -10504,13 +10541,13 @@ mod tests {
         app.explorer_action(&ctx, WsAction::OverlayOff);
         frame_with(&ctx, &mut app, vec![]);
         assert_eq!(app.views[0].overlay_target(), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_overlay_goes_with_its_views_file_and_comes_back_with_it() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_replace");
+        let _dir_guard = comment_dir("overlay_replace");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak", "d.tak"]);
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive(&ctx, &mut app, 0);
@@ -10540,13 +10577,13 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].overlay_target().is_none() && app.views[0].target().is_none());
         assert_eq!(app.file_count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rings_are_never_clicked_and_a_hidden_files_markers_neither() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_click");
+        let _dir_guard = comment_dir("overlay_click");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak"]);
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive(&ctx, &mut app, 0);
@@ -10568,13 +10605,13 @@ mod tests {
         idle(&ctx, &mut app);
         click_at(&ctx, &mut app, dot);
         assert_eq!(sel(&app), (vec![], None));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn comments_made_with_an_overlay_say_which_files_were_shown_and_old_lines_read_the_same() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_comments");
+        let _dir_guard = comment_dir("overlay_comments");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.hold_loads = true;
         // Without an overlay: as before.
@@ -10613,13 +10650,13 @@ mod tests {
         assert!(text.starts_with("time,kind,comment_id,markers,frame_start,frame_end,comment_type,comment_text,shown_a,shown_b,file_a,file_b\r\n"));
         let folded = tail_read(&dir.join("a.takm")).unwrap().unwrap();
         assert_eq!(folded.skipped, 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn same_names_get_their_folder_and_a_narrow_view_shortens_the_names_but_keeps_both_tags() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_names");
+        let _dir_guard = comment_dir("overlay_names");
+        let dir = _dir_guard.to_path_buf();
         let name = "000000_S01_perturb_20_001.tak";
         for sub in ["copy", "raw"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -10636,7 +10673,6 @@ mod tests {
         assert!(t.tags[1].right() <= narrow.right() && t.close.right() <= narrow.right(), "{:?} {narrow:?}", t.tags);
         assert!(t.labels[0].starts_with("1 00") && t.labels[0].contains('…') && t.labels[0].ends_with(".tak · copy"), "{}", t.labels[0]);
         assert!(t.labels[1].starts_with("2 00") && t.labels[1].ends_with(".tak · raw"), "{}", t.labels[1]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Plan step 8: the laid-over file's sticks (thin white lines) ─────────────
@@ -10776,7 +10812,8 @@ mod tests {
     #[test]
     fn the_laid_over_files_sticks_are_white_under_the_first_files() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_sticks");
+        let _dir_guard = comment_dir("overlay_sticks");
+        let dir = _dir_guard.to_path_buf();
         // b's C sits 5 cm off a's C; A and B are at the same place in both.
         let mut app = stick_overlay_app(&ctx, &dir, [0.0; 3], &[], [0.0, 0.0, 0.05], &[]);
         app.views[0].pb.set_frame(3, 0.0);
@@ -10818,13 +10855,13 @@ mod tests {
         // Taken off: none of b's lines.
         app.overlay_off(0);
         assert_eq!(shown(&mut app), (0, 2, 0));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_stick_with_a_missing_marker_is_not_drawn() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_gone");
+        let _dir_guard = comment_dir("overlay_gone");
+        let dir = _dir_guard.to_path_buf();
         // b's C 5 cm off and missing at frame 4; a's C missing at frame 6; b's A 10 mm off.
         let mut app = stick_overlay_app(&ctx, &dir, [0.0; 3], &[(2, 6)], [0.010, 0.0, 0.05], &[(2, 4)]);
         for (frame, white_bc, own_bc) in [(3, 1, 1), (4, 0, 1), (6, 1, 0)] {
@@ -10842,13 +10879,13 @@ mod tests {
             assert_eq!(lines_in(&shapes, theme::OVERLAY_STICK, scene::OVERLAY_STICK_W).len(), 1 + white_bc, "frame {frame}");
             assert_eq!(lines_in(&shapes, theme::color(tak_core::view_data::ColorSource::File(STICK_RGB)), 1.6).len(), 1 + own_bc, "frame {frame}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn without_an_overlay_the_first_file_is_drawn_as_before() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_none");
+        let _dir_guard = comment_dir("overlay_none");
+        let dir = _dir_guard.to_path_buf();
         let mut app = stick_overlay_app(&ctx, &dir, [0.0; 3], &[], [0.0, 0.0, 0.05], &[]);
         app.views[0].pb.set_frame(3, 0.0);
         app.overlay_off(0);
@@ -10858,7 +10895,6 @@ mod tests {
         assert_eq!((own_line(&shapes, dot(0), dot(1)).len(), own_line(&shapes, dot(1), dot(2)).len()), (1, 1));
         let (dots, rings) = circles_in(&app, &shapes);
         assert_eq!((lines_in(&shapes, theme::OVERLAY_STICK, scene::OVERLAY_STICK_W).len(), dots.len(), rings.len()), (0, 4, 0));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10873,13 +10909,13 @@ mod tests {
         assert_eq!((files, rest), (vec![PathBuf::from("b.tak")], args(&["tak_viewer", "--bench", "600", "a.tak"])));
         // `--screenshot … --overlay`: laid over the first view; a refused one stops the run.
         let ctx = egui::Context::default();
-        let dir = comment_dir("overlay_shot");
+        let _dir_guard = comment_dir("overlay_shot");
+        let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
         let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── Plan step 9: the second file's curves dashed in the graph ─────────────
@@ -10931,7 +10967,8 @@ mod tests {
     #[test]
     fn the_graph_draws_the_laid_over_files_marker_of_the_same_name_dashed_on_one_scale() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("pair_graph");
+        let _dir_guard = comment_dir("pair_graph");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = pair_app(&ctx, &dir);
         let n = marker_index(&app, "N");
         app.views[0].select(n, false);
@@ -11002,7 +11039,6 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].lanes.pair_now().is_none());
         assert_eq!(*app.views[0].lanes.drew(), alone);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ───────────── `.takm` step ③: Comments in the `.takm`, none on a TAK, save as `.takm` ─────────────
@@ -11068,7 +11104,8 @@ mod tests {
     #[test]
     fn comments_on_a_takm_go_into_its_tail_with_undo_and_redo_and_read_back_the_same() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_tail");
+        let _dir_guard = comment_dir("takm_tail");
+        let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         let takm = dir.join("a.takm");
         let fixed = fixed_part(&takm);
@@ -11103,13 +11140,13 @@ mod tests {
         let again = views::CommentsLoad::read(&takm).parsed.unwrap().comments();
         assert_eq!(again.list(), app.views[0].comments.list.list());
         assert_eq!(app.views[0].comments.list.get(2).map(|c| (c.comment_type.as_str(), c.text.as_str())), Some((comments::TYPES[0], "흔들림")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_comment_csv_next_to_a_takm_is_neither_read_nor_written() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_csv_beside");
+        let _dir_guard = comment_dir("takm_csv_beside");
+        let dir = _dir_guard.to_path_buf();
         two_comments_on_disk(&dir);
         std::fs::write(dir.join("a.comments.csv"), tak_core::takm::read_tail_text(&dir.join("a.takm")).unwrap()).unwrap();
         std::fs::remove_file(dir.join("a.takm")).unwrap();
@@ -11121,13 +11158,13 @@ mod tests {
         assert_eq!(ids(&app), vec![1]);
         assert_eq!(std::fs::read(dir.join("a.comments.csv")).unwrap(), before, "nor written");
         assert_eq!(file_events(&dir).len(), 1, "the comment is in the .takm");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_tak_has_no_comments_and_m_the_button_and_t_write_nothing_and_say_why() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("tak_no_comments");
+        let _dir_guard = comment_dir("tak_no_comments");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, tak) = tak_app(&ctx, &dir);
         let csv = std::fs::read(dir.join("a.comments.csv")).unwrap();
         let tak_sha = sha(&tak);
@@ -11170,13 +11207,13 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.comments.csv")).unwrap(), csv);
         assert!(!dir.join("a.takm").exists());
         assert_eq!(sha(&tak), tak_sha);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_comments_pane_button_saves_the_tak_as_takm_without_blocking_and_the_view_switches_keeping_its_place() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_save_pane");
+        let _dir_guard = comment_dir("takm_save_pane");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, tak) = tak_app(&ctx, &dir);
         let (csv, tak_sha, tak_meta) = (sha(&dir.join("a.comments.csv")), sha(&tak), std::fs::metadata(&tak).unwrap());
         // Where the view is: frame, camera, selection, range.
@@ -11228,13 +11265,13 @@ mod tests {
         assert_eq!((app.views[0].pb.frame, app.views[0].range), (5, Some((2, 7))));
         assert!(dir.join("a.takm").exists());
         until_saved(&ctx, &mut app);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_file_menu_item_is_dim_with_its_reason_and_saves_the_active_tak() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_save_menu");
+        let _dir_guard = comment_dir("takm_save_menu");
+        let dir = _dir_guard.to_path_buf();
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
         let out = frame_with(&ctx, &mut app, vec![]);
@@ -11261,13 +11298,13 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         let out = click_at(&ctx, &mut app, text_rects(&out, "파일")[0].center());
         assert_eq!(text_rects(&out, "지금 화면의 파일이 TAK가 아니에요(이미 .takm).").len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_explorer_menu_saves_a_tak_no_view_shows_and_lists_its_folder_again() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_save_explorer");
+        let _dir_guard = comment_dir("takm_save_explorer");
+        let dir = _dir_guard.to_path_buf();
         let tak = dir.join("b.tak");
         std::fs::write(&tak, tak_core::sample_tak::sample_tak()).unwrap();
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
@@ -11290,13 +11327,13 @@ mod tests {
         assert!(dir.join("b.takm").exists());
         assert_eq!(app.views[0].target(), None, "converted only: no view showed it");
         assert!(app.workspace.listing(&dir).is_some(), "its folder is read again");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_existing_takm_is_opened_not_overwritten() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("takm_exists");
+        let _dir_guard = comment_dir("takm_exists");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, tak) = tak_app(&ctx, &dir);
         two_comments_on_disk(&dir);
         let before = std::fs::read(dir.join("a.takm")).unwrap();
@@ -11307,13 +11344,13 @@ mod tests {
         assert_eq!(app.views[0].target(), Some(dir.join("a.takm").as_path()));
         arrive(&ctx, &mut app, 0);
         assert_eq!(ids(&app), vec![1, 2], "its own comments");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn no_takm_is_made_under_input_or_in_a_command_run() {
         let ctx = egui::Context::default();
-        let root = comment_dir("takm_input");
+        let _root_guard = comment_dir("takm_input");
+        let root = _root_guard.to_path_buf();
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "x").unwrap();
@@ -11333,7 +11370,6 @@ mod tests {
         assert!(app.takm_job.is_none());
         assert_eq!(takm_note(&app), "명령 실행은 파일을 만들지 않아요.");
         assert!(!root.join("a.takm").exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ───────────── v0.27.0: every selected marker in the X / Y / Z graph ─────────────
@@ -11342,7 +11378,8 @@ mod tests {
     fn every_selected_marker_is_in_the_graph_lanes_in_the_lane_colors_with_overlay_bands_and_both_places() {
         let lane_colors = |n: usize| vec![vec![theme::AXIS_X; n], vec![theme::AXIS_Y; n], vec![theme::AXIS_Z; n]];
         let ctx = egui::Context::default();
-        let dir = comment_dir("multi_graph");
+        let _dir_guard = comment_dir("multi_graph");
+        let dir = _dir_guard.to_path_buf();
         let (mut app, f) = pair_app_named(&ctx, &dir, "a.takm");
         wait_comment_ids(&ctx, &mut app, 0);
         let (m, n, q) = (marker_index(&app, "M"), marker_index(&app, "N"), marker_index(&app, "Q"));
@@ -11439,13 +11476,13 @@ mod tests {
         }).collect();
         assert_eq!(at, [Some(0), Some(0), Some(1), Some(1), Some(2), Some(2), None, None, Some(0), Some(0)]);
         app.views[0].lanes.hover_at = None;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_box_of_twelve_markers_draws_the_first_eight_in_labels_order() {
         let ctx = egui::Context::default();
-        let dir = comment_dir("multi_graph_limit");
+        let _dir_guard = comment_dir("multi_graph_limit");
+        let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak"]);
         let names: Vec<String> = (0..12).map(|k| format!("P{k}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -11470,7 +11507,6 @@ mod tests {
         let v = &app.views[0];
         let (graphed, total) = panels::graphed(v.data.as_ref().unwrap(), &v.selected, 11);
         assert_eq!((graphed, total), ((0..8).collect::<Vec<_>>(), 12));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
