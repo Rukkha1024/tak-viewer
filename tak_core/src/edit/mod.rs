@@ -3,6 +3,7 @@
 
 mod document;
 mod load;
+mod source;
 pub mod delete;
 pub mod fill;
 pub mod label;

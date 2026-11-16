@@ -380,20 +380,28 @@ pub(crate) struct DeviceNode {
 /// token coverage also catches malformed unknown device JSON that cannot be parsed safely.
 fn validate_device_node_coverage(nodes: &[u8], records: &[PropRecord]) -> Result<()> {
     let covered = |at: usize| records.iter().any(|r| r.start + r.sig_len + 2 <= at && at < r.end);
+    let device_key = utf16("DeviceNode_");
+    let escaped_key = utf16("\\");
     for at in find_all(nodes, &utf16("{"), 0) {
         if at < 2 || covered(at) { continue; }
         let chars = u16::from_le_bytes([nodes[at - 2], nodes[at - 1]]) as usize;
         let Some(end) = at.checked_add(chars * 2).filter(|&end| chars >= 2 && end <= nodes.len()) else { continue };
-        let Ok(text) = utf16le_strict(&nodes[at..end]) else { continue };
+        // Ordinary marker/asset JSON has no device keys. Only escaped keys need a JSON
+        // parse to prove coverage; avoid decoding every marker again before marker-ready.
+        let bytes = &nodes[at..end];
+        if find(bytes, &device_key, 0).is_none() && find(bytes, &escaped_key, 0).is_none() { continue; }
+        let Ok(text) = utf16le_strict(bytes) else { continue };
         let Ok(value) = parse_json(&text) else { continue };
         let Ok(props) = props_of(&value, true) else { continue };
-        if props.contains_key("DeviceNode_DeviceType") {
+        if props.contains_key("DeviceNode_DeviceType") || props.keys().any(|k|k.starts_with("DeviceNode_Corner")) {
             return err("unrecognized structural device node signature; full analog read required");
         }
     }
-    for at in find_all(nodes, &utf16("DeviceNode_DeviceType"), 0) {
-        if !covered(at) {
-            return err("unrecognized or malformed structural device properties; full analog read required");
+    for key in ["DeviceNode_DeviceType", "DeviceNode_Corner"] {
+        for at in find_all(nodes, &utf16(key), 0) {
+            if !covered(at) {
+                return err("unrecognized or malformed structural device properties; full analog read required");
+            }
         }
     }
     Ok(())
@@ -410,7 +418,7 @@ pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
     let refs: Vec<&[u8]> = signatures.iter().map(Vec::as_slice).collect();
     let records = property_records(nodes, &refs)?;
     validate_device_node_coverage(nodes, &records)?;
-    let (plates, _) = extract_plates(nodes)?;
+    let mut plate_names = HashSet::new();
     let mut plate = 0;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -429,6 +437,8 @@ pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
             return err("analog device type and plate geometry disagree");
         }
         let geometry = if forceplate {
+            let validated = plate_from_properties(&record.props, plate)?;
+            if !plate_names.insert(validated.name) { return err("duplicate plate identities"); }
             let i = plate;
             plate += 1;
             Some(i)
@@ -440,10 +450,34 @@ pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
             .and_then(|v| usize::try_from(v).ok());
         out.push(DeviceNode { uid: record.uid, forceplate, channel_count, plate: geometry });
     }
-    if plate != plates.len() {
-        return err("forceplate geometry has no unique structural device UID");
-    }
     Ok(out)
+}
+
+fn plate_from_properties(properties: &Props, index: usize) -> Result<ForcePlate> {
+    let plate_name = properties
+        .get("NodeName")
+        .map(py_str)
+        .unwrap_or_else(|| (index + 1).to_string());
+    let mut corners = [[0f32; 3]; 4];
+    for (i, corner) in corners.iter_mut().enumerate() {
+        let key = [format!("DeviceNode_Corner {i}"), format!("DeviceNode_Corner{i}")]
+            .into_iter()
+            .find(|k| properties.contains_key(k));
+        let Some(key) = key else {
+            return err(format!("recognized forceplate missing required corner: {plate_name}"));
+        };
+        let text = py_str(&properties[&key]);
+        let values: Vec<f64> = text
+            .split(',')
+            .map(python_float)
+            .collect::<Result<_>>()
+            .map_err(|e| TakError(format!("recognized forceplate invalid geometry: {plate_name}: {}", e.0)))?;
+        if values.len() != 3 {
+            return err(format!("recognized forceplate corner is not 3D: {plate_name}"));
+        }
+        *corner = [values[0] as f32, values[1] as f32, values[2] as f32];
+    }
+    Ok(ForcePlate { name: plate_name, corners })
 }
 
 /// Returns plates plus non-fatal `node_json:` notes. Any recognized-but-invalid plate fails.
@@ -476,30 +510,7 @@ pub fn extract_plates(nodes: &[u8]) -> Result<(Vec<ForcePlate>, Vec<String>)> {
         let device_type = py_str(properties.get("DeviceNode_DeviceType").unwrap_or(&Value::Null));
         let recognized = device_type == "2" || properties.keys().any(|k| k.starts_with("DeviceNode_Corner"));
         if recognized {
-            let plate_name = properties
-                .get("NodeName")
-                .map(py_str)
-                .unwrap_or_else(|| (plates.len() + 1).to_string());
-            let mut corners = [[0f32; 3]; 4];
-            for (i, corner) in corners.iter_mut().enumerate() {
-                let key = [format!("DeviceNode_Corner {i}"), format!("DeviceNode_Corner{i}")]
-                    .into_iter()
-                    .find(|k| properties.contains_key(k));
-                let Some(key) = key else {
-                    return err(format!("recognized forceplate missing required corner: {plate_name}"));
-                };
-                let text = py_str(&properties[&key]);
-                let values: Vec<f64> = text
-                    .split(',')
-                    .map(python_float)
-                    .collect::<Result<_>>()
-                    .map_err(|e| TakError(format!("recognized forceplate invalid geometry: {plate_name}: {}", e.0)))?;
-                if values.len() != 3 {
-                    return err(format!("recognized forceplate corner is not 3D: {plate_name}"));
-                }
-                *corner = [values[0] as f32, values[1] as f32, values[2] as f32];
-            }
-            plates.push(ForcePlate { name: plate_name, corners });
+            plates.push(plate_from_properties(&properties, plates.len())?);
         }
         cursor += needle.len();
     }
@@ -513,6 +524,18 @@ pub fn extract_plates(nodes: &[u8]) -> Result<(Vec<ForcePlate>, Vec<String>)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn unregistered_corner_only_geometry_cannot_bypass_device_coverage() {
+        for key in ["DeviceNode_Corner 0", "\\u0044eviceNode_\\u0043orner 0"] {
+            let text=format!(r#"{{"properties":[{{"name":"{key}","value":"0,0,0"}}]}}"#);
+            let mut bytes=(text.encode_utf16().count() as u16).to_le_bytes().to_vec();
+            bytes.extend(utf16(&text));
+            assert!(analog_device_nodes(&bytes).is_err());
+        }
+        // Old unframed JSON is also rejected through literal token coverage.
+        assert!(analog_device_nodes(&utf16("DeviceNode_Corner 0")).is_err());
+    }
 
     /// Node record: signature + uint16 chars + UTF-16 JSON + 68-byte trailer.
     pub(crate) fn node(sig: &[u8], name: &str, uid: Uid, parent: Uid, slot: u32) -> Vec<u8> {

@@ -6,7 +6,6 @@ use super::{
 use crate::tak::{channels, nodes, skeleton, Uid};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -131,51 +130,11 @@ pub struct CreationStreams {
 }
 impl CreationStreams {
     pub fn read_from_path(path: &Path) -> Result<Self, EditError> {
-        let metadata = std::fs::metadata(path).map_err(|e| EditError::Other(e.to_string()))?;
-        let stamp = (metadata.len(), metadata.modified().ok());
-        let (nodes, channels) = if crate::takm::is_takm_path(path) {
-            crate::takm::verify_fixed(path).map_err(|e| EditError::Other(e.to_string()))?;
-            let mut file =
-                std::fs::File::open(path).map_err(|e| EditError::Other(e.to_string()))?;
-            let index = crate::takm::read_index(&file, metadata.len())
-                .map_err(|e| EditError::Other(e.to_string()))?;
-            let read = |file: &mut std::fs::File, name: &str| -> Result<Vec<u8>, EditError> {
-                let stream = index.unique(name).ok_or(EditError::UnsupportedLayout)?;
-                let len = usize::try_from(stream.size).map_err(|_| EditError::UnsupportedLayout)?;
-                let mut bytes = vec![0; len];
-                file.seek(SeekFrom::Start(stream.offset))
-                    .map_err(|e| EditError::Other(e.to_string()))?;
-                file.read_exact(&mut bytes)
-                    .map_err(|e| EditError::Other(e.to_string()))?;
-                Ok(bytes)
-            };
-            (
-                read(&mut file, "Nodes.dat")?,
-                read(&mut file, "Channels.dat")?,
-            )
-        } else {
-            let bytes = std::fs::read(path).map_err(|e| EditError::Other(e.to_string()))?;
-            let container = crate::tak::container::Container::parse(&bytes)
-                .map_err(|e| EditError::Other(e.to_string()))?;
-            let entries = container
-                .streams()
-                .map_err(|e| EditError::Other(e.to_string()))?;
-            let read = |name: &str| -> Result<Vec<u8>, EditError> {
-                let mut found = entries.iter().filter(|(n, _)| n == name);
-                let (_, entry) = found.next().ok_or(EditError::UnsupportedLayout)?;
-                if found.next().is_some() {
-                    return Err(EditError::UnsupportedLayout);
-                }
-                container
-                    .read_stream(*entry)
-                    .map_err(|e| EditError::Other(e.to_string()))
-            };
-            (read("Nodes.dat")?, read("Channels.dat")?)
-        };
-        let after = std::fs::metadata(path).map_err(|e| EditError::Other(e.to_string()))?;
-        if (after.len(), after.modified().ok()) != stamp {
-            return Err(other("원본 파일이 읽는 중 바뀌었어요."));
-        }
+        let mut source = super::source::Source::read(path)?;
+        let ni = source.streams.iter().position(|s|s.name=="Nodes.dat").ok_or(EditError::UnsupportedLayout)?;
+        let ci = source.streams.iter().position(|s|s.name=="Channels.dat").ok_or(EditError::UnsupportedLayout)?;
+        let nodes = std::mem::take(&mut source.streams[ni].bytes);
+        let channels = std::mem::take(&mut source.streams[ci].bytes);
         Ok(Self { nodes, channels })
     }
     pub fn verify<'a>(

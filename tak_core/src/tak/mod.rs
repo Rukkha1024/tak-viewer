@@ -378,6 +378,9 @@ pub(crate) fn decode_analog(channels: &[u8]) -> (Vec<AnalogDevice>, Option<Strin
     }
 }
 
+#[cfg(test)]
+thread_local! { static LENIENT_PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Viewer-only: fill the membership of `Unknown` markers from the lenient trailer profile
 /// (`nodes::lenient_memberships`). Runs after the skeleton read, so the Python-compared parts
 /// (assets, sticks) see the strict view. A template candidate is accepted only when its
@@ -389,6 +392,9 @@ fn apply_lenient_memberships(
     assets: &[SkeletonAsset],
     trajectories: &mut [Trajectory],
 ) {
+    if !trajectories.iter().any(|t| t.kind == MarkerKind::Unknown) { return; }
+    #[cfg(test)]
+    LENIENT_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Ok(found) = nodes::lenient_memberships(nodes) else { return };
     if found.is_empty() {
         return;
@@ -469,6 +475,21 @@ mod tests {
     fn take_path_covers_tak_only() {
         assert!(is_take_path(Path::new("a.TAK")) && is_take_path(Path::new("dir/b.tak")));
         assert!(!is_take_path(Path::new("c.tak.json")) && !is_take_path(Path::new("d.png")));
+    }
+
+    #[test]
+    fn lenient_parser_is_skipped_only_when_every_kind_is_known() {
+        let mut trajectories = vec![unknown(1), unknown(2)];
+        trajectories[0].kind = MarkerKind::Unlabeled;
+        trajectories[1].kind = MarkerKind::Template;
+        let before = LENIENT_PARSE_CALLS.with(|calls| calls.get());
+        apply_lenient_memberships(&[], &HashSet::new(), &[], &mut trajectories);
+        assert_eq!(LENIENT_PARSE_CALLS.with(|calls| calls.get()), before);
+        assert_eq!(trajectories.iter().map(|t| t.kind).collect::<Vec<_>>(), [MarkerKind::Unlabeled, MarkerKind::Template]);
+        trajectories[0].kind = MarkerKind::Unknown;
+        apply_lenient_memberships(&[], &HashSet::new(), &[], &mut trajectories);
+        assert_eq!(LENIENT_PARSE_CALLS.with(|calls| calls.get()), before + 1);
+        assert_eq!(trajectories[0].kind, MarkerKind::Unknown);
     }
 
     #[test]

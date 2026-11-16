@@ -193,14 +193,38 @@ struct Thinned {
     lanes: Vec<DrawnLane>,
 }
 
-/// One lane's curves as painted (`curve_shapes`: points on screen, normal solid and dashed
-/// curves as cached meshes), made once and painted again as they are while nothing they depend
-/// on changes (`ShapesKey`), instead of every frame (v0.27.0 speed fix).
+/// One lane's complete curves: compact solid points first, then a mesh for one marker when
+/// its later-frame promotion is allowed; dots and dashed meshes retain painter order.
+/// Shapes are rebuilt only when their inputs (`ShapesKey`) change.
 struct LaneShapes {
     key: ShapesKey,
     shapes: Vec<Shape>,
+    /// A complete compact single-marker lane may become a mesh after this application frame.
+    promote_after: Option<u64>,
     #[cfg(test)]
     drew: Drew,
+}
+
+impl LaneShapes {
+    /// Promote only cached screen points; no trajectory samples or hover shapes are revisited.
+    fn promote(&mut self) {
+        let mut tess = egui::epaint::Tessellator::new(self.key.pixels_per_point, self.key.options, [1, 1], vec![]);
+        tess.set_clip_rect(self.key.clip);
+        let mut mesh = egui::Mesh::default();
+        let mut promoted = Vec::with_capacity(self.shapes.len());
+        let flush = |mesh: &mut egui::Mesh, shapes: &mut Vec<Shape>| {
+            if !mesh.is_empty() { shapes.push(Shape::mesh(std::mem::take(mesh))); }
+        };
+        for shape in std::mem::take(&mut self.shapes) {
+            match shape {
+                Shape::Path(path) => tess.tessellate_shape(Shape::Path(path), &mut mesh),
+                other => { flush(&mut mesh, &mut promoted); promoted.push(other); }
+            }
+        }
+        flush(&mut mesh, &mut promoted);
+        self.shapes = promoted;
+        self.promote_after = None;
+    }
 }
 
 /// What a lane's painted curves depend on (`LaneShapes`).
@@ -213,10 +237,148 @@ struct ShapesKey {
     x: (f64, f64),
     y: (f64, f64, f32),
     shown: [bool; 2],
-    /// What the cached line triangles depend on too (`curve_shapes`).
+    /// What the cached/promoted triangles depend on too (`curve_shapes`).
     clip: Rect,
     pixels_per_point: f32,
     options: egui::epaint::TessellationOptions,
+}
+
+type FontAtlas = egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>;
+
+#[derive(Clone, PartialEq)]
+struct DecorationGeometry {
+    rect: Rect,
+    clip: Rect,
+    /// Preserve the original plot arithmetic even for fractional floating-graph rectangles.
+    plot_x: (f32, f32),
+    frames: (u64, u64),
+    pixels_per_point: f32,
+    options: egui::epaint::TessellationOptions,
+}
+
+impl DecorationGeometry {
+    fn x(&self, frame: f64) -> f32 {
+        let (lo, hi) = (f64::from_bits(self.frames.0), f64::from_bits(self.frames.1));
+        self.plot_x.0 + ((frame - lo) / (hi - lo)) as f32 * self.plot_x.1
+    }
+
+    fn ticks(&self) -> Vec<f64> {
+        let (lo, hi) = (f64::from_bits(self.frames.0), f64::from_bits(self.frames.1));
+        let step = nice_step(hi - lo, (self.plot_x.1 / 80.0) as f64);
+        let mut ticks = Vec::new();
+        let mut t = (lo / step).ceil() * step;
+        while t <= hi { ticks.push(t); t += step; }
+        ticks
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct LaneDecorationKey {
+    geometry: DecorationGeometry,
+    index: usize,
+    lane_h: f32,
+    range: (u64, u64),
+    values: bool,
+    tag_w: f32,
+    watermark: Color32,
+}
+
+struct LaneDecoration {
+    key: LaneDecorationKey,
+    letter: String,
+    unit: &'static str,
+    shapes: Vec<Shape>,
+}
+
+#[derive(Clone, PartialEq)]
+struct NavDecorationKey {
+    geometry: DecorationGeometry,
+    bg: Color32,
+}
+
+struct NavDecoration {
+    key: NavDecorationKey,
+    background: Shape,
+    ticks: Vec<Shape>,
+}
+
+/// Raw, untinted shapes: the current Painter applies disabled/fade/opacity exactly once.
+/// A Weak retains only atlas identity, preventing address reuse without retaining its image.
+#[derive(Default)]
+struct Decorations {
+    atlas: std::sync::Weak<FontAtlas>,
+    lanes: Vec<Option<LaneDecoration>>,
+    nav: Option<NavDecoration>,
+    #[cfg(test)]
+    force_uncached: bool,
+    #[cfg(test)]
+    builds: usize,
+}
+
+fn decoration_text(shapes: &mut Vec<Shape>, painter: &egui::Painter, pos: Pos2, anchor: Align2, text: impl ToString, font: FontId, color: Color32) {
+    let galley = painter.layout_no_wrap(text.to_string(), font, color);
+    if !galley.is_empty() {
+        let rect = anchor.anchor_size(pos, galley.size());
+        shapes.push(Shape::galley(rect.min, galley, color));
+    }
+}
+
+fn lane_decoration(painter: &egui::Painter, key: &LaneDecorationKey, lane: &Lane) -> Vec<Shape> {
+    let mut shapes = Vec::new();
+    let lr = key.geometry.rect;
+    if key.index > 0 { shapes.push(Shape::line_segment([lr.left_top(), lr.right_top()], Stroke::new(1.0_f32, theme::GRAPH_SEP))); }
+    let letter_x = if key.index == 0 && key.tag_w > 0.0 && key.lane_h < 48.0 { key.tag_w + 12.0 } else { 18.0 };
+    decoration_text(&mut shapes, painter, lr.left_center() + vec2(letter_x, 0.0), Align2::LEFT_CENTER,
+        &lane.letter, FontId::proportional((key.lane_h * 0.72).min(72.0)), key.watermark);
+    // Keep compact segments, rather than expanded triangles: tint must precede egui's
+    // antialiasing exactly as in the uncached painter, including disabled panels.
+    for tk in key.geometry.ticks() {
+        let x = key.geometry.x(tk);
+        shapes.extend(Shape::dashed_line(&[pos2(x, lr.top()), pos2(x, lr.bottom())], Stroke::new(1.0_f32, theme::GRAPH_GRID), 2.0, 3.0));
+    }
+    let (lo, hi) = (f64::from_bits(key.range.0), f64::from_bits(key.range.1));
+    if lo.is_finite() && key.values {
+        let font = FontId::proportional(11.0);
+        let top = if key.index == 0 && key.tag_w > 0.0 { vec2(key.tag_w + 6.0, 6.0) } else { vec2(4.0, 2.0) };
+        decoration_text(&mut shapes, painter, lr.left_top() + top, Align2::LEFT_TOP, format!("{hi:.2} {}", lane.unit), font.clone(), theme::TEXT_DIM);
+        decoration_text(&mut shapes, painter, lr.left_bottom() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, format!("{lo:.2} {}", lane.unit), font, theme::TEXT_DIM);
+    }
+    shapes
+}
+
+impl Decorations {
+    fn begin(&mut self, ui: &Ui) {
+        let atlas = ui.fonts(|fonts| std::sync::Arc::downgrade(&fonts.texture_atlas()));
+        let reset = !self.atlas.ptr_eq(&atlas);
+        #[cfg(test)] let reset = reset || self.force_uncached;
+        if reset { self.lanes.clear(); self.nav = None; self.atlas = atlas; }
+    }
+
+    fn paint_lane(&mut self, painter: &egui::Painter, key: LaneDecorationKey, lane: &Lane) {
+        let index = key.index;
+        if self.lanes.len() <= index { self.lanes.resize_with(index + 1, || None); }
+        if !self.lanes[index].as_ref().is_some_and(|cached| cached.key == key && cached.letter == lane.letter && cached.unit == lane.unit) {
+            let shapes = lane_decoration(painter, &key, lane);
+            self.lanes[index] = Some(LaneDecoration { key, letter: lane.letter.clone(), unit: lane.unit, shapes });
+            #[cfg(test)] { self.builds += 1; }
+        }
+        painter.extend(self.lanes[index].as_ref().unwrap().shapes.iter().cloned());
+    }
+
+    fn prepare_nav(&mut self, painter: &egui::Painter, key: NavDecorationKey) {
+        if self.nav.as_ref().is_some_and(|cached| cached.key == key) { return; }
+        let nav = key.geometry.rect;
+        let background = Shape::rect_filled(nav, 0.0, key.bg);
+        let mut ticks = Vec::new();
+        for tk in key.geometry.ticks() {
+            let x = key.geometry.x(tk);
+            ticks.push(Shape::line_segment([pos2(x, nav.top()), pos2(x, nav.top() + 4.0)], Stroke::new(1.0_f32, theme::TEXT_DIM)));
+            decoration_text(&mut ticks, painter, pos2(x, nav.center().y + 1.0), Align2::CENTER_CENTER,
+                format!("{tk:.0}"), FontId::monospace(10.0), theme::TEXT);
+        }
+        self.nav = Some(NavDecoration { key, background, ticks });
+        #[cfg(test)] { self.builds += 1; }
+    }
 }
 
 /// The hovered marker's curve in one lane, thick and lighter (v0.29.0), painted over the lane's
@@ -362,11 +524,12 @@ struct Work {
     /// Work was put off in this frame, and in the frame before.
     put_off: bool,
     put_off_before: bool,
+    mesh_promoted: bool,
 }
 
 thread_local! {
     static WORK: std::cell::Cell<Work> =
-        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false }) };
+        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false, mesh_promoted: false }) };
 }
 
 /// Start of a pass of the app's frame `frame` (the input time's bits: the same for the passes of
@@ -379,7 +542,7 @@ pub fn start_frame(frame: u64, budget: Option<usize>) -> bool {
         if work.frame == frame {
             work.left = work.kept;
         } else {
-            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off };
+            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off, mesh_promoted: false };
         }
         w.set(work);
         work.put_off_before
@@ -393,6 +556,18 @@ pub fn end_frame() {
         let work = w.get();
         w.set(Work { kept: work.left, left: None, ..work });
     });
+}
+
+/// One optional mesh optimization across every view and every pass of an application frame.
+/// The complete compact curve is already visible while its promotion waits.
+fn claim_mesh_promotion(created: u64) -> bool {
+    WORK.with(|cell| {
+        let mut work = cell.get();
+        if work.frame == created || work.mesh_promoted { return false; }
+        work.mesh_promoted = true;
+        cell.set(work);
+        true
+    })
 }
 
 /// May graph work of `cost` samples be done now? `must`: done anyway (counted), for the first
@@ -454,6 +629,9 @@ pub struct Drawn {
     version: u64,
     /// Per lane, its curves as painted (`LaneShapes`).
     shapes: Vec<Option<LaneShapes>>,
+    decorations: Decorations,
+    #[cfg(test)]
+    force_immediate_mesh: bool,
     /// v0.29.0 hover: the graphed markers' names in graph order (`set_names`; a marker graph).
     /// Empty = no hover (force plate and device graphs).
     names: Vec<String>,
@@ -698,11 +876,16 @@ fn dashes(pts: &[Pos2], dash: f32, gap: f32) -> Vec<Vec<Pos2>> {
 /// Legend of the two line styles at the top right of the first lane `lr` (in the strip kept
 /// free for it): a short solid line and `1`, a short dashed line and `2`, the numbers of the
 /// name tags. A hidden file's part is dim, like its name tag. Shapes and two digits, no hover.
-fn legend(painter: &egui::Painter, lr: Rect, shown: [bool; 2]) {
+fn legend_rect(lr: Rect) -> Rect {
+    const SAMPLE: f32 = 18.0;
+    let w = 4.0 + SAMPLE + 4.0 + 7.0 + 10.0 + SAMPLE + 4.0 + 7.0 + 4.0;
+    Rect::from_min_size(pos2(lr.right() - w - 4.0, lr.top() + 1.0), vec2(w, LEGEND_H - 2.0))
+}
+
+fn legend(painter: &egui::Painter, lr: Rect, shown: [bool; 2]) -> Rect {
     const SAMPLE: f32 = 18.0;
     let font = FontId::proportional(11.0);
-    let w = 4.0 + SAMPLE + 4.0 + 7.0 + 10.0 + SAMPLE + 4.0 + 7.0 + 4.0;
-    let r = Rect::from_min_size(pos2(lr.right() - w - 4.0, lr.top() + 1.0), vec2(w, LEGEND_H - 2.0));
+    let r = legend_rect(lr);
     painter.rect_filled(r, 2.0, Color32::from_black_alpha(120));
     let y = r.center().y;
     let mut x = r.left() + 4.0;
@@ -720,6 +903,7 @@ fn legend(painter: &egui::Painter, lr: Rect, shown: [bool; 2]) {
         painter.text(pos2(x + SAMPLE + 4.0, y), Align2::LEFT_CENTER, if i == 0 { "1" } else { "2" }, font.clone(), color);
         x += SAMPLE + 4.0 + 7.0 + 10.0;
     }
+    r
 }
 
 /// Width of one column of `thin`, in points: the lines are drawn 1.4 wide, so two samples
@@ -800,9 +984,9 @@ fn in_view<'a>(run: &'a [[f64; 2]], vr: &ViewRange) -> &'a [[f64; 2]] {
 /// One lane's curves (`LaneShapes`): the second file's dashed curves first (the marker's, then the
 /// other markers'), then the solid ones on top, each in its marker's color, a run of one point as
 /// a dot. Also what they are (`Drew`, for tests). The dashes (thousands of little lines with 8
-/// markers) and normal solid lines are made into triangles here, once, with egui's own
-/// tessellator and settings (`tess`, the lane's clip rect). A frame copies their meshes instead
-/// of tessellating the unchanged lines again. Hover-width solid lines keep their Shape::line.
+/// markers) are made into triangles here, once, with egui's own tessellator and settings
+/// (`tess`, the lane's clip rect). `mesh_single` requests the prior single-marker mesh form;
+/// otherwise solid Shape::line points are complete immediately and can be promoted later.
 /// `w` / `dot`: line width and one-sample dot radius (`LINE_W`, or `HOVER_W` for a hovered curve).
 #[allow(clippy::too_many_arguments)]
 fn curve_shapes<'a>(
@@ -813,6 +997,7 @@ fn curve_shapes<'a>(
     y_of: impl Fn(f64) -> f32,
     w: f32,
     dot: f32,
+    mesh_single: bool,
 ) -> (Vec<Shape>, Drew) {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut drew = Drew { colors: vec![vec![]], dash_colors: vec![vec![]], ..Drew::default() };
@@ -841,6 +1026,8 @@ fn curve_shapes<'a>(
         }
     }
     flush(&mut mesh, &mut shapes);
+    let solid: Vec<_> = solid.collect();
+    let single_solid = mesh_single && w == LINE_W && solid.iter().filter(|(lane, _)| !lane.runs.is_empty()).count() == 1;
     for (t, color) in solid {
         if !t.runs.is_empty() {
             drew.colors[0].push(color);
@@ -849,14 +1036,11 @@ fn curve_shapes<'a>(
             drew.solid += 1;
             let pts: Vec<Pos2> = run.iter().map(|p| pos2(x_of(p[0]), y_of(p[1]))).collect();
             if pts.len() == 1 {
-                // A dot sits between the preceding and following runs in painter order.
                 flush(&mut mesh, &mut shapes);
                 shapes.push(Shape::circle_filled(pts[0], dot, color));
-            } else if w == LINE_W {
+            } else if single_solid {
                 tess.tessellate_shape(Shape::line(pts, Stroke::new(w, color)), &mut mesh);
-            } else {
-                shapes.push(Shape::line(pts, Stroke::new(w, color)));
-            }
+            } else { shapes.push(Shape::line(pts, Stroke::new(w, color))); }
         }
     }
     flush(&mut mesh, &mut shapes);
@@ -1040,24 +1224,23 @@ fn show_inner(
     }
     ui.data_mut(|d| d.insert_temp(id, vr));
 
+    // egui can measure a newly opened graph in a pass whose paint output is discarded.
+    // Keep its allocation, interaction state and legend's key boundary, but do not build
+    // thinned curves, meshes, text or decorations that the retained pass may replace.
+    if ui.is_sizing_pass() || !ui.is_visible() || ui.ctx().will_discard() {
+        return goto;
+    }
+
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, look.bg);
     paint_spans(&painter, plot, vr.lo, vr.hi, spans);
     paint_selection(&painter, plot, vr.lo, vr.hi, range.as_deref().copied().unwrap_or(look.selection));
 
-    // Frame grid ticks.
-    let step = nice_step(vr.hi - vr.lo, (plot.width() / 80.0) as f64);
-    let mut ticks = Vec::new();
-    let mut t = (vr.lo / step).ceil() * step;
-    while t <= vr.hi {
-        ticks.push(t);
-        t += step;
-    }
-
     let cols = (plot.width() / COLUMN_W).round().max(25.0) as usize;
     let key = (vr.lo.to_bits(), vr.hi.to_bits(), cols);
     let mut fresh = Drawn::default();
     let drawn = cache.unwrap_or(&mut fresh);
+    drawn.decorations.begin(ui);
     if drawn.background {
         drawn.prepare_background(lanes, vr, cols, key, ui.ctx());
     } else if !drawn.prepare_primary(lanes, vr, cols, key) {
@@ -1088,6 +1271,10 @@ fn show_inner(
     drawn.shapes.resize_with(lanes.len(), || None);
     drawn.hover_shapes.resize_with(lanes.len(), || None);
     let (pixels_per_point, options) = (ui.ctx().pixels_per_point(), ui.ctx().tessellation_options(|o| *o));
+    let decoration_geometry = |rect| DecorationGeometry {
+        rect, clip: painter.clip_rect(), plot_x: (plot.left(), plot.width()),
+        frames: (vr.lo.to_bits(), vr.hi.to_bits()), pixels_per_point, options,
+    };
 
     // Each lane's place, its value range and where its frames and values are on screen (`Map`),
     // worked out before painting: the hover (v0.29.0) needs them first.
@@ -1139,29 +1326,12 @@ fn show_inner(
 
     for (li, (lane, thinned)) in lanes.iter().zip(&drawn.lanes).enumerate() {
         let lr = lane_rect(li);
-        if li > 0 {
-            painter.line_segment([lr.left_top(), lr.right_top()], Stroke::new(1.0_f32, theme::GRAPH_SEP));
-        }
-        // In a low first lane the floating graph's name tag would hide the letter: right of it.
-        let letter_x = if li == 0 && look.tag_w > 0.0 && lane_h < 48.0 { look.tag_w + 12.0 } else { 18.0 };
-        painter.text(
-            lr.left_center() + vec2(letter_x, 0.0),
-            Align2::LEFT_CENTER,
-            &lane.letter,
-            FontId::proportional((lane_h * 0.72).min(72.0)),
-            look.watermark,
-        );
-        for &tk in &ticks {
-            let x = x_of(tk, &vr);
-            painter.extend(Shape::dashed_line(
-                &[pos2(x, lr.top()), pos2(x, lr.bottom())],
-                Stroke::new(1.0_f32, theme::GRAPH_GRID),
-                2.0,
-                3.0,
-            ));
-        }
         let dashed = drawn.pair_lanes.get(li);
         let (lo, hi) = ranges[li];
+        drawn.decorations.paint_lane(&painter, LaneDecorationKey {
+            geometry: decoration_geometry(lr), index: li, lane_h,
+            range: (lo.to_bits(), hi.to_bits()), values: look.values, tag_w: look.tag_w, watermark: look.watermark,
+        }, lane);
         #[cfg(test)]
         drew.ranges.push((lo, hi));
         let Some(map) = maps[li] else {
@@ -1172,13 +1342,12 @@ fn show_inner(
         let (ylo, yhi) = (map.ylo, map.yhi);
         let keep = if li == 0 && with_legend { LEGEND_H.min(lr.height() * 0.3) } else { 0.0 };
         let y_of = |v: f64| lr.bottom() - 3.0 - ((v - ylo) / (yhi - ylo)) as f32 * (lr.height() - 6.0 - keep);
-        if look.values {
-            let label_font = FontId::proportional(11.0);
-            let top = if li == 0 && look.tag_w > 0.0 { vec2(look.tag_w + 6.0, 6.0) } else { vec2(4.0, 2.0) };
-            painter.text(lr.left_top() + top, Align2::LEFT_TOP, format!("{hi:.2} {}", lane.unit), label_font.clone(), theme::TEXT_DIM);
-            painter.text(lr.left_bottom() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, format!("{lo:.2} {}", lane.unit), label_font, theme::TEXT_DIM);
-        }
         let lane_painter = painter.with_clip_rect(lr);
+        // Tint before tessellation can round AA colours differently from tinting an existing
+        // mesh. Such painters retain the prior immediate single-marker mesh representation.
+        let untinted = ui.is_enabled() && lane_painter.opacity() == 1.0;
+        let immediate_mesh = !untinted;
+        #[cfg(test)] let immediate_mesh = immediate_mesh || drawn.force_immediate_mesh;
         let shapes_key = ShapesKey {
             version: drawn.version,
             lane: lr,
@@ -1200,16 +1369,26 @@ fn show_inner(
             // The dashes' triangles as egui makes them for this lane (`curve_shapes`).
             let mut tess = egui::epaint::Tessellator::new(pixels_per_point, options, [1, 1], vec![]);
             tess.set_clip_rect(shapes_key.clip);
-            let (shapes, _lane_drew) = curve_shapes(&mut tess, dashed, solid, |f| x_of(f, &vr), y_of, LINE_W, DOT_R);
+            let (shapes, _lane_drew) = curve_shapes(&mut tess, dashed, solid, |f| x_of(f, &vr), y_of, LINE_W, DOT_R, immediate_mesh);
+            let promote_after = (!immediate_mesh && _lane_drew.colors.first().is_some_and(|colors| colors.len() == 1)
+                && shapes.iter().any(|shape| matches!(shape, Shape::Path(_))))
+                .then(|| WORK.with(|work| work.get().frame));
             drawn.shapes[li] = Some(LaneShapes {
                 key: shapes_key.clone(),
                 shapes,
+                promote_after,
                 #[cfg(test)]
                 drew: _lane_drew,
             });
             #[cfg(test)]
             {
                 drew.remade += 1;
+            }
+        }
+        if let Some(cached) = drawn.shapes[li].as_mut() {
+            if let Some(created) = cached.promote_after {
+                if immediate_mesh || claim_mesh_promotion(created) { cached.promote(); }
+                else { ui.ctx().request_repaint(); }
             }
         }
         if let Some(m) = &drawn.shapes[li] {
@@ -1233,9 +1412,9 @@ fn show_inner(
                 let one = std::iter::once((d, light));
                 let none = std::iter::empty();
                 let (shapes, _) = if c.laid_over {
-                    curve_shapes(&mut tess, one, none, |f| x_of(f, &vr), y_of, HOVER_W, HOVER_DOT_R)
+                    curve_shapes(&mut tess, one, none, |f| x_of(f, &vr), y_of, HOVER_W, HOVER_DOT_R, false)
                 } else {
-                    curve_shapes(&mut tess, none, one, |f| x_of(f, &vr), y_of, HOVER_W, HOVER_DOT_R)
+                    curve_shapes(&mut tess, none, one, |f| x_of(f, &vr), y_of, HOVER_W, HOVER_DOT_R, false)
                 };
                 Some(shapes)
             });
@@ -1256,7 +1435,8 @@ fn show_inner(
 
     // Frame bar with gap marks and tick labels.
     let nav = Rect::from_min_max(pos2(rect.left(), rect.bottom() - NAV_H), rect.max);
-    painter.rect_filled(nav, 0.0, look.nav_bg);
+    drawn.decorations.prepare_nav(&painter, NavDecorationKey { geometry: decoration_geometry(nav), bg: look.nav_bg });
+    painter.add(drawn.decorations.nav.as_ref().unwrap().background.clone());
     for &(a, b) in gaps {
         let (fa, fb) = (a as f64 - 0.5, b as f64 + 0.5);
         if fb < vr.lo || fa > vr.hi {
@@ -1268,11 +1448,7 @@ fn show_inner(
         );
         painter.rect_filled(r, 0.0, theme::NAV_GAP);
     }
-    for &tk in &ticks {
-        let x = x_of(tk, &vr);
-        painter.line_segment([pos2(x, nav.top()), pos2(x, nav.top() + 4.0)], Stroke::new(1.0_f32, theme::TEXT_DIM));
-        painter.text(pos2(x, nav.center().y + 1.0), Align2::CENTER_CENTER, format!("{tk:.0}"), FontId::monospace(10.0), theme::TEXT);
-    }
+    painter.extend(drawn.decorations.nav.as_ref().unwrap().ticks.iter().cloned());
     let cx = x_of(frame as f64, &vr);
     if cx >= plot.left() && cx <= plot.right() {
         painter.line_segment([pos2(cx, rect.top()), pos2(cx, nav.top())], Stroke::new(1.0_f32, theme::GRAPH_CURSOR));
@@ -1361,8 +1537,338 @@ mod tests {
 
     include!("graph_selection_tests.rs");
 
+    struct DecorationGraph {
+        ctx: eframe::egui::Context,
+        drawn: super::Drawn,
+        lanes: Vec<Lane>,
+        textures: crate::soft_render::Textures,
+        size: eframe::egui::Vec2,
+        offset: eframe::egui::Vec2,
+        clip: Option<eframe::egui::Rect>,
+        look: super::Look,
+        lane_h: f32,
+        frame: i64,
+        gaps: Vec<(i64, i64)>,
+        spans: Vec<super::Span>,
+        enabled: bool,
+        opacity: f32,
+        pass: u64,
+        sizing: bool,
+        invisible: bool,
+        discard_first: bool,
+        skipped_passes: usize,
+        allocated: eframe::egui::Vec2,
+        goto: Option<i64>,
+    }
+
+    impl DecorationGraph {
+        fn new(uncached: bool) -> Self {
+            let mut drawn = four_markers();
+            drawn.set_names(vec!["M".into(), "N".into(), "P".into(), "Q".into()]);
+            drawn.decorations.force_uncached = uncached;
+            Self {
+                ctx: Default::default(), drawn, lanes: flat(Color32::RED, 1.0), textures: Default::default(),
+                size: eframe::egui::vec2(420.0, 260.0), offset: eframe::egui::Vec2::ZERO, clip: None,
+                look: super::Look::pane(), lane_h: 60.0, frame: 100, gaps: vec![], spans: vec![],
+                enabled: true, opacity: 1.0, pass: 0,
+                sizing: false, invisible: false, discard_first: false, skipped_passes: 0,
+                allocated: eframe::egui::Vec2::ZERO, goto: None,
+            }
+        }
+
+        fn render(&mut self, events: Vec<eframe::egui::Event>) -> (Vec<(eframe::egui::Rect, eframe::egui::Mesh)>, eframe::egui::ColorImage) {
+            use eframe::egui;
+            let ctx = self.ctx.clone();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                time: Some(self.pass as f64), events, focused: true, ..Default::default()
+            };
+            super::start_frame(self.pass, None);
+            self.pass += 1;
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = egui::Rect::from_min_max(ui.max_rect().min + self.offset, ui.max_rect().max);
+                    let mut builder = egui::UiBuilder::new().max_rect(rect);
+                    if self.sizing { builder = builder.sizing_pass(); }
+                    if self.invisible || self.sizing { builder = builder.invisible(); }
+                    let mut child = ui.new_child(builder);
+                    child.set_clip_rect(ui.clip_rect().intersect(self.clip.unwrap_or(ui.clip_rect())));
+                    if !self.enabled { child.disable(); }
+                    child.set_opacity(self.opacity);
+                    if self.discard_first && ctx.output(|output| output.num_completed_passes) == 0 {
+                        ctx.request_discard("graph test discarded measurement pass");
+                        assert!(ctx.will_discard());
+                    }
+                    let skip = self.sizing || !child.is_visible() || ctx.will_discard();
+                    let cache_state = |drawn: &super::Drawn| (drawn.key, drawn.version, drawn.lanes.len(),
+                        drawn.shapes.len(), drawn.hover_shapes.len(), drawn.decorations.builds);
+                    let before = cache_state(&self.drawn);
+                    let atlas = self.drawn.decorations.atlas.clone();
+                    self.goto = super::show(&mut child, egui::Id::new("decoration_graph"), &self.lanes, 0, 3999,
+                        self.frame, &self.gaps, self.lane_h, &self.look, Some(&mut self.drawn), &self.spans);
+                    self.allocated = child.min_rect().size();
+                    if skip {
+                        self.skipped_passes += 1;
+                        assert_eq!(cache_state(&self.drawn), before, "a skipped pass must not build or replace curve/decor caches");
+                        assert!(atlas.ptr_eq(&self.drawn.decorations.atlas));
+                    }
+                });
+            });
+            super::end_frame();
+            self.textures.set(&out.textures_delta);
+            let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+            let geometry = primitives.iter().map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => (primitive.clip_rect, mesh.clone()),
+                _ => panic!("graph must not add a backend-specific callback"),
+            }).collect();
+            let size = [(self.size.x * out.pixels_per_point).round() as usize, (self.size.y * out.pixels_per_point).round() as usize];
+            let image = crate::soft_render::paint(&primitives, &self.textures, size, out.pixels_per_point, Color32::BLACK);
+            (geometry, image)
+        }
+    }
+
+    fn promotion_graph(immediate: bool) -> DecorationGraph {
+        let mut graph = DecorationGraph::new(false);
+        graph.drawn = super::Drawn::default();
+        graph.drawn.force_immediate_mesh = immediate;
+        graph.drawn.set_names(vec!["M".into()]);
+        graph.lanes = (0..3).map(|axis| {
+            let value = |frame: i64| (frame as f64 * 0.013).sin() * (axis + 1) as f64;
+            Lane {
+                letter: ["X", "Y", "Z"][axis].into(),
+                color: Color32::from_rgba_unmultiplied(210, 70 + axis as u8 * 50, 35, 173),
+                runs: vec![
+                    (0..40).map(|f| [f as f64, value(f)]).collect(),
+                    vec![[66.0, value(66)]],
+                    (100..4000).map(|f| [f as f64, value(f)]).collect(),
+                ].into(), unit: "mm",
+            }
+        }).collect();
+        graph.drawn.set_pair(Some(super::Pair { lanes: flat(Color32::GREEN, -1.5), shown: [true, true] }));
+        graph
+    }
+
+    fn pending_promotions(graph: &DecorationGraph) -> usize {
+        graph.drawn.shapes.iter().filter(|lane| lane.as_ref().is_some_and(|lane| lane.promote_after.is_some())).count()
+    }
+
     #[test]
-    fn normal_solid_mesh_matches_the_previous_lines_in_geometry_and_pixels() {
+    fn first_full_paths_and_bounded_promotions_match_immediate_mesh_geometry_and_pixels() {
+        let mut delayed = promotion_graph(false);
+        let mut reference = promotion_graph(true);
+        let mut version = None;
+        let mut points = Vec::new();
+        for frame in 0..5 {
+            for graph in [&mut delayed, &mut reference] {
+                graph.frame = 100 + frame;
+                if frame == 1 { graph.drawn.set_hover_force(Some(0)); }
+                if frame == 4 { graph.drawn.set_hover_force(None); }
+            }
+            let a = delayed.render(vec![]);
+            let b = reference.render(vec![]);
+            assert_eq!(a.0, b.0, "first/full/promoted triangles must remain exact at frame {frame}");
+            assert_eq!(a.1.pixels, b.1.pixels, "first/full/promoted pixels must remain exact at frame {frame}");
+            assert_eq!(delayed.drawn.drew.solid, 9, "every run and dot is present on the first frame too");
+            assert_eq!(pending_promotions(&delayed), 3usize.saturating_sub(frame as usize));
+            if frame == 0 {
+                assert!(delayed.drawn.shapes.iter().all(|lane| lane.as_ref().unwrap().shapes.iter().any(|shape| matches!(shape, eframe::egui::Shape::Path(_)))));
+                version = Some(delayed.drawn.version);
+                points = delayed.drawn.lanes.iter().flat_map(|lane| lane.runs.iter()).map(|run| run.as_ptr()).collect();
+            } else {
+                assert_eq!(delayed.drawn.version, version.unwrap(), "promotion must not rebuild or rethin source lanes");
+                assert_eq!(delayed.drawn.lanes.iter().flat_map(|lane| lane.runs.iter()).map(|run| run.as_ptr()).collect::<Vec<_>>(), points);
+                assert_eq!(delayed.drawn.drew.remade, 0);
+            }
+            if matches!(frame, 2 | 3) { assert_eq!(delayed.drawn.drew.hover_made, 0, "promotion must retain hover caches"); }
+        }
+    }
+
+    #[test]
+    fn single_marker_tint_uses_prior_mesh_before_first_paint_and_on_tint_change() {
+        use eframe::egui::{pos2, Rect};
+        for (enabled, opacity) in [(false, 1.0), (true, 0.55), (false, 0.55)] {
+            for tint_on_first_frame in [false, true] {
+                let mut delayed = promotion_graph(false);
+                let mut reference = promotion_graph(true);
+                for graph in [&mut delayed, &mut reference] {
+                    graph.ctx.set_pixels_per_point(1.5);
+                    graph.clip = Some(Rect::from_min_max(pos2(24.25, 31.5), pos2(370.5, 220.25)));
+                }
+                if !tint_on_first_frame {
+                    let a = delayed.render(vec![]);
+                    let b = reference.render(vec![]);
+                    assert_eq!(a.0, b.0); assert_eq!(a.1.pixels, b.1.pixels);
+                    assert_eq!(pending_promotions(&delayed), 3);
+                }
+                for graph in [&mut delayed, &mut reference] { graph.enabled = enabled; graph.opacity = opacity; }
+                let a = delayed.render(vec![]);
+                let b = reference.render(vec![]);
+                assert_eq!(a.0, b.0, "AA triangles/colours must preserve the previous tint order");
+                assert_eq!(a.1.pixels, b.1.pixels, "AA pixels must preserve the previous tint order");
+                assert_eq!(pending_promotions(&delayed), 0, "non-normal painters must use the prior mesh before painting");
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_is_one_lane_globally_per_application_frame_including_repeated_passes() {
+        let mut a = promotion_graph(false);
+        let mut b = promotion_graph(false);
+        for graph in [&mut a, &mut b] { graph.pass = 50_000; graph.render(vec![]); }
+        assert_eq!(pending_promotions(&a) + pending_promotions(&b), 6);
+        for graph in [&mut a, &mut b] { graph.pass = 50_000; graph.render(vec![]); }
+        assert_eq!(pending_promotions(&a) + pending_promotions(&b), 6, "a second sizing/layout pass must not promote first-frame paths");
+        for graph in [&mut a, &mut b] { graph.pass = 50_001; graph.render(vec![]); }
+        assert_eq!(pending_promotions(&a) + pending_promotions(&b), 5);
+        for graph in [&mut b, &mut a] { graph.pass = 50_001; graph.render(vec![]); }
+        assert_eq!(pending_promotions(&a) + pending_promotions(&b), 5, "all views and passes share one promotion allowance");
+        for graph in [&mut b, &mut a] { graph.pass = 50_002; graph.render(vec![]); }
+        assert_eq!((pending_promotions(&a), pending_promotions(&b)), (2, 2));
+    }
+
+    #[test]
+    fn changed_curve_keys_cancel_old_promotion_eligibility() {
+        use eframe::egui::{self, pos2, Rect};
+        let mut graph = promotion_graph(false);
+        graph.pass = 60_000; graph.render(vec![]);
+        graph.pass = 60_001; graph.render(vec![]);
+        assert_eq!(pending_promotions(&graph), 2);
+        for change in 0..3 {
+            // Invalidate within the current application frame: every new lane must remain
+            // complete compact paths, even if its old incarnation was already promoted.
+            graph.pass -= 1;
+            match change {
+                0 => graph.ctx.data_mut(|data| data.insert_temp(egui::Id::new("decoration_graph"), ViewRange { lo: 20.25, hi: 3000.75 })),
+                1 => graph.clip = Some(Rect::from_min_max(pos2(24.25, 31.5), pos2(370.5, 220.25))),
+                2 => graph.ctx.set_pixels_per_point(1.5),
+                _ => unreachable!(),
+            }
+            graph.render(vec![]);
+            assert_eq!(pending_promotions(&graph), 3, "new key must reset eligibility at change {change}");
+            let keys: Vec<_> = graph.drawn.shapes.iter().map(|lane| lane.as_ref().unwrap().key.clone()).collect();
+            graph.render(vec![]);
+            let next_keys: Vec<_> = graph.drawn.shapes.iter().map(|lane| lane.as_ref().unwrap().key.clone()).collect();
+            if keys != next_keys {
+                // egui can apply DPI/viewport geometry over consecutive frames. Each actual
+                // key change starts a fresh complete Path frame, rather than promoting stale points.
+                assert_eq!(pending_promotions(&graph), 3, "a second geometry change must reset every lane: change {change}");
+                graph.render(vec![]);
+                assert!(graph.drawn.shapes.iter().zip(&next_keys).all(|(lane, key)| lane.as_ref().unwrap().key == *key),
+                    "the following frame must exercise stable keys: change {change}");
+            }
+            assert_eq!(pending_promotions(&graph), 2, "one stable later frame promotes exactly one lane: change {change}");
+        }
+    }
+
+    #[test]
+    fn decoration_cache_matches_forced_uncached_geometry_pixels_and_all_key_changes() {
+        use eframe::egui::{self, pos2, vec2, Rect};
+        let mut cached = DecorationGraph::new(false);
+        let mut uncached = DecorationGraph::new(true);
+        let mut previous_pixels = Vec::new();
+        for case in 0..19 {
+            let before = cached.drawn.decorations.builds;
+            for graph in [&mut cached, &mut uncached] {
+                match case {
+                    0 | 1 => {},
+                    2 => graph.frame = 600,
+                    3 => {
+                        graph.spans = vec![super::Span { start: 120, end: 800, picked: true }];
+                        graph.look.selection = Some((400, 700)); graph.gaps = vec![(50, 100), (1500, 1800)];
+                    }
+                    4 => graph.look.watermark = Color32::from_white_alpha(55),
+                    5 => { graph.lane_h = 45.0; graph.look.tag_w = 73.5; },
+                    6 => { graph.size.x = 390.375; graph.offset = vec2(5.125, 9.375); },
+                    7 => graph.clip = Some(Rect::from_min_max(pos2(24.0, 31.0), pos2(370.0, 220.0))),
+                    8 => graph.ctx.data_mut(|data| data.insert_temp(egui::Id::new("decoration_graph"), ViewRange { lo: 25.0, hi: 3000.0 })),
+                    9 => { graph.lanes[0].letter = "changed".into(); graph.lanes[0].unit = "cm"; },
+                    10 => graph.drawn.set_more(vec![flat(Color32::BLUE, 130.25)]),
+                    11 => { graph.look.values = false; graph.look.nav_bg = Color32::from_rgb(4, 8, 12); },
+                    12 => graph.ctx.set_pixels_per_point(1.5),
+                    13 => graph.ctx.tessellation_options_mut(|options| options.feathering = false),
+                    14 => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().reverse();
+                        graph.ctx.set_fonts(fonts);
+                    }
+                    15 => graph.ctx.set_fonts(egui::FontDefinitions::default()),
+                    16 => { graph.enabled = false; graph.opacity = 0.55; },
+                    17 => { graph.enabled = true; graph.opacity = 1.0; graph.drawn.set_hover_force(Some(1)); },
+                    18 => { graph.drawn.set_pair(None); graph.drawn.set_more_pairs(vec![]); },
+                    _ => unreachable!(),
+                }
+            }
+            let a = cached.render(vec![]);
+            let b = uncached.render(vec![]);
+            assert_eq!(a.0, b.0, "cached and freshly generated ordered triangles differ at case {case}");
+            assert_eq!(a.1.pixels, b.1.pixels, "cached and freshly generated pixels differ at case {case}");
+            if matches!(case, 1 | 2 | 3 | 16 | 17) {
+                assert_eq!(cached.drawn.decorations.builds, before, "dynamic layers/tint must not rebuild static decorations: case {case}");
+            } else {
+                assert!(cached.drawn.decorations.builds > before, "changed decoration input must invalidate its cache: case {case}");
+            }
+            if matches!(case, 2 | 3 | 16 | 17) {
+                assert_ne!(a.1.pixels, previous_pixels, "dynamic layer must still change the picture: case {case}");
+            }
+            previous_pixels = a.1.pixels;
+        }
+    }
+
+    #[test]
+    fn sizing_and_invisible_graph_passes_keep_layout_and_range_without_building_caches() {
+        use eframe::egui;
+        for sizing in [false, true] {
+            let mut measured = DecorationGraph::new(false);
+            let mut visible = DecorationGraph::new(false);
+            for graph in [&mut measured, &mut visible] {
+                graph.ctx.data_mut(|data| data.insert_temp(egui::Id::new("decoration_graph"), ViewRange { lo: 15.25, hi: 3200.75 }));
+                graph.look.selection = Some((400, 700));
+                graph.spans = vec![super::Span { start: 200, end: 800, picked: true }];
+                graph.gaps = vec![(40, 60)];
+            }
+            measured.invisible = true;
+            measured.sizing = sizing;
+            measured.render(vec![]);
+            assert_eq!(measured.skipped_passes, 1);
+            assert!(measured.drawn.key.is_none() && measured.drawn.shapes.is_empty());
+            assert_eq!(measured.drawn.decorations.builds, 0);
+            assert!(measured.drawn.decorations.nav.is_none() && measured.drawn.decorations.lanes.is_empty());
+            let range = measured.ctx.data(|data| data.get_temp::<ViewRange>(egui::Id::new("decoration_graph"))).unwrap();
+            assert_eq!((range.lo, range.hi), (15.25, 3200.75));
+            let allocated = measured.allocated;
+            // The same guard must also avoid launching device-graph thinning workers.
+            measured.drawn.background = true;
+            measured.render(vec![]);
+            assert!(measured.drawn.background_rx.is_none());
+            measured.drawn.background = false;
+            measured.invisible = false;
+            measured.sizing = false;
+            let a = measured.render(vec![]);
+            let b = visible.render(vec![]);
+            assert_eq!(measured.allocated, allocated, "measurement must allocate the retained graph's full size");
+            assert_eq!(measured.allocated, visible.allocated);
+            assert_eq!(a.0, b.0, "the first retained graph must match ordinary full rendering");
+            assert_eq!(a.1.pixels, b.1.pixels);
+        }
+    }
+
+    #[test]
+    fn known_discarded_graph_pass_builds_only_in_retained_pass_and_preserves_pixels() {
+        let mut multipass = DecorationGraph::new(false);
+        let mut ordinary = DecorationGraph::new(false);
+        multipass.discard_first = true;
+        let a = multipass.render(vec![]);
+        let b = ordinary.render(vec![]);
+        assert_eq!(multipass.skipped_passes, 1, "exercise an actual egui discarded pass");
+        assert_eq!(multipass.drawn.decorations.builds, ordinary.drawn.decorations.builds,
+            "first-visible work stays in the measured frame and must be built just once");
+        assert_eq!(multipass.allocated, ordinary.allocated);
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1.pixels, b.1.pixels);
+    }
+
+    #[test]
+    fn hybrid_solid_cache_matches_frozen_meshes_in_geometry_and_pixels() {
         use super::{curve_shapes, DrawnLane, DOT_R, HOVER_DOT_R, HOVER_W, LINE_W};
         use eframe::egui::{self, pos2, Color32, Pos2, Rect, Shape, Stroke};
 
@@ -1381,23 +1887,36 @@ mod tests {
             t
         };
         let empty = || std::iter::empty::<(&DrawnLane, Color32)>();
-        let solids = || [(&red, Color32::RED), (&blue, Color32::BLUE)].into_iter();
+        for count in [1, 2] {
+        let solids = || [(&red, Color32::RED), (&blue, Color32::BLUE)].into_iter().take(count);
         let mut maker = tess();
-        let (cached, drew) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), solids(), |x| x as f32, |y| y as f32, LINE_W, DOT_R);
-        assert_eq!((drew.solid, drew.dashed), (4, 1));
-        assert!(cached.iter().filter(|shape| matches!(shape, Shape::Mesh(_))).count() >= 3,
-            "dashes, solid lines before the dot, and solid lines after it keep painter order");
+        let (cached, drew) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), solids(), |x| x as f32, |y| y as f32, LINE_W, DOT_R, true);
+        assert_eq!((drew.solid, drew.dashed), (if count == 1 { 3 } else { 4 }, 1));
+        assert_eq!(cached.iter().filter(|shape| matches!(shape, Shape::Mesh(_))).count(), if count == 1 { 3 } else { 1 },
+            "one marker retains the prior solid meshes; several retain only the dashed mesh");
+        assert_eq!(cached.iter().filter(|shape| matches!(shape, Shape::Path(_))).count(), if count == 1 { 0 } else { 3 },
+            "multiple markers retain compact points for the per-frame painter copy");
 
-        // The pre-cache rendering left solid runs as Shape::line. Recreate only that old
-        // representation; the dashed mesh is identical in both paths.
+        // Frozen v0.32.10 representation: tessellate solid runs into owned meshes, flushing
+        // around dots. Keep this reference independent of the compact solid path under test;
+        // dashed mesh generation is unchanged in both forms.
         let mut maker = tess();
-        let (mut previous, _) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), empty(), |x| x as f32, |y| y as f32, LINE_W, DOT_R);
+        let (mut previous, _) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), empty(), |x| x as f32, |y| y as f32, LINE_W, DOT_R, true);
+        let mut solid_mesh = egui::Mesh::default();
         for (lane, color) in solids() {
             for run in &lane.runs {
                 let pts: Vec<Pos2> = run.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
-                previous.push(if pts.len() == 1 { Shape::circle_filled(pts[0], DOT_R, color) } else { Shape::line(pts, Stroke::new(LINE_W, color)) });
+                if pts.len() == 1 {
+                    if !solid_mesh.is_empty() { previous.push(Shape::mesh(std::mem::take(&mut solid_mesh))); }
+                    previous.push(Shape::circle_filled(pts[0], DOT_R, color));
+                } else {
+                    maker.tessellate_shape(Shape::line(pts, Stroke::new(LINE_W, color)), &mut solid_mesh);
+                }
             }
         }
+        if !solid_mesh.is_empty() { previous.push(Shape::mesh(solid_mesh)); }
+        assert_eq!(previous.iter().filter(|shape| matches!(shape, Shape::Mesh(_))).count(), 3,
+            "the frozen reference retains dashed and solid meshes on both sides of the dot");
         let flatten = |shapes: Vec<Shape>| {
             let mut t = tess();
             let mut mesh = egui::Mesh::default();
@@ -1426,8 +1945,9 @@ mod tests {
         assert_eq!(image(&new_mesh).pixels, old_pixels.pixels);
 
         let mut maker = tess();
-        let (hover, _) = curve_shapes(&mut maker, empty(), std::iter::once((&red, Color32::RED)), |x| x as f32, |y| y as f32, HOVER_W, HOVER_DOT_R);
+        let (hover, _) = curve_shapes(&mut maker, empty(), std::iter::once((&red, Color32::RED)), |x| x as f32, |y| y as f32, HOVER_W, HOVER_DOT_R, false);
         assert!(hover.iter().all(|shape| !matches!(shape, Shape::Mesh(_))), "hover-width solid lines keep their old representation");
+        }
     }
 
     #[test]
@@ -1592,11 +2112,21 @@ mod tests {
         assert_eq!((drew.solid, drew.dashed, drew.legend), (9, 0, false));
         assert_eq!(drew.ranges[0], (-40.0, 50.0), "lane X covers the sine (±1) and both flat curves");
         assert_eq!(drew.ranges[2].1, 50.0);
-        let vertex_count = |shapes: &[eframe::egui::epaint::ClippedShape]| shapes.iter().map(|shape| {
-            if let eframe::egui::Shape::Mesh(mesh) = &shape.shape { mesh.vertices.len() } else { 0 }
-        }).sum::<usize>();
+        let vertex_count = |shapes: &[eframe::egui::epaint::ClippedShape]| {
+            let mut tess = eframe::egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+            let mut mesh = eframe::egui::Mesh::default();
+            for shape in shapes {
+                tess.set_clip_rect(shape.clip_rect);
+                tess.tessellate_shape(shape.shape.clone(), &mut mesh);
+            }
+            mesh.vertices.len()
+        };
         let has_color = |shapes: &[eframe::egui::epaint::ClippedShape], color| shapes.iter().any(|shape| {
-            matches!(&shape.shape, eframe::egui::Shape::Mesh(mesh) if mesh.vertices.iter().any(|vertex| vertex.color == color))
+            match &shape.shape {
+                eframe::egui::Shape::Path(path) => path.stroke.color == eframe::egui::epaint::ColorMode::Solid(color),
+                eframe::egui::Shape::Mesh(mesh) => mesh.vertices.iter().any(|vertex| vertex.color == color),
+                _ => false,
+            }
         });
         assert!(vertex_count(&three) > vertex_count(&alone), "two extra markers add drawn line geometry");
         for color in [blue, gold] {
@@ -1724,6 +2254,36 @@ mod tests {
         drawn.set_shown([true, true]);
         let h = frames(&mut drawn, 1, None);
         assert_eq!((h[0].1.remade, &h[0].0), (3, &f[0].0));
+    }
+
+    #[test]
+    fn changing_playback_frame_reuses_compact_solids_and_dashed_meshes() {
+        use super::{end_frame, show, start_frame, Look};
+        use eframe::egui;
+        let mut drawn = four_markers();
+        let lanes = flat(Color32::RED, 1.0);
+        let ctx = egui::Context::default();
+        let mut original = None;
+        for (iteration, frame) in [100, 101, 2000, 3999].into_iter().enumerate() {
+            start_frame(iteration as u64, None);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0))),
+                time: Some(iteration as f64),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, egui::Id::new("playback_cache"), &lanes, 0, 3999, frame, &[], 100.0, &Look::pane(), Some(&mut drawn), &[]);
+                });
+            });
+            end_frame();
+            assert!(!drawn.pending());
+            assert_eq!(drawn.drew.remade, if iteration == 0 { 3 } else { 0 },
+                "the moving current-frame line must not rebuild any cached curve");
+            let cached: Vec<_> = drawn.shapes.iter().map(|lane| lane.as_ref().unwrap().shapes.clone()).collect();
+            if let Some(original) = &original { assert_eq!(&cached, original); }
+            else { original = Some(cached); }
+        }
     }
 
     #[test]

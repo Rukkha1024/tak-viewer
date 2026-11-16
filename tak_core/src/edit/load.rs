@@ -2,8 +2,6 @@
 use super::{DeclaredLabel, DocumentInput, EditError, LabelKey, PreparedInput, RawSample, RawTrack, RecordBytes, StreamRef};
 use crate::tak::{self, channels, nodes, Take};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,49 +9,18 @@ fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string(
 
 impl PreparedInput {
     /// Read and validate source records on a worker, returning a markers-only Take for rebuilding
-    /// the display. The caller retains the live view's analog data and deferred jobs. TAKM seals
-    /// are checked. Strictly unsupported or ambiguous data is refused;
+    /// the display. The caller retains the live view's analog data and deferred jobs. Full TAKM
+    /// seals are checked during save passthrough. Unsupported or ambiguous data is refused;
     /// lenient-only node records can be displayed but are marked ineligible for modification.
-    /// A full TAK is read on demand here, never during the initial markers-first path. Analog
-    /// record bytes may be copied and their boundaries checked, but their samples are not decoded.
+    /// Device headers retain original offsets/counts, with unopened sample ranges represented
+    /// by placeholders. Save must copy those ranges from the source, never serialize zeros.
     pub fn read_from_path(path: &Path) -> Result<(PreparedInput, Take), EditError> {
-        let before = std::fs::metadata(path).map_err(error)?;
-        let before_stamp = (before.len(), before.modified().ok());
-        let (streams, nodes_bytes, channel_bytes, meta_bytes) = if crate::takm::is_takm_path(path) {
-            crate::takm::verify_fixed(path).map_err(error)?;
-            let mut file = File::open(path).map_err(error)?;
-            let index = crate::takm::read_index(&file, before.len()).map_err(error)?;
-            let get = |file: &mut File, name: &str| -> Result<Vec<u8>, EditError> {
-                let s = index.unique(name).ok_or(EditError::UnsupportedLayout)?;
-                let len = usize::try_from(s.size).map_err(|_| EditError::UnsupportedLayout)?;
-                let mut data = vec![0; len];
-                file.seek(SeekFrom::Start(s.offset)).map_err(error)?;
-                file.read_exact(&mut data).map_err(error)?;
-                Ok(data)
-            };
-            let ns = get(&mut file, "Nodes.dat")?;
-            let cs = get(&mut file, "Channels.dat")?;
-            let ms = get(&mut file, "MetaData.dat")?;
-            (index.streams.iter().map(|s| StreamRef { index: s.index, name: s.name.clone() }).collect::<Vec<_>>(), ns, cs, ms)
-        } else {
-            let raw = std::fs::read(path).map_err(error)?;
-            let container = tak::container::Container::parse(&raw).map_err(error)?;
-            let entries = container.streams().map_err(error)?;
-            let get = |name: &str| -> Result<Vec<u8>, EditError> {
-                let mut hits = entries.iter().filter(|(n, _)| n == name);
-                let entry = hits.next().ok_or(EditError::UnsupportedLayout)?;
-                if hits.next().is_some() { return Err(EditError::UnsupportedLayout); }
-                container.read_stream(entry.1).map_err(error)
-            };
-            let ns = get("Nodes.dat")?;
-            let cs = get("Channels.dat")?;
-            let ms = get("MetaData.dat")?;
-            let refs = entries.iter().enumerate().map(|(index, (name, _))| StreamRef { index, name: name.clone() }).collect();
-            (refs, ns, cs, ms)
-        };
-        let after = std::fs::metadata(path).map_err(error)?;
-        if (after.len(), after.modified().ok()) != before_stamp { return Err(EditError::Other("원본 파일이 읽는 중 바뀌었어요".into())); }
-        let take = tak::decode_markers(path, before.len() as usize, &nodes_bytes, &channel_bytes, &meta_bytes, false).map_err(error)?;
+        let source = super::source::Source::read(path)?;
+        let nodes_bytes = &source.unique("Nodes.dat")?.bytes;
+        let channel_bytes = &source.unique("Channels.dat")?.bytes;
+        let meta_bytes = &source.unique("MetaData.dat")?.bytes;
+        let streams = source.streams.iter().map(|s| StreamRef {index:s.index,name:s.name.clone()}).collect::<Vec<_>>();
+        let take = tak::decode_markers(path,source.len as usize,nodes_bytes,channel_bytes,meta_bytes,false).map_err(error)?;
         let assets = nodes::skeleton_asset_set(&nodes_bytes).map_err(error)?;
         let marker_nodes = nodes::parse_marker_nodes(&nodes_bytes, &assets).map_err(error)?;
         let properties = nodes::property_records(&nodes_bytes, &nodes::MARKER_SIGNATURES).map_err(error)?;

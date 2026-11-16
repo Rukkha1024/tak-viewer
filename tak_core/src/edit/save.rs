@@ -9,11 +9,15 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "save_stream.rs"]
+mod streaming;
+
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string()) }
 fn conflict() -> EditError { EditError::FileChangedOnDisk }
 
-/// Fixed-part fingerprint captured when a document is loaded or a destination is chosen.
+/// Selectively read streams + layout fingerprint captured on a worker. Deferred payloads
+/// are verified during save passthrough, against stream hashes/the original seal if present.
 /// Comment-only appends do not change a TAKM version; other changes do. A missing target is
 /// a version too. Capture before loading, and compare again after loading, on a worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,18 +26,7 @@ impl FileVersion {
     pub fn capture(path: &Path) -> Result<Self, EditError> {
         let path = takm::canonical_target(path).map_err(error)?;
         let digest = match File::open(&path) {
-            Ok(mut f) => {
-                let len = if takm::is_takm_path(&path) {
-                    takm::verify_fixed(&path).map_err(error)?;
-                    takm::read_index(&f, f.metadata().map_err(error)?.len()).map_err(error)?.tail_start()
-                } else { f.metadata().map_err(error)?.len() };
-                // Windows positional reads advance the cursor; hash the complete fixed part.
-                f.seek(SeekFrom::Start(0)).map_err(error)?;
-                let mut h = Sha256::new();
-                let n = std::io::copy(&mut Read::by_ref(&mut f).take(len), &mut HashWriter(&mut h)).map_err(error)?;
-                if n != len { return Err(conflict()); }
-                Some(h.finalize().into())
-            }
+            Ok(_) => Some(super::source::Source::read(&path)?.digest(&path)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(error(e)),
         };
@@ -119,8 +112,11 @@ impl TakmSave {
     }
 }
 
+#[cfg(test)]
 struct SourceStream { name: String, index: usize, bytes: Vec<u8> }
+#[cfg(test)]
 struct SourceData { streams: Vec<SourceStream>, table: Value, tail: Vec<u8> }
+#[cfg(test)]
 fn source_data(path: &Path) -> Result<SourceData, EditError> {
     let raw = std::fs::read(path).map_err(error)?;
     if takm::is_takm_path(path) {
@@ -170,15 +166,14 @@ pub fn read_creation_streams(path: &Path, expected: &FileVersion) -> Result<(Vec
         Some(takm::lock_path(&path).map_err(error)?)
     } else { None };
     if FileVersion::capture(&path)? != *expected { return Err(conflict()); }
-    let mut data = source_data(&path)?;
-    let ni = unique_stream(&data.streams, "Nodes.dat")?;
-    let ci = unique_stream(&data.streams, "Channels.dat")?;
-    let nodes = std::mem::take(&mut data.streams[ni].bytes);
-    let channels = std::mem::take(&mut data.streams[ci].bytes);
+    let data = super::source::Source::read(&path)?;
+    let nodes = data.unique("Nodes.dat")?.bytes.clone();
+    let channels = data.unique("Channels.dat")?.bytes.clone();
     if FileVersion::capture(&path)? != *expected { return Err(conflict()); }
     Ok((nodes, channels))
 }
 
+#[cfg(test)]
 fn unique_stream(streams: &[SourceStream], name: &str) -> Result<usize, EditError> {
     let mut found = streams.iter().enumerate().filter(|(_, s)| s.name == name);
     let i = found.next().ok_or(EditError::UnsupportedLayout)?.0;
@@ -267,6 +262,7 @@ fn serialize_markers(snapshot: &DocumentSnapshot, nodes: &[u8], channels: &[u8])
     Ok((new_nodes, rebuilt))
 }
 
+#[cfg(test)]
 fn write_takm(file: &mut File, source: &mut SourceData, inject: &mut impl FnMut(&str) -> Result<(), EditError>) -> Result<u64, EditError> {
     let mut offset = takm::HEADER_LEN;
     let mut entries = Vec::new();
@@ -295,40 +291,18 @@ fn write_takm(file: &mut File, source: &mut SourceData, inject: &mut impl FnMut(
     file.sync_all().map_err(error)?;
     Ok(fixed)
 }
-fn validate_temp(path: &Path, snapshot: &DocumentSnapshot, source: &SourceData) -> Result<(), EditError> {
-    takm::verify_fixed(path).map_err(error)?;
-    let mut file = File::open(path).map_err(error)?;
-    let idx = takm::read_index(&file, file.metadata().map_err(error)?.len()).map_err(error)?;
-    if idx.streams.len() != source.streams.len() { return Err(EditError::UnsupportedLayout); }
-    for (actual, expected) in idx.streams.iter().zip(&source.streams) {
-        if actual.name != expected.name || actual.index != expected.index || actual.size != expected.bytes.len() as u64 { return Err(EditError::UnsupportedLayout); }
-        file.seek(SeekFrom::Start(actual.offset)).map_err(error)?;
-        let mut bytes = vec![0; expected.bytes.len()];
-        file.read_exact(&mut bytes).map_err(error)?;
-        if bytes != expected.bytes { return Err(EditError::UnsupportedLayout); }
-    }
-    file.seek(SeekFrom::Start(idx.tail_start())).map_err(error)?;
-    let mut tail = Vec::new(); file.read_to_end(&mut tail).map_err(error)?;
-    if tail != source.tail { return Err(EditError::UnsupportedLayout); }
-    let (loaded, _) = PreparedInput::read_from_path(path)?;
-    let mut doc = super::EditDocument::unloaded(path.to_path_buf());
-    doc.install_prepared(doc.revision(), loaded)?;
-    let reopened = doc.snapshot();
-    if snapshot.tracks().count() != reopened.tracks().count() { return Err(EditError::UnsupportedLayout); }
-    for track in snapshot.tracks() {
-        let other = reopened.track(&track.uid).ok_or(EditError::UnsupportedLayout)?;
-        if track.name != other.name || track.label != other.label || track.samples != other.samples || track.records.node != other.records.node { return Err(EditError::UnsupportedLayout); }
-    }
-    Ok(())
-}
-fn complete_digest(path: &Path) -> Result<Option<[u8;32]>, EditError> {
+fn guard_digest(path: &Path) -> Result<Option<[u8;32]>, EditError> {
     match File::open(path) {
         Ok(mut file) => {
-            let mut hash = Sha256::new();
-            std::io::copy(&mut file, &mut HashWriter(&mut hash)).map_err(error)?;
-            Ok(Some(hash.finalize().into()))
+            let source = super::source::Source::read(path)?;
+            let mut h = Sha256::new(); h.update(source.digest(path)?);
+            if source.seal.is_some() {
+                file.seek(SeekFrom::Start(source.tail_start)).map_err(error)?;
+                std::io::copy(&mut file,&mut HashWriter(&mut h)).map_err(error)?;
+            }
+            Ok(Some(h.finalize().into()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(error(e)),
     }
 }
@@ -379,15 +353,9 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
     inject("after_locks")?;
     check_version(&source_path, &request.expected_source)?;
     check_version(&destination, &request.expected_destination)?;
-    let dest_before = complete_digest(&destination)?;
-    let source_before = complete_digest(&source_path)?;
-    let mut data = source_data(&source_path)?;
-    let ni = unique_stream(&data.streams, "Nodes.dat")?;
-    let ci = unique_stream(&data.streams, "Channels.dat")?;
-    unique_stream(&data.streams, "MetaData.dat")?;
-    let (nodes, channels) = serialize_markers(&request.snapshot, &data.streams[ni].bytes, &data.streams[ci].bytes)?;
-    data.streams[ni].bytes = nodes;
-    data.streams[ci].bytes = channels;
+    let dest_before = guard_digest(&destination)?;
+    let source_before = guard_digest(&source_path)?;
+    let mut data = streaming::Data::read(&source_path, &request.snapshot)?;
     inject("before_write")?;
     let name = destination.file_name().unwrap_or_default().to_string_lossy();
     let (seq, tmp_path, mut file) = loop {
@@ -400,13 +368,13 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
         }
     };
     let tmp = Temp(tmp_path);
-    let written = write_takm(&mut file, &mut data, &mut inject);
+    let written = data.write(&mut file, &mut inject);
     drop(file);
     let fixed_len = written?;
     inject("after_write")?;
-    validate_temp(&tmp.0, &request.snapshot, &data)?;
+    data.validate(&tmp.0, &request.snapshot)?;
     inject("after_validate")?;
-    if complete_digest(&source_path)? != source_before || complete_digest(&destination)? != dest_before { return Err(conflict()); }
+    if guard_digest(&source_path)? != source_before || guard_digest(&destination)? != dest_before { return Err(conflict()); }
     check_version(&source_path, &request.expected_source)?;
     check_version(&destination, &request.expected_destination)?;
     let temp_version = FileVersion::capture(&tmp.0)?;
@@ -421,7 +389,7 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
     } else { None };
     inject("before_replace")?;
     if let Some(old) = &backup {
-        if complete_digest(&old.0)? != dest_before || complete_digest(&destination)? != dest_before { return Err(conflict()); }
+        if guard_digest(&old.0)? != dest_before || guard_digest(&destination)? != dest_before { return Err(conflict()); }
         std::fs::rename(&tmp.0, &destination).map_err(error)?;
     } else {
         // Atomic create-if-absent; never use a replacing rename for a new destination.
@@ -520,6 +488,67 @@ mod tests {
             assert_eq!(actual.samples, track.samples);
             assert_eq!(actual.label, track.label);
         }
+    }
+
+    /// Count actual positional reads, including conflict/creation checks and temp validation.
+    /// Only the bounded source-to-output copy is permitted to touch deferred payload bytes.
+    #[test]
+    fn unopened_emg_lifecycle_reads_zero_until_copy_then_exactly_once() {
+        assert_counted_lifecycle(Fixture::from_bytes("counted_emg",&crate::sample_tak::sample_tak_with_devices()),false);
+    }
+
+
+    fn assert_counted_lifecycle(mut f:Fixture,check_open:bool) {
+        use crate::tak::fast_read::read_trace;
+        let source=super::super::source::Source::read(&f.tak).unwrap();
+        let channels=source.unique("Channels.dat").unwrap();
+        let ranges:Vec<_>=channels.deferred.iter().flat_map(|&(a,b)|channels.map.pieces(a,b)).map(|(o,n)|(o,o+n as u64)).collect();
+        let expected:u64=ranges.iter().map(|(a,b)|b-a).sum();assert!(expected>0);
+        let overlap=|reads:&[(u64,u64)]|->u64{reads.iter().map(|&(a,b)|ranges.iter().map(|&(c,d)|b.min(d).saturating_sub(a.max(c))).sum::<u64>()).sum()};
+        let file=File::open(&f.tak).unwrap();let trace=read_trace::start(&file);
+        if check_open {
+            let fast=tak::fast_read::read_take_fast(&f.tak,false).unwrap();
+            let (plate,_lazy)=fast.analog.expect("selective open, no full fallback").split();
+            assert!(plate.fallback_reason().is_none());plate.run().unwrap();
+            assert_eq!(overlap(&trace.lock().unwrap()),0,"normal open read EMG samples");
+        }
+        let version=FileVersion::capture(&f.tak).unwrap();
+        let (prepared,_) = PreparedInput::read_from_path(&f.tak).unwrap();
+        let _creation=crate::edit::label::CreationStreams::read_from_path(&f.tak).unwrap();
+        let _=read_creation_streams(&f.tak,&version).unwrap();drop(prepared);
+        f.edit(0.125);
+        assert_eq!(overlap(&trace.lock().unwrap()),0,"edit/creation/version read deferred samples");
+        let out=f.dir.join("counted.takm");TakmSave.save(f.request(&f.tak,&out)).unwrap();
+        assert_eq!(overlap(&trace.lock().unwrap()),expected,"deferred samples must be read exactly once, only while copying");
+        read_trace::stop(&trace);
+        let saved=File::open(&out).unwrap();let trace=read_trace::start(&saved);
+        let _=FileVersion::capture(&out).unwrap();let _=PreparedInput::read_from_path(&out).unwrap();
+        let lazy=if check_open {
+            let fast=tak::fast_read::read_take_fast(&out,false).unwrap();
+            let (plate,lazy)=fast.analog.expect("selective reopen").split();plate.run().unwrap();lazy
+        }else{None};
+        let current=super::super::source::Source::read(&out).unwrap();let c=current.unique("Channels.dat").unwrap();
+        let saved_ranges:Vec<_>=c.deferred.iter().flat_map(|&(a,b)|c.map.pieces(a,b)).map(|(o,n)|(o,o+n as u64)).collect();
+        let loaded:u64=trace.lock().unwrap().iter().map(|&(a,b)|saved_ranges.iter().map(|&(c,d)|b.min(d).saturating_sub(a.max(c))).sum::<u64>()).sum();
+        assert_eq!(loaded,0,"reopen or save validation read deferred samples");
+        if let Some(lazy)=lazy {lazy.run().unwrap();let reads=trace.lock().unwrap();
+            assert!(reads.iter().any(|&(a,b)|saved_ranges.iter().any(|&(c,d)|a<d && c<b)),"explicit EMG access must read its samples");}
+        read_trace::stop(&trace);
+        takm::verify_fixed(&out).unwrap(); // separate full-integrity audit, after the counter
+        assert_eq!(raw_analog_records(&source_data(&f.tak).unwrap()),raw_analog_records(&source_data(&out).unwrap()));
+        eprintln!("EMG sample reads: preparation=0, copy={expected}, reopen=0 bytes");
+    }
+
+    #[test]
+    fn deferred_corruption_is_rejected_by_stream_hash_and_original_seal_during_copy() {
+        let f=Fixture::from_bytes("deferred_corrupt",&crate::sample_tak::sample_tak_with_devices());
+        let out=f.dir.join("sealed.takm");TakmSave.save(f.request(&f.tak,&out)).unwrap();
+        let source=super::super::source::Source::read(&out).unwrap();let c=source.unique("Channels.dat").unwrap();
+        let offset=c.map.pieces(c.deferred[0].0,c.deferred[0].0+1)[0].0;
+        let req=f.request(&out,&out);let mut bytes=std::fs::read(&out).unwrap();bytes[offset as usize]^=1;
+        std::fs::write(&out,&bytes).unwrap();
+        assert_eq!(TakmSave.save(req).unwrap_err(),EditError::FileChangedOnDisk);
+        assert_eq!(std::fs::read(&out).unwrap(),bytes);
     }
 
     #[test]

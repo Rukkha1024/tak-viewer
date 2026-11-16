@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime};
 
 /// Largest single positional read; big ranges are cut into pieces of this size.
 const CHUNK: usize = 2 << 20;
-/// Threads for big reads (the WSL share gives ~2x the single-thread speed with 2-8 readers).
+/// Maximum single-file read width; extra readers share a process-wide budget.
 const THREADS: usize = 8;
 /// Every supported kind has at least this many header bytes, even with an empty property:
 /// uint16 type length + FloatChannel (12) + version/name length (3) + UID (16) + f32/count (8).
@@ -512,10 +512,21 @@ struct MarkerTailPlan {
 
 fn marker_tail_plan(nodes: &[u8], devices: &[super::nodes::DeviceNode]) -> Result<Option<MarkerTailPlan>> {
     let Some(channels) = devices.iter().map(|d| d.channel_count.map(|n| (d.uid,n))).collect::<Option<_>>() else { return Ok(None) };
-    let assets = super::nodes::skeleton_asset_set(nodes)?;
-    let rows = super::nodes::parse_marker_nodes(nodes, &assets)?;
-    let markers: std::collections::HashSet<Uid> = rows.iter().map(|m|m.uid).collect();
-    if markers.len() != rows.len() { return err("duplicate marker UID prevents proving a marker-only suffix"); }
+    // This proof needs framed marker UIDs only. Decode/validate JSON and classify each
+    // marker once, later in decode_markers, rather than doing it twice before readiness.
+    let mut records=Vec::new();
+    for sig in super::nodes::MARKER_SIGNATURES {
+        records.extend(super::container::find_all(nodes,sig,0).into_iter().map(|at|(at,sig.len())));
+    }
+    records.sort_unstable();records.dedup();
+    let mut markers=std::collections::HashSet::new();
+    for &(at,sig_len) in &records {
+        let chars=u16_at(nodes,at+sig_len)? as usize;
+        let Some(end)=(at+sig_len+2).checked_add(chars*2) else {return Ok(None)};
+        let Some(tail)=nodes.get(end..end+35) else {return Ok(None)};
+        if tail[..19]!=super::nodes::MARKER_PREFIX {return Ok(None);}
+        if !markers.insert(super::container::uid_from(&tail[19..35])) {return err("duplicate marker UID prevents proving a marker-only suffix");}
+    }
     Ok((!markers.is_empty()).then_some(MarkerTailPlan { channels, markers }))
 }
 
@@ -646,10 +657,11 @@ fn walk_channel_records(file: &File, map: &StreamMap, device_uids: &std::collect
         if end > len { return Ok(None); }
         let record = channel_record(pos, &bytes, header, data, analog, device_uids)?;
         if let Some(plan) = tail_plan.filter(|_| marker_payloads) {
-            let remaining_markers: std::collections::HashSet<_> = plan.markers.difference(&marker_seen).copied().collect();
             let counts_complete = counts_valid && plan.channels.iter().all(|(uid,n)| device_seen.get(uid).copied().unwrap_or(0) == *n);
             if counts_complete && record.kind == "Vector3fChannel" && record.name == "Translation"
-                && !record.analog && remaining_markers.contains(&record.uid) && count - records.len() == remaining_markers.len() {
+                && !record.analog && plan.markers.contains(&record.uid) && !marker_seen.contains(&record.uid)
+                && count - records.len() == plan.markers.len() - marker_seen.len() {
+                let remaining_markers = plan.markers.difference(&marker_seen).copied().collect();
                 let t = Instant::now();
                 let tail = map.read(file, pos, len)?;
                 bulk_ms += ms(t);
@@ -687,21 +699,57 @@ fn walk_channel_records(file: &File, map: &StreamMap, device_uids: &std::collect
     Ok(Some(Walked { records, kept, bulk_ms }))
 }
 
+/// Sparse original channel stream for editing. Unopened non-forceplate samples remain zero
+/// placeholders; callers must copy those ranges from the source rather than serialize zeros.
+pub(crate) fn edit_channels(file: &File, map: &StreamMap, nodes: &[u8]) -> Result<(Vec<u8>, Vec<(u64,u64)>)> {
+    // Editing is stricter than the display fallback: only proven marker/plate samples
+    // may be read. Unknown device/asset payloads are opaque passthrough as well.
+    let typed = super::nodes::analog_device_nodes(nodes).unwrap_or_default();
+    let markers: std::collections::HashSet<_> = super::nodes::property_records(nodes, &super::nodes::MARKER_SIGNATURES)?.iter().map(|r|r.uid).collect();
+    let devices = typed.iter().map(|n| n.uid).collect();
+    let head = map.read(file, 0, 10)?;
+    if head[..6] != CHANNELS_HEADER {return err("unsupported editable channel header");}
+    let count = u32::from_le_bytes(head[6..10].try_into().unwrap());
+    let mut bytes = vec![0; map.len as usize]; bytes[..10].copy_from_slice(&head);
+    let mut deferred = Vec::new(); let mut pos=10;
+    for _ in 0..count {
+        if pos + MIN_HEADER > map.len {return err("short editable channel header");}
+        let mut h=map.read(file,pos,pos+MIN_HEADER)?;
+        let (header,data,analog)=loop {match parse_head(&h) {
+            Head::Need(n) if pos+n as u64<=map.len => {let old=h.len();h.extend(map.read(file,pos+old as u64,pos+n as u64)?);},
+            Head::Ok {header,data,analog} => break (header,data,analog),
+            _ => return err("unsupported editable channel layout"),
+        }};
+        let rec=channel_record(pos,&h,header,data,analog,&devices)?;
+        if rec.end>map.len {return err("short editable channel payload");}
+        bytes[pos as usize..rec.data_start as usize].copy_from_slice(&h);
+        let marker=markers.contains(&rec.uid) && rec.kind=="Vector3fChannel" && rec.name=="Translation";
+        let plate=typed.iter().any(|n|n.uid==rec.uid && n.forceplate);
+        if marker || plate {
+            let data=map.read(file,rec.data_start,rec.end)?;
+            bytes[rec.data_start as usize..rec.end as usize].copy_from_slice(&data);
+        }else if rec.data_start<rec.end {deferred.push((rec.data_start,rec.end));}
+        pos=rec.end;
+    }
+    if pos!=map.len {return err("editable channel record count mismatch");}
+    Ok((bytes, deferred))
+}
+
 /// Where a stream lies in the file: a regular container stream = its sectors in order (from
 /// `Container::stream_chain`); a `.takm` stream = one piece starting at `flat`.
 #[derive(Clone)]
-struct StreamMap {
-    sector: u64,
-    chain: Vec<u32>,
-    len: u64,
+pub(crate) struct StreamMap {
+    pub(crate) sector: u64,
+    pub(crate) chain: Vec<u32>,
+    pub(crate) len: u64,
     /// `.takm`: file offset of the stream's first byte (`sector` / `chain` unused).
-    flat: Option<u64>,
+    pub(crate) flat: Option<u64>,
 }
 
 impl StreamMap {
     /// Stream bytes [a, b) as file pieces (file offset, length): consecutive sectors merged,
     /// pieces at most `CHUNK` long.
-    fn pieces(&self, a: u64, b: u64) -> Vec<(u64, usize)> {
+    pub(crate) fn pieces(&self, a: u64, b: u64) -> Vec<(u64, usize)> {
         let mut out: Vec<(u64, usize)> = Vec::new();
         let mut pos = a;
         if let Some(base) = self.flat {
@@ -727,7 +775,7 @@ impl StreamMap {
     }
 
     /// Stream bytes [a, b), read by several threads when big.
-    fn read(&self, file: &File, a: u64, b: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read(&self, file: &File, a: u64, b: u64) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; (b - a) as usize];
         let mut jobs = Vec::new();
         let mut rest: &mut [u8] = &mut buf;
@@ -800,7 +848,7 @@ pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> Re
     Ok(())
 }
 
-/// Read (file offset, destination) jobs; several threads when there is more than one job.
+/// Read jobs on the caller plus available helpers; another file never makes this wait.
 fn read_parallel(file: &File, jobs: Vec<(u64, &mut [u8])>) -> Result<()> {
     if jobs.len() <= 1 {
         for (off, buf) in jobs {
@@ -808,23 +856,26 @@ fn read_parallel(file: &File, jobs: Vec<(u64, &mut [u8])>) -> Result<()> {
         }
         return Ok(());
     }
-    let threads = THREADS.min(jobs.len());
+    let helpers = crate::par::io_helpers(THREADS.min(jobs.len()) - 1);
+    if helpers.len() == 0 {
+        for (off, buf) in jobs { read_exact_at(file, buf, off)?; }
+        return Ok(());
+    }
     let queue = Mutex::new(jobs.into_iter());
     let failed = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| loop {
-                let job = queue.lock().map(|mut q| q.next()).unwrap_or(None);
-                let Some((off, buf)) = job else { break };
-                if let Err(e) = read_exact_at(file, buf, off) {
-                    if let Ok(mut f) = failed.lock() {
-                        f.get_or_insert(e);
-                    }
-                    break;
-                }
-            });
+    let work = || loop {
+        let job = queue.lock().map(|mut q| q.next()).unwrap_or(None);
+        let Some((off, buf)) = job else { break };
+        if let Err(e) = read_exact_at(file, buf, off) {
+            if let Ok(mut f) = failed.lock() { f.get_or_insert(e); }
+            break;
         }
+    };
+    std::thread::scope(|s| {
+        for _ in 0..helpers.len() { s.spawn(&work); }
+        work();
     });
+    drop(helpers);
     match failed.into_inner().ok().flatten() {
         Some(e) => Err(e),
         None => Ok(()),
@@ -835,7 +886,7 @@ fn read_parallel(file: &File, jobs: Vec<(u64, &mut [u8])>) -> Result<()> {
 /// Registering by native file identity lets handles/stages share a trace without conflating
 /// separate copies that happen to have identical lengths and modification timestamps.
 #[cfg(test)]
-mod read_trace {
+pub(crate) mod read_trace {
     use super::*;
     type Key = (u64, u64);
     type Ranges = Arc<Mutex<Vec<(u64, u64)>>>;
@@ -882,6 +933,24 @@ mod read_trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_reads_preserve_offsets_and_report_short_input() {
+        // Read a stable small source file: this regression needs no writable fixture or
+        // version-specific temporary-directory helper.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let bytes = std::fs::read(&path).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut buffers = vec![[0u8; 16]; 16];
+        let jobs = buffers.iter_mut().enumerate().map(|(i, out)| ((i * 3) as u64, out.as_mut_slice())).collect();
+        read_parallel(&file, jobs).unwrap();
+        for (i, actual) in buffers.iter().enumerate() {
+            assert_eq!(actual.as_slice(), &bytes[i * 3..i * 3 + 16]);
+        }
+        let (mut valid, mut past_end) = ([0u8; 4], [0u8; 1]);
+        assert!(read_parallel(&file, vec![(0, &mut valid), (bytes.len() as u64, &mut past_end)]).is_err());
+        drop(file);
+    }
 
     fn map(chain: Vec<u32>, len: u64) -> StreamMap {
         StreamMap { sector: 512, chain, len, flat: None }

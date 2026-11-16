@@ -404,6 +404,46 @@ impl<'a> Container<'a> {
         Ok(out)
     }
 
+    /// Physical sector starts without reading stream payloads, including mini streams.
+    /// The sparse index used by edit preparation intentionally contains no mini payload.
+    pub(crate) fn physical_sectors(&self, index: usize) -> Result<(u64, Vec<u64>)> {
+        let entry = &self.entries[index];
+        let small = entry.size < self.cutoff as u64;
+        let (unit, fat) = if small { (self.mini_size as u64, &self.mini_fat) }
+                          else { (self.sector_size as u64, &self.fat) };
+        let root = &self.entries[0];
+        let mut roots = Vec::new();
+        if small {
+            let mut cur = root.start;
+            let mut seen = std::collections::HashSet::new();
+            while cur != END {
+                if !seen.insert(cur) || cur as usize >= self.fat.len() { return err("invalid mini root chain"); }
+                roots.push((cur as u64 + 1) * self.sector_size as u64);
+                cur = self.fat[cur as usize];
+            }
+        }
+        let mut out = Vec::new();
+        let mut current = entry.start;
+        let mut seen = std::collections::HashSet::new();
+        while current != END {
+            if current as usize >= fat.len() || !seen.insert(current) { return err("invalid stream chain"); }
+            let off = if small {
+                let logical = current as u64 * unit;
+                if logical >= root.size { return err("mini sector outside root"); }
+                *roots.get((logical / self.sector_size as u64) as usize).ok_or_else(|| super::TakError("short mini root".into()))?
+                    + logical % self.sector_size as u64
+            } else { (current as u64 + 1) * unit };
+            let done = out.len() as u64 * unit;
+            if done >= entry.size || off.checked_add(unit.min(entry.size - done)).is_none_or(|end| end > self.data.len() as u64) {
+                return err("stream extent outside file");
+            }
+            out.push(off);
+            current = fat[current as usize];
+        }
+        if out.len() as u64 * unit < entry.size { return err("short stream extent"); }
+        Ok((unit, out))
+    }
+
     /// Read the named top-level streams (`'/'.join(parts)`); later duplicates win like a dict.
     /// Python reads every matching stream inside the dict comprehension, so a broken
     /// earlier duplicate still fails the read.
