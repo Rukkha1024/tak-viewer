@@ -154,7 +154,9 @@ def inventory(stream, probe_bytes):
         def read_head(need):
             if pos + need > stream.length:
                 raise ValueError("Truncated channel header")
-            return stream.read(pos, min(max(need, probe_bytes), stream.length - pos))
+            # A speculative probe can cross into EMG samples. Only headers may
+            # be read while building the inventory, even with a large probe.
+            return stream.read(pos, need)
         data = read_head(2)
         kind_len = struct.unpack_from("<H", data)[0]
         cur = 2 + kind_len
@@ -175,7 +177,8 @@ def inventory(stream, probe_bytes):
         if end > stream.length:
             raise ValueError("Truncated channel samples")
         records.append(dict(start=pos, header=header, data=pos + header, count=n,
-                            stride=stride, analog=name.startswith("AnalogChannel"), end=end))
+                            stride=stride, analog=name.startswith("AnalogChannel"),
+                            name=name, uid=data[uid:uid + 16], end=end))
         pos = end
     if pos != stream.length:
         raise ValueError("Unexpected trailing channel bytes")
@@ -259,6 +262,7 @@ class Source:
             else:
                 raise Failure("unsupported_format", "Unsupported TAK/TAKM container; no full-file fallback")
             self.records = inventory(self.streams["Channels.dat"], probe)
+            self.nodes = None
             self.check()
         except Exception:
             self.file.close()
@@ -268,16 +272,147 @@ class Source:
         if identity(self.file, self.path) != (self.identity if expected is None else expected):
             raise Failure("source_changed", "Source changed since the initial read")
 
-    def channels(self, analog):
+    def classify(self, maximum):
+        if self.nodes is None:
+            budget([self.streams["Nodes.dat"].length], maximum)
+            self.nodes = self.streams["Nodes.dat"].read(0, self.streams["Nodes.dat"].length)
+            try:
+                registry = device_registry(self.nodes)
+            except (ValueError, KeyError, TypeError, AttributeError, struct.error) as error:
+                self.full_fallback = True
+                self.plate_devices, self.device_types, self.fallback_reason = None, None, str(error)
+                return
+            self.full_fallback = False
+            # A known device UID is device data even when its property has an
+            # unsupported name. Do not send those samples with marker payloads.
+            uids = registry[0]
+            for record in self.records:
+                record["analog"] = record["analog"] or record["uid"] in uids
+            self.plate_devices, self.device_types, self.fallback_reason = classify_devices(self.nodes, self.records, registry)
+
+    def channels(self, analog, devices=None, headers_only=False):
         stream = self.streams["Channels.dat"]
         selected = [record for record in self.records if record["analog"] == analog]
-        return (CHANNELS_HEADER + struct.pack("<I", len(selected))
-                + stream.many([(record["start"], record["end"] - record["start"])
-                               for record in selected]))
+        result = [CHANNELS_HEADER, struct.pack("<I", len(selected))]
+        for record in selected:
+            if headers_only or (devices is not None and record["device"] not in devices):
+                head = stream.read(record["start"], record["header"])
+                result.append(head[:-4] + bytes(4))
+            else:
+                result.append(stream.read(record["start"], record["end"] - record["start"]))
+        return b"".join(result)
 
-    def channel_length(self, analog):
-        return 10 + sum(record["end"] - record["start"] for record in self.records
+    def channel_length(self, analog, devices=None, headers_only=False):
+        return 10 + sum(record["header"] if headers_only or
+                        (devices is not None and record["device"] not in devices)
+                        else record["end"] - record["start"] for record in self.records
                         if record["analog"] == analog)
+
+
+def device_node_offsets(nodes):
+    generic = b"class MoCapCore::cDeviceNode<float,16>"
+    signatures = [b"\x0a\x00ForcePlate", b"\x0a\x00" + "ForcePlate".encode("utf-16le"),
+                  struct.pack("<H", len(generic)) + generic]
+    matches = []
+    for signature in signatures:
+        cursor = 0
+        while True:
+            at = nodes.find(signature, cursor)
+            if at < 0:
+                break
+            matches.append((at, at + len(signature)))
+            cursor = at + 1
+    return sorted(matches)
+
+
+def device_registry(nodes):
+    devices, plates = {}, []
+    offsets = device_node_offsets(nodes)
+    regions = []
+    for _, at in offsets:
+        chars = struct.unpack_from("<H", nodes, at)[0]
+        regions.append((at + 2, at + 2 + chars * 2))
+    # Unknown/malformed envelopes cannot be assigned marker/device ranges safely.
+    for key in ("DeviceNode_DeviceType", "DeviceNode_Corner"):
+        token = key.encode("utf-16le")
+        if nodes.count(token) != sum(nodes[start:end].count(token) for start, end in regions):
+            raise ValueError("unrecognized structural device node record")
+    known_json = {start for start, _ in regions}
+    cursor = 0
+    while True:
+        at = nodes.find(b"{\0", cursor)
+        if at < 0:
+            break
+        cursor = at + 2
+        if at < 2 or at in known_json:
+            continue
+        chars = struct.unpack_from("<H", nodes, at - 2)[0]
+        end = at + chars * 2
+        if not chars or end > len(nodes):
+            continue
+        try:
+            obj = json.loads(nodes[at:end].decode("utf-16le"))
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("properties"), list):
+            if any(isinstance(row, dict) and row.get("name") == "DeviceNode_DeviceType"
+                   for row in obj["properties"]):
+                raise ValueError("unrecognized structural device node record")
+    for _, at in offsets:
+        chars = struct.unpack_from("<H", nodes, at)[0]
+        tail = at + 2 + chars * 2
+        obj = json.loads(nodes[at + 2:tail].decode("utf-16le"))
+        properties = {row["name"]: row.get("value") for row in obj.get("properties", [])}
+        uid = nodes[tail + 19:tail + 35]
+        kind = properties.get("DeviceNode_DeviceType")
+        if str(kind) not in ("1", "2") or len(uid) != 16 or not any(uid) or uid in devices:
+            raise ValueError("Device node UID/type is unknown or duplicated")
+        if (int(kind) == 2) != any(key.startswith("DeviceNode_Corner") for key in properties):
+            raise ValueError("Device type and forceplate geometry disagree")
+        devices[uid] = int(kind)
+        if int(kind) == 2:
+            plates.append(uid)
+    return devices, plates
+
+
+def classify_devices(nodes, records, registry):
+    """Join device node UIDs to channel header UIDs; never infer from names/order."""
+    groups, current, next_channel = [], None, 0
+    reason = None
+    for record in records:
+        if not record["analog"]:
+            continue
+        if not record["name"].startswith("AnalogChannel"):
+            return None, None, "unsupported structural device channel property"
+        try:
+            index = int(record["name"][len("AnalogChannel"):])
+        except ValueError:
+            index = -1
+        if index == 0:
+            current = len(groups)
+            groups.append(record["uid"])
+            next_channel = 0
+        record["device"] = current
+        if current is None or index != next_channel or record["uid"] != groups[current]:
+            reason = "Analog channel device UID/group is ambiguous"
+        next_channel += 1
+    if not groups:
+        if reason:
+            return None, None, reason
+        if "DeviceNode_Corner".encode("utf-16le") in nodes:
+            return None, None, "Forceplate geometry has no matching analog device"
+        return [], [], None
+    try:
+        devices, plates = registry
+        if reason:
+            raise ValueError(reason)
+        if len(set(groups)) != len(groups) or any(not any(uid) or uid not in devices for uid in groups):
+            raise ValueError("Analog device UID is missing, duplicated or unmatched")
+        if any(uid not in groups for uid in plates):
+            raise ValueError("Forceplate node has no matching analog device")
+        return [groups.index(uid) for uid in plates], [devices[uid] for uid in groups], None
+    except (ValueError, KeyError, TypeError, AttributeError, struct.error) as error:
+        return None, None, str(error)
 
 
 def integer(request, key, minimum, maximum):
@@ -406,20 +541,43 @@ class Server:
         source = self.source
         source.check(expected if op == "analog" else None)
         maximum = min(maximum, source.reader.size + (64 << 10))
-        if op == "open":
-            lengths = [source.streams["Nodes.dat"].length, source.streams["MetaData.dat"].length,
-                       source.channel_length(False), source.reader.size - source.tail]
+        source.classify(maximum)
+        if op == "open" and source.full_fallback:
+            lengths = [len(source.nodes), source.streams["MetaData.dat"].length,
+                       source.streams["Channels.dat"].length, source.reader.size - source.tail]
             budget(lengths, maximum)
-            blocks = [source.streams[name].read(0, source.streams[name].length)
-                      for name in ("Nodes.dat", "MetaData.dat")]
-            blocks.extend([source.channels(False), source.reader.read(source.tail, lengths[3])])
+            # Establish and expose the reason before any unclassified sample read.
+            print("TAK SSH full-read fallback: " + source.fallback_reason, file=sys.stderr, flush=True)
+            blocks = [source.nodes, source.streams["MetaData.dat"].read(0, lengths[1]),
+                      source.streams["Channels.dat"].read(0, lengths[2]), source.reader.read(source.tail, lengths[3])]
+            header = dict(ok=True, lengths=lengths, identity=source.identity, file_size=source.reader.size,
+                          has_analog=False, format=source.format, full_fallback=True,
+                          channel_order=[False for _ in source.records], analog_fallback=source.fallback_reason)
+        elif op == "open":
+            lengths = [source.streams["Nodes.dat"].length, source.streams["MetaData.dat"].length,
+                       source.channel_length(False), source.reader.size - source.tail,
+                       source.channel_length(True, headers_only=True)]
+            budget(lengths, maximum)
+            blocks = [source.nodes, source.streams["MetaData.dat"].read(0, lengths[1])]
+            blocks.extend([source.channels(False), source.reader.read(source.tail, lengths[3]),
+                           source.channels(True, headers_only=True)])
             header = dict(ok=True, lengths=lengths, identity=source.identity, file_size=source.reader.size,
                           has_analog=any(record["analog"] for record in source.records), format=source.format,
-                          channel_order=[record["analog"] for record in source.records])
+                          channel_order=[record["analog"] for record in source.records],
+                          plate_devices=source.plate_devices, device_types=source.device_types,
+                          analog_fallback=source.fallback_reason)
         else:
-            lengths = [source.channel_length(True)]
+            selection = request.get("selection", "all")
+            if selection not in ("all", "forceplates", "non_forceplates"):
+                raise Failure("invalid_request", "Invalid analog selection")
+            if source.device_types is None or selection == "all":
+                selected = None
+            else:
+                kind = 2 if selection == "forceplates" else 1
+                selected = {i for i, value in enumerate(source.device_types) if value == kind}
+            lengths = [source.channel_length(True, selected)]
             budget(lengths, maximum)
-            blocks = [source.channels(True)]
+            blocks = [source.channels(True, selected)]
             header = dict(ok=True, lengths=lengths, identity=source.identity)
         source.check(expected if op == "analog" else None)
         if len(encoded(header)) > REQUEST_LIMIT:

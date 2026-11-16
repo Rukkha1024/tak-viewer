@@ -23,12 +23,54 @@ use tak_core::view_data::GroupKind;
 
 #[derive(Default)]
 pub(super) struct MarkerUi {
+    #[cfg(test)]
+    pub(super) pending_work_checks: std::cell::Cell<usize>,
     file_id: usize,
     pub(super) labeling: LabelingState,
     tools: EditToolsState,
     job: Option<MarkerJob>,
     save: Option<SaveJob>,
     save_started: Option<Instant>,
+    detached_job_selection: bool,
+}
+
+impl MarkerUi {
+    /// Hidden tabs need polling only while they own a worker; panel state stays untouched.
+    pub(super) fn has_pending_work(&self) -> bool {
+        #[cfg(test)] self.pending_work_checks.set(self.pending_work_checks.get() + 1);
+        self.job.is_some() || self.save.is_some()
+    }
+    pub(super) fn has_marker_job(&self) -> bool {
+        #[cfg(test)] self.pending_work_checks.set(self.pending_work_checks.get() + 1);
+        self.job.is_some()
+    }
+    pub(super) fn has_save(&self) -> bool {
+        #[cfg(test)] self.pending_work_checks.set(self.pending_work_checks.get() + 1);
+        self.save.is_some()
+    }
+    pub(super) fn bind_file(&mut self, file_id: usize) { self.file_id = file_id; }
+    fn discard_work(&mut self) {
+        drop_later(self.job.take());
+        if let Some(SaveJob::Running { cancelled, .. }) = &self.save {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        }
+        drop_later(self.save.take());
+        self.save_started = None;
+    }
+
+    /// Transfer only worker ownership when its view closes. Panel settings and the receiving
+    /// view's selection stay its own; its file identity must be set before the next poll.
+    pub(super) fn transfer_work_to(&mut self, target: &mut Self, target_file_id: usize) -> bool {
+        if !self.has_pending_work() || target.has_pending_work() { return false; }
+        let moved_job = self.job.is_some();
+        target.file_id = target_file_id;
+        target.job = self.job.take();
+        target.save = self.save.take();
+        target.save_started = self.save_started.take();
+        target.detached_job_selection = moved_job || self.detached_job_selection;
+        self.detached_job_selection = false;
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,6 +165,18 @@ pub(super) enum PendingTransition {
     CloseView {
         slot: usize,
     },
+    CloseLayoutTab {
+        id: u64,
+    },
+    OverlayOff {
+        slot: usize,
+    },
+    ReplaceOverlay {
+        slot: usize,
+        path: PathBuf,
+        quiet: bool,
+    },
+    OverlayBridgeComplete,
     SwitchTakm {
         tak: PathBuf,
         takm: PathBuf,
@@ -133,9 +187,9 @@ pub(super) enum PendingTransition {
     Exit,
 }
 pub(super) struct DirtyPrompt {
-    slot: usize,
-    transition: PendingTransition,
-    saving: bool,
+    pub(super) slot: usize,
+    pub(super) transition: PendingTransition,
+    pub(super) saving: bool,
     retrying_comments: bool,
     pub(super) started: Instant,
 }
@@ -149,6 +203,9 @@ struct Saved {
     snapshot: DocumentSnapshot,
     view: tak_core::view_data::ViewData,
     comments: views::CommentsLoad,
+    source_stamp: (PathBuf, u64, Option<SystemTime>),
+    /// Prepared on the save worker against the rewritten stream table; no EMG samples read.
+    deferred_emg: Result<Option<tak_core::tak::fast_read::AnalogJob>, String>,
 }
 enum SaveFailure {
     ChoosePath,
@@ -323,7 +380,7 @@ impl TakViewerApp {
         self.refresh_marker_ui(slot);
         self.marker_ui[slot].tools.interpolation = FillMethod::PatternBased;
     }
-    fn same_local_path(a: &Path, b: &Path) -> bool {
+    pub(super) fn same_local_path(a: &Path, b: &Path) -> bool {
         match (
             tak_core::takm::canonical_target(a),
             tak_core::takm::canonical_target(b),
@@ -334,22 +391,33 @@ impl TakViewerApp {
     }
 
     pub(super) fn save_destination_reserved(&self, path: &Path) -> bool {
-        self.marker_ui.iter().any(|ui| matches!(&ui.save,
+        let hidden = self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).flat_map(|runtime| runtime.marker_ui.iter());
+        self.marker_ui.iter().chain(hidden).chain(self.overlay_marker_ui.values()).any(|ui| matches!(&ui.save,
             Some(SaveJob::Running { reserved: Some(dest), .. }) if Self::same_local_path(path, dest)))
     }
 
     fn save_destination_open_elsewhere(&self, slot: usize, path: &Path) -> bool {
-        self.open_views().into_iter().any(|k| {
+        let active = self.open_views().into_iter().any(|k| {
+            let same_overlay = self.views[slot].document_id().is_some()
+                && self.views[slot].document_id() == self.views[k].overlay_document_id();
             (k != slot
+                && !self.views[slot].shares_document(&self.views[k])
                 && self.views[k]
                     .target()
                     .is_some_and(|p| Self::same_local_path(p, path)))
-                || self.views[k]
+                || (!same_overlay && (self.views[k]
                     .overlay_target()
                     .is_some_and(|p| Self::same_local_path(p, path))
                 || self.views[k]
                     .overlay_paths()
-                    .any(|p| Self::same_local_path(p, path))
+                    .any(|p| Self::same_local_path(p, path))))
+        });
+        active || self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).flat_map(|runtime| runtime.views.iter()).any(|view| {
+            let same_overlay = self.views[slot].document_id().is_some()
+                && self.views[slot].document_id() == view.overlay_document_id();
+            (!self.views[slot].shares_document(view) && view.shared_target().is_some_and(|p| Self::same_local_path(&p, path)))
+                || (!same_overlay && (view.overlay_target().is_some_and(|p| Self::same_local_path(p, path))
+                    || view.overlay_paths().any(|p| Self::same_local_path(p, path))))
         })
     }
     pub(super) fn quick_label_available(&self, ctx: &egui::Context, slot: usize) -> bool {
@@ -357,7 +425,7 @@ impl TakViewerApp {
             && self.hold.is_none()
             && self.dirty_prompt.is_none()
             && !ctx.memory(|m| m.any_popup_open())
-            && self.marker_ui[slot].job.is_none()
+            && !self.marker_job_running(slot)
             && !self.marker_saving(slot)
             && self.views[slot].edit_refresh.is_none()
     }
@@ -404,23 +472,32 @@ impl TakViewerApp {
         self.apply_panel_setting(slot, &after);
         if !self.no_persist {
             if let Some(file) = self.views[slot].path().map(Path::to_path_buf) {
-                self.history.push(vec![undo::Part::PanelSetting {
+                let part = self.view_undo_part(slot, undo::Part::PanelSetting {
                     file,
                     before,
                     after,
-                }]);
+                });
+                self.history.push(vec![part]);
             }
         }
     }
 
     pub(super) fn guard_dirty(&mut self, slot: usize, transition: PendingTransition) -> bool {
+        if matches!(&transition, PendingTransition::Remote { .. }) {
+            return self.guard_view_removal(slot, transition);
+        }
+        self.guard_primary_dirty(slot, transition)
+    }
+
+    pub(super) fn guard_primary_dirty(&mut self, slot: usize, transition: PendingTransition) -> bool {
+        if let Some(view) = self.views.get_mut(slot) { view.sync_shared(); }
         if self.dirty_prompt.is_some() {
             return true;
         }
         if self.views.get(slot).is_some_and(View::marker_dirty)
             || self.comments_unsaved(slot)
             || self.marker_saving(slot)
-            || self.marker_ui.get(slot).is_some_and(|ui| ui.job.is_some())
+            || self.marker_job_running(slot)
         {
             self.dirty_prompt = Some(DirtyPrompt {
                 slot,
@@ -443,13 +520,22 @@ impl TakViewerApp {
     }
 
     pub(super) fn request_exit(&mut self, ctx: &egui::Context) {
-        if let Some(slot) = self.open_views().into_iter().find(|&k| {
-            self.views[k].marker_dirty()
-                || self.comments_unsaved(k)
-                || self.marker_saving(k)
-                || self.marker_ui[k].job.is_some()
+        if self.dirty_prompt.is_some() { return; }
+        for slot in self.open_views() {
+            if self.guard_primary_dirty(slot, PendingTransition::Exit) { return; }
+            if self.guard_overlay_exit(slot) { return; }
+        }
+        if let Some(id) = self.layout_tabs.tabs().iter().find_map(|tab| {
+            let runtime = tab.layout.as_ref()?;
+            runtime.views.iter().enumerate().any(|(slot, view)| view.marker_dirty()
+                || view.comments.pending > 0 || view.comments.failed.is_some()
+                || runtime.marker_ui[slot].has_pending_work()
+                || view.overlay_owner().is_some_and(|owner| owner.marker_dirty() || owner.comments.pending > 0
+                    || owner.comments.failed.is_some() || owner.document_id().is_some_and(|id| self.overlay_marker_ui.contains_key(&id))))
+                .then_some(tab.id)
         }) {
-            self.guard_dirty(slot, PendingTransition::Exit);
+            self.switch_layout_tab_internal(id);
+            self.request_exit(ctx);
         } else {
             self.exit_approved = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -479,7 +565,7 @@ impl TakViewerApp {
         self.request_exit(ctx);
     }
 
-    fn finish_transition(&mut self, ctx: &egui::Context, transition: PendingTransition) {
+    pub(super) fn finish_transition(&mut self, ctx: &egui::Context, transition: PendingTransition) {
         match transition {
             PendingTransition::Open { slot, path } => self.open_in(ctx, slot, path),
             PendingTransition::Remote {
@@ -488,6 +574,10 @@ impl TakViewerApp {
                 cached,
             } => self.open_remote_in(ctx, slot, location, cached),
             PendingTransition::CloseView { slot } => self.close_view(slot),
+            PendingTransition::CloseLayoutTab { id } => self.close_layout_tab(id),
+            PendingTransition::OverlayOff { slot } => self.overlay_off(slot),
+            PendingTransition::ReplaceOverlay { slot, path, quiet } => self.start_overlay(ctx, slot, path, quiet),
+            PendingTransition::OverlayBridgeComplete => self.finish_overlay_dirty_bridge(ctx),
             PendingTransition::SwitchTakm { tak, takm } => {
                 self.switch_to_takm(ctx, &tak, &takm);
             }
@@ -497,15 +587,30 @@ impl TakViewerApp {
     }
 
     pub(super) fn discard_pending_transition(&mut self, ctx: &egui::Context) {
+        if !self.overlay_owner_scope {
+            if let Some(slot) = self.overlay_prompt_slot() {
+                self.with_overlay_owner(ctx, slot, |app| app.discard_pending_transition(ctx));
+                return;
+            }
+        }
         let Some(slot) = self.dirty_prompt.as_ref().map(|prompt| prompt.slot) else {
             return;
         };
-        self.cancel_pending_marker_job(slot);
-        let tag = self.views[slot].file_id;
-        if let Some(SaveJob::Running { cancelled, .. }) = self.marker_ui[slot].save.take() {
-            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let document = self.views[slot].document_id();
+        for (view, ui) in self.views.iter().zip(&mut self.marker_ui) {
+            if view.document_id() == document { ui.discard_work(); }
         }
-        self.marker_ui[slot].save_started = None;
+        for tab in self.layout_tabs.tabs_mut() {
+            if let Some(runtime) = &mut tab.layout {
+                for (view, ui) in runtime.views.iter().zip(&mut runtime.marker_ui) {
+                    if view.document_id() == document { ui.discard_work(); }
+                }
+            }
+        }
+        if let Some(document) = document {
+            if let Some(mut ui) = self.overlay_marker_ui.remove(&document) { ui.discard_work(); drop_later(Some(ui)); }
+        }
+        let tag = self.views[slot].file_id;
         let old_waiting = self.comment_waiting.len();
         self.comment_waiting.retain(|(id, _, _)| *id != tag);
         self.comment_outstanding = self.comment_outstanding.saturating_sub(old_waiting - self.comment_waiting.len());
@@ -525,6 +630,7 @@ impl TakViewerApp {
             }
         }
         self.views[slot].comments.failed = None;
+        self.views[slot].publish_shared_file();
         let result = if self.views[slot].marker_dirty() {
             self.discard_marker_edits(slot)
         } else {
@@ -538,13 +644,19 @@ impl TakViewerApp {
     }
 
     pub(super) fn dirty_dialog(&mut self, ctx: &egui::Context) {
+        if !self.overlay_owner_scope {
+            if let Some(slot) = self.overlay_prompt_slot() {
+                self.with_overlay_owner(ctx, slot, |app| app.dirty_dialog(ctx));
+                return;
+            }
+        }
         let Some(prompt) = &self.dirty_prompt else {
             return;
         };
         let slot = prompt.slot;
         let saving = prompt.saving || self.marker_saving(slot);
         let computing =
-            self.marker_ui[slot].job.is_some() || self.views[slot].edit_refresh.is_some();
+            self.marker_job_running(slot) || self.views[slot].edit_refresh.is_some();
         let pending_comments = self.views[slot].comments.pending > 0;
         let stalled = (saving || pending_comments) && prompt.started.elapsed() >= Duration::from_secs(10);
         if saving || pending_comments { ctx.request_repaint_after(Duration::from_millis(250)); }
@@ -599,7 +711,7 @@ impl TakViewerApp {
             }
             2 => self.discard_pending_transition(ctx),
             3 => {
-                self.dirty_prompt = None;
+                self.cancel_dirty_transition(ctx);
             }
             _ => {}
         }
@@ -647,10 +759,17 @@ impl TakViewerApp {
             }
             self.send_comment(ctx, slot, path, event);
         }
+        self.views[slot].publish_shared_file();
         ctx.request_repaint_after(Duration::from_millis(30));
     }
 
     pub(super) fn poll_comment_retry_transition(&mut self, ctx: &egui::Context) {
+        if !self.overlay_owner_scope {
+            if let Some(slot) = self.overlay_prompt_slot() {
+                self.with_overlay_owner(ctx, slot, |app| app.poll_comment_retry_transition(ctx));
+                return;
+            }
+        }
         let Some(slot) = self
             .dirty_prompt
             .as_ref()
@@ -681,11 +800,78 @@ impl TakViewerApp {
     }
 
     pub(super) fn marker_saving(&self, slot: usize) -> bool {
-        self.marker_ui.get(slot).is_some_and(|ui| ui.save.is_some())
+        if self.views.get(slot).and_then(View::document_id).and_then(|id| self.overlay_marker_ui.get(&id)).is_some_and(MarkerUi::has_save) { return true; }
+        self.marker_ui.iter().enumerate().any(|(index, ui)| ui.has_save()
+            && (index == slot || self.views.get(slot).is_some_and(|view| view.shares_document(&self.views[index]))))
+            || self.views.get(slot).and_then(View::document_id)
+                .is_some_and(|document| self.hidden_document_work(document, hidden_work::DocumentWork::Save))
     }
 
     pub(super) fn marker_job_running(&self, slot: usize) -> bool {
-        self.marker_ui.get(slot).is_some_and(|ui| ui.job.is_some())
+        if self.views.get(slot).and_then(View::document_id).and_then(|id| self.overlay_marker_ui.get(&id)).is_some_and(MarkerUi::has_marker_job) { return true; }
+        self.marker_ui.iter().enumerate().any(|(index, ui)| ui.has_marker_job()
+            && (index == slot || self.views.get(slot).is_some_and(|view| view.shares_document(&self.views[index]))))
+            || self.views.get(slot).and_then(View::document_id)
+                .is_some_and(|document| self.hidden_document_work(document, hidden_work::DocumentWork::Marker))
+    }
+
+    /// A save uses one canonical analog generation. Wait for workers owned by any alias,
+    /// including hidden primaries and overlay owners, before capturing its view snapshot.
+    fn document_analog_work_pending(&self, slot: usize) -> bool {
+        let Some(document) = self.views.get(slot).and_then(View::document_id) else { return false };
+        // Hidden followers may retain an old analog_pending flag until activation. Only the
+        // owner has live work, so old display snapshots cannot keep a save waiting forever.
+        let pending = |view: &View| view.document_id() == Some(document) && view.analog_work_pending();
+        let owns = |view: &View| pending(view) || view.overlay_owner().is_some_and(&pending);
+        self.views.iter().any(&owns) || self.hidden_document_work(document, hidden_work::DocumentWork::Analog)
+    }
+
+    fn install_saved_deferred_emg(&mut self, slot: usize, document: DocumentId,
+                                  refreshed: Result<Option<tak_core::tak::fast_read::AnalogJob>, String>) -> Option<String> {
+        fn clear(view: &mut View, document: DocumentId) {
+            if view.document_id() == Some(document) { view.clear_deferred_emg_reader(); }
+            if let Some(owner) = view.overlay_owner_mut().filter(|owner| owner.document_id() == Some(document)) {
+                owner.clear_deferred_emg_reader();
+            }
+        }
+        for view in &mut self.views { clear(view, document); }
+        for tab in self.layout_tabs.tabs_mut() {
+            if let Some(runtime) = &mut tab.layout { for view in &mut runtime.views { clear(view, document); } }
+        }
+        for item in self.layout_tabs.closed_items_mut() {
+            match item {
+                layout_tabs::ClosedItem::View { view, .. } => clear(&mut view.view, document),
+                layout_tabs::ClosedItem::Tab(closed) => {
+                    if let Some(runtime) = &mut closed.tab.layout { for view in &mut runtime.views { clear(view, document); } }
+                }
+            }
+        }
+        match refreshed {
+            Ok(Some(job)) => { self.views[slot].install_deferred_emg_reader(job); None }
+            Ok(None) => None,
+            Err(reason) => {
+                let apply = |view: &mut View| {
+                    if view.document_id() == Some(document) {
+                        view.emg_failure = Some(reason.clone());
+                        view.emg_requested = true;
+                    }
+                };
+                for view in &mut self.views { apply(view); if let Some(owner) = view.overlay_owner_mut() { apply(owner); } }
+                for tab in self.layout_tabs.tabs_mut() {
+                    if let Some(runtime) = &mut tab.layout {
+                        for view in &mut runtime.views { apply(view); if let Some(owner) = view.overlay_owner_mut() { apply(owner); } }
+                    }
+                }
+                for item in self.layout_tabs.closed_items_mut() {
+                    let apply_host = |view: &mut View| { apply(view); if let Some(owner) = view.overlay_owner_mut() { apply(owner); } };
+                    match item {
+                        layout_tabs::ClosedItem::View { view, .. } => apply_host(&mut view.view),
+                        layout_tabs::ClosedItem::Tab(closed) => if let Some(runtime) = &mut closed.tab.layout { for view in &mut runtime.views { apply_host(view); } },
+                    }
+                }
+                Some(reason)
+            }
+        }
     }
 
     fn choose_marker_save_path(&self, slot: usize) -> Option<PathBuf> {
@@ -708,12 +894,18 @@ impl TakViewerApp {
         save_as: bool,
         close_after: bool,
     ) {
+        if !self.overlay_owner_scope && self.overlay_prompt_slot() == Some(slot) {
+            self.with_overlay_owner(ctx, slot, |app| app.save_markers(ctx, slot, save_as, close_after));
+            return;
+        }
+        self.views[slot].sync_shared();
         let view = &self.views[slot];
         if view.remote.is_some()
             || self.no_persist
             || view.data.is_none()
+            || view.waiting_shared_path().is_some()
             || view.edit_refresh.is_some()
-            || self.marker_ui[slot].job.is_some()
+            || self.marker_job_running(slot)
             || self.marker_saving(slot)
             || self.comment_edit.is_some()
             || self.hold.is_some()
@@ -773,6 +965,11 @@ impl TakViewerApp {
             };
             match job {
                 SaveJob::Waiting(intent) => {
+                    if self.document_analog_work_pending(slot) {
+                        self.marker_ui[slot].save = Some(SaveJob::Waiting(intent));
+                        ctx.request_repaint_after(Duration::from_millis(10));
+                        continue;
+                    }
                     if self.comment_registration.is_some() {
                         self.marker_ui[slot].save = Some(SaveJob::Waiting(intent));
                         ctx.request_repaint_after(Duration::from_millis(30));
@@ -884,11 +1081,9 @@ impl TakViewerApp {
                                     "The destination is open in another view.".into(),
                                 ));
                             }
-                            let mut take = data.take.clone();
-                            take.path = target;
-                            let mut updated =
-                                tak_core::view_data::ViewData::rebuild_edited(take, &snapshot)
-                                    .map_err(|e| SaveFailure::Other(edit_error(e)))?;
+                            let mut updated = data.rebuild_markers(&snapshot)
+                                .map_err(|e| SaveFailure::Other(edit_error(e)))?;
+                            updated.take.path = target;
                             let outcome = TakmSave
                                 .save_cancellable(SaveRequest {
                                     snapshot: snapshot.clone(),
@@ -899,15 +1094,23 @@ impl TakViewerApp {
                                 }, &worker_cancelled)
                                 .map_err(|e| SaveFailure::Other(edit_error(e)))?;
                             updated.take.path = outcome.destination.clone();
-                            if let Ok(meta) = std::fs::metadata(&outcome.destination) {
-                                updated.take.file_size = meta.len();
-                            }
+                            let meta = std::fs::metadata(&outcome.destination)
+                                .map_err(|error| SaveFailure::Other(error.to_string()))?;
+                            updated.take.file_size = meta.len();
+                            let source_stamp = (outcome.version.path().to_path_buf(), meta.len(), meta.modified().ok());
                             let comments = views::CommentsLoad::read(&outcome.destination);
+                            let deferred_emg = if updated.emg_pending {
+                                tak_core::tak::fast_read::deferred_job_after_save(&outcome.destination)
+                                    .map_err(|error| format!("저장은 끝났지만 EMG 읽기를 준비하지 못했어요. 파일을 다시 열어 주세요: {error}"))
+                                    .and_then(|job| job.map(Some).ok_or_else(|| "저장은 끝났지만 EMG 위치를 찾지 못했어요. 파일을 다시 열어 주세요.".into()))
+                            } else { Ok(None) };
                             Ok(Saved {
                                 outcome,
                                 snapshot,
                                 view: updated,
                                 comments,
+                                source_stamp,
+                                deferred_emg,
                             })
                         };
                         let result = run();
@@ -1014,19 +1217,27 @@ impl TakViewerApp {
                             }
                             continue;
                         }
+                        if let Some(stamp) = &self.views[slot].source_stamp {
+                            if let Ok(mut stamp) = stamp.lock() { *stamp = Some(saved.source_stamp); }
+                        } else {
+                            self.views[slot].source_stamp = Some(Arc::new(std::sync::Mutex::new(Some(saved.source_stamp))));
+                        }
                         self.views[slot].comments.take_load(saved.comments);
                         self.views[slot].comments.blocks = Default::default();
                         self.views[slot].comments.spans = Default::default();
+                        self.views[slot].publish_shared_file();
+                        let emg_warning = self.install_saved_deferred_emg(slot, document, saved.deferred_emg);
                         if let Some(old) = old {
                             self.rebind_saved_history(&old, &destination, document);
                         }
                         self.takm_note = Some((
                             format!(
-                                "Save · {}",
+                                "Save · {}{}",
                                 destination
                                     .file_name()
                                     .unwrap_or_default()
-                                    .to_string_lossy()
+                                    .to_string_lossy(),
+                                emg_warning.map(|warning| format!(" · {warning}")).unwrap_or_default()
                             ),
                             ctx.input(|i| i.time),
                         ));
@@ -1044,6 +1255,7 @@ impl TakViewerApp {
     }
 
     fn start_marker_command(&mut self, ctx: &egui::Context, slot: usize, command: MarkerCommand) {
+        self.views[slot].sync_shared();
         let now = ctx.input(|i| i.time);
         let view = &self.views[slot];
         if self.no_persist
@@ -1053,8 +1265,9 @@ impl TakViewerApp {
             || view.remote.is_some()
             || view.remote_loading.is_some()
             || view.loading.is_some()
+            || view.waiting_shared_path().is_some()
             || view.edit_refresh.is_some()
-            || self.marker_ui[slot].job.is_some()
+            || self.marker_job_running(slot)
             || self.marker_saving(slot)
         {
             self.takm_note = Some(("지금은 마커를 편집할 수 없어요.".into(), now));
@@ -1067,6 +1280,7 @@ impl TakViewerApp {
         let Some(document) = view.edit_document.clone() else {
             return;
         };
+        self.marker_ui[slot].detached_job_selection = false;
         let Some(data) = view.data.clone() else {
             return;
         };
@@ -1088,8 +1302,9 @@ impl TakViewerApp {
                     .as_ref()
                     .and_then(|s| s.lock().ok()?.clone())
                     .ok_or("파일을 처음 연 시각을 확인할 수 없어요.")?;
+                let canonical_path = tak_core::takm::canonical_target(&path).map_err(|e| e.to_string())?;
                 let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-                if expected != (path.clone(), meta.len(), meta.modified().ok()) {
+                if expected != (canonical_path, meta.len(), meta.modified().ok()) {
                     return Err("파일을 연 뒤 원본이 바뀌었어요. 다시 열어 주세요.".into());
                 }
                 let before = FileVersion::capture(&path).map_err(edit_error)?;
@@ -1101,7 +1316,8 @@ impl TakViewerApp {
                     Arc::new(CreationStreams::read_from_path(&path).map_err(edit_error)?);
                 let after = FileVersion::capture(&path).map_err(edit_error)?;
                 let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-                if before != after || expected != (path.clone(), meta.len(), meta.modified().ok()) {
+                let canonical_path = tak_core::takm::canonical_target(&path).map_err(|e| e.to_string())?;
+                if before != after || expected != (canonical_path, meta.len(), meta.modified().ok()) {
                     return Err("원본을 읽는 동안 파일이 바뀌었어요. 다시 열어 주세요.".into());
                 }
                 Ok(Prepared {
@@ -1163,10 +1379,7 @@ impl TakViewerApp {
                     let rebuilding = Instant::now();
                     let new_view = match &patch {
                         Some(patch) => Some(
-                            tak_core::view_data::ViewData::rebuild_edited(
-                                data.take.clone(),
-                                &patch.after_snapshot(),
-                            )
+                            data.rebuild_markers(&patch.after_snapshot())
                             .map_err(edit_error)?,
                         ),
                         None => None,
@@ -1225,7 +1438,8 @@ impl TakViewerApp {
                                 .ok()
                                 .is_some_and(|d| d.id() == document && d.revision() == revision)
                         });
-                        if !same || self.views[slot].edit_selection_state() != *command.selection()
+                        if !same || (!self.marker_ui[slot].detached_job_selection
+                            && self.views[slot].edit_selection_state() != *command.selection())
                         {
                             drop_later(Some(prepared));
                             self.takm_note = Some((
@@ -1270,7 +1484,8 @@ impl TakViewerApp {
                             .edit_document
                             .as_ref()
                             .is_some_and(|s| s.lock().ok().is_some_and(|d| d.id() == document));
-                        if !same || self.views[slot].edit_selection_state() != selection {
+                        if !same || (!self.marker_ui[slot].detached_job_selection
+                            && self.views[slot].edit_selection_state() != selection) {
                             drop_later(Some(done));
                             self.takm_note = Some((
                                 "선택이나 파일이 바뀌어 편집을 취소했어요.".into(),
@@ -1278,9 +1493,14 @@ impl TakViewerApp {
                             ));
                             continue;
                         }
+                        let retained_selection = self.marker_ui[slot].detached_job_selection
+                            .then(|| self.views[slot].edit_selection_state());
                         if let Some(patch) = done.patch {
                             match self.commit_marker_edit(slot, Arc::new(patch)) {
                                 Ok(()) => {
+                                    if let Some(selection) = retained_selection {
+                                        self.views[slot].edit_selection = Some(selection);
+                                    }
                                     if let Some(view) = done.view {
                                         if let Err(error) = self.publish_marker_view(slot, view) {
                                             self.takm_note =
@@ -1297,6 +1517,7 @@ impl TakViewerApp {
                                 }
                             }
                         }
+                        self.marker_ui[slot].detached_job_selection = false;
                         self.takm_note = Some((done.message, ctx.input(|i| i.time)));
                     }
                 },
@@ -1335,6 +1556,8 @@ impl TakViewerApp {
     }
 
     fn start_marker_refresh(&mut self, ctx: &egui::Context, slot: usize) {
+        self.views[slot].sync_shared();
+        if self.marker_job_running(slot) || self.marker_saving(slot) { return; }
         let view = &self.views[slot];
         let Some(snapshot) = view.edit_refresh_snapshot() else {
             return;
@@ -1348,7 +1571,7 @@ impl TakViewerApp {
         std::thread::spawn(move || {
             let started = Instant::now();
             let result =
-                tak_core::view_data::ViewData::rebuild_edited(data.take.clone(), &snapshot)
+                data.rebuild_markers(&snapshot)
                     .map_err(edit_error);
             trace_timing("undo/redo view rebuild", started);
             let _ = tx.send(result);
@@ -1362,6 +1585,8 @@ impl TakViewerApp {
     }
 
     fn refresh_marker_ui(&mut self, slot: usize) {
+        self.views[slot].sync_shared();
+        let busy = self.marker_job_running(slot) || self.marker_saving(slot);
         let view = &self.views[slot];
         let Some(data) = &view.data else { return };
         let ui = &mut self.marker_ui[slot];
@@ -1541,10 +1766,10 @@ impl TakViewerApp {
         ui.labeling.blocked_reason = if view.remote.is_some() {
             Some("원격 파일은 편집할 수 없어요.".to_owned())
         } else if self.dirty_prompt.is_some()
-            || ui.job.is_some()
-            || ui.save.is_some()
+            || busy
             || view.edit_refresh.is_some()
             || view.loading.is_some()
+            || view.waiting_shared_path().is_some()
         {
             Some("마커 작업이 끝날 때까지 기다려 주세요.".to_owned())
         } else {
@@ -1919,9 +2144,41 @@ impl TakViewerApp {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
+    fn step(ctx: &egui::Context, app: &mut TakViewerApp, elapsed: f64) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 960.0),
+            )),
+            time: Some(elapsed),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+    }
 
+    fn wait_for(
+        ctx: &egui::Context,
+        app: &mut TakViewerApp,
+        predicate: impl Fn(&TakViewerApp) -> bool,
+    ) {
+        let began = Instant::now();
+        while !predicate(app) {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "timed out: {:?}",
+                app.takm_note
+            );
+            step(ctx, app, began.elapsed().as_secs_f64());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
+    fn settled(app: &TakViewerApp) -> bool {
+        app.marker_ui[0].job.is_none() && app.views[0].edit_refresh.is_none()
+    }
 
     fn labeling_data(path: &str) -> tak_core::view_data::ViewData {
         let mut take = views::sample_take(path, &["A", "B", "Extra", "Unlabeled 4"]);
@@ -1942,6 +2199,641 @@ mod integration_tests {
         app.refresh_marker_ui(0);
         app.observe(false);
         app
+    }
+
+    fn prepared_app(ctx: &egui::Context) -> TakViewerApp {
+        use tak_core::edit::{DocumentInput, RawSample, RawTrack, RecordBytes};
+        let app = labeling_app(ctx);
+        let tracks = app.views[0].data.as_ref().unwrap().take.trajectories.iter().map(|track| RawTrack {
+            uid: track.uid, name: track.name.clone(), label: None,
+            records: RecordBytes { node: Arc::from([1]), translation_header: Arc::from([2]), serialization_verified: true },
+            samples: track.frames.iter().zip(&track.xyz).map(|(&frame, &xyz)| RawSample::new(frame, xyz)).collect::<Vec<_>>().into(),
+        }).collect();
+        {
+            let mut document = app.views[0].edit_document.as_ref().unwrap().lock().unwrap();
+            let revision = document.revision();
+            document.install_input(revision, DocumentInput {
+                streams: Vec::new().into(), nodes_prefix: Arc::from([]), channels_prefix: Arc::from([]),
+                tracks, labels: Vec::new(), first_frame: 0, last_frame: 9,
+            }).unwrap();
+        }
+        app
+    }
+
+    fn dirty_prepared_app(ctx: &egui::Context) -> TakViewerApp {
+        let mut app = prepared_app(ctx);
+        app.views[0].select(0, false);
+        let before = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = delete_samples(&before, &DeleteRequest {
+            selection: app.views[0].edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        app.commit_marker_edit(0, Arc::new(patch)).unwrap();
+        let snapshot = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let updated = app.views[0].data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        app.publish_marker_view(0, updated).unwrap();
+        app
+    }
+
+    fn add_overlay_host(ctx: &egui::Context, app: &mut TakViewerApp) {
+        let path = app.views[0].shared_target().unwrap();
+        let mut data = (**app.views[0].data.as_ref().unwrap()).clone();
+        data.take.path = "host.tak".into();
+        let (_, rx) = mpsc::channel();
+        app.views[1].show(data, rx, 12, 1.0, 0.0);
+        app.views[1].fresh = false;
+        app.views[1].fit_pending = false;
+        dock::set_editor_layout(&mut app.dock, &dock::EditorLayout::Leaf { slots: vec![0, 1], active: 0 });
+        app.start_overlay(ctx, 1, path, false);
+        app.poll_overlays(ctx);
+        assert_eq!(app.views[0].document_id(), app.views[1].overlay_document_id());
+        app.observe(false);
+    }
+
+    #[test]
+    fn dirty_shared_overlay_last_reference_cancel_and_discard() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        let document = app.views[0].edit_document.as_ref().unwrap().clone();
+        app.close_view(0);
+        assert!(app.dirty_prompt.is_none(), "the surviving overlay retains dirty edits");
+        assert!(document.lock().unwrap().is_dirty());
+        app.observe(true);
+        let before = app.history.kinds().len();
+        app.overlay_off(1);
+        assert!(app.dirty_prompt.is_some());
+        assert_eq!(app.history.kinds().len(), before);
+        assert_eq!(app.views[1].path(), Some(Path::new("host.tak")), "the dialog never replaces the displayed host");
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.views[1].overlay.is_some());
+        assert!(document.lock().unwrap().is_dirty());
+        app.overlay_off(1);
+        app.discard_pending_transition(&ctx);
+        assert!(app.dirty_prompt.is_none());
+        assert!(app.views[1].overlay.is_none());
+        assert!(!document.lock().unwrap().is_dirty());
+
+    }
+
+    #[test]
+    fn dirty_shared_overlay_replacement_and_host_replacement_close_wait_for_choice() {
+        let ctx = egui::Context::default();
+        for operation in 0..3 {
+            let mut app = dirty_prepared_app(&ctx);
+            add_overlay_host(&ctx, &mut app);
+            app.close_view(0);
+            app.observe(true);
+            app.hold_loads = true;
+            match operation {
+                0 => app.start_overlay(&ctx, 1, "next.tak".into(), false),
+                1 => app.open_in(&ctx, 1, "next.tak".into()),
+                _ => app.close_view(1),
+            }
+            assert!(app.dirty_prompt.is_some(), "operation={operation}");
+            assert!(app.views[1].overlay.as_ref().unwrap().marker_dirty());
+            app.cancel_dirty_transition(&ctx);
+            assert_eq!(app.views[1].path(), Some(Path::new("host.tak")));
+            assert!(app.views[1].overlay.as_ref().unwrap().marker_dirty());
+        }
+    }
+
+    #[test]
+    fn dirty_shared_overlay_remote_replacement_checks_overlay_even_when_primary_is_shared() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        app.close_view(0);
+        let shared_host = app.views[1].shared_file().unwrap();
+        app.views[2].show_shared_file(shared_host, 50, 1.0, 0.0);
+        dock::set_editor_layout(&mut app.dock, &dock::EditorLayout::Leaf { slots: vec![1, 2], active: 1 });
+        app.observe(false);
+        assert!(app.file_has_other_view(1, Path::new("host.tak")));
+        app.open_remote_in(&ctx, 1, crate::ssh::RemoteLocation { host: "test.invalid".into(), path: "/next.tak".into() }, false);
+        assert!(app.dirty_prompt.is_some());
+        assert!(!app.ssh.is_busy(), "dirty checking runs before any remote request");
+        assert_eq!(app.views[1].path(), Some(Path::new("host.tak")));
+        assert!(app.views[1].overlay.as_ref().unwrap().marker_dirty());
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.views[1].overlay.as_ref().unwrap().marker_dirty());
+    }
+
+    #[test]
+    fn dirty_shared_overlay_tab_batch_prompts_each_document_and_cancel_preserves_remaining() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        app.close_view(0);
+        let overlay_doc = app.views[1].overlay_owner().unwrap().edit_document.as_ref().unwrap().clone();
+        // Make the host independently dirty using the same prepared marker records.
+        let prepared = prepared_app(&ctx);
+        app.views[1].edit_document = prepared.views[0].edit_document.clone();
+        let before = app.views[1].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        app.views[1].select(0, false);
+        let patch = delete_samples(&before, &DeleteRequest { selection: app.views[1].edit_selection_state(), range: None, current_frame: 0 }).unwrap().patch.unwrap();
+        app.views[1].apply_marker_patch(&patch, true).unwrap();
+        app.views[1].publish_shared_file();
+        let host_doc = app.views[1].edit_document.as_ref().unwrap().clone();
+        let tab = app.layout_tabs.active_id().unwrap();
+        app.close_layout_tab(tab);
+        assert!(app.dirty_prompt.is_some());
+        app.discard_pending_transition(&ctx);
+        assert!(app.dirty_prompt.is_some(), "one discarded document must not close the other dirty document");
+        assert!(!host_doc.lock().unwrap().is_dirty());
+        assert!(overlay_doc.lock().unwrap().is_dirty());
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.layout_tabs.tab(tab).is_some());
+        assert!(app.views[1].overlay.is_some());
+        assert!(overlay_doc.lock().unwrap().is_dirty());
+        app.close_layout_tab(tab);
+        app.discard_pending_transition(&ctx);
+        assert!(app.layout_tabs.tab(tab).is_none());
+        assert!(!overlay_doc.lock().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn inactive_tab_close_is_one_action_and_cancel_undo_redo_restore_original_active_tab() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        let dirty_tab = app.layout_tabs.active_id().unwrap();
+        let original = next_empty_tab(&mut app);
+        app.ensure_open_view(0);
+        app.views[0].show(views::sample_data("visible.tak", &["M"]), mpsc::channel().1, 23, 1.0, 0.0);
+        app.observe(false);
+        let before = app.history.kinds().len();
+        app.close_layout_tab(dirty_tab);
+        assert!(app.dirty_prompt.is_some());
+        app.cancel_dirty_transition(&ctx);
+        assert_eq!(app.layout_tabs.active_id(), Some(original));
+        assert_eq!(app.history.kinds().len(), before);
+        app.close_layout_tab(dirty_tab);
+        app.discard_pending_transition(&ctx);
+        assert_eq!(app.layout_tabs.active_id(), Some(original));
+        assert_eq!(app.history.kinds().iter().filter(|kind| kind.as_str() == "TabLifecycle").count(), 1);
+        assert!(!app.history.kinds().iter().any(|kind| kind == "TabSwitch"));
+        assert_eq!(app.history.kinds().last().map(String::as_str), Some("TabLifecycle"));
+        app.undo_redo(&ctx, false);
+        assert!(app.layout_tabs.tab(dirty_tab).is_some());
+        assert_eq!(app.layout_tabs.active_id(), Some(original));
+        app.undo_redo(&ctx, true);
+        assert!(app.layout_tabs.tab(dirty_tab).is_none());
+        assert_eq!(app.layout_tabs.active_id(), Some(original));
+    }
+
+    #[test]
+    fn saved_deferred_emg_error_reaches_closed_primary_and_overlay_aliases() {
+        let ctx = egui::Context::default();
+        let mut app = prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        let document = app.views[0].document_id().unwrap();
+        let tab = app.layout_tabs.active_id().unwrap();
+        app.views[0].data.as_mut().map(|data| Arc::make_mut(data).emg_pending = true);
+        app.close_layout_tab(tab);
+        assert!(app.dirty_prompt.is_none());
+        // A new visible alias receives the save completion while old aliases are closed.
+        let shared = app.layout_tabs.closed_items_mut().find_map(|item| {
+            let layout_tabs::ClosedItem::Tab(closed) = item else { return None };
+            closed.tab.layout.as_mut()?.views[0].shared_file()
+        }).unwrap();
+        app.ensure_open_view(0);
+        app.views[0].show_shared_file(shared, 44, 1.0, 0.0);
+        assert_eq!(app.install_saved_deferred_emg(0, document, Err("descriptor refresh failed".into())), Some("descriptor refresh failed".into()));
+        let closed = app.layout_tabs.closed_items().find_map(|item| {
+            let layout_tabs::ClosedItem::Tab(closed) = item else { return None }; closed.tab.layout.as_ref()
+        }).unwrap();
+        assert_eq!(closed.views[0].emg_failure.as_deref(), Some("descriptor refresh failed"));
+        assert!(closed.views[0].emg_requested);
+        assert_eq!(closed.views[1].overlay_owner().unwrap().emg_failure.as_deref(), Some("descriptor refresh failed"));
+        assert!(closed.views[1].overlay_owner().unwrap().emg_requested);
+    }
+
+    #[test]
+    fn inactive_tab_close_waiting_for_shared_comment_restores_origin_without_a_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        let closing = app.layout_tabs.active_id().unwrap();
+        let shared = app.views[0].shared_file().unwrap();
+        app.views[0].comments.pending = 1;
+        let original = next_empty_tab(&mut app);
+        app.ensure_open_view(0);
+        app.views[0].show_shared_file(shared, 24, 1.0, 0.0);
+        app.observe(false);
+        let before = app.history.kinds().len();
+        app.close_layout_tab(closing);
+        assert!(app.dirty_prompt.is_none());
+        assert!(app.notice.is_some());
+        assert_eq!(app.layout_tabs.active_id(), Some(original));
+        assert!(app.tab_close_origin.is_none());
+        assert!(app.layout_tabs.tab(closing).is_some());
+        assert_eq!(app.history.kinds().len(), before);
+    }
+
+    #[test]
+    fn dirty_shared_overlay_completed_edit_worker_can_undo_and_redo_without_a_primary() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        let before = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let selection = app.views[0].edit_selection_state();
+        let patch = delete_samples(&before, &DeleteRequest { selection: selection.clone(), range: Some((1, 1)), current_frame: 1 }).unwrap().patch.unwrap();
+        let after = patch.after_snapshot();
+        let rebuilt = app.views[0].data.as_ref().unwrap().rebuild_markers(&after).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].job = Some(MarkerJob::Edit { document: before.document_id(), selection, rx });
+        app.close_view(0);
+        assert!(app.dirty_prompt.is_none());
+        app.observe(true);
+        tx.send(Ok(EditDone { patch: Some(patch), view: Some(rebuilt), message: "completed after close".into() })).unwrap_or_else(|_| panic!("edit worker was lost"));
+        app.poll_overlay_marker_work(&ctx);
+        let session = app.views[1].overlay_owner().unwrap().edit_document.as_ref().unwrap().clone();
+        assert_eq!(session.lock().unwrap().revision(), after.revision());
+        app.undo_redo(&ctx, false);
+        assert_eq!(session.lock().unwrap().revision(), before.revision());
+        assert_eq!(app.views[1].path(), Some(Path::new("host.tak")));
+        wait_for(&ctx, &mut app, |app| app.overlay_marker_ui.is_empty());
+        app.undo_redo(&ctx, true);
+        assert_eq!(session.lock().unwrap().revision(), after.revision());
+        assert_eq!(app.views[1].path(), Some(Path::new("host.tak")));
+    }
+
+    #[test]
+    fn dirty_shared_overlay_discard_from_primary_alias_cancels_the_overlay_save_worker() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        let document = app.views[0].document_id().unwrap();
+        let shared = app.views[0].shared_file().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running { document, close_after: false, rx, reserved: None, cancelled: cancelled.clone() });
+        app.close_view(0);
+        assert!(app.overlay_marker_ui.contains_key(&document));
+        app.views[0].show_shared_file(shared, 71, 1.0, 0.0);
+        dock::set_editor_layout(&mut app.dock, &dock::EditorLayout::Leaf { slots: vec![0, 1], active: 0 });
+        app.request_exit(&ctx);
+        assert_eq!(app.dirty_prompt.as_ref().unwrap().slot, 0);
+        app.discard_pending_transition(&ctx);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!app.overlay_marker_ui.contains_key(&document));
+        assert!(!app.views[0].marker_dirty());
+        assert!(app.exit_approved);
+    }
+
+    #[test]
+    fn dirty_shared_overlay_worker_handoff_and_failed_save_keep_the_last_reference() {
+        let ctx = egui::Context::default();
+        let mut app = dirty_prepared_app(&ctx);
+        add_overlay_host(&ctx, &mut app);
+        let document = app.views[0].document_id().unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document, close_after: false, rx, reserved: Some("reserved_overlay.takm".into()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        app.marker_ui[0].save_started = Some(Instant::now());
+        let (_analog_tx, analog_rx) = mpsc::channel();
+        let (_emg_tx, emg_rx) = mpsc::channel();
+        app.views[0].analog_rx = Some((app.views[0].file_id, analog_rx));
+        app.views[0].emg_rx = Some((app.views[0].file_id, emg_rx));
+        app.close_view(0);
+        assert!(app.dirty_prompt.is_none());
+        assert!(!app.marker_ui[0].has_pending_work());
+        assert!(app.overlay_marker_ui.get(&document).is_some_and(MarkerUi::has_save));
+        assert!(app.save_destination_reserved(Path::new("reserved_overlay.takm")));
+        app.overlay_off(1);
+        assert!(app.dirty_prompt.as_ref().unwrap().saving);
+        let owner = app.views[1].overlay_owner().unwrap();
+        assert_eq!(owner.analog_rx.as_ref().unwrap().0, owner.file_id);
+        assert_eq!(owner.emg_rx.as_ref().unwrap().0, owner.file_id);
+        tx.send(SaveMessage::Done(Err(SaveFailure::Other("overlay write failed".into())))).unwrap_or_else(|_| panic!("save worker was lost"));
+        app.poll_overlay_marker_work(&ctx);
+        assert!(!app.dirty_prompt.as_ref().unwrap().saving);
+        assert!(!app.save_destination_reserved(Path::new("reserved_overlay.takm")));
+        assert!(app.views[1].overlay.as_ref().unwrap().marker_dirty());
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.views[1].overlay.is_some());
+        app.overlay_off(1);
+        app.discard_pending_transition(&ctx);
+        assert!(app.views[1].overlay.is_none());
+        assert!(app.overlay_marker_ui.is_empty());
+    }
+
+    #[test]
+    fn dirty_shared_overlay_save_actual_file_and_source_stamp() {
+        let Some(dir) = std::env::var_os("TAK_OVERLAY_E2E_DIR").map(PathBuf::from) else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let original = root.join("input/raw/000000_S01_perturb_20_001.tak");
+        let source_meta = std::fs::metadata(&original).unwrap();
+        let source = tak_core::takm::convert(&original, Some(&dir)).unwrap().out;
+        let destination = source.clone();
+        let before_save = FileVersion::capture(&source).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.open_in(&ctx, 0, source.clone());
+        wait_for(&ctx, &mut app, |app| app.views[0].data.is_some() && !app.views[0].analog_work_pending());
+        let marker = app.views[0].data.as_ref().unwrap().markers.iter().position(|marker| marker.kind != MarkerKind::Unlabeled
+            && marker.segments.iter().any(|&(first, last)| first <= 100 && last >= 120)).unwrap();
+        let uid = app.views[0].data.as_ref().unwrap().markers[marker].uid;
+        app.views[0].select(marker, false);
+        app.views[0].range = Some((100, 120));
+        app.delete_selected(&ctx, 0);
+        wait_for(&ctx, &mut app, settled);
+        assert!(app.views[0].marker_dirty());
+        let expected = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let document = app.views[0].edit_document.as_ref().unwrap().clone();
+        let stamp = app.views[0].source_stamp.as_ref().unwrap().clone();
+        add_overlay_host(&ctx, &mut app);
+        assert!(Arc::ptr_eq(&stamp, app.views[1].overlay_owner().unwrap().source_stamp.as_ref().unwrap()));
+        app.close_view(0);
+        assert!(app.dirty_prompt.is_none());
+        app.overlay_off(1);
+        assert!(app.dirty_prompt.is_some());
+        app.cancel_dirty_transition(&ctx);
+        assert!(document.lock().unwrap().is_dirty());
+        assert_eq!(FileVersion::capture(&source).unwrap(), before_save, "Cancel leaves the temporary TAKM untouched");
+        app.overlay_off(1);
+        app.save_markers(&ctx, 1, false, true);
+        wait_for(&ctx, &mut app, |app| app.dirty_prompt.is_none());
+        assert!(app.views[1].overlay.is_none(), "Save completes the originally requested overlay removal");
+        assert!(destination.is_file(), "save failed: {:?}", app.takm_note);
+        assert!(!document.lock().unwrap().is_dirty());
+        let (prepared, _) = PreparedInput::read_from_path(&destination).unwrap();
+        let mut reopened = tak_core::edit::EditDocument::unloaded(destination.clone());
+        reopened.install_prepared(reopened.revision(), prepared).unwrap();
+        assert_eq!(reopened.snapshot().track(&uid).unwrap().samples, expected.track(&uid).unwrap().samples);
+        let actual_stamp = stamp.lock().unwrap().clone().unwrap();
+        assert!(TakViewerApp::same_local_path(&actual_stamp.0, &destination));
+        let meta = std::fs::metadata(&destination).unwrap();
+        assert_eq!(actual_stamp.1, meta.len());
+        assert_eq!(actual_stamp.2, meta.modified().ok());
+        let after = std::fs::metadata(&original).unwrap();
+        assert_eq!(after.len(), source_meta.len());
+        assert_eq!(after.modified().ok(), source_meta.modified().ok());
+        app.observe(true);
+        app.undo_redo(&ctx, false);
+        wait_for(&ctx, &mut app, |app| app.views[1].overlay.is_some() && !app.views[1].overlay_owner().unwrap().analog_work_pending());
+        assert!(TakViewerApp::same_local_path(app.views[1].overlay_path().unwrap(), &destination));
+        assert_eq!(app.views[1].overlay_document_id(), Some(expected.document_id()));
+        assert!(app.layout_restore_files.is_empty());
+        // Simulate an incoming edit between Undo and Redo. Redo must leave its close
+        // action in place while the final-overlay prompt is waiting or cancelled.
+        app.with_overlay_owner(&ctx, 1, |app| {
+            let before = app.views[1].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+            let patch = delete_samples(&before, &DeleteRequest {
+                selection: EditSelection { selected: [uid].into_iter().collect(), ..Default::default() },
+                range: Some((121, 130)), current_frame: 121,
+            }).unwrap().patch.unwrap();
+            app.views[1].apply_marker_patch(&patch, true).unwrap();
+            let updated = app.views[1].data.as_ref().unwrap().rebuild_markers(&patch.after_snapshot()).unwrap();
+            app.views[1].publish_edited_view(updated).unwrap();
+        });
+        assert!(document.lock().unwrap().is_dirty());
+        app.undo_redo(&ctx, true);
+        assert!(app.dirty_prompt.is_some());
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.views[1].overlay.is_some());
+        app.undo_redo(&ctx, true);
+        assert!(app.dirty_prompt.is_some());
+        app.discard_pending_transition(&ctx);
+        assert!(app.dirty_prompt.is_none());
+        assert!(app.views[1].overlay.is_none());
+        assert!(!document.lock().unwrap().is_dirty());
+        assert!(app.layout_restore_files.is_empty());
+        println!("shared overlay Save/Discard/Cancel + Undo/Redo fixture: {}", destination.display());
+    }
+
+    fn next_empty_tab(app: &mut TakViewerApp) -> layout_tabs::TabId {
+        let previous = app.layout_tabs.active_id().unwrap();
+        let next = app.layout_tabs.add(Some(LayoutRuntime::default()));
+        app.layout_tabs.activate(previous);
+        assert!(app.switch_layout_tab_internal(next));
+        next
+    }
+
+    #[test]
+    fn shared_hidden_save_progresses_through_exit_prompt_and_returns_to_visible_tab() {
+        let ctx = egui::Context::default();
+        let mut app = prepared_app(&ctx);
+        let source_tab = app.layout_tabs.active_id().unwrap();
+        app.views[0].select(0, false);
+        let before = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = delete_samples(&before, &DeleteRequest {
+            selection: app.views[0].edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        app.views[0].apply_marker_patch(&patch, true).unwrap();
+        let snapshot = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let updated = app.views[0].data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        app.views[0].publish_edited_view(updated).unwrap();
+        let document = snapshot.document_id();
+        let shared = app.views[0].shared_file().unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document, close_after: false, rx, reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        app.marker_ui[0].save_started = Some(Instant::now());
+        let visible_tab = next_empty_tab(&mut app);
+        app.ensure_open_view(0);
+        app.views[0].show_shared_file(shared, 11, 1.0, 0.0);
+        app.refresh_marker_ui(0);
+        app.request_exit(&ctx);
+        assert!(app.dirty_prompt.as_ref().unwrap().saving);
+        assert!(matches!(app.dirty_prompt.as_ref().unwrap().transition, PendingTransition::Exit));
+        app.poll_hidden_marker_work(&ctx);
+        assert_eq!(app.layout_tabs.active_id(), Some(visible_tab));
+        assert!(app.dirty_prompt.as_ref().unwrap().saving, "an incomplete worker must keep the original exit prompt");
+        assert!(!app.exit_approved);
+        assert!(app.layout_tabs.tab(source_tab).unwrap().layout.as_ref().unwrap().marker_ui[0].has_save());
+
+        let destination = std::env::temp_dir().join(format!("hidden_save_result_{}_{}.takm", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut saved_view = app.views[0].data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        saved_view.take.path = destination.clone();
+        tx.send(SaveMessage::Done(Ok(Saved {
+            outcome: SaveOutcome { destination: destination.clone(), written_revision: snapshot.revision(), fixed_len: 0,
+                version: FileVersion::capture(&destination).unwrap() },
+            snapshot, view: saved_view,
+            comments: views::CommentsLoad { target: Ok(destination.clone()), parsed: None, label: None },
+            source_stamp: (destination.clone(), 0, None),
+            deferred_emg: Ok(None),
+        }))).unwrap_or_else(|_| panic!("hidden save receiver disappeared"));
+        app.poll_hidden_marker_work(&ctx);
+        assert_eq!(app.layout_tabs.active_id(), Some(visible_tab));
+        assert_eq!(app.views[0].path(), Some(destination.as_path()));
+        assert!(!app.views[0].marker_dirty());
+        assert!(!app.marker_saving(0));
+        assert!(app.exit_approved, "the original exit transition completes after returning to its tab");
+        assert!(app.dirty_prompt.is_none());
+    }
+
+    #[test]
+    fn shared_save_waits_for_sibling_analog_in_active_hidden_primary_and_overlay_owners() {
+        for hidden in [false, true] {
+            for overlay in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = prepared_app(&ctx);
+                Arc::get_mut(app.views[0].data.as_mut().unwrap()).unwrap().emg_pending = true;
+                let target = app.views[0].data.as_ref().unwrap().analog_target();
+                let (tx, rx) = mpsc::channel();
+                app.views[0].emg_rx = Some((app.views[0].file_id, rx));
+                app.views[0].emg_requested = true;
+                let shared = app.views[0].shared_file().unwrap();
+                if overlay {
+                    dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+                    let (_tx, rx) = mpsc::channel();
+                    app.views[1].show(views::sample_data("carrier.tak", &["M"]), rx, 12, 1.0, 0.0);
+                    app.views[1].start_shared_overlay("labeling.tak".into(), shared.clone(), false);
+                    let (_, result, _) = app.views[1].poll_overlay().unwrap();
+                    app.views[1].overlay = Some(result.unwrap());
+                    let mut source = std::mem::take(&mut app.views[0]);
+                    assert!(source.transfer_primary_work_to_overlay(&mut app.views[1]));
+                    drop_later(source.clear());
+                }
+                let slot = if hidden { next_empty_tab(&mut app); 0 } else { 2 };
+                app.ensure_open_view(slot);
+                if !app.open_views().contains(&slot) { dock::add_view(&mut app.dock, slot as u8, dock::NOMINAL_AREA); }
+                app.views[slot].show_shared_file(shared, 13, 1.0, 0.0);
+                app.refresh_marker_ui(slot);
+                assert!(!app.views[slot].analog_work_pending(), "the save view owns no analog worker");
+                assert!(!app.views[slot].data.as_ref().unwrap().analog_pending, "only deferred EMG is running");
+                app.marker_ui[slot].save = Some(SaveJob::Waiting(SaveIntent { destination: None, close_after: false }));
+                app.comment_registration = None;
+                app.comment_registration_error = Some("passed analog barrier".into());
+                app.poll_marker_saves(&ctx);
+                assert!(matches!(app.marker_ui[slot].save, Some(SaveJob::Waiting(_))), "hidden={hidden}, overlay={overlay}");
+                tx.send(views::LoadMsg::Analog(Ok(tak_core::view_data::AnalogPart::prepare_selected(
+                    vec![], None, &target, vec![], false,
+                )), 1.0)).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while app.document_analog_work_pending(slot) {
+                    for view in &mut app.views { view.poll_analog(); view.poll_overlay_file_work_gated(&ctx, false); }
+                    app.poll_hidden_file_work(&ctx);
+                    assert!(Instant::now() < deadline, "hidden={hidden}, overlay={overlay}");
+                    std::thread::yield_now();
+                }
+                app.poll_marker_saves(&ctx);
+                assert!(app.marker_ui[slot].save.is_none(), "the save proceeds after analog completes: hidden={hidden}, overlay={overlay}, registration={}, pending={}, note={:?}", app.comment_registration.is_some(), app.document_analog_work_pending(slot), app.takm_note);
+                assert!(app.takm_note.as_ref().unwrap().0.contains("passed analog barrier"));
+            }
+        }
+    }
+
+    #[test]
+    fn real_takm_overwrite_refreshes_shared_deferred_emg_without_loading_samples() {
+        let Some(original) = std::env::var_os("TAK_SAVE_EMG_E2E_SOURCE").map(PathBuf::from) else { return };
+        let dir = PathBuf::from(std::env::var_os("TAK_SAVE_EMG_E2E_DIR").expect("set a fresh TAK_SAVE_EMG_E2E_DIR"));
+        assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "use a fresh output directory");
+        let source_before = std::fs::metadata(&original).unwrap();
+        let converted = tak_core::takm::convert(&original, Some(&dir)).unwrap();
+        let output = converted.out;
+        let old_fixed = tak_core::takm::read_index_path(&output).unwrap().fixed_len;
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.open_in(&ctx, 0, output.clone());
+        wait_for(&ctx, &mut app, |app| app.views[0].data.is_some() && !app.views[0].file_work_pending());
+        let source_tab = app.layout_tabs.active_id().unwrap();
+        let nonplate: Vec<_> = app.views[0].data.as_ref().unwrap().devices.iter().enumerate()
+            .filter_map(|(index, device)| device.plate.is_none().then_some(index)).collect();
+        assert!(!nonplate.is_empty());
+        let deferred_empty = |view: &View| view.data.as_ref().is_some_and(|data| data.emg_pending
+            && nonplate.iter().all(|&device| data.take.analog[device].channels.iter().all(|channel| channel.values.is_empty())));
+        assert!(deferred_empty(&app.views[0]), "EMG must remain deferred at open");
+        let shared = app.views[0].shared_file().unwrap();
+        let saving_tab = next_empty_tab(&mut app);
+        app.ensure_open_view(0);
+        app.views[0].show_shared_file(shared, app.next_file_id + 1, 1.0, 0.0);
+        app.next_file_id += 1;
+        app.refresh_marker_ui(0);
+        let marker = app.views[0].data.as_ref().unwrap().markers.iter().position(|marker| marker.n_samples > 100).unwrap();
+        app.views[0].select(marker, false);
+        app.views[0].range = Some((app.views[0].pb.first, app.views[0].pb.last));
+        app.delete_selected(&ctx, 0);
+        wait_for(&ctx, &mut app, settled);
+        assert!(app.views[0].marker_dirty());
+        app.save_markers(&ctx, 0, false, false);
+        wait_for(&ctx, &mut app, |app| !app.marker_saving(0));
+        assert!(!app.views[0].marker_dirty(), "save failed: {:?}", app.takm_note);
+        assert!(app.views[0].emg_failure.is_none(), "deferred metadata refresh failed: {:?}", app.views[0].emg_failure);
+        assert!(deferred_empty(&app.views[0]), "save must refresh descriptors without loading EMG samples");
+        assert!(tak_core::takm::read_index_path(&output).unwrap().fixed_len < old_fixed,
+            "the overwritten file must actually relocate/shrink its streams");
+        let expected = tak_core::tak::read_take(&output).unwrap();
+        assert!(nonplate.iter().any(|&device| expected.analog[device].channels.iter().any(|channel| !channel.values.is_empty())));
+        app.switch_layout_tab_internal(source_tab);
+        assert!(deferred_empty(&app.views[0]));
+        app.views[0].devices.request_emg = true;
+        app.views[0].request_emg(&ctx);
+        wait_for(&ctx, &mut app, |app| app.views[0].data.as_ref().is_some_and(|data| !data.emg_pending)
+            || app.views[0].emg_failure.is_some());
+        assert!(app.views[0].emg_failure.is_none(), "old deferred offsets were used: {:?}", app.views[0].emg_failure);
+        let actual = app.views[0].data.as_ref().unwrap();
+        assert!(!actual.emg_pending);
+        for &device in &nonplate {
+            assert_eq!(actual.take.analog[device].channels.len(), expected.analog[device].channels.len());
+            for (actual, expected) in actual.take.analog[device].channels.iter().zip(&expected.analog[device].channels) {
+                assert_eq!(actual.frames, expected.frames);
+                assert_eq!(actual.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+            }
+        }
+        let hidden = &app.layout_tabs.tab(saving_tab).unwrap().layout.as_ref().unwrap().views[0];
+        assert!(Arc::ptr_eq(app.views[0].data.as_ref().unwrap(), hidden.data.as_ref().unwrap()));
+        let source_after = std::fs::metadata(&original).unwrap();
+        assert_eq!((source_before.len(), source_before.modified().unwrap()), (source_after.len(), source_after.modified().unwrap()));
+        println!("post-save deferred EMG fixture: {}", output.display());
+    }
+
+    #[test]
+    fn shared_documents_block_parallel_workers_but_allow_their_own_save_path() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let shared = app.views[0].shared_file().unwrap();
+        app.views[1].show_shared_file(shared, 11, 1.0, 0.0);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        assert!(!app.save_destination_open_elsewhere(0, Path::new("labeling.tak")),
+            "another view of the same document is the same save destination");
+        let document = app.views[0].edit_document.as_ref().unwrap().lock().unwrap();
+        let (id, revision) = (document.id(), document.revision());
+        drop(document);
+        let (_job_tx, job_rx) = mpsc::channel();
+        app.marker_ui[0].job = Some(MarkerJob::Refresh { document: id, revision, rx: job_rx });
+        assert!(app.marker_job_running(1));
+        assert!(!app.quick_label_available(&ctx, 1));
+        app.refresh_marker_ui(1);
+        assert!(app.marker_ui[1].labeling.blocked_reason.is_some());
+        app.marker_ui[0].job = None;
+        let (_save_tx, save_rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document: id, close_after: false, rx: save_rx, reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(app.marker_saving(1));
+        assert!(!app.quick_label_available(&ctx, 1));
+        app.marker_ui[0].save = None;
+        let (_tx, rx) = mpsc::channel();
+        app.views[2].show(labeling_data("labeling.tak"), rx, 12, 1.0, 0.0);
+        dock::add_view(&mut app.dock, 2, dock::NOMINAL_AREA);
+        assert!(!app.views[0].shares_document(&app.views[2]));
+        assert!(app.save_destination_open_elsewhere(0, Path::new("labeling.tak")),
+            "an independently loaded document must still block replacement");
+        assert!(!app.marker_job_running(2));
+        assert!(!app.marker_saving(2));
+    }
+
+    #[test]
+    fn transferring_marker_workers_keeps_receiver_settings_and_rebinds_poll_identity() {
+        let mut source = MarkerUi::default();
+        let mut target = MarkerUi::default();
+        target.labeling.mode = LabelingMode::Select;
+        target.tools.max_gap = "17".into();
+        let document = tak_core::edit::EditDocument::unloaded("move.tak".into());
+        let (_tx, rx) = mpsc::channel();
+        source.job = Some(MarkerJob::Refresh { document: document.id(), revision: document.revision(), rx });
+        assert!(source.transfer_work_to(&mut target, 81));
+        assert!(!source.has_pending_work());
+        assert!(target.has_marker_job());
+        assert_eq!(target.file_id, 81);
+        assert_eq!(target.labeling.mode, LabelingMode::Select);
+        assert_eq!(target.tools.max_gap, "17");
+        assert!(target.detached_job_selection);
     }
 
     #[test]

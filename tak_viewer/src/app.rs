@@ -22,6 +22,8 @@ mod undo;
 use undo::History;
 #[path = "app_overlay.rs"]
 mod overlay;
+#[path = "app_overlay_dirty.rs"]
+mod overlay_dirty;
 #[path = "app_takm.rs"]
 mod takm_save;
 #[path = "app_editors.rs"]
@@ -30,6 +32,12 @@ mod editors;
 mod remote_ui;
 #[path = "app_marker_edit.rs"]
 mod marker_edit;
+#[path = "app_tabs.rs"]
+mod layout_tabs;
+#[path = "app_layout_tabs.rs"]
+mod layout_controller;
+#[path = "app_hidden_work.rs"]
+mod hidden_work;
 use crate::workspace::{self, AddRoot, Workspace, MAX_ROOTS};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use egui_dock::{DockArea, DockState};
@@ -55,6 +63,71 @@ const NEW_WINDOW_SHIFT: f32 = 40.0;
 /// opens, then each kind alone, then everything.
 const OPEN_FILTERS: [(&str, &[&str]); 4] =
     [("TAK · TAKM (.tak, .takm)", &["tak", "takm"]), ("TAK (.tak)", &["tak"]), ("TAKM (.takm)", &["takm"]), ("모든 파일", &["*"])];
+
+/// The persistent, small part of a layout tab. Remote file paths are never saved.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedLayoutTab {
+    name: String,
+    layout: dock::EditorLayout,
+    views: Vec<SavedLayoutView>,
+    active: u8,
+    graph_boxes: Vec<GraphBox>,
+    plate_boxes: Vec<GraphBox>,
+    plate_channels: Vec<LaneSet>,
+}
+
+impl Default for SavedLayoutTab {
+    fn default() -> Self {
+        Self {
+            name: String::new(), layout: dock::EditorLayout::Empty, views: Vec::new(), active: 0,
+            graph_boxes: vec![GraphBox::default(); MAX_VIEWS],
+            plate_boxes: vec![GraphBox::default(); MAX_VIEWS],
+            plate_channels: vec![LaneSet::default(); MAX_VIEWS],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedLayoutView {
+    slot: u8,
+    path: String,
+    spot: Option<Spot>,
+}
+
+/// Hidden tabs own live views, not copies of the underlying file data.
+struct LayoutRuntime {
+    views: [View; MAX_VIEWS],
+    marker_ui: [marker_edit::MarkerUi; MAX_VIEWS],
+    layout: dock::EditorLayout,
+    active: usize,
+    graph_boxes: Vec<GraphBox>,
+    plate_boxes: Vec<GraphBox>,
+    plate_channels: Vec<LaneSet>,
+}
+
+/// A recently closed view retains its controls and any unfinished worker. Shared files still
+/// point at one document and one underlying data buffer.
+struct ClosedLayoutView {
+    view: View,
+    marker_ui: marker_edit::MarkerUi,
+    slot: usize,
+    layout: dock::EditorLayout,
+}
+
+impl Default for LayoutRuntime {
+    fn default() -> Self {
+        Self {
+            views: std::array::from_fn(|_| View::default()),
+            marker_ui: std::array::from_fn(|_| marker_edit::MarkerUi::default()),
+            layout: dock::EditorLayout::Empty,
+            active: 0,
+            graph_boxes: vec![GraphBox::default(); MAX_VIEWS],
+            plate_boxes: vec![GraphBox::default(); MAX_VIEWS],
+            plate_channels: vec![LaneSet::default(); MAX_VIEWS],
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,6 +157,9 @@ pub struct Settings {
     pub views: Vec<(u8, String)>,
     /// The view that was active (side panes, keys, status bar).
     pub active_view: u8,
+    /// `None` is the old single-layout schema. `Some([])` means every tab was closed.
+    layout_tabs: Option<Vec<SavedLayoutTab>>,
+    active_layout_tab: usize,
     /// Where each file was being viewed, newest first (at most `views::MAX_SPOTS`).
     pub file_memory: Vec<Spot>,
     pub speed: f64,
@@ -120,6 +196,8 @@ impl Default for Settings {
             hidden: dock::Hidden::default(),
             views: vec![],
             active_view: 0,
+            layout_tabs: None,
+            active_layout_tab: 0,
             file_memory: vec![],
             speed: 1.0,
             graph_float: true,
@@ -306,10 +384,25 @@ pub struct TakViewerApp {
     /// The 3D views by slot; the ones on screen are the `Pane::View` tabs in `dock`.
     views: [View; MAX_VIEWS],
     marker_ui: [marker_edit::MarkerUi; MAX_VIEWS],
+    /// The active tab's runtime is in `views` / `marker_ui`; its model payload is None.
+    /// Hidden tabs own their payload and are never drawn or ticked.
+    layout_tabs: layout_tabs::TabModel<Option<LayoutRuntime>, ClosedLayoutView>,
+    hidden_work: hidden_work::HiddenWork,
+    editor_cache: std::cell::RefCell<editors::EditorCache>,
+    layout_strip: layout_tabs::TabStrip,
+    layout_time: f64,
+    pending_shared_promotions: Vec<PathBuf>,
+    /// Only the newest admitted request. Existing views own their identities independently.
+    identity_candidate: std::cell::RefCell<Option<(PathBuf, PathBuf)>>,
     marker_sessions: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::PreparedSession>,
     marker_click: Option<(usize, tak_core::tak::Uid)>,
     marker_delete: Option<usize>,
     dirty_prompt: Option<marker_edit::DirtyPrompt>,
+    overlay_dirty: Option<overlay_dirty::OverlayDirty>,
+    overlay_marker_ui: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::MarkerUi>,
+    overlay_owner_scope: bool,
+    layout_restore_files: Vec<overlay_dirty::LayoutRestoreFile>,
+    tab_close_origin: Option<(u64, Option<u64>)>,
     exit_approved: bool,
     restoring_layout: bool,
     /// Slot of the active view (blue edge; side panes, keys, status bar, captures).
@@ -337,7 +430,7 @@ pub struct TakViewerApp {
     ssh: crate::ssh::SshManager,
     ssh_sources: std::collections::HashMap<PathBuf, crate::ssh::RemoteLocation>,
     ssh_cache: std::collections::VecDeque<remote_ui::Cached>,
-    ssh_reads: std::collections::HashMap<u64, (usize, crate::ssh::RemoteLocation)>,
+    ssh_reads: std::collections::HashMap<u64, remote_ui::RemoteRead>,
     ssh_note: Option<(String, f64)>,
     ssh_demo_applied: bool,
     explorer: ExplorerState,
@@ -506,10 +599,22 @@ impl TakViewerApp {
         let mut app = TakViewerApp {
             views: std::array::from_fn(|_| View::default()),
             marker_ui: std::array::from_fn(|_| marker_edit::MarkerUi::default()),
+            layout_tabs: layout_tabs::TabModel::new(None),
+            hidden_work: hidden_work::HiddenWork::default(),
+            editor_cache: Default::default(),
+            layout_strip: layout_tabs::TabStrip::default(),
+            layout_time: 0.0,
+            pending_shared_promotions: Vec::new(),
+            identity_candidate: Default::default(),
             marker_sessions: Default::default(),
             marker_click: None,
             marker_delete: None,
             dirty_prompt: None,
+            overlay_dirty: None,
+            overlay_marker_ui: Default::default(),
+            overlay_owner_scope: false,
+            layout_restore_files: Vec::new(),
+            tab_close_origin: None,
             exit_approved: false,
             restoring_layout: false,
             active: 0,
@@ -593,7 +698,8 @@ impl TakViewerApp {
                 app.explorer.expand(&mut app.workspace, &r);
             }
         }
-        app.restore_views(ctx);
+        app.restore_layout_tabs(ctx);
+        if app.capture.is_none() { dock::ensure_layout_strip(&mut app.dock, app.active as u8); }
         // Command line: a folder is added to the saved folders; files open directly, the first
         // in the active view, the others next to it (WSL paths OK).
         let args: Vec<PathBuf> = initial.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect();
@@ -669,7 +775,7 @@ impl TakViewerApp {
             return Some(format!("{} · {}", remote_ui::remote_name(location), location.host));
         }
         let path = self.views[slot].target()?;
-        let same = open.iter().any(|&k| k != slot && self.views[k].target().is_some_and(|q| name(q) == name(path)));
+        let same = open.iter().any(|&k| k != slot && self.views[k].target().is_some_and(|q| q != path && name(q) == name(path)));
         let folder = path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned());
         let mut label = match folder {
             Some(f) if same => format!("{} · {f}", name(path)),
@@ -688,6 +794,7 @@ impl TakViewerApp {
     /// Add a folder to the saved folders (at most `MAX_ROOTS`) and expand it.
     /// Returns false when the list is full (nothing changed, a notice is shown).
     fn open_workspace(&mut self, root: PathBuf) -> bool {
+        if self.dirty_prompt.is_some() { return false; }
         if self.workspace.add_root(root.clone()) == AddRoot::Full {
             self.notice = Some(format!(
                 "저장 폴더는 {MAX_ROOTS}개까지예요.\n왼쪽 Explorer에서 폴더 줄에 마우스를 올리고 ✕로 하나 뺀 뒤 다시 추가하세요.\n\n추가하려던 폴더:\n{}",
@@ -739,6 +846,7 @@ impl TakViewerApp {
 
     /// Open whatever a path points to: folder -> saved folders, file -> take.
     fn open_any(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.dirty_prompt.is_some() { return; }
         if path.is_dir() {
             self.open_workspace(path);
         } else {
@@ -785,28 +893,24 @@ impl TakViewerApp {
         }
     }
 
-    /// Open a file in the active view (Explorer click). A file already open in another view
-    /// is not opened twice: that view becomes the active one.
+    /// Open a file in the active view. Another view may already show the same shared document.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        match self.view_of(&path) {
-            Some(k) => self.activate(k),
-            None => self.open_in(ctx, self.active, path),
-        }
+        if self.dirty_prompt.is_some() { return; }
+        self.open_in(ctx, self.active, path);
     }
 
     /// Open a file in a new view next to the others (Ctrl+click, "옆 화면에 열기").
     fn open_side(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if let Some(k) = self.view_of(&path) {
-            self.activate(k);
-            return;
-        }
+        if self.dirty_prompt.is_some() { return; }
+        if !self.allow_open_file(&path, None) { return; }
         // The first file goes into a default view, including after every view was closed.
         if self.open_views().is_empty() || (self.open_views().len() == 1 && self.view().target().is_none()) {
             self.open_in(ctx, self.active, path);
             return;
         }
-        let Some(slot) = dock::free_slot(&self.dock).filter(|_| self.file_count() < MAX_VIEWS) else {
+        let Some(slot) = dock::free_slot(&self.dock) else {
             self.full_notice(&path);
+            self.discard_identity_candidate();
             return;
         };
         dock::add_view(&mut self.dock, slot, self.dock_area);
@@ -816,7 +920,7 @@ impl TakViewerApp {
 
     fn full_notice(&mut self, path: &Path) {
         self.notice = Some(format!(
-            "3D 화면은 {MAX_VIEWS}개까지예요 (화면에 얹은 파일도 하나로 세요).\n화면 이름표의 ✕로 하나 닫거나, 얹은 파일을 내리거나, 화면 가운데에 놓아서 그 화면의 파일을 바꾸세요.\n\n열려던 파일:\n{}",
+            "한 탭에는 3D 화면을 {MAX_VIEWS}개까지 열 수 있어요.\n화면 이름표의 ✕로 하나 닫거나 화면 가운데에 놓아서 파일을 바꾸세요.\n\n열려던 파일:\n{}",
             path.display()
         ));
     }
@@ -825,10 +929,9 @@ impl TakViewerApp {
     /// a new view on that side (VS Code editor drop). A file already open in a view is not
     /// opened twice: that view is chosen.
     fn drop_file(&mut self, ctx: &egui::Context, slot: usize, zone: dock::DropZone, path: PathBuf) {
-        if let Some(k) = self.view_of(&path) {
-            self.activate(k);
-            return;
-        }
+        if self.dirty_prompt.is_some() { return; }
+        let replacing = (zone == dock::DropZone::Center).then_some(slot);
+        if !self.allow_open_file(&path, replacing) { return; }
         if self.open_views().is_empty() {
             self.open_in(ctx, slot, path);
             return;
@@ -839,56 +942,126 @@ impl TakViewerApp {
             self.open_in(ctx, slot, path);
             return;
         }
-        let Some(new) = dock::free_slot(&self.dock).filter(|_| self.file_count() < MAX_VIEWS) else {
+        let Some(new) = dock::free_slot(&self.dock) else {
             self.full_notice(&path);
+            self.discard_identity_candidate();
             return;
         };
         if dock::add_view_at(&mut self.dock, new, slot as u8, zone) {
             self.activate(usize::from(new));
             self.open_in(ctx, usize::from(new), path);
+        } else {
+            self.discard_identity_candidate();
         }
     }
 
     /// Read a file into a view on a background thread (markers first, `views.rs`). The file
     /// the view showed is remembered where it was; the new one comes back to its own spot.
     fn open_in(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf) {
+        if self.dirty_prompt.is_some() { return; }
+        let creating_tab = self.layout_tabs.active_id().is_none();
+        if self.views[slot].target() == Some(path.as_path()) { self.discard_identity_candidate(); return; }
+        if !self.allow_open_file(&path, Some(slot)) { return; }
         if self.save_destination_reserved(&path) {
+            self.discard_identity_candidate();
             self.takm_note = Some(("Save in progress for this file.".into(), ctx.input(|i| i.time)));
             return;
         }
-        if !self.restoring_layout && self.guard_dirty(slot, marker_edit::PendingTransition::Open { slot, path: path.clone() }) { return; }
+        let shared_elsewhere = self.views[slot].target().is_some_and(|old| self.file_has_other_view(slot, old));
+        if !self.restoring_layout && self.guard_view_removal(slot, marker_edit::PendingTransition::Open { slot, path: path.clone() }) {
+            self.discard_identity_candidate();
+            return;
+        }
+        if shared_elsewhere {
+            if self.comments_unsaved(slot) {
+                self.discard_identity_candidate();
+                self.notice = Some("Comment 저장을 마친 뒤 다시 열어 주세요.".into());
+                return;
+            }
+            let needs_handoff = self.views[slot].owns_shared_file_work() || self.marker_ui[slot].has_pending_work();
+            if !self.handoff_shared_owner(slot, false) && needs_handoff {
+                self.discard_identity_candidate();
+                self.notice = Some("읽기나 편집을 마친 뒤 다시 열어 주세요.".into());
+                return;
+            }
+        }
+        if self.views[slot].owns_shared_file_work() && self.has_other_overlay_for_primary(slot, false)
+            && !self.handoff_primary_to_overlay(slot, false) {
+            self.discard_identity_candidate();
+            self.notice = Some("겹쳐 본 파일의 읽기나 저장을 마친 뒤 다시 열어 주세요.".into());
+            return;
+        }
+        if self.views[slot].overlay_owner().is_some_and(View::owns_shared_file_work)
+            && self.has_other_reference_for_overlay(slot, false) && !self.handoff_overlay_file_work(slot) {
+            self.discard_identity_candidate();
+            self.notice = Some("겹쳐 본 파일의 읽기를 마친 뒤 다시 열어 주세요.".into());
+            return;
+        }
+        let previous_load = self.views[slot].loading.as_ref().map(|(path, _)| path.clone());
+        let shared = self.find_shared_file(&path, slot);
+        let wait_for_shared = shared.is_none() && self.file_is_loading_elsewhere(&path, slot);
+        let retained = if shared.is_none() && !wait_for_shared { self.find_retained_document(&path) } else { None };
         self.cancel_pending_marker_job(slot);
-        self.cancel_remote_load(slot);
+        self.prepare_close_remote_view(slot);
         if let Some(location) = self.ssh_sources.get(&path).cloned() {
+            self.discard_identity_candidate();
             self.open_remote_in(ctx, slot, location, true);
             return;
         }
         if remote_ui::is_remote_key(&path) {
+            self.discard_identity_candidate();
             self.ssh_note = Some(("이 원격 파일은 SSH 목록에서 다시 여세요.".into(), ctx.input(|i| i.time)));
             return;
         }
+        let pending_identity = self.known_identity(&path);
+        if creating_tab { self.observe(true); }
         self.ensure_open_view(slot);
         self.remember(slot);
         // A file laid over this view goes with the file it was laid over (plan step 7).
         drop_later(self.views[slot].take_overlay());
         let restore = if self.no_persist { None } else { views::recall(&self.settings.file_memory, &path).cloned() };
+        if let Some(shared) = shared {
+            self.next_file_id += 1;
+            self.views[slot].restore = restore;
+            drop_later(self.views[slot].show_shared_file(shared, self.next_file_id, self.settings.speed, ctx.input(|i| i.time)));
+            self.handoff_closed_file_work(slot);
+            if let Some(old) = previous_load { self.promote_shared_waiter(ctx, &old); }
+            self.error = None;
+            self.record_implicit_file_open(creating_tab);
+            self.discard_identity_candidate_for(&path);
+            return;
+        }
+        if wait_for_shared {
+            self.views[slot].wait_for_shared(path, restore);
+            self.views[slot].set_pending_identity(pending_identity);
+            if let Some(old) = previous_load { self.promote_shared_waiter(ctx, &old); }
+            self.error = None;
+            self.record_implicit_file_open(creating_tab);
+            return;
+        }
         #[cfg(test)]
         if self.hold_loads {
             self.views[slot].hold_load(path, restore);
+            self.views[slot].set_pending_identity(pending_identity);
+            self.views[slot].set_fresh_open_candidate(retained);
             self.error = None;
+            self.record_implicit_file_open(creating_tab);
             return;
         }
         self.views[slot].start_load(ctx, path, restore);
+        self.views[slot].set_pending_identity(pending_identity);
+        self.views[slot].set_fresh_open_candidate(retained);
+        if let Some(old) = previous_load { self.promote_shared_waiter(ctx, &old); }
         self.error = None;
+        self.record_implicit_file_open(creating_tab);
     }
 
     /// A first file after closing every view starts with the default panel arrangement.
     /// Undo restoring an old layout already supplied its own views and never resets it here.
     fn ensure_open_view(&mut self, slot: usize) {
+        if self.layout_tabs.active_id().is_none() { self.layout_tabs.add(None); }
         if self.open_views().is_empty() {
-            self.dock = dock::default_layout_for(&[slot as u8]);
-            self.hidden = dock::Hidden::default();
-            self.settings.graph_float = true;
+            dock::set_editor_layout(&mut self.dock, &dock::EditorLayout::Leaf { slots: vec![slot as u8], active: slot as u8 });
             self.activate(slot);
         }
     }
@@ -905,13 +1078,62 @@ impl TakViewerApp {
 
     /// Close a view (tab ✕): remember its spot, stop its load, free its file.
     fn close_view(&mut self, slot: usize) {
-        if !self.open_views().contains(&slot) { return; }
-        if !self.restoring_layout && self.guard_dirty(slot, marker_edit::PendingTransition::CloseView { slot }) { return; }
+        if self.dirty_prompt.is_some() { return; }
+        let open_before = self.open_views();
+        if !open_before.contains(&slot) { return; }
+        if !self.restoring_layout && open_before.len() == 1 {
+            if let Some(id) = self.layout_tabs.active_id() { self.close_layout_tab(id); }
+            return;
+        }
+        let shared_elsewhere = self.views[slot].target().is_some_and(|path| self.file_has_other_view(slot, path));
+        if !self.restoring_layout && self.guard_view_removal(slot, marker_edit::PendingTransition::CloseView { slot }) { return; }
+        if !self.restoring_layout && shared_elsewhere {
+            if self.comments_unsaved(slot) {
+                self.notice = Some("Comment 저장을 마친 뒤 다시 닫아 주세요.".into());
+                return;
+            }
+            let needs_handoff = self.views[slot].owns_shared_file_work() || self.marker_ui[slot].has_pending_work();
+            if !self.handoff_shared_owner(slot, false) && needs_handoff {
+                self.notice = Some("읽기나 편집을 마친 뒤 다시 닫아 주세요.".into());
+                return;
+            }
+        }
+        if !self.restoring_layout && self.views[slot].owns_shared_file_work()
+            && self.has_other_overlay_for_primary(slot, false) && !self.handoff_primary_to_overlay(slot, false) {
+            self.notice = Some("겹쳐 본 파일의 읽기나 저장을 마친 뒤 다시 닫아 주세요.".into());
+            return;
+        }
+        if !self.restoring_layout && self.views[slot].overlay_owner().is_some_and(View::owns_shared_file_work)
+            && self.has_other_reference_for_overlay(slot, false) && !self.handoff_overlay_file_work(slot) {
+            self.notice = Some("겹쳐 본 파일의 읽기를 마친 뒤 다시 닫아 주세요.".into());
+            return;
+        }
+        let previous_layout = dock::editor_layout(&self.dock);
+        let previous_load = self.views[slot].loading.as_ref().map(|(path, _)| path.clone());
         self.cancel_pending_marker_job(slot);
         self.remember_layout_spot(slot);
         self.remember(slot);
-        self.cancel_remote_load(slot);
-        drop_later(self.views[slot].clear());
+        let previous_remote = self.views[slot].remote_loading.as_ref().map(|(_, _, path)| path.clone());
+        self.prepare_close_remote_view(slot);
+        if let Some(path) = previous_remote { self.pending_shared_promotions.push(path); }
+        let mut view = std::mem::take(&mut self.views[slot]);
+        if let Some(path) = &previous_load {
+            let restore = view.restore.clone();
+            view.wait_for_shared(path.clone(), restore);
+        }
+        let marker_ui = std::mem::take(&mut self.marker_ui[slot]);
+        if !self.restoring_layout {
+            if let Some(id) = self.layout_tabs.active_id() {
+                let closed = ClosedLayoutView { view, marker_ui, slot, layout: previous_layout };
+                let evicted = self.layout_tabs.record_closed_view(id, slot, closed);
+                drop_later(evicted);
+            } else {
+                drop_later(Some((view, marker_ui)));
+            }
+        } else {
+            drop_later(Some((view, marker_ui)));
+        }
+        if let Some(path) = previous_load { self.pending_shared_promotions.push(path); }
         dock::remove_view(&mut self.dock, slot as u8);
         let open = self.open_views();
         if open.is_empty() {
@@ -934,12 +1156,14 @@ impl TakViewerApp {
             }
             self.views[slot].poll_comments();
             self.views[slot].poll_analog();
+            if !self.marker_saving(slot) { self.views[slot].request_emg(ctx); }
         }
         self.poll_comment_ids(ctx);
         self.poll_overlays(ctx);
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
         self.poll_ssh(ctx);
+        self.poll_remote_emg(ctx);
     }
 
     fn finish_load(&mut self, ctx: &egui::Context, slot: usize, loaded: Loaded) {
@@ -948,8 +1172,10 @@ impl TakViewerApp {
             Ok(r) => r,
             Err(e) => {
                 // The view keeps what it showed, with that file's comments.
+                self.views[slot].set_fresh_open_candidate(None);
                 self.views[slot].comments_rx = None;
                 self.error = Some(format!("{}\n\n{}", path.display(), e));
+                self.fail_shared_waiters(&path);
                 // A new view whose file cannot be read closes again. (Not an action: the undo
                 // history takes the layout as it is.)
                 if self.views[slot].data.is_none() && self.open_views().len() > 1 {
@@ -967,8 +1193,9 @@ impl TakViewerApp {
         drop_later(v.show(data, rx, self.next_file_id, speed, now));
         push_recent(&mut self.settings.recent, path.to_string_lossy().into_owned());
         if slot == self.active {
-            self.explorer.reveal = Some(path);
+            self.explorer.reveal = Some(path.clone());
         }
+        self.attach_shared_waiters(ctx, &path);
     }
 
     /// `--screenshot`: go to frame, select marker, wait a few frames, capture, save, close.
@@ -1464,6 +1691,8 @@ impl TakViewerApp {
     /// `slot`: the list changes at once, the writer thread writes. False when nothing may be
     /// written there (then nothing changes).
     fn write_change(&mut self, ctx: &egui::Context, slot: usize, kind: EventKind, c: &Comment) -> bool {
+        if self.dirty_prompt.is_some() { return false; }
+        self.views[slot].sync_shared();
         if kind != EventKind::Add && self.views[slot].comments.list.id_is_ambiguous(c.id) {
             self.notice = Some("This older file has duplicate Comment IDs; this comment cannot be edited safely.".into());
             return false;
@@ -1483,6 +1712,7 @@ impl TakViewerApp {
         }
         self.views[slot].comments.list.apply(&event);
         self.send_comment(ctx, slot, path, event);
+        self.views[slot].publish_shared_file();
         true
     }
 
@@ -1779,7 +2009,7 @@ impl TakViewerApp {
 
     /// Keys belong to a text field now (egui's keyboard focus): the app's keys do nothing.
     fn typing(&self, ctx: &egui::Context) -> bool {
-        ctx.wants_keyboard_input()
+        self.layout_strip.is_renaming() || ctx.wants_keyboard_input()
     }
 
     /// Right click on a block: a delete line (with the comment's fields, for people reading the
@@ -1969,10 +2199,14 @@ impl TakViewerApp {
                         if !submitted {
                             self.comment_failed.push((tag, path, event));
                             self.comment_outstanding = self.comment_outstanding.saturating_sub(1);
-                            for view in self.views.iter_mut().filter(|v| v.file_id == tag) {
+                            let hidden = self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()).flat_map(|runtime| runtime.views.iter_mut());
+                            for host in self.views.iter_mut().chain(hidden) {
+                                let view = if host.file_id == tag { host } else if let Some(owner) = host.overlay_owner_mut().filter(|owner| owner.file_id == tag) { owner } else { continue };
+                                view.sync_shared();
                                 view.comments.pending = view.comments.pending.saturating_sub(1);
                                 if view.comments.pending == 0 { view.comments.pending_since = None; }
                                 view.comments.failed = Some(self.comment_registration_error.clone().unwrap_or_else(|| "Comment 저장이 중단됐어요.".into()));
+                                view.publish_shared_file();
                             }
                         }
                     }
@@ -1990,22 +2224,34 @@ impl TakViewerApp {
             if let Some(conflict) = &d.conflict {
                 self.history.forget_comment(&d.path, conflict.id);
             }
-            for v in self.views.iter_mut().filter(|v| v.file_id == d.tag && v.data.is_some()) {
+            let hidden = self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()).flat_map(|runtime| runtime.views.iter_mut());
+            for host in self.views.iter_mut().chain(hidden) {
+                let v = if host.file_id == d.tag && host.data.is_some() { host } else if let Some(owner) = host.overlay_owner_mut().filter(|owner| owner.file_id == d.tag && owner.data.is_some()) { owner } else { continue };
+                v.sync_shared();
                 v.comments.pending = v.comments.pending.saturating_sub(1);
                 if v.comments.pending == 0 { v.comments.pending_since = None; }
-                if d.cancelled { continue; }
+                if d.cancelled { v.publish_shared_file(); continue; }
                 if let Some(conflict) = &d.conflict {
                     v.comments.list.reload_one(conflict.id, conflict.latest.clone());
                     if conflict.latest.is_none() && v.picked == Some(conflict.id) { v.picked = None; }
                     let message = format!("Comment {} changed in another window · reloaded", conflict.id);
                     self.history.note = Some((message.clone(), now));
                     self.notice = Some(message);
+                    v.publish_shared_file();
                     continue;
+                }
+                if d.result.is_ok() {
+                    if let (Some(change), Some(stamp)) = (&d.source_stamp, &v.source_stamp) {
+                        if let Ok(mut known) = stamp.lock() {
+                            if known.as_ref() == Some(&change.before) { *known = Some(change.after.clone()); }
+                        }
+                    }
                 }
                 match d.result {
                     Ok(()) => v.comments.saved_at = Some(now),
                     Err(ref e) => v.comments.failed = Some(e.clone()),
                 }
+                v.publish_shared_file();
             }
         }
         self.poll_comment_retry_transition(ctx);
@@ -2359,6 +2605,7 @@ impl TakViewerApp {
     }
 
     fn apply(&mut self, action: Option<Action>, now: f64) {
+        if self.dirty_prompt.is_some() { return; }
         match action {
             Some(Action::Select { marker, additive }) => {
                 self.view_mut().select(marker, additive);
@@ -2377,6 +2624,7 @@ impl TakViewerApp {
     fn menu_bar(&mut self, ctx: &egui::Context) {
         let frame = egui::Frame::side_top_panel(&ctx.style()).fill(theme::MENU_BG);
         egui::TopBottomPanel::top("menu").frame(frame).show(ctx, |ui| {
+            if self.dirty_prompt.is_some() { ui.disable(); }
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("파일", |ui| {
                     if ui.button("파일 열기…  (Ctrl+O)").clicked() {
@@ -2560,6 +2808,7 @@ impl TakViewerApp {
         let mut show_warnings = false;
         let mut open_comments = false;
         egui::TopBottomPanel::bottom("status").exact_height(STATUS_H).frame(frame).show(ctx, |ui| {
+            if self.dirty_prompt.is_some() { ui.disable(); }
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 let text = |s: String| RichText::new(s).size(12.0).color(theme::STATUS_TEXT);
@@ -2645,9 +2894,26 @@ impl TakViewerApp {
 
     /// What a click in the Explorer asked for (applied after drawing).
     fn explorer_action(&mut self, ctx: &egui::Context, a: WsAction) {
+        if self.dirty_prompt.is_some() { return; }
         match a {
             WsAction::Open(p) => self.open(ctx, p),
             WsAction::OpenSide(p) => self.open_side(ctx, p),
+            WsAction::OpenNewTab(p) => {
+                if self.allow_open_file(&p, None) {
+                    let id = self.new_layout_tab();
+                    self.open(ctx, p);
+                    // The context-menu command creates the tab and opens its file as one
+                    // action; update that tab's lifecycle snapshot instead of recording a
+                    // second layout action when the view appears.
+                    self.observe(false);
+                    if let Some(snapshot) = self.tab_undo_snapshot(id) {
+                        if let Some([undo::Part::TabLifecycle { id: action_id, snapshot: saved, .. }]) =
+                            self.history.undo.last_mut().map(Vec::as_mut_slice) {
+                            if *action_id == id { *saved = snapshot; }
+                        }
+                    }
+                }
+            }
             WsAction::PickFolder => self.pick_folder(),
             WsAction::EnterPath => self.open_path_dialog(),
             WsAction::Overlay(p) => self.overlay_on(ctx, p),
@@ -2759,7 +3025,7 @@ impl TakViewerApp {
         let overlay_frame = v.overlay_frame();
         let layers = scene::Layers {
             own: v.shown[0] || v.overlay.is_none(),
-            overlay: v.overlay.as_ref().zip(overlay_frame).filter(|_| v.shown[1]).map(|(o, f)| (&o.data, f)),
+            overlay: v.overlay.as_ref().zip(overlay_frame).filter(|_| v.shown[1]).map(|(o, f)| (o.data.as_ref(), f)),
         };
         let out = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(input), |ui| {
@@ -2843,7 +3109,7 @@ impl TakViewerApp {
             // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
             let (graphed, total) = panels::graphed(d, &v.selected, mi);
             // Plan step 9: the file laid over the view, dashed in the same lanes.
-            v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown);
+            v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), o.data.as_ref())), v.shown);
             let (lanes, gaps, drawn) = v.lanes.get(d, v.file_id, &graphed);
             let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
             let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
@@ -2989,14 +3255,19 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         let app = &mut *self.app;
-        if self.open.is_empty() && !matches!(tab, Pane::Empty | Pane::Explorer) {
+        // Floating dock windows have independent UIs; the central panel's disabled state does
+        // not reach them while a dirty-file decision is pending.
+        if app.dirty_prompt.is_some() { ui.disable(); }
+        if self.open.is_empty() && !matches!(tab, Pane::Empty | Pane::LayoutTabs | Pane::Explorer) {
             crate::ui::empty::panel(ui, *tab);
             return;
         }
         match tab {
+            Pane::LayoutTabs => return,
             Pane::Empty => {
-                let rect = ui.available_rect_before_wrap();
-                crate::ui::empty::editor(ui);
+                let body = ui.available_rect_before_wrap();
+                let rect = egui::Rect::from_min_max(body.min - egui::vec2(0.0, dock::TAB_H), body.max);
+                crate::ui::empty::editor_at(ui, rect);
                 if let Some(file) = egui::DragAndDrop::payload::<explorer::FileDrag>(ui.ctx()) {
                     let hovered = ui.ctx().pointer_hover_pos().is_some_and(|p| rect.contains(p)
                         && ui.ctx().layer_id_at(p).map_or(true, |layer| layer == ui.layer_id()));
@@ -3089,7 +3360,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
                 let (graphed, total) = v.primary.filter(|m| *m < d.markers.len()).map_or((vec![], 0), |mi| panels::graphed(d, &v.selected, mi));
                 // Plan step 9: the file laid over the view, dashed in the same lanes.
-                v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown);
+                v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), o.data.as_ref())), v.shown);
                 // The Comment bands of the graphed markers (step 6).
                 let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
                 let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
@@ -3097,9 +3368,9 @@ impl egui_dock::TabViewer for Tabs<'_> {
             }
             Pane::Devices => {
                 ui.add_space(4.0);
-                panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate)
+                panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate, v.emg_failure.as_deref())
             }
-            Pane::Empty | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
+            Pane::Empty | Pane::LayoutTabs | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
         };
         if action.is_some() {
             self.action = action;
@@ -3108,10 +3379,11 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     /// Every 3D view can close; the empty editor is a permanent layout placeholder.
     fn closeable(&mut self, tab: &mut Pane) -> bool {
-        !matches!(tab, Pane::Empty)
+        self.app.dirty_prompt.is_none() && !matches!(tab, Pane::Empty | Pane::LayoutTabs)
     }
 
     fn on_close(&mut self, tab: &mut Pane) -> bool {
+        if self.app.dirty_prompt.is_some() { return false; }
         if let Pane::View(k) = tab {
             // The app closes it after drawing (remember spot, free the file).
             self.closed_view = Some(usize::from(*k));
@@ -3122,7 +3394,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     /// 3D views stay in the main window.
     fn allowed_in_windows(&self, tab: &mut Pane) -> bool {
-        !matches!(tab, Pane::View(_) | Pane::Empty)
+        !matches!(tab, Pane::View(_) | Pane::Empty | Pane::LayoutTabs)
     }
 
     /// 3D view and Explorer paint their own background.
@@ -3179,6 +3451,7 @@ impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
+        self.layout_time = now;
         if !self.no_persist && !self.exit_approved && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.request_exit(ctx);
@@ -3214,7 +3487,9 @@ impl TakViewerApp {
                 }
             }
         }
-        let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none() && !ctx.memory(|m| m.any_popup_open());
+        let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none()
+            && self.capture.is_none()
+            && !ctx.input(|input| input.key_down(Key::M)) && !ctx.memory(|m| m.any_popup_open());
         if global_keys && exact_key(ctx, Key::O, true, true, false) {
             self.pick_folder();
         }
@@ -3223,6 +3498,18 @@ impl TakViewerApp {
         }
         if global_keys && exact_key(ctx, Key::L, true, false, false) {
             self.open_path_dialog();
+        }
+        let tab_keys = global_keys && self.capture.is_none();
+        if tab_keys && exact_key(ctx, Key::T, true, true, false) { self.reopen_layout_item(); }
+        if tab_keys && exact_key(ctx, Key::T, true, false, false) { self.new_layout_tab(); }
+        if tab_keys && (exact_key(ctx, Key::Tab, true, true, false) || exact_key(ctx, Key::PageUp, true, false, false)) {
+            self.step_layout_tab(-1);
+        }
+        if tab_keys && (exact_key(ctx, Key::Tab, true, false, false) || exact_key(ctx, Key::PageDown, true, false, false)) {
+            self.step_layout_tab(1);
+        }
+        if tab_keys && exact_key(ctx, Key::F2, false, false, false) {
+            if let Some(id) = self.layout_tabs.active_id() { self.layout_strip.begin_rename(&self.layout_tabs, id); }
         }
         // Side toggles (VS Code keys). Ctrl+Alt+B first: Ctrl+B also matches it.
         for (key, alt, side) in [(Key::B, true, Side::Right), (Key::B, false, Side::Left), (Key::J, false, Side::Bottom)] {
@@ -3257,8 +3544,13 @@ impl TakViewerApp {
         }
         // Background loads: markers ready? Then force plates / EMG.
         self.poll_loads(ctx);
+        for path in std::mem::take(&mut self.pending_shared_promotions) { self.promote_shared_waiter(ctx, &path); }
+        self.poll_hidden_file_work(ctx);
         self.poll_marker_jobs(ctx);
         self.poll_marker_saves(ctx);
+        self.poll_overlay_marker_work(ctx);
+        self.poll_hidden_marker_work(ctx);
+        for slot in self.open_views() { self.views[slot].sync_shared(); }
         self.poll_exit_wait(ctx);
 
         self.apply_ssh_demo(ctx);
@@ -3293,6 +3585,11 @@ impl TakViewerApp {
         self.menu_bar(ctx);
         self.status_bar(ctx);
 
+        if self.capture.is_none() && !dock::has(&self.dock, Pane::LayoutTabs) {
+            dock::ensure_layout_strip(&mut self.dock, self.active as u8);
+        }
+        dock::size_layout_strip(&mut self.dock);
+
         // Panes (Explorer, 3D views, Labels, graph, devices): tabs that can be dragged anywhere.
         // The dock is taken out while drawing so the tabs can use the rest of the app.
         let open = self.open_views();
@@ -3311,15 +3608,17 @@ impl TakViewerApp {
         let order = dock::views_reading_order(&self.dock).into_iter().map(usize::from).collect();
         let mut dock_state = std::mem::replace(&mut self.dock, dock::scene_only(0));
         let style = dock::style(&ctx.style());
+        let dock_enabled = self.dirty_prompt.is_none();
         let mut tabs = Tabs { app: self, action: None, ws_action: None, pressed_view: None, closed_view: None, open, lone, tags: Default::default(), order, ed_action: None };
         let area = egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
+                if !dock_enabled { ui.disable(); }
                 DockArea::new(&mut dock_state)
                     .id(egui::Id::new("panes"))
                     .style(style)
                     .show_add_buttons(false)
-                    .show_window_close_buttons(true)
+                    .show_window_close_buttons(dock_enabled)
                     .show_inside(ui, &mut tabs);
             })
             .response
@@ -3329,15 +3628,26 @@ impl TakViewerApp {
         let ed_action = tabs.ed_action.take();
         self.dock = dock_state;
         self.dock_area = area;
+        if let Some(rect) = dock::layout_strip_rect(&self.dock).filter(|_| self.capture.is_none()) {
+            let actions = egui::Area::new(egui::Id::new("whole_layout_strip"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .show(ctx, |ui| {
+                    ui.set_min_width(rect.width());
+                    ui.set_max_width(rect.width());
+                    ui.add_enabled_ui(self.dirty_prompt.is_none(), |ui| self.layout_strip.show(ui, &self.layout_tabs)).inner
+                }).inner;
+            for action in actions { self.layout_strip_action(ctx, action); }
+        }
         // A click on a view's tab or inside a view makes it the active one.
         let focused = self.dock.find_active_focused().map(|(_, t)| *t);
-        if focused != self.focused_tab {
+        if self.dirty_prompt.is_none() && focused != self.focused_tab {
             self.focused_tab = focused;
             if let Some(Pane::View(k)) = focused {
                 self.activate(usize::from(k));
             }
         }
-        if let Some(k) = pressed_view {
+        if let Some(k) = pressed_view.filter(|_| self.dirty_prompt.is_none()) {
             if k != self.active {
                 self.activate(k);
             }
@@ -3357,14 +3667,15 @@ impl TakViewerApp {
                 }
             }
         }
-        match self.deck_action.take() {
+        let deck_action = self.deck_action.take().filter(|_| self.dirty_prompt.is_none());
+        match deck_action {
             Some((slot, DeckAction::MakeComment)) => self.make_comment(ctx, slot),
             Some((slot, DeckAction::DeleteComment(id))) => self.delete_comment(ctx, slot, id),
             Some((_, DeckAction::GotoComment(_))) | None => {}
         }
         self.apply(action, now);
-        if let Some((slot, uid)) = self.marker_click.take() { self.label_sample(ctx, slot, uid); }
-        if let Some(slot) = self.marker_delete.take() { self.delete_selected(ctx, slot); }
+        if let Some((slot, uid)) = self.marker_click.take().filter(|_| self.dirty_prompt.is_none()) { self.label_sample(ctx, slot, uid); }
+        if let Some(slot) = self.marker_delete.take().filter(|_| self.dirty_prompt.is_none()) { self.delete_selected(ctx, slot); }
         if let Some(a) = ws_action {
             self.explorer_action(ctx, a);
         }
@@ -3422,8 +3733,10 @@ impl TakViewerApp {
         if let Some(mut text) = self.path_input.take() {
             let mut open = true;
             let mut submit = false;
+            let locked = self.dirty_prompt.is_some();
             let (focus, name) = (&mut self.path_focus, &mut self.path_name);
             egui::Window::new("경로로 열기").open(&mut open).collapsible(false).default_width(620.0).show(ctx, |ui| {
+                if locked { ui.disable(); }
                 ui.label("폴더나 .tak 파일 경로를 붙여 넣으세요. WSL 경로도 됩니다.");
                 ui.label(
                     RichText::new("예: /home/user/workspace/tak-viewer   ·   /mnt/c/Users/User/…   ·   \\\\wsl.localhost\\Ubuntu\\…   ·   C:\\…")
@@ -3431,7 +3744,7 @@ impl TakViewerApp {
                         .color(theme::TEXT_DIM),
                 );
                 let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
-                if std::mem::take(focus) {
+                if !locked && std::mem::take(focus) {
                     resp.request_focus();
                 }
                 let enter = |ui: &egui::Ui| ui.input(|i| i.key_pressed(Key::Enter));
@@ -3522,6 +3835,7 @@ impl TakViewerApp {
         if self.show_settings {
             let mut open = true;
             egui::Window::new("설정").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+                if self.dirty_prompt.is_some() { ui.disable(); }
                 ui.label(RichText::new("3D 위에 뜬 그래프 (마커 · forceplate)").color(theme::TEXT_DIM));
                 ui.horizontal(|ui| {
                     ui.label("바탕 진하기");
@@ -3570,8 +3884,13 @@ impl TakViewerApp {
                         ("COMMENTS 탭", "보기 메뉴 · 상태 줄 Comments N으로 열기. 줄 누르기 = 그 Comment와 마커 고르기(프레임 · 재생은 그대로) · # 두 번 누르기 = 그 Comment 첫 프레임으로 · 칸 두 번 누르기 = 고치기(Markers: 3D · Labeling에서 마커를 고르고 Enter, Frames · Comment: 쓰고 Enter; 프레임은 그대로), Esc = 취소 · Type ▼ 상자 한 번 누르기 = 유형 목록(누르면 바로 저장, ↑ ↓ Enter, Esc · 다른 곳 = 닫기) · ✕ = 지우기 · 칸 이름 = 정렬 (한 번 더 = 거꾸로)"),
                         ("Ctrl+Z / Ctrl+Y", "한 번 = 동작 하나 되돌리기 / 다시 하기: 프레임 · 시점 · 선택 · 구간 · Comment · 설정 · 패널 · 파일 열기 · 폴더를 한 일의 차례대로 (앱 전체, 이어진 움직임은 하나, 최근 동작 500개까지, 글 칸에 커서가 있으면 그 글의 되돌리기)"),
                         ("Ctrl+O", "파일 열기 (창에 끌어다 놓아도 됨)"),
+                        ("Ctrl+T / Ctrl+Shift+T", "빈 탭 만들기 / 마지막으로 닫은 화면 또는 탭 다시 열기"),
+                        ("Ctrl+Tab / Ctrl+Shift+Tab", "다음 / 이전 탭"),
+                        ("Ctrl+PageDown / Ctrl+PageUp", "다음 / 이전 탭"),
+                        ("F2", "현재 탭 이름 바꾸기 (Enter 확정, Esc 취소)"),
+                        ("Ctrl+W", "선택한 3D 화면 닫기 (마지막 화면이면 탭 닫기)"),
                         ("Explorer 클릭 / Ctrl+클릭", "지금 화면에 열기 / 옆 화면에 열기 (3D 화면 최대 4개, 2×2까지)"),
-                        ("Explorer 파일 오른쪽 클릭 → 이 화면에 얹기", "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 = 같은 메뉴 또는 이름표 2의 ✕. 화면과 얹은 파일을 합쳐 4개까지"),
+                        ("Explorer 파일 오른쪽 클릭 → 이 화면에 얹기", "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 = 같은 메뉴 또는 이름표 2의 ✕. 서로 다른 파일은 전체에서 12개까지"),
                         ("1 / 2 (이름표 1 / 2 누르기)", "얹은 화면에서 처음 파일 / 얹은 파일의 마커 숨기기 · 다시 보이기"),
                         ("3D 화면 누르기 · 탭 ✕", "그 화면 고르기 (탭이 밝아지고 파란 테두리, 패널·재생 막대·키가 그 화면 기준) · 그 화면 닫기"),
                         ("Ctrl+Shift+O", "폴더 추가 → Explorer 트리 (최대 10개, 펼칠 때만 그 폴더를 읽음)"),
@@ -3612,6 +3931,10 @@ pub struct BenchView {
     /// ms from the open to markers on screen / force plates attached.
     pub markers_ms: Option<f64>,
     pub analog_ms: Option<f64>,
+    pub lazy_analog: bool,
+    /// A requested lazy read can finish with an error even after pending becomes false.
+    pub emg_failure: Option<String>,
+    pub fallback: Option<String>,
     /// Step times of the open in ms (container, channels, markers, view, analog).
     pub steps: Vec<(&'static str, f64)>,
     /// The file laid over this view and ms from asking until it was on screen (plan step 7).
@@ -3629,6 +3952,9 @@ impl TakViewerApp {
                     file: v.target().map(|p| p.display().to_string()).unwrap_or_default(),
                     markers_ms: v.markers_ms,
                     analog_ms: v.analog_ms,
+                    lazy_analog: v.data.as_ref().is_some_and(|d| d.emg_pending),
+                    emg_failure: v.emg_failure.clone(),
+                    fallback: v.analog_fallback.clone(),
                     steps: v.load_steps.clone(),
                     overlay: v.overlay_target().map(|p| (p.display().to_string(), v.overlay_ms)),
                 }
@@ -3636,7 +3962,7 @@ impl TakViewerApp {
             .collect();
         BenchState {
             loaded: open.iter().all(|&k| self.views[k].data.is_some() && self.views[k].loading.is_none()),
-            analog_pending: open.iter().any(|&k| self.views[k].analog_rx.is_some()),
+            analog_pending: open.iter().any(|&k| self.views[k].analog_rx.is_some() || self.views[k].data.as_ref().is_some_and(|d| d.analog_pending)),
             overlay_pending: open.iter().any(|&k| self.views[k].overlay_load.is_some()),
             error: self.error.clone(),
             views,
@@ -3682,6 +4008,30 @@ impl TakViewerApp {
             pb.play(now);
         }
         plates
+    }
+
+    /// Open the existing Devices tab/header and trigger the ordinary lazy path while timing.
+    pub fn bench_emg(&mut self, ctx: &egui::Context) -> usize {
+        dock::show(&mut self.dock, Pane::Devices);
+        let mut count = 0;
+        for slot in self.open_views() {
+            let view = &mut self.views[slot];
+            view.devices.open_device = view.data.as_ref().and_then(|d| d.devices.iter().position(|device| device.plate.is_none()));
+            if view.devices.open_device.is_some() {
+                view.devices.request_emg = true;
+                view.request_emg(ctx);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn bench_emg_pending(&self) -> bool {
+        self.open_views().into_iter().any(|slot| {
+            let view = &self.views[slot];
+            (view.emg_requested && view.data.as_ref().is_some_and(|d| d.emg_pending))
+                || view.analog_work_pending() || view.devices.graphs_pending()
+        })
     }
 
     /// `--bench-hover` (v0.29.0): before playing frame `i`, every view's marker graph hovered as if
@@ -3760,6 +4110,7 @@ impl TakViewerApp {
         for k in open.into_iter().filter(|&k| k != active).chain([active]) {
             self.remember(k);
         }
+        self.sync_layout_settings();
     }
 
 }
@@ -3772,6 +4123,9 @@ mod tests {
     include!("app_graph_selection_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
+    include!("app_layout_tabs_tests.rs");
+    include!("app_freshness_tests.rs");
+    include!("app_hidden_work_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.
@@ -4055,7 +4409,7 @@ mod tests {
     fn view_tab(ctx: &egui::Context, app: &TakViewerApp, k: u8) -> egui::Rect {
         let r = view_tab_response(ctx, app, k).rect;
         let place = place_of(app, Pane::View(k));
-        assert!((r.min - place.min).length() < 0.5 && (r.height() - dock::TAB_H).abs() < 0.5, "the tab is at the top-left of its place: {r:?} in {place:?}");
+        assert!(place.contains(r.center()) && (r.height() - dock::TAB_H).abs() < 0.5, "the tab is within its view: {r:?} in {place:?}");
         r
     }
 
@@ -4647,6 +5001,138 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_device_manifest_opens_loading_emg_and_channel_choice_undo_redo() {
+        use tak_core::tak::{AnalogDevice, AnalogChannel};
+        let ctx = egui::Context::default();
+        let mut app = views_with_plates(&ctx, 1);
+        let mut take = views::sample_data("a.tak", &["M"]).take;
+        take.analog.push(AnalogDevice { channels: (0..2).map(|i| AnalogChannel {
+            name: format!("AnalogChannel{i}"), kind: "Analog".into(), dim: 1,
+            frames: vec![], values: vec![],
+        }).collect() });
+        let mut data = tak_core::view_data::ViewData::build(take);
+        data.emg_pending = true;
+        app.views[0].data = Some(std::sync::Arc::new(data));
+        dock::show(&mut app.dock, Pane::Devices);
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let header = text_rects(&out, "아날로그 장치 1");
+        assert_eq!(header.len(), 1, "manifest header is visible before any sample read");
+        assert!(text_rects(&out, "Loading EMG…").is_empty());
+        assert!(!app.views[0].devices.request_emg);
+        let mut out = click_at(&ctx, &mut app, header[0].center());
+        for _ in 0..3 { out = frame_with(&ctx, &mut app, vec![]); }
+        assert!(!text_rects(&out, "Loading EMG…").is_empty());
+        assert!(app.views[0].devices.request_emg, "opening the existing header must request lazy samples");
+        assert_eq!(app.views[0].devices.channel.get(&0), Some(&0));
+        let choose = text_rects(&out, "AnalogChannel0");
+        let out = click_at(&ctx, &mut app, choose.last().unwrap().center());
+        let choice = text_rects(&out, "AnalogChannel1 (1값/프레임)");
+        assert!(!choice.is_empty(), "channel headers remain selectable while loading");
+        click_at(&ctx, &mut app, choice[0].center());
+        assert_eq!(app.views[0].devices.channel.get(&0), Some(&1));
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.views[0].devices.channel.get(&0), Some(&0));
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[0].devices.channel.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn actual_lazy_file_close_undo_redo_preserves_jobs_before_and_during_emg_read() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
+        if !path.exists() { return; }
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let ready = |app: &mut TakViewerApp| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                frame_with(&ctx, app, vec![]);
+                if app.views[0].data.is_some() && app.views[0].loading.is_none() && !app.views[0].analog_work_pending() { break; }
+                assert!(Instant::now() < deadline, "file must reopen without forcing EMG");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            frame_with(&ctx, app, vec![]);
+            assert!(app.views[0].data.as_ref().unwrap().emg_pending && !app.views[0].emg_requested);
+        };
+        app.open(&ctx, path.clone()); ready(&mut app);
+        let first_id = app.views[0].file_id;
+        let first_data = app.views[0].data.clone().unwrap();
+        let document = app.views[0].edit_document.clone().unwrap();
+        app.close_view(0); frame_with(&ctx, &mut app, vec![]);
+        assert!(app.open_views().is_empty() && app.views[0].data.is_none());
+        app.undo_redo(&ctx, false); ready(&mut app);
+        assert_eq!(app.views[0].file_id, first_id, "reopening retains the same view and reader");
+        assert!(std::sync::Arc::ptr_eq(&first_data, app.views[0].data.as_ref().unwrap()),
+            "last-close undo keeps the loaded marker and forceplate data");
+        assert!(std::sync::Arc::ptr_eq(&document, app.views[0].edit_document.as_ref().unwrap()));
+        app.views[0].devices.request_emg = true;
+        app.views[0].request_emg(&ctx);
+        assert!(app.views[0].emg_requested && app.views[0].emg_rx.is_some());
+        app.close_view(0); frame_with(&ctx, &mut app, vec![]);
+        app.undo_redo(&ctx, false);
+        frame_with(&ctx, &mut app, vec![]);
+        assert_eq!(app.views[0].file_id, first_id);
+        assert!(std::sync::Arc::ptr_eq(&document, app.views[0].edit_document.as_ref().unwrap()));
+        assert!(app.views[0].emg_requested || !app.views[0].data.as_ref().unwrap().emg_pending,
+            "the in-flight read must survive closing and reopening");
+        app.undo_redo(&ctx, true); frame_with(&ctx, &mut app, vec![]);
+        assert!(app.views[0].data.is_none(), "redo closes the same restored file");
+        app.undo_redo(&ctx, false);
+        frame_with(&ctx, &mut app, vec![]);
+        assert_eq!(app.views[0].file_id, first_id);
+        assert!(std::sync::Arc::ptr_eq(&document, app.views[0].edit_document.as_ref().unwrap()));
+        app.views[0].devices.request_emg = true;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            frame_with(&ctx, &mut app, vec![]);
+            if !app.views[0].data.as_ref().unwrap().emg_pending { break; }
+            assert!(Instant::now() < deadline, "restored file must still load EMG on access");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.views[0].load_steps.iter().filter(|(stage, _)| *stage == "emg").count(), 1);
+    }
+
+    #[test]
+    fn bench_state_retains_lazy_emg_failure_after_loading_finishes() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let mut data = views::sample_data("failed_emg.tak", &["M"]);
+        data.emg_pending = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.views[0].show(data, rx, 17, 1.0, 0.0);
+        app.views[0].emg_requested = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.views[0].emg_rx = Some((17, rx));
+        tx.send(views::LoadMsg::Analog(Err("TAK changed during marker extraction".into()), 1.0)).unwrap();
+        app.views[0].poll_analog();
+        assert!(!app.bench_emg_pending(), "a completed failure is no longer pending");
+        let state = app.bench_state();
+        assert_eq!(state.views.len(), 1);
+        assert!(!state.views[0].lazy_analog);
+        assert!(state.views[0].emg_failure.as_ref().is_some_and(|error| error.contains("TAK changed")),
+            "the benchmark must distinguish successful completion from a failed lazy read");
+        assert!(state.views[0].file.ends_with("failed_emg.tak"));
+    }
+
+    #[test]
+    fn capture_takes_precedence_over_path_and_tab_shortcuts() {
+        let ctx = egui::Context::default();
+        let mut app = views_with_plates(&ctx, 1);
+        // Keep capture waiting for the outstanding force data during these key presses.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.views[0].analog_rx = Some((app.views[0].file_id, rx));
+        app.start_menu_capture();
+        assert!(app.capture.is_some());
+        let tab = app.layout_tabs.active_id();
+        let count = app.layout_tabs.tabs().len();
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::L)]);
+        assert!(app.capture.is_some());
+        assert!(app.path_input.is_none(), "capture must not open the path dialog");
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::T)]);
+        assert_eq!(app.layout_tabs.active_id(), tab);
+        assert_eq!(app.layout_tabs.tabs().len(), count);
+    }
+
+    #[test]
     fn no_floating_graph_while_capturing() {
         // Pictures show the 3D only.
         let ctx = egui::Context::default();
@@ -5088,6 +5574,11 @@ mod tests {
         app.views[0].shown = [false, true];
         app.views[0].cam.yaw += 0.4;
         let yaw = app.views[0].cam.yaw;
+        let data = app.views[0].data.clone().unwrap();
+        let document = app.views[0].edit_document.clone().unwrap();
+        let file_id = app.views[0].file_id;
+        let overlay_data = app.views[0].overlay.as_ref().unwrap().data.clone();
+        let overlay_document = app.views[0].overlay_owner().unwrap().edit_document.clone().unwrap();
         frame_with(&ctx, &mut app, vec![]);
         let before = steps(&app, 0).0;
         run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
@@ -5101,8 +5592,15 @@ mod tests {
         assert_eq!(app.active, 0);
         assert_eq!(app.views[0].target(), Some(files[0].as_path()));
         assert_eq!(app.views[0].overlay_target(), Some(files[1].as_path()));
-        arrive(&ctx, &mut app, 0);
-        overlay_arrive(&ctx, &mut app, 0);
+        assert!(app.views[0].loading.is_none() && app.views[0].overlay_load.is_none(),
+            "undo restores both live files without starting another read");
+        assert_eq!(app.views[0].file_id, file_id);
+        assert!(std::sync::Arc::ptr_eq(&data, app.views[0].data.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&document, app.views[0].edit_document.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&overlay_data, &app.views[0].overlay.as_ref().unwrap().data),
+            "reopening retains the same overlay without another read");
+        assert!(std::sync::Arc::ptr_eq(&overlay_document,
+            app.views[0].overlay_owner().unwrap().edit_document.as_ref().unwrap()));
         assert_eq!(app.views[0].pb.frame, 6);
         assert_eq!(app.views[0].range, Some((2, 7)));
         assert_eq!(app.views[0].primary, Some(1));
@@ -5438,25 +5936,40 @@ mod tests {
     }
 
     fn wait_comment_ids(ctx: &egui::Context, app: &mut TakViewerApp, slot: usize) {
-        for _ in 0..2000 {
+        // Reserving IDs is asynchronous disk work, independent of the rendering budget.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        loop {
             if app.views[slot].comments.id_pool.as_ref().is_some_and(|ids| !ids.is_empty()) { return; }
             assert!(app.views[slot].comments.id_error.is_none(), "{:?}", app.views[slot].comments.id_error);
+            assert!(Instant::now() < deadline,
+                "Comment IDs not ready after {:?}: target={:?}, receiving={}, registration={}, error={:?}",
+                started.elapsed(), app.views[slot].comments.target,
+                app.views[slot].comments.id_rx.is_some(), app.comment_registration.is_some(), app.error);
             frame_with(ctx, app, vec![]);
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("Comment IDs not ready");
     }
 
     /// Frames until the writer thread has confirmed every write.
     fn until_saved(ctx: &egui::Context, app: &mut TakViewerApp) {
-        for _ in 0..2000 {
+        // These fixtures await disk completion, including contended UNC I/O. Rendering
+        // latency is measured separately; a frame count is not an asynchronous deadline.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        loop {
             frame_with(ctx, app, vec![]);
             if app.views.iter().all(|v| v.comments.pending == 0) {
                 return;
             }
+            assert!(Instant::now() < deadline,
+                "comment writes not confirmed after {:?}: pending={:?}, outstanding={}, queued={}, registration={}, registration_error={:?}, failed={}, error={:?}",
+                started.elapsed(), app.views.iter().enumerate().map(|(slot, view)|
+                    (slot, view.file_id, view.comments.pending, view.comments.failed.as_deref())).collect::<Vec<_>>(),
+                app.comment_outstanding, app.comment_waiting.len(), app.comment_registration.is_some(),
+                app.comment_registration_error, app.comment_failed.len(), app.error);
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("comment writes not confirmed");
     }
 
     #[test]
@@ -7006,6 +7519,24 @@ mod tests {
     /// with its comment file read from disk; two frames. Needs `hold_loads`: no reading thread
     /// runs on the stub files (it would fail on them at a random time and close or keep views).
     fn arrive(ctx: &egui::Context, app: &mut TakViewerApp, k: usize) {
+        if let Some(path) = app.views[k].waiting_shared_path().map(Path::to_path_buf) {
+            app.promote_shared_waiter(ctx, &path);
+        }
+        // A closed view can now return with its original live data instead of a new read.
+        if app.views[k].loading.is_none() && app.views[k].waiting_shared_path().is_none() && app.views[k].data.is_some() {
+            // Conversion switches as soon as markers arrive. Its real Comment reader
+            // may still be running, so visible data alone does not complete this fixture.
+            for _ in 0..2000 {
+                frame_with(ctx, app, vec![]);
+                if app.views[k].comments_rx.is_none() { break; }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(app.views[k].comments_rx.is_none(), "the shown file's Comments did not arrive");
+            if !app.no_persist && matches!(app.views[k].comments.target, Some(Ok(_))) {
+                wait_comment_ids(ctx, app, k);
+            }
+            return;
+        }
         let p = app.views[k].loading.as_ref().expect("a file is being read").0.clone();
         let tx = app.views[k].held.take().expect("a held load (`hold_loads`)");
         tx.send(views::LoadMsg::Markers(Ok((views::sample_data(p.to_str().unwrap(), &["M", "N"]), vec![])))).unwrap();
@@ -7026,6 +7557,30 @@ mod tests {
                 arrive(ctx, app, k);
             }
         }
+    }
+
+    #[test]
+    fn arrive_waits_for_comments_after_the_staged_markers_are_already_visible() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("staged_comments_arrive");
+        two_comments_on_disk(&dir);
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let path = dir.join("a.takm");
+        let (_, markers) = std::sync::mpsc::channel();
+        app.views[0].show(views::sample_data(path.to_str().unwrap(), &["M", "N"]), markers, 1, 1.0, 0.0);
+        let comments = load_c(&path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.views[0].comments_rx = Some(rx);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            tx.send(comments).unwrap();
+        });
+        arrive(&ctx, &mut app, 0);
+        sender.join().unwrap();
+        assert_eq!(ids(&app), vec![1, 2]);
+        assert!(app.views[0].comments_rx.is_none());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Files that exist (`not a take`: the tests hand the view a sample instead, `arrive`). A
@@ -7140,7 +7695,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_redo_keep_four_views_at_most_and_no_file_twice() {
+    fn undo_and_redo_keep_four_views_at_most_and_share_repeated_files() {
         let ctx = egui::Context::default();
         let dir = comment_dir("undo_views");
         let f = take_files(&dir, &["a.tak", "b.tak", "c.tak", "d.tak", "e.tak"]);
@@ -7150,8 +7705,14 @@ mod tests {
         let check = |app: &TakViewerApp| {
             let open = app.open_views();
             let files: Vec<&Path> = open.iter().filter_map(|&k| app.views[k].target()).collect();
-            let unique: std::collections::HashSet<&Path> = files.iter().copied().collect();
-            assert!(open.len() <= MAX_VIEWS && unique.len() == files.len(), "{open:?} {files:?}");
+            assert!(open.len() <= MAX_VIEWS, "{open:?} {files:?}");
+            for &a in &open {
+                for &b in &open {
+                    if a < b && app.views[a].path().is_some() && app.views[a].path() == app.views[b].path() {
+                        assert!(app.views[a].shares_document(&app.views[b]));
+                    }
+                }
+            }
         };
         for p in &f[..4] {
             app.open_side(&ctx, p.clone());
@@ -7214,7 +7775,10 @@ mod tests {
         let ctx = egui::Context::default();
         let saved = |app: &mut TakViewerApp| {
             app.sync_settings();
-            ron::to_string(&app.settings).unwrap()
+            let mut settings = app.settings.clone();
+            let layout = dock::shape(settings.layout.as_ref().unwrap());
+            settings.layout = None;
+            (ron::to_string(&settings).unwrap(), layout)
         };
         let mut by_hand = one_view(&ctx);
         let mut undone = one_view(&ctx);
@@ -8854,14 +9418,15 @@ mod tests {
         app.sync_settings();
         let again: Settings = ron::from_str(&ron::to_string(&app.settings).unwrap()).unwrap();
         assert!(dock::has(again.layout.as_ref().unwrap(), Pane::Comments));
-        // The 4-view and one-file-once rules do not care about the new pane.
+        // The four-view limit and shared-file rule do not depend on the new pane.
         for k in 1..6 {
             app.open_side(&ctx, missing(k));
         }
         assert_eq!(app.open_views().len(), MAX_VIEWS);
         app.open(&ctx, missing(2));
         let files: Vec<_> = app.open_views().iter().filter_map(|&k| app.views[k].target().map(Path::to_path_buf)).collect();
-        assert_eq!(files.len(), files.iter().collect::<std::collections::HashSet<_>>().len());
+        assert_eq!(files.len(), 4);
+        assert_eq!(files.iter().filter(|path| **path == missing(2)).count(), 2, "the same file may occupy two views");
     }
 
     #[test]
@@ -9073,14 +9638,17 @@ mod tests {
             }
             assert_eq!(app.views[0].path(), Some(want.as_path()), "{key:?}");
         }
-        // The TAK and its .takm are two files: both open at once, each once.
+        // The TAK and its .takm are two files; another reference opens in the active view.
         app.open_side(&ctx, takm.clone());
         frame_with(&ctx, &mut app, vec![]);
         takm_arrive(&ctx, &mut app, 1);
         assert_eq!((app.views[0].path(), app.views[1].path()), (Some(tak.as_path()), Some(takm.as_path())));
         app.activate(0);
         app.open(&ctx, takm.clone());
-        assert_eq!((app.active, app.open_views()), (1, vec![0, 1]), "the .takm is not opened twice");
+        assert_eq!((app.active, app.open_views()), (0, vec![0, 1]));
+        assert_eq!((app.views[0].path(), app.views[1].path()), (Some(takm.as_path()), Some(takm.as_path())));
+        assert_eq!(app.views[0].document_id(), app.views[1].document_id());
+        assert!(std::sync::Arc::ptr_eq(app.views[0].data.as_ref().unwrap(), app.views[1].data.as_ref().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9183,9 +9751,10 @@ mod tests {
     }
 
     #[test]
-    fn open_beside_fills_four_views_then_says_full_and_never_opens_a_file_twice() {
+    fn open_beside_fills_four_views_and_a_repeat_opens_in_the_active_view() {
         let ctx = egui::Context::default();
         let mut app = window_app();
+        app.hold_loads = true;
         app.open_side(&ctx, missing(0));
         assert_eq!(app.open_views(), vec![0], "the first file goes into the empty view");
         for k in 1..4 {
@@ -9197,12 +9766,13 @@ mod tests {
         assert_eq!(app.open_views().len(), MAX_VIEWS);
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("4개까지")));
         app.open(&ctx, missing(1));
-        assert_eq!(app.active, 1, "a file open in another view is shown there, not opened twice");
+        assert_eq!(app.active, 3);
+        assert_eq!(app.views[3].waiting_shared_path(), Some(missing(1).as_path()), "a repeat uses the existing read");
         app.open(&ctx, missing(9));
-        assert_eq!(app.views[1].target(), Some(missing(9).as_path()), "a click replaces the active view's file");
-        app.close_view(1);
-        assert_eq!(app.open_views(), vec![0, 2, 3]);
-        assert!(app.views[1].target().is_none());
+        assert_eq!(app.views[3].target(), Some(missing(9).as_path()), "a click replaces the active view's file");
+        app.close_view(3);
+        assert_eq!(app.open_views(), vec![0, 1, 2]);
+        assert!(app.views[3].target().is_none());
         assert!(app.open_views().contains(&app.active));
     }
 
@@ -9354,11 +9924,11 @@ mod tests {
         // leaves it out (v0.27.1: the folder goes first, the name stays whole).
         let row = |name: &str| name.to_owned();
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak"]);
-        // One view: no group header, just the row (the folder is in no WORKSPACE folder).
-        assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (1)".to_owned(), row("a.tak"), ADD_FOLDER.into()]);
+        // Even one view keeps its whole-layout tab/group title and active-view label.
+        assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (1)".to_owned(), "tab1 · View 1".into(), CHOSEN_VIEW.into(), row("a.tak"), ADD_FOLDER.into()]);
         // A laid-over file is listed at once, while it is read.
         lay_over(&ctx, &mut app, &f[1]);
-        assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (2)".to_owned(), row("a.tak"), ADD_FOLDER.into(), row("b.tak …"), ADD_FOLDER.into()]);
+        assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (2)".to_owned(), "tab1 · View 1".into(), CHOSEN_VIEW.into(), row("a.tak"), ADD_FOLDER.into(), row("b.tak …"), ADD_FOLDER.into()]);
         overlay_arrive(&ctx, &mut app, 0);
         // A file opened beside it: listed at once too, then two groups in screen order.
         app.open_side(&ctx, f[2].clone());
@@ -9366,11 +9936,11 @@ mod tests {
         arrive(&ctx, &mut app, 1);
         assert_eq!(app.active, 1);
         let want = |chosen: [bool; 2]| {
-            let mut w = vec!["OPEN EDITORS (3)".to_owned(), "화면 1".into()];
+            let mut w = vec!["OPEN EDITORS (3)".to_owned(), "tab1 · View 1".into()];
             if chosen[0] {
                 w.push(CHOSEN_VIEW.into());
             }
-            w.extend([row("a.tak"), ADD_FOLDER.into(), row("b.tak"), ADD_FOLDER.into(), "화면 2".into()]);
+            w.extend([row("a.tak"), ADD_FOLDER.into(), row("b.tak"), ADD_FOLDER.into(), "tab1 · View 2".into()]);
             if chosen[1] {
                 w.push(CHOSEN_VIEW.into());
             }
@@ -9385,7 +9955,7 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         let t = editor_texts(&out, explorer);
         let color = |s: &str| t.iter().find(|x| x.1 == s).unwrap().2;
-        assert_eq!((color("화면 1"), color("화면 2") == CHOSEN), (CHOSEN, false));
+        assert_eq!((color("tab1 · View 1"), color("tab1 · View 2") == CHOSEN), (CHOSEN, false));
         let y = |s: &str| t.iter().find(|x| x.1 == s).unwrap().0.center().y;
         let mark = |s: &str| circles_at(&out, egui::pos2(explorer.left() + 44.0, y(s)));
         assert_eq!((mark(&row("a.tak")), mark(&row("b.tak")), mark(&row("c.tak"))), ((1, 0), (0, 1), (0, 0)));
@@ -9562,23 +10132,31 @@ mod tests {
 
     #[test]
     fn folding_open_editors_is_one_action_that_undo_unfolds() {
+        use crate::ui::open_editors::{ADD_FOLDER, CHOSEN_VIEW};
         let ctx = egui::Context::default();
         let dir = comment_dir("editors_fold");
         let (mut app, _) = overlay_app(&ctx, &dir, &["a.tak"]);
         app.quiet();
+        let shown = editor_lines(&ctx, &mut app);
+        assert_eq!(shown, vec!["OPEN EDITORS (1)", "tab1 · View 1", CHOSEN_VIEW, "a.tak", ADD_FOLDER]);
+        let before = steps(&app, 0).0;
         let at = editor_at(&ctx, &mut app, "OPEN EDITORS (1)");
         click_at(&ctx, &mut app, at);
         assert!(app.explorer.editors_collapsed);
         assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (1)"]);
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Folders"));
+        assert_eq!(steps(&app, 0), (before + 1, 0), "folding adds one action");
         let explorer = place_of(&app, Pane::Explorer);
         let out = frame_with(&ctx, &mut app, vec![]);
         assert!(text_rects(&out, &format!("WORKSPACE (0/{MAX_ROOTS})")).iter().any(|r| explorer.contains(r.center())), "WORKSPACE stays");
         undo_key(&ctx, &mut app);
         assert!(!app.explorer.editors_collapsed, "{}", note(&app));
-        assert_eq!(editor_lines(&ctx, &mut app).len(), 3);
+        assert_eq!(editor_lines(&ctx, &mut app), shown, "undo restores group, active label, file and add-folder row");
+        assert_eq!(steps(&app, 0), (before, 1));
         redo_key(&ctx, &mut app);
         assert!(app.explorer.editors_collapsed);
+        assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (1)"]);
+        assert_eq!(steps(&app, 0), (before + 1, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9730,44 +10308,62 @@ mod tests {
     }
 
     #[test]
-    fn no_file_is_open_twice_overlays_included() {
+    fn repeated_views_and_overlays_share_one_document_and_self_overlay_is_refused() {
         let ctx = egui::Context::default();
         let dir = comment_dir("overlay_twice");
         let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak"]);
         app.open_side(&ctx, f[1].clone());
         frame_with(&ctx, &mut app, vec![]);
         arrive_all(&ctx, &mut app);
+        let primary_data = app.views[1].data.clone().unwrap();
+        let primary_document = app.views[1].edit_document.clone().unwrap();
         app.activate(0);
-        let refused = |app: &mut TakViewerApp, p: &Path, says: &str| {
-            lay_over(&ctx, app, p);
-            assert!(app.views[0].overlay_load.is_none(), "{}", p.display());
-            let note = app.overlay_note.take().expect("a reason").0;
-            assert!(note.contains(says), "{note}");
-        };
-        refused(&mut app, &f[0], "이 화면에 열린 파일");
-        refused(&mut app, &f[1], "다른 화면에 열려 있어요");
+        lay_over(&ctx, &mut app, &f[0]);
+        assert!(app.views[0].overlay.is_none() && app.views[0].overlay_load.is_none());
+        assert!(app.overlay_note.take().unwrap().0.contains("이 화면에 열린 파일"));
+
+        // A primary in another view supplies this overlay without another reader.
+        lay_over(&ctx, &mut app, &f[1]);
+        assert!(app.views[0].overlay_load.is_none());
+        assert!(std::sync::Arc::ptr_eq(&primary_data, &app.views[0].overlay.as_ref().unwrap().data));
+        assert!(std::sync::Arc::ptr_eq(&primary_document,
+            app.views[0].overlay_owner().unwrap().edit_document.as_ref().unwrap()));
+
+        // An overlay can in turn supply other overlays and ordinary primary views.
         lay_over(&ctx, &mut app, &f[2]);
         overlay_arrive(&ctx, &mut app, 0);
-        assert_eq!(app.views[0].overlay_path(), Some(f[2].as_path()));
-        refused(&mut app, &f[2], "이미 이 화면에 얹혀");
+        let shared_data = app.views[0].overlay.as_ref().unwrap().data.clone();
+        let shared_document = app.views[0].overlay_owner().unwrap().edit_document.clone().unwrap();
+        lay_over(&ctx, &mut app, &f[2]);
+        assert!(app.views[0].overlay_load.is_none());
+        assert!(app.overlay_note.take().unwrap().0.contains("이미 이 화면에 얹혀"));
         app.activate(1);
         lay_over(&ctx, &mut app, &f[2]);
         assert!(app.views[1].overlay_load.is_none());
-        assert!(app.overlay_note.take().unwrap().0.contains("다른 화면에 이미 얹혀"));
-        // Opening the laid-over file goes to the view it lies on (like an open file).
-        app.open(&ctx, f[2].clone());
-        assert_eq!((app.active, app.views[1].target()), (0, Some(f[1].as_path())));
-        app.activate(1);
+        assert!(std::sync::Arc::ptr_eq(&shared_data, &app.views[1].overlay.as_ref().unwrap().data));
+        assert!(std::sync::Arc::ptr_eq(&shared_document, app.views[1].overlay_owner().unwrap().edit_document.as_ref().unwrap()));
+
         app.open_side(&ctx, f[2].clone());
-        assert_eq!((app.active, app.open_views()), (0, vec![0, 1]));
+        assert_eq!((app.active, app.open_views()), (2, vec![0, 1, 2]));
+        assert!(app.views[2].loading.is_none());
+        assert!(std::sync::Arc::ptr_eq(&shared_data, app.views[2].data.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&shared_document, app.views[2].edit_document.as_ref().unwrap()));
+        app.open_side(&ctx, f[1].clone());
+        assert_eq!((app.active, app.open_views()), (3, vec![0, 1, 2, 3]));
+        assert!(app.views[3].loading.is_none());
+        assert!(std::sync::Arc::ptr_eq(&primary_data, app.views[3].data.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&primary_document, app.views[3].edit_document.as_ref().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn views_and_overlays_together_are_at_most_four_files() {
+    fn four_views_with_overlays_obey_the_app_wide_twelve_distinct_file_limit() {
         let ctx = egui::Context::default();
         let dir = comment_dir("overlay_four");
-        let (mut app, f) = overlay_app(&ctx, &dir, &["a.tak", "b.tak", "c.tak", "d.tak", "e.tak", "g.tak"]);
+        let names: Vec<String> = (0..13).map(|i| format!("source_{i}.tak")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, f) = overlay_app(&ctx, &dir, &names);
+        let first_tab = app.layout_tabs.active_id().unwrap();
         for p in &f[1..3] {
             app.open_side(&ctx, p.clone());
             frame_with(&ctx, &mut app, vec![]);
@@ -9775,33 +10371,51 @@ mod tests {
         }
         app.activate(0);
         lay_over(&ctx, &mut app, &f[3]);
-        assert_eq!(app.file_count(), 4, "a file being read for an overlay counts");
         overlay_arrive(&ctx, &mut app, 0);
-        // A fourth view: full (three views + one overlay).
+        let overlay_data = app.views[0].overlay.as_ref().unwrap().data.clone();
+        let overlay_document = app.views[0].overlay_owner().unwrap().edit_document.clone().unwrap();
+
+        // An overlay uses a file reference, not one of the four 3D view slots.
         app.open_side(&ctx, f[4].clone());
-        assert_eq!(app.open_views(), vec![0, 1, 2]);
-        assert!(app.notice.take().is_some_and(|n| n.contains("4개까지") && n.contains("얹은 파일")));
-        // Another overlay on view 1: refused; replacing view 0's overlay is fine.
-        app.activate(1);
-        lay_over(&ctx, &mut app, &f[4]);
-        assert!(app.views[1].overlay_load.is_none());
-        assert!(app.overlay_note.take().unwrap().0.contains("4개까지"));
-        app.activate(0);
-        lay_over(&ctx, &mut app, &f[4]);
-        assert_eq!(app.views[0].overlay_path(), Some(f[3].as_path()), "the old one stays until the new one is on screen");
-        overlay_arrive(&ctx, &mut app, 0);
-        assert_eq!((app.views[0].overlay_path(), app.file_count()), (Some(f[4].as_path()), 4));
-        // Undo the replace: d.tak comes back (read again, quietly).
-        let n = steps(&app, 0);
-        undo_key(&ctx, &mut app);
-        assert_eq!(note(&app), "Undo · Overlay d.tak");
-        overlay_arrive(&ctx, &mut app, 0);
-        assert_eq!((app.views[0].overlay_path(), steps(&app, 0)), (Some(f[3].as_path()), (n.0 - 1, 1)));
-        // Taking it off frees a place: a fourth view opens.
-        app.explorer_action(&ctx, WsAction::OverlayOff);
         frame_with(&ctx, &mut app, vec![]);
-        app.open_side(&ctx, f[5].clone());
+        arrive_all(&ctx, &mut app);
         assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
+        for (slot, path) in (1..4).zip(&f[5..8]) {
+            app.activate(slot);
+            lay_over(&ctx, &mut app, path);
+            overlay_arrive(&ctx, &mut app, slot);
+        }
+        assert_eq!(app.file_count(), 8, "all four views keep their four overlay references");
+        app.open_side(&ctx, f[0].clone());
+        assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
+        assert!(app.notice.take().is_some_and(|n| n.contains("4개까지")));
+
+        // Hidden pending primary reads also reserve distinct sources, bringing the total to 12.
+        app.new_layout_tab();
+        for (i, path) in f[8..12].iter().enumerate() {
+            if i == 0 { app.open(&ctx, path.clone()); } else { app.open_side(&ctx, path.clone()); }
+        }
+        assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
+        assert!(app.views.iter().all(|view| view.loading.is_some()));
+        app.new_layout_tab();
+        app.open(&ctx, f[12].clone());
+        assert!(app.open_views().is_empty(), "the thirteenth source must not create a view");
+        assert!(app.notice.take().is_some_and(|n| n.contains("12개까지")));
+
+        // Repeated sources still open at the cap, including a ready overlay and a pending read.
+        app.open(&ctx, f[3].clone());
+        assert!(std::sync::Arc::ptr_eq(&overlay_data, app.views[0].data.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&overlay_document, app.views[0].edit_document.as_ref().unwrap()));
+        app.open_side(&ctx, f[8].clone());
+        assert_eq!(app.views[1].waiting_shared_path(), Some(f[8].as_path()));
+        app.activate(0);
+        lay_over(&ctx, &mut app, &f[12]);
+        assert!(app.views[0].overlay_load.is_none() && app.views[0].overlay.is_none());
+        assert!(app.notice.take().is_some_and(|n| n.contains("12개까지")));
+        app.switch_layout_tab(first_tab);
+        assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
+        assert_eq!(app.file_count(), 8, "refused opens leave existing views and overlays intact");
+        assert!(std::sync::Arc::ptr_eq(&overlay_data, &app.views[0].overlay.as_ref().unwrap().data));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10406,14 +11020,20 @@ mod tests {
 
     /// Frames until the `.takm` conversion has finished.
     fn until_converted(ctx: &egui::Context, app: &mut TakViewerApp) {
-        for _ in 0..2000 {
+        // A conversion may wait for the shared Comment writer's disk barrier. Keep its
+        // completion wait independent of the functional frame count and latency checks.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        loop {
             frame_with(ctx, app, vec![]);
             if app.takm_job.is_none() {
                 return;
             }
+            assert!(Instant::now() < deadline,
+                "conversion not finished after {:?}: working={:?}, note={:?}, error={:?}, notice={:?}, outstanding_comments={}",
+                started.elapsed(), app.takm_working(), app.takm_note, app.error, app.notice, app.comment_outstanding);
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("conversion not finished");
     }
 
     fn takm_note(app: &TakViewerApp) -> String {

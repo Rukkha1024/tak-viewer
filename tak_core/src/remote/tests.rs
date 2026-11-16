@@ -145,10 +145,17 @@ os.scandir = scan
             let mut remote = s
                 .open(f.0.to_str().unwrap(), &CancelToken::default())
                 .unwrap();
-            assert!(remote.take.analog.is_empty());
-            assert!(remote.analog_pending());
             let mut expected = crate::tak::read_take(&f.0).unwrap();
-            let analog = std::mem::take(&mut expected.analog);
+            let analog = expected.analog.clone();
+            if remote.analog_pending() {
+                assert!(remote.take.analog.iter().flat_map(|d| &d.channels).all(|c| c.frames.is_empty() && c.values.is_empty()));
+                for channel in expected.analog.iter_mut().flat_map(|d| &mut d.channels) {
+                    channel.frames.clear();
+                    channel.values.clear();
+                }
+            } else {
+                assert!(remote.fallback_reason().is_some(), "synthetic untyped nodes use full fallback");
+            }
             assert_eq!(
                 verification_data(&remote.take),
                 verification_data(&expected)
@@ -162,6 +169,45 @@ os.scandir = scan
             );
         }
     }
+
+    #[test]
+    fn real_helper_full_dump_and_selective_stages_keep_exact_samples() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input");
+        let mut paths = vec![root.join("raw/000000_S01_perturb_20_001.tak"), root.join("static/000000_S01_static.tak")];
+        if let Some(path) = std::env::var_os("TAK_SELECTIVE_TEST_FILE") { paths.push(path.into()); }
+        for path in paths {
+            if !path.exists() { continue; } // Real references are optional outside this workspace.
+            let expected = crate::tak::read_take(&path).unwrap();
+            let cancel = CancelToken::default();
+            let assert_samples = |loaded: &RemoteTake| {
+                assert_eq!(crate::dump::to_json(&loaded.take), crate::dump::to_json(&expected));
+                for (actual, reference) in loaded.take.trajectories.iter().zip(&expected.trajectories) {
+                    assert_eq!(actual.frames, reference.frames);
+                    assert!(actual.xyz.iter().map(|p| p.map(f32::to_bits)).eq(reference.xyz.iter().map(|p| p.map(f32::to_bits))));
+                }
+                assert_eq!(loaded.take.analog.len(), expected.analog.len());
+                for (actual, reference) in loaded.take.analog.iter().zip(&expected.analog) {
+                    assert_eq!(actual.channels.len(), reference.channels.len());
+                    for (actual, reference) in actual.channels.iter().zip(&reference.channels) {
+                        assert_eq!(actual.frames, reference.frames);
+                        assert!(actual.values.iter().map(|v| v.to_bits()).eq(reference.values.iter().map(|v| v.to_bits())));
+                    }
+                }
+            };
+            let mut session = session();
+            let mut loaded = session.open(path.to_str().unwrap(), &cancel).unwrap();
+            assert!(loaded.fallback_reason().is_none(), "{}: {:?}", path.display(), loaded.fallback_reason());
+            session.read_analog(&mut loaded, &cancel).unwrap();
+            assert_samples(&loaded); // --ssh-dump's explicit full branch, with every device.
+            let mut loaded = session.open(path.to_str().unwrap(), &cancel).unwrap();
+            let lazy = loaded.lazy_device_indices();
+            session.read_initial_analog(&mut loaded, &cancel).unwrap();
+            assert!(lazy.iter().all(|i| loaded.take.analog[*i].channels.iter().all(|c| c.frames.is_empty())));
+            assert!(loaded.marker_channels.is_empty(), "deferred metadata must release marker sample bytes");
+            session.read_lazy_analog(&mut loaded, &cancel).unwrap();
+            assert_samples(&loaded);
+        }
+    }
     #[test]
     fn replacement_rejected_and_loaded_markers_retained() {
         let f = Fixture::new(false);
@@ -169,6 +215,7 @@ os.scandir = scan
         let mut remote = s
             .open(f.0.to_str().unwrap(), &CancelToken::default())
             .unwrap();
+        remote.analog_pending = true; // Force an identity-checked stage after the full fallback.
         let before = verification_data(&remote.take);
         // Windows read handles may deny deletion. Reconnect after replacement to
         // exercise identity validation without depending on Unix unlink behavior.
@@ -188,6 +235,7 @@ os.scandir = scan
         let mut remote = session()
             .open(f.0.to_str().unwrap(), &CancelToken::default())
             .unwrap();
+        remote.analog_pending = true;
         let mut wrong = session();
         wrong.host = "other".into();
         assert!(wrong
@@ -205,6 +253,7 @@ os.scandir = scan
         let mut remote = s
             .open(f.0.to_str().unwrap(), &CancelToken::default())
             .unwrap();
+        remote.analog_pending = true;
         let before = verification_data(&remote.take);
         let token = CancelToken::default();
         token.cancel();
@@ -398,6 +447,103 @@ mod fake_tests {
         assert_eq!(requests[0]["op"], "open");
         assert_eq!(requests[1]["op"], "analog");
         assert_eq!(requests[1]["expected_identity"], identity());
+    }
+
+    fn selective_frames() -> (Frame, Frame, Frame, Take) {
+        let (mut open, full, expected) = sample_frames(b"tail");
+        let records = crate::tak::channels::iter_channel_inventory(&full.1[0]).unwrap();
+        let selected = |wanted: Option<usize>| {
+            let mut bytes = crate::tak::channels::CHANNELS_HEADER.to_vec();
+            bytes.extend((records.len() as u32).to_le_bytes());
+            let mut device = usize::MAX;
+            for record in &records {
+                if record.name == "AnalogChannel0" { device = device.wrapping_add(1); }
+                if wanted == Some(device) {
+                    bytes.extend_from_slice(&full.1[0][record.start..record.end]);
+                } else {
+                    bytes.extend_from_slice(&full.1[0][record.start..record.data_start - 4]);
+                    bytes.extend(0u32.to_le_bytes());
+                }
+            }
+            bytes
+        };
+        open.0["device_types"] = json!([2, 1]);
+        open.0["plate_devices"] = json!([0]);
+        open.1.push(selected(None));
+        let plate = (json!({"identity":identity()}), vec![selected(Some(0))]);
+        let emg = (json!({"identity":identity()}), vec![selected(Some(1))]);
+        (open, plate, emg, expected)
+    }
+
+    #[test]
+    fn selective_stages_request_emg_once_on_access_and_preserve_full_parity() {
+        let (open, plate, emg, mut expected) = selective_frames();
+        let (mut session, requests) = session(vec![Ok(open), Ok(plate), Ok(emg)]);
+        let cancel = CancelToken::default();
+        let mut loaded = session.open("/data/record.takm", &cancel).unwrap();
+        assert_eq!(loaded.plate_devices(), Some([0].as_slice()));
+        assert!(loaded.initial_analog_pending() && loaded.lazy_analog_pending());
+        assert!(loaded.take.analog.iter().flat_map(|d| &d.channels).all(|c| c.frames.is_empty()));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        session.read_initial_analog(&mut loaded, &cancel).unwrap();
+        session.read_initial_analog(&mut loaded, &cancel).unwrap();
+        assert!(!loaded.initial_analog_pending());
+        assert!(loaded.lazy_analog_pending());
+        assert!(!loaded.take.analog[0].channels[0].frames.is_empty());
+        assert!(loaded.take.analog[1].channels[0].frames.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 2, "startup must never request EMG");
+        session.read_lazy_analog(&mut loaded, &cancel).unwrap();
+        session.read_lazy_analog(&mut loaded, &cancel).unwrap();
+        expected.path = loaded.take.path.clone();
+        assert_eq!(verification_data(&loaded.take), verification_data(&expected));
+        assert!(!loaded.analog_pending());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "only one request is sent for explicit EMG access");
+        assert_eq!(requests[1]["selection"], "forceplates");
+        assert_eq!(requests[2]["selection"], "non_forceplates");
+    }
+
+    #[test]
+    fn selective_failed_or_cancelled_emg_keeps_loaded_plate_samples() {
+        for error in ["SSH pipe closed unexpectedly", "source_changed: changed"] {
+            let (open, plate, _, _) = selective_frames();
+            let (mut session, _) = session(vec![Ok(open), Ok(plate), Err(error.into())]);
+            let cancel = CancelToken::default();
+            let mut loaded = session.open("/data/record.takm", &cancel).unwrap();
+            session.read_initial_analog(&mut loaded, &cancel).unwrap();
+            let before = verification_data(&loaded.take);
+            assert!(session.read_lazy_analog(&mut loaded, &cancel).is_err());
+            assert_eq!(verification_data(&loaded.take), before);
+            let cancelled = CancelToken::default();
+            cancelled.cancel();
+            assert!(session.read_lazy_analog(&mut loaded, &cancelled).is_err());
+            assert_eq!(verification_data(&loaded.take), before);
+        }
+    }
+
+    #[test]
+    fn selective_bad_frames_or_missing_manifest_return_failure_without_replacing_samples() {
+        for bad_frames in [false, true] {
+            let (open, plate, mut emg, _) = selective_frames();
+            if bad_frames {
+                let records = crate::tak::channels::iter_channel_inventory(&emg.1[0]).unwrap();
+                let record = records.iter().find(|r| r.n_samples > 1).unwrap();
+                let second = record.data_start + 4 + 4 * record.dim();
+                emg.1[0][second..second + 4].copy_from_slice(&0u32.to_le_bytes());
+            } else {
+                emg.1[0] = crate::tak::channels::CHANNELS_HEADER.to_vec();
+                emg.1[0].extend(0u32.to_le_bytes());
+            }
+            let (mut session, _) = session(vec![Ok(open), Ok(plate), Ok(emg)]);
+            let cancel = CancelToken::default();
+            let mut loaded = session.open("/data/record.takm", &cancel).unwrap();
+            session.read_initial_analog(&mut loaded, &cancel).unwrap();
+            let before = verification_data(&loaded.take);
+            let error = session.read_lazy_analog(&mut loaded, &cancel).unwrap_err();
+            assert!(error.contains("Selective analog"), "{error}");
+            assert!(loaded.lazy_analog_pending());
+            assert_eq!(verification_data(&loaded.take), before);
+        }
     }
 
     #[test]

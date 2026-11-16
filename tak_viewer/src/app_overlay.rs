@@ -15,6 +15,101 @@ fn name_of(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+#[cfg(test)]
+mod shared_overlay_tests {
+    use super::*;
+    use std::sync::{Arc, mpsc::channel};
+
+    fn show(view: &mut View, path: &str, id: usize) {
+        let (_tx, rx) = channel();
+        drop_later(view.show(views::sample_data(path, &["M"]), rx, id, 1.0, 0.0));
+    }
+
+    fn app(ctx: &egui::Context) -> TakViewerApp {
+        let mut app = TakViewerApp::build(ctx, None, vec![], None, None);
+        app.set_command_run();
+        app.hold_loads = true;
+        show(&mut app.views[0], "overlay_host.tak", 1);
+        app
+    }
+
+    #[test]
+    fn hidden_primary_and_multiple_overlays_share_one_data_document_without_reading() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        show(&mut app.views[1], "overlay_shared.tak", 2);
+        let document = app.views[1].document_id();
+        let data = app.views[1].data.as_ref().unwrap().clone();
+        app.new_layout_tab();
+        show(&mut app.views[0], "another_host.tak", 3);
+        app.overlay_on(&ctx, "overlay_shared.tak".into());
+        assert!(app.views[0].overlay_reading_path().is_none(), "the hidden primary already owns the file");
+        app.poll_overlays(&ctx);
+        assert_eq!(app.views[0].overlay_document_id(), document);
+        assert!(Arc::ptr_eq(&data, &app.views[0].overlay.as_ref().unwrap().data));
+        show(&mut app.views[1], "third_host.tak", 4);
+        app.active = 1;
+        app.overlay_on(&ctx, "overlay_shared.tak".into());
+        app.poll_overlays(&ctx);
+        assert_eq!(app.views[1].overlay_document_id(), document);
+        assert!(Arc::ptr_eq(&app.views[0].overlay.as_ref().unwrap().data, &app.views[1].overlay.as_ref().unwrap().data));
+    }
+
+    #[test]
+    fn overlay_primary_of_same_view_is_still_refused_and_shared_mismatch_keeps_old_overlay() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.overlay_on(&ctx, "overlay_host.tak".into());
+        assert!(app.views[0].overlay_load.is_none());
+        assert!(app.overlay_note.take().unwrap().0.contains("이 화면에 열린 파일"));
+        app.error = None;
+        app.views[0].overlay = Some(views::Overlay::from_data("old_overlay.tak".into(), views::sample_data("old_overlay.tak", &["M"])));
+        let mut incompatible = views::sample_take("different_rate.tak", &["M"]);
+        incompatible.frame_rate = 120.0;
+        let (_tx, rx) = channel();
+        app.views[1].show(tak_core::view_data::ViewData::build(incompatible), rx, 2, 1.0, 0.0);
+        app.overlay_on(&ctx, "different_rate.tak".into());
+        app.poll_overlays(&ctx);
+        assert_eq!(app.views[0].overlay_path(), Some(Path::new("old_overlay.tak")));
+        let why = app.overlay_note.as_ref().unwrap().0.as_str();
+        assert!(why.contains("100 Hz") && why.contains("120 Hz"));
+    }
+
+    #[test]
+    fn in_flight_overlay_is_one_reader_and_follower_waits_for_it() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.overlay_on(&ctx, "waiting_overlay.tak".into());
+        assert_eq!(app.views[0].overlay_reading_path(), Some(Path::new("waiting_overlay.tak")));
+        show(&mut app.views[1], "other_host.tak", 2);
+        app.active = 1;
+        app.overlay_on(&ctx, "waiting_overlay.tak".into());
+        assert!(app.views[1].overlay_reading_path().is_none());
+        assert_eq!(app.views[1].overlay_waiting_shared_path(), Some(Path::new("waiting_overlay.tak")));
+        let sender = app.views[0].overlay_load.as_mut().unwrap().held.take().unwrap();
+        sender.send(views::LoadMsg::Markers(Ok((views::sample_data("waiting_overlay.tak", &["M"]), vec![])))).unwrap();
+        app.poll_overlays(&ctx);
+        app.poll_overlays(&ctx);
+        assert!(Arc::ptr_eq(&app.views[0].overlay.as_ref().unwrap().data, &app.views[1].overlay.as_ref().unwrap().data));
+    }
+
+    #[test]
+    fn same_view_primary_refusal_uses_live_saved_path_before_the_view_syncs() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let shared = app.views[0].shared_file().unwrap();
+        app.views[1].show_shared_file(shared, 2, 1.0, 0.0);
+        let mut renamed = app.views[1].data.as_ref().unwrap().as_ref().clone();
+        renamed.take.path = "renamed_host.takm".into();
+        app.views[1].data = Some(Arc::new(renamed));
+        assert!(app.views[1].publish_shared_file());
+        assert_eq!(app.views[0].path(), Some(Path::new("overlay_host.tak")));
+        app.overlay_on(&ctx, "renamed_host.takm".into());
+        assert!(app.views[0].overlay_load.is_none());
+        assert!(app.overlay_note.as_ref().unwrap().0.contains("이 화면에 열린 파일"));
+    }
+}
+
 /// The two name tags of a view with a file laid over it: where they are this frame, their text
 /// and whose markers are shown.
 pub(super) struct OverlayTags {
@@ -57,22 +152,14 @@ impl TakViewerApp {
             return Err("원격 파일의 겹쳐 보기는 아직 지원하지 않아요.".into());
         }
         let name = name_of(path);
-        let Some(own) = v.target() else { return Err("얹을 수 없어요: 이 화면에 먼저 파일을 여세요.".into()) };
-        if own == path {
+        let Some(own) = v.shared_target() else { return Err("얹을 수 없어요: 이 화면에 먼저 파일을 여세요.".into()) };
+        let wanted = self.known_identity(path);
+        if Self::bound_primary_identity(v, &own) == wanted {
             return Err(format!("얹을 수 없어요: {name}은(는) 이 화면에 열린 파일이에요."));
         }
-        if v.overlay_paths().any(|p| p == path) {
+        if v.overlay_paths().any(|p| Self::bound_overlay_identity(v, p) == wanted)
+            || v.overlay_shared_target().is_some_and(|p| Self::bound_overlay_identity(v, &p) == wanted) {
             return Err(format!("{name}은(는) 이미 이 화면에 얹혀 있어요."));
-        }
-        let open = self.open_views();
-        if open.iter().any(|&k| self.views[k].target() == Some(path)) {
-            return Err(format!("얹을 수 없어요: {name}은(는) 다른 화면에 열려 있어요. 같은 파일은 한 번만 열어요."));
-        }
-        if open.iter().any(|&k| self.views[k].overlay_paths().any(|p| p == path)) {
-            return Err(format!("얹을 수 없어요: {name}은(는) 다른 화면에 이미 얹혀 있어요. 같은 파일은 한 번만 열어요."));
-        }
-        if v.overlay_target().is_none() && self.file_count() >= MAX_VIEWS {
-            return Err(format!("얹을 수 없어요: 화면과 얹은 파일을 합쳐 {MAX_VIEWS}개까지예요. 화면 하나를 닫거나 얹은 파일을 내리세요."));
         }
         Ok(())
     }
@@ -91,31 +178,127 @@ impl TakViewerApp {
     /// Read on a background thread; it is checked and shown when its markers are in.
     pub(super) fn overlay_on(&mut self, ctx: &egui::Context, path: PathBuf) {
         let slot = self.active;
+        // An explicit open rechecks a symlink; previously admitted aliases stay bound.
+        self.admit_identity(&path);
         match self.overlay_allowed(slot, &path) {
             Ok(()) => {
                 self.overlay_note = None;
                 self.start_overlay(ctx, slot, path, false);
             }
-            Err(why) => self.overlay_say(ctx, why),
+            Err(why) => { self.discard_identity_candidate(); self.overlay_say(ctx, why); }
         }
     }
 
     pub(super) fn start_overlay(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, quiet: bool) {
+        if !self.allow_replace_overlay(&path, slot) { return; }
+        let identity = self.known_identity(&path);
+        if self.views[slot].shared_target().is_some_and(|own| Self::bound_primary_identity(&self.views[slot], &own) == identity) {
+            self.discard_identity_candidate();
+            self.overlay_say(ctx, format!("얹을 수 없어요: {}은(는) 이 화면에 열린 파일이에요.", name_of(&path)));
+            return;
+        }
         if self.save_destination_reserved(&path) {
+            self.discard_identity_candidate();
             self.overlay_say(ctx, "Save in progress for this file.".into());
             return;
         }
+        if !self.restoring_layout && self.guard_overlay_removal(slot, marker_edit::PendingTransition::ReplaceOverlay { slot, path: path.clone(), quiet }) {
+            self.discard_identity_candidate();
+            return;
+        }
+        if let Some(shared) = self.find_shared_file(&path, usize::MAX).or_else(|| self.find_shared_overlay_file(&path)) {
+            self.views[slot].start_shared_overlay(path, shared, quiet);
+            self.views[slot].set_overlay_pending_identity(identity);
+            ctx.request_repaint();
+            return;
+        }
+        if self.file_is_loading_elsewhere(&path, usize::MAX) || self.overlay_file_is_loading(&path) {
+            self.views[slot].wait_overlay_shared(path, quiet);
+            self.views[slot].set_overlay_pending_identity(identity);
+            return;
+        }
+        let retained = self.find_retained_document(&path);
         #[cfg(test)]
         if self.hold_loads {
             self.views[slot].hold_overlay(path, quiet);
+            self.views[slot].set_overlay_pending_identity(identity);
+            self.views[slot].set_overlay_fresh_open_candidate(retained);
             return;
         }
         self.views[slot].start_overlay(ctx, path, quiet);
+        self.views[slot].set_overlay_pending_identity(identity);
+        self.views[slot].set_overlay_fresh_open_candidate(retained);
     }
 
     /// Take the file laid over view `slot` off (Explorer "얹은 파일 내리기", ✕ on name tag 2).
     pub(super) fn overlay_off(&mut self, slot: usize) {
+        if !self.restoring_layout && self.guard_overlay_removal(slot, marker_edit::PendingTransition::OverlayOff { slot }) { return; }
+        self.handoff_overlay_file_work(slot);
         drop_later(self.views[slot].take_overlay());
+    }
+
+    /// Canonical overlay-only files are also available to ordinary primary-view opens.
+    pub(super) fn find_shared_overlay_file(&mut self, path: &Path) -> Option<views::SharedFile> {
+        let wanted = self.known_identity(path);
+        for view in &mut self.views {
+            if view.overlay_shared_target().is_some_and(|p| Self::bound_overlay_identity(view, &p) == wanted) {
+                if let Some(existing) = view.overlay_path().map(Path::to_path_buf) {
+                    if let Some(shared) = view.shared_overlay_file(&existing) { return Some(shared); }
+                }
+            }
+        }
+        for tab in self.layout_tabs.tabs_mut() {
+            if let Some(runtime) = &mut tab.layout {
+                for view in &mut runtime.views {
+                    if view.overlay_shared_target().is_some_and(|p| Self::bound_overlay_identity(view, &p) == wanted) {
+                        if let Some(existing) = view.overlay_path().map(Path::to_path_buf) {
+                            if let Some(shared) = view.shared_overlay_file(&existing) { return Some(shared); }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn overlay_file_is_loading(&self, path: &Path) -> bool {
+        let wanted = self.known_identity(path);
+        self.views.iter().any(|view| view.overlay_reading_path().is_some_and(|p| Self::bound_overlay_identity(view, p) == wanted))
+            || self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref())
+                .flat_map(|runtime| runtime.views.iter()).any(|view| view.overlay_reading_path().is_some_and(|p| Self::bound_overlay_identity(view, p) == wanted))
+    }
+
+    /// Preserve the sole deferred-reader owner when an overlay is explicitly removed. Close
+    /// whole-view/tab paths call this same hook before removing those overlay references.
+    pub(super) fn handoff_overlay_file_work(&mut self, slot: usize) -> bool {
+        self.handoff_overlay_file_work_impl(slot, false)
+    }
+
+    pub(super) fn handoff_overlay_file_work_outside_tab(&mut self, slot: usize) -> bool {
+        self.handoff_overlay_file_work_impl(slot, true)
+    }
+
+    fn handoff_overlay_file_work_impl(&mut self, slot: usize, outside_tab: bool) -> bool {
+        let Some(document) = self.views[slot].overlay_document_id() else { return false };
+        for other in 0..MAX_VIEWS {
+            if outside_tab || slot == other { continue; }
+            if self.views[other].document_id() != Some(document) && self.views[other].overlay_document_id() != Some(document) { continue; }
+            let (source, target) = if slot < other {
+                let (left, right) = self.views.split_at_mut(other); (&mut left[slot], &mut right[0])
+            } else {
+                let (left, right) = self.views.split_at_mut(slot); (&mut right[0], &mut left[other])
+            };
+            if source.transfer_overlay_work_to(target) { return true; }
+        }
+        for tab in self.layout_tabs.tabs_mut() {
+            let Some(runtime) = &mut tab.layout else { continue };
+            for target in &mut runtime.views {
+                if target.document_id() == Some(document) || target.overlay_document_id() == Some(document) {
+                    if self.views[slot].transfer_overlay_work_to(target) { return true; }
+                }
+            }
+        }
+        false
     }
 
     /// Name tag 1 / 2, key 1 / 2: hide or show the markers of view `slot`'s own file (0) or of
@@ -141,31 +324,104 @@ impl TakViewerApp {
     /// Overlays whose markers arrived: shown when they fit the view's file (same frame count and
     /// frame rate), else refused with the reason. One put back by undo / redo is no action.
     pub(super) fn poll_overlays(&mut self, ctx: &egui::Context) {
-        for slot in self.open_views() {
-            let Some((path, result, quiet)) = self.views[slot].poll_overlay() else { continue };
+        let saving_documents = self.saving_documents();
+        let mut notes = Vec::new();
+        let mut arrived = Vec::new();
+        let mut retired = Vec::new();
+        let mut quiet_layout = false;
+        let poll = |v: &mut View, notes: &mut Vec<String>, arrived: &mut Vec<PathBuf>, retired: &mut Vec<views::Overlay>, quiet_layout: &mut bool| {
+            let allow_emg = !v.overlay_document_id().is_some_and(|document| saving_documents.contains(&document));
+            v.poll_overlay_file_work_gated(ctx, allow_emg);
+            let Some((path, result, quiet)) = v.poll_overlay() else { return };
             let name = name_of(&path);
-            let data = match result {
+            let overlay = match result {
                 Ok(d) => d,
                 Err(e) => {
-                    self.overlay_say(ctx, format!("얹을 수 없어요: {name}을(를) 읽지 못했어요 ({e})"));
-                    continue;
+                    notes.push(format!("얹을 수 없어요: {name}을(를) 읽지 못했어요 ({e})"));
+                    arrived.push(path);
+                    return;
                 }
             };
-            let v = &mut self.views[slot];
-            let Some(own) = v.data.as_ref() else { continue };
-            if let Some(why) = views::overlay_mismatch(own, &data) {
-                drop_later(Some(data));
-                self.overlay_say(ctx, why);
-                continue;
+            let Some(own) = v.data.as_ref() else { drop_later(Some(overlay)); return };
+            if let Some(why) = views::overlay_mismatch(own, &overlay.data) {
+                drop_later(Some(overlay));
+                notes.push(why);
+                arrived.push(path);
+                return;
             }
-            let old = v.overlay.replace(views::Overlay { path, data });
-            drop_later(old.map(|o| o.data));
+            if let Some(old) = v.overlay.replace(overlay) { retired.push(old); }
+            drop_later(Some(std::mem::take(&mut v.lanes)));
+            arrived.push(path);
             if quiet {
-                self.history.quiet_layout = true;
+                *quiet_layout = true;
             } else {
                 // A new file laid over: its markers shown.
                 v.shown[1] = true;
             }
+        };
+        for v in &mut self.views { poll(v, &mut notes, &mut arrived, &mut retired, &mut quiet_layout); }
+        for (tab, slot) in self.hidden_overlay_locations() {
+            if let Some(runtime) = self.layout_tabs.work_payload_mut(tab).and_then(|tab| tab.layout.as_mut()) {
+                poll(&mut runtime.views[slot], &mut notes, &mut arrived, &mut retired, &mut quiet_layout);
+            }
+            self.reindex_hidden_slot(tab, slot);
+        }
+        self.history.quiet_layout |= quiet_layout;
+        for mut old in retired {
+            for view in self.views.iter_mut().chain(self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()).flat_map(|runtime| runtime.views.iter_mut())) {
+                if old.transfer_work_to(view) { break; }
+            }
+            drop_later(Some(old));
+        }
+        for why in notes { self.overlay_say(ctx, why); }
+        for path in arrived {
+            if self.find_shared_file(&path, usize::MAX).or_else(|| self.find_shared_overlay_file(&path)).is_some() {
+                self.attach_shared_waiters(ctx, &path);
+            } else {
+                self.promote_shared_waiter(ctx, &path);
+            }
+            self.discard_identity_candidate_for(&path);
+        }
+        let waiting = self.changed_overlay_wait_paths();
+        for path in waiting {
+            let wanted = self.known_identity(&path);
+            if let Some(shared) = self.find_shared_file(&path, usize::MAX).or_else(|| self.find_shared_overlay_file(&path)) {
+                for view in &mut self.views {
+                    if view.overlay_waiting_shared_path().is_some_and(|p| Self::bound_overlay_identity(view, p) == wanted) {
+                        if let Some(existing) = view.overlay_waiting_shared_path().map(Path::to_path_buf) {
+                            view.attach_overlay_shared(&existing, shared.clone());
+                        }
+                    }
+                }
+                for tab in self.layout_tabs.tabs_mut() {
+                    if let Some(runtime) = &mut tab.layout {
+                        for view in &mut runtime.views {
+                            if view.overlay_waiting_shared_path().is_some_and(|p| Self::bound_overlay_identity(view, p) == wanted) {
+                                if let Some(existing) = view.overlay_waiting_shared_path().map(Path::to_path_buf) {
+                                    view.attach_overlay_shared(&existing, shared.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            } else if !self.file_is_loading_elsewhere(&path, usize::MAX) && !self.overlay_file_is_loading(&path) {
+                // The earlier owner failed or closed. Promote just one overlay waiter; all
+                // other waiters keep waiting for that single reader.
+                let candidate = self.views.iter_mut().chain(self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()).flat_map(|runtime| runtime.views.iter_mut()))
+                    .find(|v| v.overlay_waiting_shared_path().is_some_and(|p| Self::bound_overlay_identity(v, p) == wanted));
+                if let Some(view) = candidate {
+                    let quiet = view.overlay_load.as_ref().is_some_and(|load| load.quiet);
+                    let identity = view.overlay_bound_identity(&path).unwrap_or_else(|| wanted.clone());
+                    #[cfg(test)]
+                    if self.hold_loads { view.hold_overlay(path, quiet); view.set_overlay_pending_identity(identity); continue; }
+                    view.start_overlay(ctx, path, quiet);
+                    view.set_overlay_pending_identity(identity);
+                }
+            }
+        }
+        if self.views.iter().any(|view| view.overlay_load.is_some()) || !self.hidden_overlay_locations().is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -196,11 +452,12 @@ impl TakViewerApp {
         let room = ((rect.right() - GAP - x0) - GAP - 2.0 * (PAD + ICON_W + PAD) - 4.0 - CLOSE_W + PAD) / 2.0;
         let labels: [String; 2] = std::array::from_fn(|i| {
             let hidden = if v.shown[i] { "" } else { " · 숨김" };
+            let dirty = if if i == 0 { v.marker_dirty() } else { o.marker_dirty() } { " *" } else { "" };
             let (base, folder) = match names[i].rsplit_once(" · ") {
                 Some((b, f)) => (b.to_owned(), format!(" · {f}")),
                 None => (names[i].clone(), String::new()),
             };
-            let label = |name: &str| format!("{} {name}{folder}{hidden}", i + 1);
+            let label = |name: &str| format!("{} {name}{folder}{dirty}{hidden}", i + 1);
             let chars: Vec<char> = base.chars().collect();
             let mut keep = chars.len();
             let mut text = label(&base);

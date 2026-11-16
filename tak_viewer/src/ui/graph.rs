@@ -2,12 +2,13 @@
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
+#[derive(Clone)]
 pub struct Lane {
     /// Short label drawn as the faded watermark (e.g. "X").
     pub letter: String,
     pub color: Color32,
     /// Runs of (frame, value) without gaps.
-    pub runs: Vec<Vec<[f64; 2]>>,
+    pub runs: std::sync::Arc<Vec<Vec<[f64; 2]>>>,
     pub unit: &'static str,
 }
 
@@ -192,8 +193,8 @@ struct Thinned {
     lanes: Vec<DrawnLane>,
 }
 
-/// One lane's curves as painted (`curve_shapes`: points on screen, the dashes of the second
-/// file's curves as one mesh), made once and painted again as they are while nothing they depend
+/// One lane's curves as painted (`curve_shapes`: points on screen, normal solid and dashed
+/// curves as cached meshes), made once and painted again as they are while nothing they depend
 /// on changes (`ShapesKey`), instead of every frame (v0.27.0 speed fix).
 struct LaneShapes {
     key: ShapesKey,
@@ -212,7 +213,7 @@ struct ShapesKey {
     x: (f64, f64),
     y: (f64, f64, f32),
     shown: [bool; 2],
-    /// What the dashes' triangles depend on too (`curve_shapes`).
+    /// What the cached line triangles depend on too (`curve_shapes`).
     clip: Rect,
     pixels_per_point: f32,
     options: egui::epaint::TessellationOptions,
@@ -341,8 +342,8 @@ fn hover_text_at(p: Pos2, size: Vec2, inside: Rect) -> Pos2 {
 /// range or width (`show`) each cost the marker's samples, about 11 ns a sample each (measured,
 /// 122 MB file, 21 708 frames). With 8 markers in each of 4 graphs everything at once took 23 ms
 /// in the frame after the selection; now what does not fit comes in the next frames (a frame or
-/// a few later). The first marker of each graph (and a force plate graph) is always done at
-/// once, as before.
+/// a few later). Initial marker and forceplate thinning shares this limit across views and
+/// sizing passes; screenshots and captures use no limit.
 pub const FRAME_WORK: usize = 128_000;
 
 /// The graph work of the current frame (`WORK`).
@@ -425,6 +426,9 @@ fn thin_cost(lanes: &[Lane], vr: &ViewRange) -> usize {
 /// 3D view). Use a new `Drawn` when the lanes change.
 #[derive(Default)]
 pub struct Drawn {
+    /// Device graphs share source runs and thin them on a worker, including zoom/resize.
+    background: bool,
+    background_rx: Option<(ThinKey, std::sync::mpsc::Receiver<Vec<DrawnLane>>)> ,
     /// Frame range in view and the number of columns of the lanes below.
     key: Option<ThinKey>,
     lanes: Vec<DrawnLane>,
@@ -525,6 +529,54 @@ impl Drew {
 }
 
 impl Drawn {
+    /// Initial marker / plate graphs share the same per-frame budget as later curves.
+    /// The frame budget survives egui sizing passes, so opening several graphs cannot repeat it.
+    fn prepare_primary(&mut self, lanes: &[Lane], vr: ViewRange, cols: usize, key: ThinKey) -> bool {
+        if self.key == Some(key) && self.lanes.len() == lanes.len() { return true; }
+        let cost = |source: &[Lane]| source.iter().map(|lane| lane.runs.iter().map(|run| in_view(run, &vr).len()).sum::<usize>()).sum::<usize>();
+        if !spend(cost(lanes) + self.pair.as_ref().map_or(0, |pair| cost(&pair.lanes)), false) { return false; }
+        self.lanes = lanes.iter().map(|lane| thin(lane, &vr, cols)).collect();
+        self.pair_lanes = self.pair.as_ref().map_or_else(Vec::new, |pair| pair.lanes.iter().map(|lane| thin(lane, &vr, cols)).collect());
+        self.key = Some(key);
+        self.version += 1;
+        true
+    }
+
+    pub fn background() -> Self { Self { background: true, ..Self::default() } }
+
+    fn prepare_background(&mut self, lanes: &[Lane], vr: ViewRange, cols: usize, key: ThinKey, ctx: &egui::Context) {
+        if let Some((pending_key, rx)) = &self.background_rx {
+            match rx.try_recv() {
+                Ok(prepared) => {
+                    let prepared_key = *pending_key;
+                    self.background_rx = None;
+                    if prepared_key == key {
+                        let retired = std::mem::replace(&mut self.lanes, prepared);
+                        crate::views::drop_later(Some(retired));
+                        self.key = Some(key);
+                        self.version += 1;
+                    } else { crate::views::drop_later(Some(prepared)); }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.background_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.key != Some(key) && self.background_rx.is_none() {
+            let source = lanes.to_vec(); // Arc-backed runs: O(number of lanes), never O(samples).
+            let wake = ctx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.background_rx = Some((key, rx));
+            std::thread::spawn(move || {
+                let result = source.iter().map(|lane| thin(lane, &vr, cols)).collect();
+                let _ = tx.send(result);
+                wake.request_repaint();
+            });
+        }
+    }
+    pub fn background_pending(&self) -> bool {
+        self.background && (self.background_rx.is_some() || self.key.is_none())
+    }
+
     /// The second file laid over the view (None = none); what was worked out is done again.
     pub fn set_pair(&mut self, pair: Option<Pair>) {
         self.pair = pair;
@@ -697,7 +749,7 @@ fn thin(lane: &Lane, vr: &ViewRange, cols: usize) -> DrawnLane {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     let per_frame = cols.max(1) as f64 / (vr.hi - vr.lo);
     let mut runs = Vec::new();
-    for run in &lane.runs {
+    for run in lane.runs.iter() {
         let mut out = Vec::new();
         let mut cur: Option<Column> = None;
         for p in in_view(run, vr) {
@@ -748,9 +800,9 @@ fn in_view<'a>(run: &'a [[f64; 2]], vr: &ViewRange) -> &'a [[f64; 2]] {
 /// One lane's curves (`LaneShapes`): the second file's dashed curves first (the marker's, then the
 /// other markers'), then the solid ones on top, each in its marker's color, a run of one point as
 /// a dot. Also what they are (`Drew`, for tests). The dashes (thousands of little lines with 8
-/// markers) are made into triangles here, once, with egui's own tessellator and settings (`tess`,
-/// the lane's clip rect), so the picture is the same and a frame copies one mesh instead of
-/// making every dash again (v0.27.0 speed fix: the dashes were 1.7 of 2.7 ms a frame).
+/// markers) and normal solid lines are made into triangles here, once, with egui's own
+/// tessellator and settings (`tess`, the lane's clip rect). A frame copies their meshes instead
+/// of tessellating the unchanged lines again. Hover-width solid lines keep their Shape::line.
 /// `w` / `dot`: line width and one-sample dot radius (`LINE_W`, or `HOVER_W` for a hovered curve).
 #[allow(clippy::too_many_arguments)]
 fn curve_shapes<'a>(
@@ -796,9 +848,18 @@ fn curve_shapes<'a>(
         for run in &t.runs {
             drew.solid += 1;
             let pts: Vec<Pos2> = run.iter().map(|p| pos2(x_of(p[0]), y_of(p[1]))).collect();
-            shapes.push(if pts.len() == 1 { Shape::circle_filled(pts[0], dot, color) } else { Shape::line(pts, Stroke::new(w, color)) });
+            if pts.len() == 1 {
+                // A dot sits between the preceding and following runs in painter order.
+                flush(&mut mesh, &mut shapes);
+                shapes.push(Shape::circle_filled(pts[0], dot, color));
+            } else if w == LINE_W {
+                tess.tessellate_shape(Shape::line(pts, Stroke::new(w, color)), &mut mesh);
+            } else {
+                shapes.push(Shape::line(pts, Stroke::new(w, color)));
+            }
         }
     }
+    flush(&mut mesh, &mut shapes);
     (shapes, drew)
 }
 
@@ -861,6 +922,10 @@ struct RangeDrag {
 #[allow(clippy::too_many_arguments)]
 fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, frame_at: impl Fn(f32) -> i64, first: i64, last: i64, range: &mut Option<(i64, i64)>) -> (bool, bool) {
     let id = id.with("range_drag");
+    if !ui.is_enabled() {
+        ui.data_mut(|data| { data.remove::<RangeDrag>(id); });
+        return (false, false);
+    }
     let mut drag: Option<RangeDrag> = ui.data(|d| d.get_temp(id));
     // The panel may have been hidden when the button was released. A later pointer move
     // must not resume the abandoned gesture when the panel is shown again.
@@ -993,13 +1058,10 @@ fn show_inner(
     let key = (vr.lo.to_bits(), vr.hi.to_bits(), cols);
     let mut fresh = Drawn::default();
     let drawn = cache.unwrap_or(&mut fresh);
-    if drawn.key != Some(key) || drawn.lanes.len() != lanes.len() {
-        // The (first) marker's lanes and its dashed ones: at once, as before v0.27.0.
-        spend(thin_cost(lanes, &vr) + drawn.pair.as_ref().map_or(0, |p| thin_cost(&p.lanes, &vr)), true);
-        drawn.lanes = lanes.iter().map(|l| thin(l, &vr, cols)).collect();
-        drawn.pair_lanes = drawn.pair.as_ref().map_or_else(Vec::new, |p| p.lanes.iter().map(|l| thin(l, &vr, cols)).collect());
-        drawn.key = Some(key);
-        drawn.version += 1;
+    if drawn.background {
+        drawn.prepare_background(lanes, vr, cols, key, ui.ctx());
+    } else if !drawn.prepare_primary(lanes, vr, cols, key) {
+        ui.ctx().request_repaint();
     }
     // v0.27.0: the other markers of a graph of several, and their dashed lanes, as far as the
     // frame's work allows (`spend`), each marker with its dashed lanes; the others in the next
@@ -1300,11 +1362,119 @@ mod tests {
     include!("graph_selection_tests.rs");
 
     #[test]
+    fn normal_solid_mesh_matches_the_previous_lines_in_geometry_and_pixels() {
+        use super::{curve_shapes, DrawnLane, DOT_R, HOVER_DOT_R, HOVER_W, LINE_W};
+        use eframe::egui::{self, pos2, Color32, Pos2, Rect, Shape, Stroke};
+
+        let dashed = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[3.0, 14.0], [31.0, 18.0], [58.0, 10.0]]] };
+        let red = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![
+            vec![[2.0, 8.0], [18.0, 15.0], [39.0, 7.0], [60.0, 20.0]],
+            vec![[28.0, 24.0]], // A circle must stay between the two red runs.
+            vec![[5.0, 36.0], [54.0, 29.0]],
+        ] };
+        let blue = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[8.0, 34.0], [45.0, 13.0], [62.0, 34.0]]] };
+        let clip = Rect::from_min_max(pos2(8.0, 4.0), pos2(56.0, 44.0));
+        let options = egui::epaint::TessellationOptions::default();
+        let tess = || {
+            let mut t = egui::epaint::Tessellator::new(1.5, options, [1, 1], vec![]);
+            t.set_clip_rect(clip);
+            t
+        };
+        let empty = || std::iter::empty::<(&DrawnLane, Color32)>();
+        let solids = || [(&red, Color32::RED), (&blue, Color32::BLUE)].into_iter();
+        let mut maker = tess();
+        let (cached, drew) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), solids(), |x| x as f32, |y| y as f32, LINE_W, DOT_R);
+        assert_eq!((drew.solid, drew.dashed), (4, 1));
+        assert!(cached.iter().filter(|shape| matches!(shape, Shape::Mesh(_))).count() >= 3,
+            "dashes, solid lines before the dot, and solid lines after it keep painter order");
+
+        // The pre-cache rendering left solid runs as Shape::line. Recreate only that old
+        // representation; the dashed mesh is identical in both paths.
+        let mut maker = tess();
+        let (mut previous, _) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), empty(), |x| x as f32, |y| y as f32, LINE_W, DOT_R);
+        for (lane, color) in solids() {
+            for run in &lane.runs {
+                let pts: Vec<Pos2> = run.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
+                previous.push(if pts.len() == 1 { Shape::circle_filled(pts[0], DOT_R, color) } else { Shape::line(pts, Stroke::new(LINE_W, color)) });
+            }
+        }
+        let flatten = |shapes: Vec<Shape>| {
+            let mut t = tess();
+            let mut mesh = egui::Mesh::default();
+            for shape in shapes { t.tessellate_shape(shape, &mut mesh); }
+            mesh
+        };
+        let old_mesh = flatten(previous);
+        let new_mesh = flatten(cached);
+        assert!(!new_mesh.indices.is_empty());
+        assert_eq!(new_mesh, old_mesh, "egui triangle vertices, colors, and painter order must match exactly");
+
+        // Exercise the same CPU painter used by headless screenshots, with egui's white
+        // managed texture for untextured line and circle vertices.
+        let mut textures = crate::soft_render::Textures::default();
+        let mut delta = egui::epaint::textures::TexturesDelta::default();
+        delta.set.push((egui::TextureId::Managed(0), egui::epaint::ImageDelta::full(
+            egui::ColorImage::new([1, 1], Color32::WHITE), egui::TextureOptions::NEAREST,
+        )));
+        textures.set(&delta);
+        let image = |mesh: &egui::Mesh| crate::soft_render::paint(
+            &[egui::epaint::ClippedPrimitive { clip_rect: clip, primitive: egui::epaint::Primitive::Mesh(mesh.clone()) }],
+            &textures, [96, 72], 1.5, Color32::BLACK,
+        );
+        let old_pixels = image(&old_mesh);
+        assert!(old_pixels.pixels.iter().any(|pixel| *pixel != Color32::BLACK));
+        assert_eq!(image(&new_mesh).pixels, old_pixels.pixels);
+
+        let mut maker = tess();
+        let (hover, _) = curve_shapes(&mut maker, empty(), std::iter::once((&red, Color32::RED)), |x| x as f32, |y| y as f32, HOVER_W, HOVER_DOT_R);
+        assert!(hover.iter().all(|shape| !matches!(shape, Shape::Mesh(_))), "hover-width solid lines keep their old representation");
+    }
+
+    #[test]
+    fn initial_marker_and_plate_thinning_share_budget_across_sizing_passes_and_finish() {
+        use super::{Drawn, start_frame, end_frame};
+        let lanes: Vec<Lane> = ["X", "Y", "Z"].into_iter().map(|letter| Lane {
+            letter: letter.into(), color: Color32::RED,
+            runs: vec![(0..1000).map(|f| [f as f64, f as f64 * 0.01]).collect()].into(), unit: "",
+        }).collect();
+        let vr = ViewRange { lo: -0.5, hi: 999.5 };
+        let key = (vr.lo.to_bits(), vr.hi.to_bits(), 200);
+        let mut graphs = [Drawn::default(), Drawn::default(), Drawn::default()];
+        start_frame(20_001, Some(3000));
+        for graph in &mut graphs { graph.prepare_primary(&lanes, vr, 200, key); }
+        assert_eq!(graphs.iter().filter(|g| g.key == Some(key)).count(), 1);
+        end_frame();
+        // egui may size and then draw the same floating areas in one application frame.
+        start_frame(20_001, Some(3000));
+        for graph in &mut graphs { graph.prepare_primary(&lanes, vr, 200, key); }
+        assert_eq!(graphs.iter().filter(|g| g.key == Some(key)).count(), 1, "second pass must not reset the budget");
+        end_frame();
+        assert!(start_frame(20_002, Some(3000)), "deferred primary work must request the following frame");
+        for graph in &mut graphs { graph.prepare_primary(&lanes, vr, 200, key); }
+        end_frame();
+        start_frame(20_003, Some(3000));
+        for graph in &mut graphs { graph.prepare_primary(&lanes, vr, 200, key); }
+        end_frame();
+        assert!(graphs.iter().all(|g| g.key == Some(key)));
+        // Capture/screenshot mode is unlimited: exactly the original thin data in one pass.
+        start_frame(20_004, None);
+        let mut capture = Drawn::default();
+        capture.prepare_primary(&lanes, vr, 200, key);
+        end_frame();
+        for graph in &graphs {
+            for (actual, expected) in graph.lanes.iter().zip(&capture.lanes) {
+                assert_eq!(actual.runs, expected.runs);
+                assert_eq!((actual.lo.to_bits(), actual.hi.to_bits()), (expected.lo.to_bits(), expected.hi.to_bits()));
+            }
+        }
+    }
+
+    #[test]
     fn thinned_lines_keep_spikes_gaps_and_both_ends_whatever_the_file_length() {
         // Two runs with a gap between them: frames 0..=9999 and 12000..=12999, value = frame,
         // one spike at frame 5000.
         let run = |a: i64, b: i64| (a..=b).map(|f| [f as f64, if f == 5000 { 1.0e6 } else { f as f64 }]).collect::<Vec<_>>();
-        let lane = Lane { letter: "X".into(), color: Color32::RED, runs: vec![run(0, 9999), run(12000, 12999)], unit: "mm" };
+        let lane = Lane { letter: "X".into(), color: Color32::RED, runs: (vec![run(0, 9999), run(12000, 12999)]).into(), unit: "mm" };
         let whole = thin(&lane, &ViewRange { lo: -0.5, hi: 12999.5 }, 100);
         assert_eq!((whole.lo, whole.hi), (0.0, 1.0e6));
         assert_eq!(whole.runs.len(), 2, "the gap stays a gap");
@@ -1314,7 +1484,7 @@ mod tests {
         assert!(whole.runs[0].contains(&[5000.0, 1.0e6]), "the spike is kept");
         assert!(whole.runs[0].windows(2).all(|w| w[0][0] < w[1][0]), "in time order");
         // Ten times as many samples: the same number of points.
-        let long = Lane { letter: "X".into(), color: Color32::RED, runs: vec![run(0, 99_999), run(120_000, 129_999)], unit: "mm" };
+        let long = Lane { letter: "X".into(), color: Color32::RED, runs: (vec![run(0, 99_999), run(120_000, 129_999)]).into(), unit: "mm" };
         let long_points: usize = thin(&long, &ViewRange { lo: -0.5, hi: 129_999.5 }, 100).runs.iter().map(Vec::len).sum();
         assert!(long_points <= points + 2, "{long_points} vs {points}");
         // Zoomed in: min / max are of the frames in view only; runs outside are left out.
@@ -1367,7 +1537,7 @@ mod tests {
 
     /// Three lanes, each a curve of `color` at `value` over 4000 frames (v0.27.0 tests).
     fn flat(color: Color32, value: f64) -> Vec<Lane> {
-        ["X", "Y", "Z"].iter().map(|l| Lane { letter: (*l).into(), color, runs: vec![(0..4000).map(|f| [f as f64, value]).collect()], unit: "mm" }).collect()
+        ["X", "Y", "Z"].iter().map(|l| Lane { letter: (*l).into(), color, runs: (vec![(0..4000).map(|f| [f as f64, value]).collect()]).into(), unit: "mm" }).collect()
     }
 
     /// `painted`, with the other markers of a graph of several (`Drawn::set_more`) and their
@@ -1375,7 +1545,7 @@ mod tests {
     fn painted_with(pair: Option<super::Pair>, more: Vec<Vec<Lane>>, more_pairs: Vec<Vec<Lane>>) -> (Vec<eframe::egui::epaint::ClippedShape>, super::Drew) {
         use super::{show, Drawn, Look};
         use eframe::egui;
-        let lane = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * k]).collect()], unit: "mm" };
+        let lane = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: (vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * k]).collect()]).into(), unit: "mm" };
         let lanes = [lane(1.0), lane(2.0), lane(3.0)];
         let mut drawn = Drawn::default();
         drawn.set_pair(pair);
@@ -1400,7 +1570,7 @@ mod tests {
         assert_eq!(missing, alone);
         // With one: one range over both, the dashes, the legend; the first lane's curve keeps
         // the legend's strip free.
-        let other = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: vec![(0..4000).map(|f| [f as f64, 5.0 + k]).collect()], unit: "mm" };
+        let other = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: (vec![(0..4000).map(|f| [f as f64, 5.0 + k]).collect()]).into(), unit: "mm" };
         let (both, drew) = painted(Some(super::Pair { lanes: vec![other(1.0), other(2.0), other(3.0)], shown: [true, true] }));
         assert_eq!((drew.solid, drew.dashed, drew.legend), (3, 3, true));
         assert!(drew.dashes > 3 && drew.dashes < 1000, "{}", drew.dashes);
@@ -1422,7 +1592,17 @@ mod tests {
         assert_eq!((drew.solid, drew.dashed, drew.legend), (9, 0, false));
         assert_eq!(drew.ranges[0], (-40.0, 50.0), "lane X covers the sine (±1) and both flat curves");
         assert_eq!(drew.ranges[2].1, 50.0);
-        assert!(three.len() > alone.len());
+        let vertex_count = |shapes: &[eframe::egui::epaint::ClippedShape]| shapes.iter().map(|shape| {
+            if let eframe::egui::Shape::Mesh(mesh) = &shape.shape { mesh.vertices.len() } else { 0 }
+        }).sum::<usize>();
+        let has_color = |shapes: &[eframe::egui::epaint::ClippedShape], color| shapes.iter().any(|shape| {
+            matches!(&shape.shape, eframe::egui::Shape::Mesh(mesh) if mesh.vertices.iter().any(|vertex| vertex.color == color))
+        });
+        assert!(vertex_count(&three) > vertex_count(&alone), "two extra markers add drawn line geometry");
+        for color in [blue, gold] {
+            assert!(has_color(&three, color), "{color:?} marker must reach the painter");
+            assert!(!has_color(&alone, color));
+        }
         // A second file laid over: the dashed curve of each marker that has one, in its color;
         // the legend `— 1  ┄ 2`; the range covers the dashed ones too.
         let pair = super::Pair { lanes: flat(Color32::RED, 0.5), shown: [true, true] };
@@ -1468,7 +1648,7 @@ mod tests {
     fn frames(drawn: &mut super::Drawn, n: usize, budget: Option<usize>) -> Vec<(Vec<eframe::egui::epaint::ClippedShape>, super::Drew, bool)> {
         use super::{end_frame, show, start_frame, Look};
         use eframe::egui;
-        let lane = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * k]).collect()], unit: "mm" };
+        let lane = |k: f64| Lane { letter: "X".into(), color: Color32::RED, runs: (vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * k]).collect()]).into(), unit: "mm" };
         let lanes = [lane(1.0), lane(2.0), lane(3.0)];
         let ctx = egui::Context::default();
         (0..n)
@@ -1505,17 +1685,17 @@ mod tests {
     fn markers_past_the_frames_work_are_thinned_in_the_next_frames_and_end_as_drawn_at_once() {
         // No budget (a picture run, tests): every curve in the first frame.
         let mut at_once = four_markers();
-        let all = frames(&mut at_once, 5, None);
+        let all = frames(&mut at_once, 6, None);
         assert_eq!((all[0].1.colors[0].len(), all[0].1.dash_colors[0].len(), all[0].2), (4, 3, false));
-        // A budget of one marker's samples (4000) a frame: the first marker and its dashed curve
-        // at once, then one more marker's solid or dashed lanes a frame (an empty one costs
-        // nothing), the others drawn from the frame they are thinned in.
+        // A budget of one marker's samples (4000) a frame: the first solid/dashed pair also
+        // spends the shared allowance. Then one more solid or dashed curve can finish per
+        // frame (an empty one costs nothing); the last frame matches unlimited capture.
         let mut spread = four_markers();
-        let few = frames(&mut spread, 5, Some(4000));
+        let few = frames(&mut spread, 6, Some(4000));
         let solid: Vec<usize> = few.iter().map(|f| f.1.colors[0].len()).collect();
         let dashed: Vec<usize> = few.iter().map(|f| f.1.dash_colors[0].len()).collect();
-        assert_eq!((solid, dashed), (vec![2, 2, 3, 4, 4], vec![1, 2, 2, 2, 3]));
-        assert_eq!(few.iter().map(|f| f.2).collect::<Vec<_>>(), [true, true, true, true, false], "not complete until the last one");
+        assert_eq!((solid, dashed), (vec![1, 2, 2, 3, 4, 4], vec![1, 1, 2, 2, 2, 3]));
+        assert_eq!(few.iter().map(|f| f.2).collect::<Vec<_>>(), [true, true, true, true, true, false], "not complete until the last one");
         // Then the very same picture as at once (the texts' glyphs aside: other value texts
         // were laid out on the way, so they sit elsewhere in the font atlas).
         use eframe::egui::{epaint::ClippedShape, Shape};
@@ -1523,10 +1703,10 @@ mod tests {
         let texts = |s: &[ClippedShape]| {
             s.iter().filter_map(|c| if let Shape::Text(t) = &c.shape { Some((t.pos, t.galley.job.text.clone())) } else { None }).collect::<Vec<_>>()
         };
-        assert_eq!(shapes(&few[4].0), shapes(&all[4].0));
-        assert_eq!(texts(&few[4].0), texts(&all[4].0));
-        assert_eq!((few[4].1.remade, all[4].1.remade), (3, 0), "made again in the last frame, kept at once");
-        assert_eq!(super::Drew { remade: 0, ..few[4].1.clone() }, all[4].1);
+        assert_eq!(shapes(&few[5].0), shapes(&all[5].0));
+        assert_eq!(texts(&few[5].0), texts(&all[5].0));
+        assert_eq!((few[5].1.remade, all[5].1.remade), (3, 0), "made again in the last frame, kept at once");
+        assert_eq!(super::Drew { remade: 0, ..few[5].1.clone() }, all[5].1);
     }
 
     #[test]
@@ -1663,7 +1843,7 @@ mod tests {
         use super::theme;
         [("X", theme::AXIS_X), ("Y", theme::AXIS_Y), ("Z", theme::AXIS_Z)]
             .iter()
-            .map(|(l, color)| Lane { letter: (*l).into(), color: *color, runs: vec![(0..4000).map(|f| [f as f64, value]).collect()], unit: "mm" })
+            .map(|(l, color)| Lane { letter: (*l).into(), color: *color, runs: (vec![(0..4000).map(|f| [f as f64, value]).collect()]).into(), unit: "mm" })
             .collect()
     }
 
@@ -1681,7 +1861,7 @@ mod tests {
             use super::theme;
             let colors = [theme::AXIS_X, theme::AXIS_Y, theme::AXIS_Z];
             let lanes = (0..3)
-                .map(|k| Lane { letter: ["X", "Y", "Z"][k].into(), color: colors[k], runs: vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * (k + 1) as f64]).collect()], unit: "mm" })
+                .map(|k| Lane { letter: ["X", "Y", "Z"][k].into(), color: colors[k], runs: (vec![(0..4000).map(|f| [f as f64, (f as f64 * 0.01).sin() * (k + 1) as f64]).collect()]).into(), unit: "mm" })
                 .collect();
             let mut drawn = super::Drawn::default();
             if laid_over {

@@ -256,6 +256,8 @@ enum OperationKind {
     List,
     Open,
 }
+#[derive(Clone, Copy)]
+enum AnalogStage { Initial, Full, OnAccess }
 struct Operation {
     cancel: CancelToken,
     kind: OperationKind,
@@ -275,6 +277,13 @@ enum Command {
     Open {
         id: u64,
         location: RemoteLocation,
+        cancel: CancelToken,
+        full: bool,
+    },
+    Analog {
+        id: u64,
+        location: RemoteLocation,
+        target: AnalogTarget,
         cancel: CancelToken,
     },
     Stop,
@@ -333,6 +342,7 @@ pub struct SshManager {
     pub collapsed: bool,
     pub discovery_pending: bool,
     pub discovery_note: Option<String>,
+    pub full_analog_probe: bool,
     ctx: egui::Context,
     tx: Sender<Envelope>,
     rx: Receiver<Envelope>,
@@ -354,6 +364,7 @@ impl SshManager {
             collapsed: false,
             discovery_pending: false,
             discovery_note: None,
+            full_analog_probe: false,
             ctx: ctx.clone(),
             tx,
             rx,
@@ -518,6 +529,9 @@ impl SshManager {
     }
 
     pub fn open(&mut self, location: RemoteLocation) -> Result<u64, String> {
+        self.open_mode(location, self.full_analog_probe)
+    }
+    fn open_mode(&mut self, location: RemoteLocation, full: bool) -> Result<u64, String> {
         if self.demo {
             return Err("그림 확인용 SSH 목록이에요. 실제 서버에는 연결하지 않아요.".into());
         }
@@ -538,6 +552,7 @@ impl SshManager {
                 id,
                 location,
                 cancel: cancel.clone(),
+                full,
             })
             .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
         worker.operations.insert(
@@ -547,6 +562,18 @@ impl SshManager {
                 kind: OperationKind::Open,
             },
         );
+        Ok(id)
+    }
+
+    /// Send an on-access request to the existing worker; no network work here.
+    pub fn request_analog(&mut self, location: RemoteLocation, target: AnalogTarget) -> Result<u64, String> {
+        let id = self.id();
+        let worker = self.hosts.iter_mut().find(|h| h.alias == location.host && h.state == HostState::Connected)
+            .and_then(|h| h.worker.as_mut()).ok_or("연결이 끊겼어요. EMG를 읽으려면 다시 연결해 주세요.")?;
+        let cancel = CancelToken::default();
+        worker.tx.send(Command::Analog { id, location, target, cancel: cancel.clone() })
+            .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
+        worker.operations.insert(id, Operation { cancel, kind: OperationKind::Open });
         Ok(id)
     }
 
@@ -1109,9 +1136,19 @@ fn host_worker(
         emit(WorkerEvent::Stopped { cancelled: false });
         return;
     }
-    let mut analog: VecDeque<(u64, RemoteLocation, RemoteTake, AnalogTarget, CancelToken)> =
+    let mut analog: VecDeque<(u64, RemoteLocation, RemoteTake, AnalogTarget, CancelToken, AnalogStage)> =
         VecDeque::new();
+    let mut deferred: HashMap<RemoteLocation, RemoteTake> = HashMap::new();
+    let mut pending_access: VecDeque<(u64, RemoteLocation, AnalogTarget, CancelToken)> = VecDeque::new();
     loop {
+        if let Some(index) = pending_access.iter().position(|(_, l, _, _)| !analog.iter().any(|(_, active, _, _, _, _)| active == l)) {
+            let (id, location, target, cancel) = pending_access.remove(index).unwrap();
+            if let Some(loaded) = deferred.remove(&location) {
+                analog.push_back((id, location, loaded, target, cancel, AnalogStage::OnAccess));
+            } else {
+                emit(WorkerEvent::Error { id:Some(id), message:"EMG를 읽을 준비가 없어요. 파일을 다시 열어 주세요.".into(), kind:SshErrorKind::Failed });
+            }
+        }
         // Any queued marker/list request goes before analog work from an earlier open.
         let command = match commands.try_recv() {
             Ok(cmd) => Some(cmd),
@@ -1181,6 +1218,7 @@ fn host_worker(
                 id,
                 location,
                 cancel,
+                full,
             }) => {
                 if cancel.is_cancelled() {
                     emit(WorkerEvent::Done(id));
@@ -1196,14 +1234,25 @@ fn host_worker(
                             return;
                         }
                         loaded.take.path = location.memory_key();
-                        let pending = loaded.analog_pending();
+                        deferred.remove(&location);
+                        let pending = if full { loaded.analog_pending() } else { loaded.initial_analog_pending() };
+                        let lazy = !full && loaded.lazy_analog_pending();
+                        let plate_devices = loaded.plate_devices().map(<[usize]>::to_vec);
+                        let fallback = loaded.fallback_reason().map(str::to_owned);
                         // Keep the one large marker allocation in the snapshot sent to the
                         // view. The analog worker only retains the small metadata take.
                         let trajectories = std::mem::take(&mut loaded.take.trajectories);
                         let mut marker_take = loaded.take.clone();
                         marker_take.trajectories = trajectories;
-                        let mut data = ViewData::build(marker_take);
+                        let mut data = ViewData::build_with_plate_devices(marker_take, plate_devices);
                         data.analog_pending = pending;
+                        data.emg_pending = lazy;
+                        if !full {
+                            if let Some(reason) = fallback {
+                                emit(WorkerEvent::Diagnostic(reason.clone()));
+                                data.take.warnings.push(format!("장치를 확실히 나누지 못해 아날로그를 모두 읽어요: {reason}"));
+                            }
+                        }
                         let target = data.analog_target();
                         loaded.take.warnings.clear();
                         let parsed =
@@ -1224,8 +1273,9 @@ fn host_worker(
                             return;
                         }
                         if pending {
-                            analog.push_back((id, location, loaded, target, cancel));
+                            analog.push_back((id, location, loaded, target, cancel, if full { AnalogStage::Full } else { AnalogStage::Initial }));
                         } else {
+                            if lazy { deferred.insert(location, loaded); }
                             emit(WorkerEvent::Done(id));
                         }
                     }
@@ -1247,15 +1297,37 @@ fn host_worker(
                     }
                 }
             }
+            Some(Command::Analog { id, location, target, cancel }) => {
+                if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }
+                // An immediate access can arrive while the initial plate job is queued.
+                if let Some(index) = analog.iter().position(|(_, l, _, _, _, _)| *l == location) {
+                    let old = analog.remove(index).unwrap();
+                    analog.push_front(old);
+                    pending_access.push_back((id, location, target, cancel));
+                } else if let Some(loaded) = deferred.remove(&location) {
+                    analog.push_back((id, location, loaded, target, cancel, AnalogStage::OnAccess));
+                } else {
+                    emit(WorkerEvent::Error { id:Some(id), message:"EMG를 읽을 준비가 없어요. 파일을 다시 열어 주세요.".into(), kind:SshErrorKind::Failed });
+                }
+            }
             None => {
-                let Some((id, location, mut loaded, target, cancel)) = analog.pop_front() else {
+                let Some((id, location, mut loaded, target, cancel, stage)) = analog.pop_front() else {
                     continue;
                 };
                 if cancel.is_cancelled() {
+                    if matches!(stage, AnalogStage::OnAccess) {
+                        deferred.insert(location, loaded);
+                    }
                     emit(WorkerEvent::Done(id));
                     continue;
                 }
-                let read = session.read_analog(&mut loaded, &cancel);
+                let indices = if matches!(stage, AnalogStage::OnAccess) { loaded.lazy_device_indices() } else { loaded.initial_device_indices() };
+                let selective = loaded.plate_devices().is_some();
+                let read = match stage {
+                    AnalogStage::Full => session.read_analog(&mut loaded, &cancel),
+                    AnalogStage::Initial => session.read_initial_analog(&mut loaded, &cancel),
+                    AnalogStage::OnAccess => session.read_lazy_analog(&mut loaded, &cancel),
+                };
                 emit(WorkerEvent::Metrics(session.received_bytes()));
                 if let Err(error) = &read { emit(WorkerEvent::Diagnostic(error.clone())); }
                 match read {
@@ -1269,18 +1341,17 @@ fn host_worker(
                         } else {
                             Some(loaded.take.warnings.join("\n"))
                         };
-                        let part = AnalogPart::prepare(
-                            std::mem::take(&mut loaded.take.analog),
-                            warning,
-                            &target,
-                        );
+                        let values = std::mem::take(&mut loaded.take.analog);
+                        let part = if matches!(stage, AnalogStage::Full) || !selective { AnalogPart::prepare(values, warning, &target) }
+                            else { AnalogPart::prepare_selected(values, warning, &target, indices, matches!(stage, AnalogStage::Initial)) };
                         if cancel.is_cancelled() {
                             emit(WorkerEvent::Stopped { cancelled: true });
                             return;
                         }
-                        if !emit(WorkerEvent::Analog { id, location, part }) {
+                        if !emit(WorkerEvent::Analog { id, location:location.clone(), part }) {
                             return;
                         }
+                        if loaded.lazy_analog_pending() { deferred.insert(location, loaded); }
                         emit(WorkerEvent::Done(id));
                     }
                     Err(error) => {
@@ -1541,6 +1612,28 @@ mod tests {
         assert!(matches!(&manager.hosts[0].rows[0], TreeRow::Dir { path, .. } if path == "E:\\"));
         for bad in [" ", "a\0b"] { assert!(manager.navigate("lab", bad.into()).is_err()); }
         assert!(manager.navigate("lab", "a".repeat(32769)).is_err());
+    }
+
+    #[test]
+    fn open_only_queues_markers_until_explicit_analog_access_and_dump_requests_full() {
+        let mut manager = SshManager::new(&egui::Context::default(), HashMap::new());
+        let mut host = Host::new("lab".into());
+        let (tx, rx) = mpsc::channel();
+        host.state = HostState::Connected;
+        host.worker = Some(WorkerHandle { tx, operations: HashMap::new() });
+        manager.hosts.push(host);
+        let location = RemoteLocation { host:"lab".into(), path:"/data/a.tak".into() };
+        let opened = manager.open(location.clone()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Open { id, full:false, .. } if id == opened));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let data = crate::views::sample_data("test.tak", &["marker"]);
+        let id = manager.request_analog(location.clone(), data.analog_target()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Analog { id: sent, location: sent_location, .. } if sent == id && sent_location == location));
+        manager.cancel_request(id);
+        assert!(manager.drain_events().iter().any(|event| matches!(event, SshEvent::Cancelled { request_id } if *request_id == id)));
+        manager.full_analog_probe = true;
+        manager.open(location).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Open { full:true, .. }));
     }
 
     #[test]

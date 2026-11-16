@@ -54,16 +54,23 @@ impl FileBase {
 /// The pane layout with the file of each view slot (what an open / close / move puts back).
 #[derive(Clone)]
 pub(super) struct LayoutSnap {
+    /// Stable owner; swapping whole layouts must never apply this to another tab.
+    tab: Option<layout_tabs::TabId>,
     dock: DockState<Pane>,
     shape: u64,
     hidden: dock::Hidden,
     /// File shown or being read in each view slot.
     files: [Option<PathBuf>; MAX_VIEWS],
+    /// The particular closed view, so a reused same-file slot cannot consume an old item.
+    file_ids: [usize; MAX_VIEWS],
     /// Each layout owns its viewing position; later opens must not replace it in file memory.
     spots: [Option<Spot>; MAX_VIEWS],
     picked: [Option<u64>; MAX_VIEWS],
     /// Keep editable state across reversible layout changes without sharing ViewData.
     documents: [Option<crate::views::EditSession>; MAX_VIEWS],
+    /// Kept with the document even after heavy close-history runtimes are evicted.
+    /// A fallback disk read may reuse that identity only after its worker verifies freshness.
+    source_stamps: [Option<crate::views::SourceStamp>; MAX_VIEWS],
     edit_selections: [Option<EditSelection>; MAX_VIEWS],
     /// The range each of those files had (a file read again gets it back).
     ranges: [Range; MAX_VIEWS],
@@ -75,10 +82,22 @@ pub(super) struct LayoutSnap {
     shown: [[bool; 2]; MAX_VIEWS],
 }
 
+/// Independent of the 20-item reopen menu: app undo keeps the small restore state for
+/// its full 500-action lifetime. Heavy ViewData stays only in live/recently closed runtimes.
+#[derive(Clone)]
+pub(super) struct TabSnapshot {
+    name: String,
+    index: usize,
+    layout: LayoutSnap,
+    graph_boxes: Vec<GraphBox>,
+    plate_boxes: Vec<GraphBox>,
+    plate_channels: Vec<LaneSet>,
+}
+
 /// During replacement the old file can still be drawn. Undo must retain the incoming
 /// file's restore state, rather than assigning the old file's frame or selection to it.
 fn pending_view(v: &View) -> bool {
-    v.loading.is_some() || v.remote_loading.is_some()
+    v.loading.is_some() || v.remote_loading.is_some() || v.waiting_shared_path().is_some()
 }
 
 fn layout_spot(v: &View) -> Option<Spot> {
@@ -90,7 +109,11 @@ fn layout_overlay(v: &View) -> Option<&Path> {
 }
 
 fn layout_document(v: &View) -> Option<crate::views::EditSession> {
-    if pending_view(v) { v.restore_edit_document.clone() } else { v.edit_document.clone() }
+    if pending_view(v) { v.restore_edit_document.clone().or_else(|| v.fresh_open_document()) } else { v.edit_document.clone() }
+}
+
+fn layout_source_stamp(v: &View) -> Option<crate::views::SourceStamp> {
+    if pending_view(v) { v.fresh_open_source_stamp().or_else(|| v.source_stamp.clone()) } else { v.source_stamp.clone() }
 }
 
 fn layout_edit_selection(v: &View) -> Option<EditSelection> {
@@ -170,9 +193,11 @@ impl Folders {
     }
 }
 
-/// One change inside an action. File parts name the file (found again by path, not by view slot).
+/// One change inside an action. Viewing actions carry a stable tab + slot in `View`;
+/// the nested file path validates the slot. Marker changes still identify one shared document.
 #[derive(Clone)]
 pub(super) enum Part {
+    View { tab: Option<layout_tabs::TabId>, slot: usize, part: Box<Part> },
     Frame { file: PathBuf, before: i64, after: i64 },
     Camera { file: PathBuf, before: Camera, after: Camera },
     Selection { file: PathBuf, before: Selection, after: Selection },
@@ -187,15 +212,45 @@ pub(super) enum Part {
     /// One entire marker command, including selection / armed label, in global order.
     MarkerEdit { file: PathBuf, patch: Arc<EditPatch> },
     Layout { before: Box<LayoutSnap>, after: Box<LayoutSnap> },
-    Options { before: Box<Options>, after: Box<Options> },
+    /// One atomic primary-file conversion across active and hidden layout tabs.
+    TakmSwitch { batch: takm_save::SharedBatch },
+    Options { tab: Option<layout_tabs::TabId>, before: Box<Options>, after: Box<Options> },
     Folders { before: Box<Folders>, after: Box<Folders> },
     /// How the COMMENTS pane is sorted (v0.17.0; not saved in the settings).
     Sort { before: comment_list::Sort, after: comment_list::Sort },
+    TabSwitch { before: layout_tabs::TabId, after: layout_tabs::TabId },
+    TabRename { id: layout_tabs::TabId, before: String, after: String },
+    TabMove { id: layout_tabs::TabId, before: usize, after: usize },
+    TabLifecycle {
+        id: layout_tabs::TabId,
+        before_open: bool,
+        after_open: bool,
+        before_active: Option<layout_tabs::TabId>,
+        after_active: Option<layout_tabs::TabId>,
+        snapshot: Box<TabSnapshot>,
+    },
 }
 
 impl Part {
-    fn file(&self) -> Option<&Path> {
+    fn inner(&self) -> &Part {
+        match self { Part::View { part, .. } => part.inner(), _ => self }
+    }
+
+    fn inner_mut(&mut self) -> &mut Part {
+        match self { Part::View { part, .. } => part.inner_mut(), _ => self }
+    }
+
+    fn owner(&self) -> Option<layout_tabs::TabId> {
         match self {
+            Part::View { tab, .. } => *tab,
+            Part::Layout { before, .. } => before.tab,
+            Part::Options { tab, .. } => *tab,
+            _ => None,
+        }
+    }
+
+    fn file(&self) -> Option<&Path> {
+        match self.inner() {
             Part::Frame { file, .. }
             | Part::Camera { file, .. }
             | Part::Selection { file, .. }
@@ -207,7 +262,7 @@ impl Part {
             | Part::Channels { file, .. }
             | Part::Comment { file, .. }
             | Part::MarkerEdit { file, .. } => Some(file),
-            Part::Layout { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. } => None,
+            _ => None,
         }
     }
 
@@ -215,6 +270,12 @@ impl Part {
     /// as one part. None = not merged.
     fn merged(&self, next: &Part) -> Option<Part> {
         match (self, next) {
+            (Part::View { tab, slot, part }, Part::View { tab: t, slot: s, part: n }) if tab == t && slot == s => {
+                part.merged(n).map(|merged| Part::View { tab: *tab, slot: *slot, part: Box::new(merged) })
+            }
+            (Part::TabSwitch { before, after: mid }, Part::TabSwitch { before: mid2, after }) if mid == mid2 => {
+                Some(Part::TabSwitch { before: *before, after: *after })
+            }
             (Part::Frame { file, before, .. }, Part::Frame { file: f, after, .. }) if file == f => {
                 Some(Part::Frame { file: file.clone(), before: *before, after: *after })
             }
@@ -239,10 +300,14 @@ impl Part {
 
     /// Before and after are the same (a merge came back to where it started).
     fn is_noop(&self) -> bool {
-        match self {
+        match self.inner() {
             Part::Frame { before, after, .. } => before == after,
             Part::Camera { before, after, .. } => before == after,
             Part::PanelSetting { before, after, .. } => before == after,
+            Part::TabSwitch { before, after } => before == after,
+            Part::TabRename { before, after, .. } => before == after,
+            Part::TabMove { before, after, .. } => before == after,
+            Part::TabLifecycle { before_open, after_open, .. } => before_open == after_open,
             Part::Comment { change: Change::Edited { before, after }, cleared: None, .. } => before == after,
             _ => false,
         }
@@ -283,6 +348,9 @@ pub(super) struct History {
     pub(super) quiet_layout: bool,
     /// Take everything as it is (a capture ended).
     pub(super) quiet_all: bool,
+    /// Disk fallback after mixed-close eviction gets a fresh UI/writer id. Once loaded,
+    /// rebind just that old view's snapshots so later close undo consumes the retained view.
+    restored_view_ids: HashMap<(Option<layout_tabs::TabId>, usize), (usize, PathBuf)>,
 }
 
 impl History {
@@ -291,7 +359,8 @@ impl History {
         for stack in [&mut self.undo, &mut self.redo] {
             for action in stack.iter_mut() {
                 action.retain(|part| match part {
-                    Part::Comment { file, change, .. } if file == path => {
+                    part if matches!(part.inner(), Part::Comment { file, .. } if file == path) => {
+                        let Part::Comment { change, .. } = part.inner() else { unreachable!() };
                         let comment = match change {
                             Change::Added(c) | Change::Deleted(c) => c,
                             Change::Edited { before, .. } => before,
@@ -308,6 +377,7 @@ impl History {
     /// A new action (none if empty). A lone frame or camera part continues the newest action
     /// when that is the same kind for the same file; coming back to the start removes it.
     pub(super) fn push(&mut self, parts: Vec<Part>) {
+        let parts: Vec<_> = parts.into_iter().filter(|part| !part.is_noop()).collect();
         if parts.is_empty() {
             return;
         }
@@ -340,7 +410,7 @@ impl History {
         let mut cursor = saved;
         for action in self.undo.iter().rev() {
             for part in action.iter().rev() {
-                if let Part::MarkerEdit { patch, .. } = part {
+                if let Part::MarkerEdit { patch, .. } = part.inner() {
                     if patch.document_id() == id && patch.after_revision() == cursor {
                         keep.insert(cursor);
                         cursor = patch.before_revision();
@@ -352,7 +422,7 @@ impl History {
         for (is_redo, stack) in [(false, &mut self.undo), (true, &mut self.redo)] {
             for action in stack.iter_mut() {
                 for part in std::mem::take(action) {
-                    if matches!(&part, Part::MarkerEdit { patch, .. } if patch.document_id() == id && (is_redo || !keep.contains(&patch.after_revision()))) { retired.push(part); }
+                    if matches!(part.inner(), Part::MarkerEdit { patch, .. } if patch.document_id() == id && (is_redo || !keep.contains(&patch.after_revision()))) { retired.push(part); }
                     else { action.push(part); }
                 }
             }
@@ -373,7 +443,7 @@ impl History {
     /// Tests: the kinds of the parts of each undo action, oldest first ("Frame+Range", …).
     #[cfg(test)]
     pub(super) fn kinds(&self) -> Vec<String> {
-        let name = |p: &Part| match p {
+        let name = |p: &Part| match p.inner() {
             Part::Frame { .. } => "Frame",
             Part::Camera { .. } => "Camera",
             Part::Selection { .. } => "Selection",
@@ -386,9 +456,15 @@ impl History {
             Part::Comment { .. } => "Comment",
             Part::MarkerEdit { .. } => "MarkerEdit",
             Part::Layout { .. } => "Layout",
+            Part::TakmSwitch { .. } => "TakmSwitch",
             Part::Options { .. } => "Options",
             Part::Folders { .. } => "Folders",
             Part::Sort { .. } => "Sort",
+            Part::TabSwitch { .. } => "TabSwitch",
+            Part::TabRename { .. } => "TabRename",
+            Part::TabMove { .. } => "TabMove",
+            Part::TabLifecycle { .. } => "TabLifecycle",
+            Part::View { .. } => unreachable!("inner removes the view wrapper"),
         };
         self.undo.iter().map(|a| a.iter().map(name).collect::<Vec<_>>().join("+")).collect()
     }
@@ -436,10 +512,30 @@ fn comment_now(change: &Change, redo: bool) -> Option<&Comment> {
 }
 
 impl TakViewerApp {
+    /// Explicitly pushed controls use the same per-view identity as observed changes.
+    pub(super) fn view_undo_part(&self, slot: usize, part: Part) -> Part {
+        Part::View { tab: self.layout_tabs.active_id(), slot, part: Box::new(part) }
+    }
+
+    /// Capture after create/reopen, before close. The controller makes this tab active first.
+    pub(super) fn tab_undo_snapshot(&self, id: layout_tabs::TabId) -> Option<Box<TabSnapshot>> {
+        if self.layout_tabs.active_id() != Some(id) { return None; }
+        let tab = self.layout_tabs.tab(id)?;
+        Some(Box::new(TabSnapshot {
+            name: tab.name.clone(),
+            index: self.layout_tabs.tabs().iter().position(|tab| tab.id == id)?,
+            layout: self.layout_now(std::array::from_fn(|slot| self.views[slot].range)),
+            graph_boxes: self.settings.graph_boxes.clone(),
+            plate_boxes: self.settings.plate_boxes.clone(),
+            plate_channels: self.settings.plate_channels.clone(),
+        }))
+    }
+
     /// A save changes the path associated with the same editable document, not its history.
     pub(super) fn rebind_saved_history(&mut self, old: &Path, new: &Path, document: DocumentId) {
         fn layout(snap: &mut LayoutSnap, old: &Path, new: &Path, id: DocumentId) {
             for k in 0..MAX_VIEWS {
+                if snap.overlays[k].as_deref() == Some(old) { snap.overlays[k] = Some(new.to_path_buf()); }
                 let same = snap.documents[k].as_ref().is_some_and(|s| s.lock().ok().is_some_and(|d| d.id() == id));
                 if same && snap.files[k].as_deref() == Some(old) {
                     snap.files[k] = Some(new.to_path_buf());
@@ -449,7 +545,7 @@ impl TakViewerApp {
         }
         for action in self.history.undo.iter_mut().chain(&mut self.history.redo) {
             for part in action {
-                match part {
+                match part.inner_mut() {
                     Part::Frame { file, .. } | Part::Camera { file, .. } | Part::Selection { file, .. } | Part::PanelSetting { file, .. }
                     | Part::Range { file, .. } | Part::Plate { file, .. } | Part::Speed { file, .. }
                     | Part::Folds { file, .. } | Part::Channels { file, .. } | Part::Comment { file, .. } => {
@@ -459,6 +555,7 @@ impl TakViewerApp {
                         if file == old && patch.document_id() == document { *file = new.to_path_buf(); }
                     }
                     Part::Layout { before, after } => { layout(before, old, new, document); layout(after, old, new, document); }
+                    Part::TabLifecycle { snapshot, .. } => layout(&mut snapshot.layout, old, new, document),
                     _ => {}
                 }
             }
@@ -478,13 +575,16 @@ impl TakViewerApp {
 
     fn layout_now(&self, ranges: [Range; MAX_VIEWS]) -> LayoutSnap {
         LayoutSnap {
+            tab: self.layout_tabs.active_id(),
             dock: self.dock.clone(),
             shape: dock::shape(&self.dock),
             hidden: self.hidden.clone(),
             files: std::array::from_fn(|k| self.views[k].target().map(Path::to_path_buf)),
+            file_ids: std::array::from_fn(|k| self.views[k].file_id),
             spots: std::array::from_fn(|k| layout_spot(&self.views[k])),
             picked: std::array::from_fn(|k| if pending_view(&self.views[k]) { self.views[k].restore_picked.unwrap_or(None) } else { self.views[k].picked }),
             documents: std::array::from_fn(|k| layout_document(&self.views[k])),
+            source_stamps: std::array::from_fn(|k| layout_source_stamp(&self.views[k])),
             edit_selections: std::array::from_fn(|k| layout_edit_selection(&self.views[k])),
             ranges: std::array::from_fn(|k| layout_range(&self.views[k], ranges[k])),
             active: self.active,
@@ -501,6 +601,7 @@ impl TakViewerApp {
             base.layout.spots[slot] = layout_spot(v);
             base.layout.picked[slot] = if pending_view(v) { v.restore_picked.unwrap_or(None) } else { v.picked };
             base.layout.documents[slot] = layout_document(v);
+            base.layout.source_stamps[slot] = layout_source_stamp(v);
             base.layout.edit_selections[slot] = layout_edit_selection(v);
             base.layout.ranges[slot] = layout_range(v, v.range);
             base.layout.overlays[slot] = layout_overlay(v).map(Path::to_path_buf);
@@ -522,11 +623,22 @@ impl TakViewerApp {
     /// Compare the state with the base; `record` = push what changed as actions (false = only
     /// take it as it is, e.g. after an undo). Command runs never record.
     pub(super) fn observe(&mut self, record: bool) {
+        if self.overlay_owner_scope { return; }
+        self.rebind_restored_view_ids();
         let record = record && !self.no_persist;
         let Some(mut base) = self.history.base.take() else {
             self.history.base = Some(Box::new(self.base_now()));
             return;
         };
+        // Tab switching has its own explicit history part. Comparing the newly active
+        // runtime to the previous tab would invent opens, closes and viewing changes.
+        if base.layout.tab != self.layout_tabs.active_id() {
+            *base = self.base_now();
+            self.history.base = Some(base);
+            self.history.quiet_layout = false;
+            self.history.quiet_all = false;
+            return;
+        }
         if std::mem::take(&mut self.history.quiet_all) {
             *base = self.base_now();
             self.history.base = Some(base);
@@ -541,6 +653,7 @@ impl TakViewerApp {
             if base.layout.files[k].as_deref() == v.path() && v.edit_document.is_some()
                 && !base.layout.documents[k].as_ref().zip(v.edit_document.as_ref()).is_some_and(|(a, b)| Arc::ptr_eq(a, b)) {
                 base.layout.documents[k] = v.edit_document.clone();
+                base.layout.source_stamps[k] = v.source_stamp.clone();
             }
         }
         let marker_edit = self.marker_edit();
@@ -638,7 +751,9 @@ impl TakViewerApp {
                 parts.push(Part::Channels { file: b.file.clone(), before, after: v.devices.channel.clone() });
             }
             if record {
-                file_parts.extend(parts);
+                file_parts.extend(parts.into_iter().map(|part| Part::View {
+                    tab: base.layout.tab, slot: k, part: Box::new(part),
+                }));
             }
         }
         for k in 0..MAX_VIEWS {
@@ -651,7 +766,8 @@ impl TakViewerApp {
             let after = Options::of(&self.settings);
             let before = std::mem::replace(&mut base.options, after.clone());
             if record {
-                app_parts.push(Part::Options { before: Box::new(before), after: Box::new(after) });
+                let local = before.graph_boxes != after.graph_boxes || before.plate_boxes != after.plate_boxes || before.plate_channels != after.plate_channels;
+                app_parts.push(Part::Options { tab: if local { base.layout.tab } else { None }, before: Box::new(before), after: Box::new(after) });
             }
         }
         if !base.folders.same(&self.workspace, &self.explorer) {
@@ -671,6 +787,36 @@ impl TakViewerApp {
         // What belongs to files first, then what belongs to the whole app.
         self.history.push(file_parts);
         self.history.push(app_parts);
+    }
+
+    fn rebind_restored_view_ids(&mut self) {
+        let active = self.layout_tabs.active_id();
+        self.history.restored_view_ids.retain(|&(tab, slot), (_, path)| {
+            tab != active || self.views.get(slot).is_some_and(|view| view.target() == Some(path.as_path()))
+        });
+        let finished: Vec<_> = self.history.restored_view_ids.iter().filter_map(|(&(tab, slot), (old, path))| {
+            if tab != active { return None; }
+            let view = self.views.get(slot)?;
+            (!pending_view(view) && view.path() == Some(path.as_path()) && view.data.is_some())
+                .then_some(((tab, slot), *old, view.file_id, path.clone()))
+        }).collect();
+        for ((tab, slot), old, new, path) in finished {
+            self.history.restored_view_ids.remove(&(tab, slot));
+            for action in self.history.undo.iter_mut().chain(&mut self.history.redo) {
+                for part in action {
+                    let rebind = |snap: &mut LayoutSnap| {
+                        if snap.tab == tab && snap.file_ids[slot] == old && snap.files[slot].as_ref() == Some(&path) {
+                            snap.file_ids[slot] = new;
+                        }
+                    };
+                    match part.inner_mut() {
+                        Part::Layout { before, after } => { rebind(before); rebind(after); }
+                        Part::TabLifecycle { snapshot, .. } => rebind(&mut snapshot.layout),
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// A comment was added, edited or deleted in view `slot` (its line is on its way to the
@@ -696,6 +842,7 @@ impl TakViewerApp {
             }
         }
         if !self.no_persist {
+            let parts = parts.into_iter().map(|part| self.view_undo_part(slot, part)).collect();
             self.history.push(parts);
         }
     }
@@ -707,7 +854,7 @@ impl TakViewerApp {
         self.observe(true);
         let file = self.views.get(slot).and_then(View::path).ok_or(EditError::NotLoaded)?.to_path_buf();
         self.views[slot].apply_marker_patch(&patch, true)?;
-        self.history.push(vec![Part::MarkerEdit { file, patch }]);
+        self.history.push(vec![self.view_undo_part(slot, Part::MarkerEdit { file, patch })]);
         self.observe(false);
         Ok(())
     }
@@ -733,6 +880,7 @@ impl TakViewerApp {
         view.edit_refresh = Some(document.revision());
         view.edit_selection = None;
         drop(document);
+        view.notify_editor_updates();
         drop_later(Some(discarded));
         self.history.forget_marker_document(id, saved);
         self.observe(false);
@@ -753,20 +901,43 @@ impl TakViewerApp {
         }
         let v = &self.views[slot];
         let Some(file) = v.path() else { return };
-        let ours = matches!(h.undo.last().map(Vec::as_slice), Some([Part::Selection { file: f, after, .. }]) if f == file && after.comment == Some(id));
+        let ours = h.undo.last().filter(|action| action.len() == 1).is_some_and(|action| {
+            let part = &action[0];
+            let same_view = matches!(part, Part::View { tab, slot: s, .. } if *tab == self.layout_tabs.active_id() && *s == slot);
+            same_view && matches!(part.inner(), Part::Selection { file: f, after, .. } if f == file && after.comment == Some(id))
+        });
         let Some(b) = h.base.as_mut().and_then(|b| b.views[slot].as_mut()).filter(|b| ours && b.file_id == v.file_id) else { return };
-        if let Some(Some(Part::Selection { before, .. })) = h.undo.pop().map(|mut a| a.pop()) {
-            (b.selected, b.order, b.primary, b.picked, b.armed_label) = (before.selected, before.order, before.primary, before.comment, before.armed_label);
+        if let Some(Some(part)) = h.undo.pop().map(|mut a| a.pop()) {
+            if let Part::Selection { before, .. } = part.inner() {
+                (b.selected, b.order, b.primary, b.picked, b.armed_label) = (before.selected.clone(), before.order.clone(), before.primary, before.comment, before.armed_label);
+            }
         }
     }
 
-    /// The view showing (or reading) this file.
+    /// A legacy unscoped part is safe only when exactly one active view has this path.
     fn slot_of(&self, file: &Path) -> Option<usize> {
-        (0..MAX_VIEWS).find(|&k| self.views[k].target() == Some(file))
+        let mut slots = (0..MAX_VIEWS).filter(|&k| self.views[k].target() == Some(file));
+        let slot = slots.next()?;
+        slots.next().is_none().then_some(slot)
     }
 
     fn part_slot(&self, part: &Part) -> Option<usize> {
-        if let Part::MarkerEdit { patch, .. } = part {
+        if let Part::View { tab, slot, part } = part {
+            if *tab == self.layout_tabs.active_id() && self.views.get(*slot).is_some_and(|view| {
+                if let Part::MarkerEdit { patch, .. } = part.inner() {
+                    return view.edit_document.iter().chain(view.restore_edit_document.iter()).any(|s| {
+                        s.lock().ok().is_some_and(|d| d.id() == patch.document_id())
+                    });
+                }
+                part.file().is_some_and(|file| view.target() == Some(file))
+            }) {
+                return Some(*slot);
+            }
+            // Document changes are shared, even after their original view was closed.
+            // Viewing changes must never fall through to another occurrence of the file.
+            if !matches!(part.inner(), Part::MarkerEdit { .. }) { return None; }
+        }
+        if let Part::MarkerEdit { patch, .. } = part.inner() {
             return self.views.iter().position(|v| {
                 v.edit_document.iter().chain(v.restore_edit_document.iter()).any(|s| s.lock().ok().is_some_and(|d| d.id() == patch.document_id()))
             });
@@ -774,31 +945,97 @@ impl TakViewerApp {
         part.file().and_then(|file| self.slot_of(file))
     }
 
+    /// Prefer the command's original view; a shared document may remain in another tab.
+    fn history_owner(&self, parts: &[Part]) -> Option<layout_tabs::TabId> {
+        for part in parts {
+            if let Part::MarkerEdit { patch, .. } = part.inner() {
+                let owns = |view: &View| view.overlay_document_id() == Some(patch.document_id())
+                    || view.edit_document.iter().chain(view.restore_edit_document.iter()).any(|session| {
+                        session.lock().ok().is_some_and(|doc| doc.id() == patch.document_id())
+                    });
+                if let Part::View { tab: Some(tab), slot, .. } = part {
+                    let view = if Some(*tab) == self.layout_tabs.active_id() { self.views.get(*slot) }
+                        else { self.layout_tabs.tab(*tab).and_then(|tab| tab.layout.as_ref()).and_then(|layout| layout.views.get(*slot)) };
+                    if view.is_some_and(owns) { return Some(*tab); }
+                }
+                if self.views.iter().any(owns) { return self.layout_tabs.active_id(); }
+                if let Some(tab) = self.layout_tabs.tabs().iter().find(|tab| tab.layout.as_ref().is_some_and(|layout| layout.views.iter().any(owns))) {
+                    return Some(tab.id);
+                }
+            } else if let Some(tab) = part.owner() { return Some(tab); }
+        }
+        None
+    }
+
+    fn layout_snapshot_available(&self, to: &LayoutSnap) -> bool {
+        let live = |path: &Path| self.views.iter().any(|view| view.target() == Some(path))
+            || self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).any(|runtime| runtime.views.iter().any(|view| view.target() == Some(path)));
+        let retained_view = |slot: usize| self.layout_tabs.closed_items().find_map(|item| match item {
+            layout_tabs::ClosedItem::View { tab_id, index, view }
+                if Some(*tab_id) == to.tab && *index == slot && view.view.file_id == to.file_ids[slot]
+                    && view.view.target() == to.files[slot].as_deref() => Some(&view.view),
+            _ => None,
+        });
+        for (slot, file) in to.files.iter().enumerate() {
+            let Some(file) = file else { continue };
+            if retained_view(slot).is_some() || live(file) { continue; }
+            if remote_ui::is_remote_key(file) {
+                let cached = self.ssh_cache.iter().any(|cached| cached.key == *file);
+                let connected = self.ssh_sources.get(file).is_some_and(|location| self.ssh.is_connected(&location.host));
+                if !cached && !connected { return false; }
+            } else if !file.is_file() { return false; }
+        }
+        for (slot, file) in to.overlays.iter().enumerate() {
+            let Some(file) = file else { continue };
+            // The exact closed runtime restores its overlay without another disk read;
+            // an already-live primary can also supply this overlay's shared document.
+            let retained = retained_view(slot).is_some_and(|view| view.overlay_path() == Some(file.as_path()))
+                || live(file)
+                || self.views.iter().any(|view| view.overlay_paths().any(|path| path == file))
+                || self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).any(|runtime| runtime.views.iter().any(|view| view.overlay_paths().any(|path| path == file)));
+            if !retained && !file.is_file() { return false; }
+        }
+        true
+    }
+
     fn ready(&self, parts: &[Part], redo: bool) -> Ready {
-        for p in parts {
+        for scoped in parts {
+            let p = scoped.inner();
+            if scoped.owner().is_some_and(|tab| self.layout_tabs.active_id() != Some(tab))
+                && !matches!(p, Part::MarkerEdit { .. }) { return Ready::Gone; }
+            match p {
+                Part::TakmSwitch { batch } => {
+                    if !self.takm_batch_ready(batch) { return Ready::Gone; }
+                    continue;
+                }
+                Part::TabSwitch { before, after } => {
+                    if self.layout_tabs.tab(pick(redo, *before, *after)).is_none() { return Ready::Gone; }
+                    continue;
+                }
+                Part::TabRename { id, before, after } => {
+                    if self.layout_tabs.validate_name(*id, if redo { after } else { before }).is_err() { return Ready::Gone; }
+                    continue;
+                }
+                Part::TabMove { id, .. } => {
+                    if self.layout_tabs.tab(*id).is_none() { return Ready::Gone; }
+                    continue;
+                }
+                Part::TabLifecycle { id, before_open, after_open, snapshot, .. } => {
+                    let open = pick(redo, *before_open, *after_open);
+                    if open && !self.layout_tabs.has_closed_tab(*id) && !self.layout_snapshot_available(&snapshot.layout)
+                        || !open && self.layout_tabs.tab(*id).is_none() { return Ready::Gone; }
+                    continue;
+                }
+                _ => {}
+            }
             if let Part::Layout { before, after } = p {
                 let to = if redo { after } else { before };
-                for (k, f) in to.files.iter().enumerate() {
-                    if let Some(f) = f {
-                        if self.views[k].target() != Some(f.as_path()) && self.slot_of(f).is_none() {
-                            if remote_ui::is_remote_key(f) {
-                                let cached = self.ssh_cache.iter().any(|c| c.key == *f);
-                                let connected = self.ssh_sources.get(f).is_some_and(|l| self.ssh.is_connected(&l.host));
-                                if !cached && !connected { return Ready::Gone; }
-                            } else if !f.is_file() { return Ready::Gone; }
-                        }
-                    }
-                }
-                // A laid-over file to read again must still be there (plan step 7).
-                for f in to.overlays.iter().flatten() {
-                    if !self.views.iter().any(|v| v.overlay_paths().any(|p| p == f)) && !f.is_file() {
-                        return Ready::Gone;
-                    }
-                }
+                if to.tab != self.layout_tabs.active_id() { return Ready::Gone; }
+                if !self.layout_snapshot_available(to) { return Ready::Gone; }
                 continue;
             }
             let Some(file) = p.file() else { continue };
-            let Some(k) = self.part_slot(p) else { return Ready::Gone };
+            let Some(k) = self.part_slot(scoped) else { return Ready::Gone };
             let v = &self.views[k];
             if v.remote_loading.is_some() || v.loading.is_some() || v.data.is_none() {
                 return Ready::Wait(file_name(file));
@@ -831,15 +1068,14 @@ impl TakViewerApp {
     /// undone one again. What was changed just before is recorded first. An action on a file
     /// being read waits; one that cannot be done any more is dropped and the next one is taken.
     pub(super) fn undo_redo(&mut self, ctx: &egui::Context, redo: bool) {
-        if self.open_views().into_iter().any(|slot| self.marker_saving(slot)) {
+        if self.open_views().into_iter().any(|slot| self.marker_saving(slot))
+            || self.overlay_marker_ui.values().any(marker_edit::MarkerUi::has_save) {
             self.history.note = Some(("저장 중에는 되돌릴 수 없어요.".into(), ctx.input(|i| i.time)));
             return;
         }
         // Playback stops first: the play run so far is an action (then undone, or it drops the
         // redo side like any new action).
-        for v in &mut self.views {
-            v.pb.playing = false;
-        }
+        self.stop_history_playback();
         self.observe(true);
         self.history.merge_open = false;
         let now = ctx.input(|i| i.time);
@@ -853,41 +1089,132 @@ impl TakViewerApp {
                 }
                 return;
             };
-            let dirty_removed = top.iter().find_map(|part| {
-                let Part::Layout { before, after } = part else { return None };
-                let target = if redo { after } else { before };
-                self.open_views().into_iter().find(|&slot| {
-                    let view = &self.views[slot];
-                    if !view.marker_dirty() && !self.comments_unsaved(slot) && !self.marker_job_running(slot) { return false; }
-                    let id = view.edit_document.as_ref().and_then(|s| s.lock().ok().map(|d| d.id()));
-                    !target.documents.iter().flatten().any(|s| s.lock().ok().is_some_and(|d| Some(d.id()) == id))
-                })
-            });
-            if let Some(slot) = dirty_removed {
-                self.guard_dirty(slot, marker_edit::PendingTransition::Undo { redo });
-                return;
+            let operation_origin = self.layout_tabs.active_id();
+            let owner = self.history_owner(top);
+            if let Some(tab) = owner {
+                if self.layout_tabs.active_id() != Some(tab) && self.switch_layout_tab_internal(tab) {
+                    self.observe(false);
+                }
             }
+            // The internal switch moves runtimes only. It does not record another action.
+            let top = if redo { self.history.redo.last() } else { self.history.undo.last() }.expect("history unchanged by internal switch");
+            if let Some(batch) = top.iter().find_map(|part| match part.inner() {
+                Part::TakmSwitch { batch } => Some(batch.clone()), _ => None,
+            }) {
+                if self.guard_takm_batch(&batch, redo) { return; }
+            }
+            let top = if redo { self.history.redo.last() } else { self.history.undo.last() }.expect("conversion guard keeps history");
+            // A worker may finish after its final primary closes. Its latest shared
+            // marker action still belongs to the surviving overlay document.
+            if !self.overlay_owner_scope {
+                let overlay_slot = top.iter().find_map(|part| {
+                    let Part::MarkerEdit { patch, .. } = part.inner() else { return None };
+                    if self.views.iter().any(|view| view.document_id() == Some(patch.document_id())) { return None; }
+                    self.views.iter().position(|view| view.overlay_document_id() == Some(patch.document_id()))
+                });
+                if let Some(slot) = overlay_slot {
+                    self.with_overlay_owner(ctx, slot, |app| { app.undo_redo(ctx, redo); app.poll_marker_jobs(ctx); });
+                    return;
+                }
+            }
+            let closing_tab = top.iter().find_map(|part| match part.inner() {
+                Part::TabLifecycle { id, before_open, after_open, .. } if !pick(redo, *before_open, *after_open) => Some(*id),
+                _ => None,
+            });
+            let removed_layout = top.iter().find_map(|part| {
+                let Part::Layout { before, after } = part.inner() else { return None };
+                let target = if redo { after } else { before };
+                let mut removed = Vec::new();
+                for slot in self.open_views() {
+                    let view = &self.views[slot];
+                    if view.target() != target.files[slot].as_deref() { removed.push(overlay_dirty::Reference::Primary(slot)); }
+                    if view.overlay_path() != target.overlays[slot].as_deref() { removed.push(overlay_dirty::Reference::Overlay(slot)); }
+                }
+                let kept = target.files.iter().chain(target.overlays.iter()).flatten().cloned().collect::<Vec<_>>();
+                Some((removed, kept))
+            });
+            if let Some((removed, kept)) = removed_layout {
+                if self.guard_reference_removal(&removed, &kept, marker_edit::PendingTransition::Undo { redo }) { return; }
+            }
+            let top = if redo { self.history.redo.last() } else { self.history.undo.last() }.expect("guard keeps history");
             match self.ready(top, redo) {
                 Ready::Wait(name) => {
                     self.history.note = Some((format!("Wait · loading {name}"), now));
                     return;
                 }
                 Ready::Gone => {
-                    if redo {
-                        self.history.redo.pop();
+                    let retired = if redo {
+                        self.history.redo.pop()
                     } else {
-                        self.history.undo.pop();
-                    }
+                        self.history.undo.pop()
+                    };
+                    drop_later(retired);
                     skipped += 1;
                 }
                 Ready::Go => {
+                    if let Some(id) = closing_tab {
+                        if self.tab_close_origin.is_none() { self.tab_close_origin = Some((id, operation_origin)); }
+                        if self.guard_layout_tab_undo(id, redo) { return; }
+                    }
                     let parts = if redo { self.history.redo.pop() } else { self.history.undo.pop() }.unwrap_or_default();
+                    if let [Part::TakmSwitch { batch }] = parts.as_slice() {
+                        if !self.swap_takm_batch(batch, now) {
+                            if redo { self.history.redo.push(parts); } else { self.history.undo.push(parts); }
+                            self.observe(false);
+                            self.restore_tab_close_origin();
+                            self.history.note = Some((format!("{word} · 지금은 파일을 바꿀 수 없어요."), now));
+                            return;
+                        }
+                        let words = self.takm_batch_words(batch);
+                        self.restore_tab_close_origin();
+                        self.stop_history_playback();
+                        if redo { self.history.undo.push(parts); } else { self.history.redo.push(parts); }
+                        self.observe(false);
+                        self.history.note = Some((format!("{word} · {words}"), now));
+                        return;
+                    }
+                    // Lifecycle actions stand alone. Keep the source stack intact if the
+                    // controller refuses a restore (e.g. the distinct-file cap was reached).
+                    if let [Part::TabLifecycle { id, before_open, after_open, before_active, after_active, snapshot }] = parts.as_slice() {
+                        let open = pick(redo, *before_open, *after_open);
+                        let done = if open {
+                            if self.layout_tabs.has_closed_tab(*id) { self.restore_closed_tab_internal(*id) }
+                            else {
+                                let paths: Vec<_> = snapshot.layout.files.iter().chain(&snapshot.layout.overlays).flatten().cloned().collect();
+                                if self.create_layout_tab_for_undo(*id, &snapshot.name, snapshot.index, &paths) {
+                                    self.settings.graph_boxes = snapshot.graph_boxes.clone();
+                                    self.settings.plate_boxes = snapshot.plate_boxes.clone();
+                                    self.settings.plate_channels = snapshot.plate_channels.clone();
+                                    self.restoring_layout = true;
+                                    self.restore_layout(ctx, &snapshot.layout);
+                                    self.restoring_layout = false;
+                                    true
+                                } else { false }
+                            }
+                        } else { self.close_layout_tab_internal(*id) };
+                        if !done {
+                            if redo { self.history.redo.push(parts); } else { self.history.undo.push(parts); }
+                            self.observe(false);
+                            self.history.note = Some((format!("{word} · 지금은 탭을 복원할 수 없어요."), now));
+                            return;
+                        }
+                        if let Some(active) = pick(redo, *before_active, *after_active) {
+                            self.switch_layout_tab_internal(active);
+                        }
+                        self.tab_close_origin = None;
+                        self.stop_history_playback();
+                        if redo { self.history.undo.push(parts); } else { self.history.redo.push(parts); }
+                        self.observe(false);
+                        self.history.note = Some((format!("{word} · Tab {}", if open { "opened" } else { "closed" }), now));
+                        return;
+                    }
                     let mut words: Vec<String> = parts.iter().map(|p| self.apply_part(ctx, p, redo, now)).collect();
+                    self.stop_history_playback();
                     // A comment added or deleted carries the change of the selected comment it
                     // made: the comment's own words say enough.
-                    if parts.iter().any(|p| matches!(p, Part::Comment { .. })) {
+                    if parts.iter().any(|p| matches!(p.inner(), Part::Comment { .. })) {
                         for (p, w) in parts.iter().zip(words.iter_mut()) {
-                            if matches!(p, Part::Selection { before, after, .. } if (&before.selected, &before.order, before.primary) == (&after.selected, &after.order, after.primary)) {
+                            if matches!(p.inner(), Part::Selection { before, after, .. } if (&before.selected, &before.order, before.primary) == (&after.selected, &after.order, after.primary)) {
                                 w.clear();
                             }
                         }
@@ -908,10 +1235,33 @@ impl TakViewerApp {
         }
     }
 
+    fn stop_history_playback(&mut self) {
+        for view in &mut self.views { view.pb.playing = false; }
+        for runtime in self.layout_tabs.tabs_mut().iter_mut().filter_map(|tab| tab.layout.as_mut()) {
+            for view in &mut runtime.views { view.pb.playing = false; }
+        }
+    }
+
     /// Put one part's "before" (undo) or "after" (redo) side back; returns its status bar words.
     fn apply_part(&mut self, ctx: &egui::Context, part: &Part, redo: bool, now: f64) -> String {
         let slot = self.part_slot(part);
+        let original_view = match part { Part::View { tab, slot, .. } => Some((*tab, *slot)), _ => None };
+        let part = part.inner();
         match part {
+            Part::TabSwitch { before, after } => {
+                let id = pick(redo, *before, *after);
+                self.switch_layout_tab_internal(id);
+                return self.layout_tabs.tab(id).map(|tab| format!("Tab {}", tab.name)).unwrap_or_default();
+            }
+            Part::TabRename { id, before, after } => {
+                let name = if redo { after } else { before };
+                let _ = self.layout_tabs.rename(*id, name);
+                return format!("Tab {name}");
+            }
+            Part::TabMove { id, before, after } => {
+                self.layout_tabs.move_tab(*id, pick(redo, *before, *after));
+                return "Tab order".into();
+            }
             Part::Layout { before, after } => {
                 let to = if redo { after } else { before };
                 let words = self.layout_words(to);
@@ -920,15 +1270,15 @@ impl TakViewerApp {
                 self.restoring_layout = false;
                 return words;
             }
-            Part::Options { before, after } => {
+            Part::Options { before, after, .. } => {
                 let (from, to) = if redo { (before, after) } else { (after, before) };
                 let s = &mut self.settings;
-                s.scene = to.scene.clone();
-                s.graph_float = to.graph_float;
-                s.graph_opacity = to.opacity;
-                s.graph_boxes = to.graph_boxes.clone();
-                s.plate_boxes = to.plate_boxes.clone();
-                s.plate_channels = to.plate_channels.clone();
+                if from.scene != to.scene { s.scene = to.scene.clone(); }
+                if from.graph_float != to.graph_float { s.graph_float = to.graph_float; }
+                if from.opacity != to.opacity { s.graph_opacity = to.opacity; }
+                if from.graph_boxes != to.graph_boxes { s.graph_boxes = to.graph_boxes.clone(); }
+                if from.plate_boxes != to.plate_boxes { s.plate_boxes = to.plate_boxes.clone(); }
+                if from.plate_channels != to.plate_channels { s.plate_channels = to.plate_channels.clone(); }
                 return from.words(to);
             }
             Part::Sort { before, after } => {
@@ -1014,14 +1364,26 @@ impl TakViewerApp {
             }
             Part::MarkerEdit { patch, .. } => {
                 let started = Instant::now();
+                let preserve = original_view.is_some_and(|owner| owner != (self.layout_tabs.active_id(), k));
+                let selection = preserve.then(|| (self.views[k].selection(), self.views[k].edit_selection_state()));
                 let result = self.views[k].apply_marker_patch(patch, redo);
+                if result.is_ok() {
+                    // The document outlived its original view. Replaying its shared edit
+                    // must not replace the surviving view's independent selection.
+                    if let Some((visible, uid)) = selection {
+                        self.views[k].set_selection(visible);
+                        self.views[k].edit_selection = Some(uid);
+                    }
+                }
                 marker_edit::trace_timing(if redo { "redo commit" } else { "undo commit" }, started);
                 match result {
                     Ok(()) => if patch.result.message.is_empty() { "Marker edit restored".into() } else { format!("{} · restored", patch.result.message) },
                     Err(_) => "Marker edit failed".into(),
                 }
             }
-            Part::Layout { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. } => String::new(),
+            Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
+            | Part::TabSwitch { .. } | Part::TabRename { .. } | Part::TabMove { .. }
+            | Part::TabLifecycle { .. } | Part::View { .. } => String::new(),
         }
     }
 
@@ -1067,9 +1429,31 @@ impl TakViewerApp {
     }
 
     /// Put a layout back: the panes, the hidden sides, the file of each view (read again with
-    /// its remembered spot and the range it had) and the active view. A past layout always kept
-    /// the rules (at most 4 views, no file twice), and the whole of it comes back, so they hold.
+    /// its remembered spot and the range it had) and the active view. A snapshot belongs to
+    /// one stable tab and keeps that tab's at-most-four-view split, including repeated files.
     fn restore_layout(&mut self, ctx: &egui::Context, snap: &LayoutSnap) {
+        // Keep the shared document and its readers while its final current reference
+        // migrates to a different slot in the destination layout.
+        let kept: Vec<_> = snap.files.iter().chain(snap.overlays.iter()).flatten().cloned().collect();
+        for slot in 0..MAX_VIEWS {
+            let keep = |path: Option<PathBuf>| path.is_some_and(|path| kept.iter().any(|kept| Self::same_local_path(&path, kept)));
+            if self.views[slot].target() != snap.files[slot].as_deref()
+                && (keep(self.views[slot].shared_target()) || keep(self.views[slot].overlay_shared_target())) {
+                self.remember(slot);
+                self.hold_layout_reference(slot, true, snap.files[slot].is_none() && !dock::views(&snap.dock).contains(&(slot as u8)));
+            } else if self.views[slot].overlay_path() != snap.overlays[slot].as_deref()
+                && keep(self.views[slot].overlay_shared_target()) { self.hold_layout_reference(slot, false, false); }
+        }
+        // Save the pre-close split in mixed reopen history before installing the target
+        // dock. Redoing a view close is then the same move as closing it by hand.
+        if let Some(tab) = snap.tab {
+            let wanted = dock::views(&snap.dock);
+            for slot in 0..MAX_VIEWS {
+                if !wanted.contains(&(slot as u8)) && snap.files[slot].is_none() {
+                    self.remember_closed_view_for_history(tab, slot);
+                }
+            }
+        }
         self.dock = snap.dock.clone();
         dock::place_windows(&mut self.dock);
         self.hidden = snap.hidden.clone();
@@ -1086,13 +1470,45 @@ impl TakViewerApp {
                     drop_later(self.views[k].clear());
                 }
                 Some(p) => {
+                    if let Some(tab) = snap.tab {
+                        if self.restore_closed_view_for_history(tab, k, p, snap.file_ids[k]) { continue; }
+                    }
                     self.open_in(ctx, k, p.clone());
-                    self.views[k].restore_edit_document = snap.documents[k].clone();
+                    if self.views[k].target() == Some(p.as_path()) {
+                        self.history.restored_view_ids.insert((snap.tab, k), (snap.file_ids[k], p.clone()));
+                    }
+                    if self.views[k].loading.is_some() {
+                        let candidate = snap.documents[k].clone().map(|document| crate::views::RetainedDocument::new(document, snap.source_stamps[k].clone()));
+                        self.views[k].set_fresh_open_candidate(candidate);
+                    }
                     self.views[k].restore_edit_selection = snap.edit_selections[k].clone();
-                    if self.views[k].remote.is_some() && self.views[k].remote_loading.is_none() {
-                        if let Some(spot) = &snap.spots[k] { self.views[k].apply_spot(spot, ctx.input(|i| i.time)); }
-                        self.views[k].range = snap.ranges[k];
-                        self.views[k].picked = snap.picked[k];
+                    if !pending_view(&self.views[k]) && self.views[k].path() == Some(p.as_path()) {
+                        // Same-file sharing can complete synchronously, just like a cached
+                        // remote open. There will be no future show() to consume restores.
+                        let view = &mut self.views[k];
+                        if let Some(spot) = &snap.spots[k] {
+                            view.fit_pending = false;
+                            view.apply_spot(spot, ctx.input(|i| i.time));
+                        }
+                        view.range = snap.ranges[k];
+                        view.picked = snap.picked[k];
+                        if let (Some(selection), Some(data)) = (&snap.edit_selections[k], &view.data) {
+                            let find = |uid: &[u8; 16]| data.markers.iter().position(|marker| marker.uid == *uid);
+                            let visible = Selection {
+                                selected: selection.selected.iter().filter_map(find).collect(),
+                                order: selection.order.iter().filter_map(find).collect(),
+                                primary: selection.primary.as_ref().and_then(find),
+                                comment: snap.picked[k],
+                                armed_label: selection.armed_label,
+                            };
+                            view.set_selection(visible);
+                            view.edit_selection = Some(selection.clone());
+                        }
+                        drop_later(view.restore_edit_document.take());
+                        view.restore_edit_selection = None;
+                        view.restore = None;
+                        view.restore_range = None;
+                        view.restore_picked = None;
                     } else {
                         self.views[k].restore = snap.spots[k].clone().or_else(|| self.views[k].restore.take());
                         self.views[k].restore_range = Some(snap.ranges[k]);
@@ -1105,6 +1521,12 @@ impl TakViewerApp {
         // the view's own file is in) and whose markers were shown.
         for k in 0..MAX_VIEWS {
             let want = snap.overlays[k].as_ref().filter(|_| open.contains(&k));
+            if let Some(path) = want {
+                if self.install_layout_restore_overlay(k, path) {
+                    self.views[k].shown = snap.shown[k];
+                    continue;
+                }
+            }
             let v = &mut self.views[k];
             match want {
                 None => drop_later(v.take_overlay()),
@@ -1118,6 +1540,7 @@ impl TakViewerApp {
             }
             self.views[k].shown = snap.shown[k];
         }
+        self.finish_layout_reference_handoffs();
         if let Some(active) = open.iter().copied().find(|k| *k == snap.active).or_else(|| open.first().copied()) {
             self.activate(active);
         } else {
@@ -1175,6 +1598,641 @@ mod marker_edit_tests {
         Arc::new(EditPatch::prepare(&snapshot, vec![TrackChange { uid, before: Some(before), after: Some(Arc::new(after)) }], EditSelection::default(), selected, AffectedFrames { first: 0, last: 0 }, EditResult { tracks: 1, samples: 1, message: "Label M".into(), ..EditResult::default() }).unwrap())
     }
     fn app(ctx: &egui::Context) -> TakViewerApp { TakViewerApp::build(ctx, None, vec![], None, None) }
+
+    fn shared_view(app: &mut TakViewerApp, from: usize, to: usize, id: usize) {
+        let shared = app.views[from].shared_file().unwrap();
+        app.views[to].show_shared_file(shared, id, 1.0, 0.0);
+        app.views[to].fresh = false;
+        app.views[to].fit_pending = false;
+    }
+
+    fn another_tab(app: &mut TakViewerApp) -> layout_tabs::TabId {
+        let before = app.layout_tabs.active_id().unwrap();
+        let id = app.layout_tabs.add(Some(LayoutRuntime::default()));
+        app.layout_tabs.activate(before);
+        assert!(app.switch_layout_tab_internal(id));
+        id
+    }
+
+    #[test]
+    fn redo_view_close_with_shared_overlay_returns_the_exact_view_to_reopen_history() {
+        for live_primary in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx);
+            dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+            show(&mut app, 0, "close_A.tak", 1);
+            show(&mut app, 1, "close_B.tak", 2);
+            app.start_overlay(&ctx, 0, "close_B.tak".into(), false);
+            app.poll_overlays(&ctx);
+            let document = app.views[1].document_id();
+            if !live_primary { show(&mut app, 1, "close_C.tak", 3); }
+            let file_id = app.views[0].file_id;
+            let snapshot = app.layout_now(std::array::from_fn(|slot| app.views[slot].range));
+            app.observe(false);
+            app.close_view(0);
+            app.observe(true);
+            assert_eq!(app.layout_tabs.closed_len(), 1);
+            assert!(app.layout_snapshot_available(&snapshot));
+            let mut missing_overlay = snapshot.clone();
+            missing_overlay.overlays[0] = Some("close_missing_overlay.tak".into());
+            assert!(!app.layout_snapshot_available(&missing_overlay), "a different missing overlay must still require a reader");
+            app.undo_redo(&ctx, false);
+            assert_eq!(app.views[0].file_id, file_id);
+            assert_eq!(app.views[0].overlay_document_id(), document);
+            assert_eq!(app.layout_tabs.closed_len(), 0);
+            app.undo_redo(&ctx, true);
+            assert_eq!(app.layout_tabs.closed_len(), 1, "redo must return the migrated source to the reopen menu");
+            assert!(app.layout_restore_files.is_empty());
+            app.reopen_layout_item();
+            assert_eq!(app.views[0].file_id, file_id);
+            assert_eq!(app.views[0].path(), Some(Path::new("close_A.tak")));
+            assert_eq!(app.views[0].overlay_document_id(), document);
+            assert!(app.views[0].loading.is_none());
+            assert_eq!(app.layout_tabs.closed_len(), 0);
+        }
+    }
+
+    #[test]
+    fn evicted_view_close_undo_reuses_live_primaries_for_main_file_and_overlay() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let tab = app.layout_tabs.active_id().unwrap();
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        dock::add_view(&mut app.dock, 2, dock::NOMINAL_AREA);
+        show(&mut app, 0, "evicted_overlay_A.tak", 1);
+        show(&mut app, 1, "evicted_overlay_B.tak", 2);
+        shared_view(&mut app, 0, 2, 3);
+        app.next_file_id = 3;
+        app.start_overlay(&ctx, 0, "evicted_overlay_B.tak".into(), false);
+        app.poll_overlays(&ctx);
+        let document = app.views[0].document_id();
+        let overlay_document = app.views[0].overlay_document_id();
+        assert!(overlay_document.is_some());
+        app.observe(false);
+        app.close_view(0);
+        app.observe(true);
+        drop(app.layout_tabs.take_closed_where(|item| matches!(item,
+            layout_tabs::ClosedItem::View { tab_id, index: 0, .. } if *tab_id == tab)));
+        assert_eq!(app.layout_tabs.closed_len(), 0);
+        app.undo_redo(&ctx, false);
+        app.poll_overlays(&ctx);
+        assert_eq!(app.open_views().len(), 3);
+        assert_eq!(app.views[0].document_id(), document);
+        assert_eq!(app.views[0].overlay_document_id(), overlay_document);
+        assert!(app.views[0].loading.is_none());
+        assert!(app.views[0].overlay_load.is_none());
+        assert_eq!(app.history.redo.len(), 1);
+    }
+
+    #[test]
+    fn same_file_frame_moves_keep_their_view_and_do_not_merge_across_views() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        show(&mut app, 0, "same.tak", 1);
+        shared_view(&mut app, 0, 1, 2);
+        app.observe(false);
+        app.views[0].pb.set_frame(2, 0.0);
+        app.observe(true);
+        app.views[1].pb.set_frame(7, 0.0);
+        app.observe(true);
+        assert_eq!(app.history.kinds(), ["Frame", "Frame"]);
+        app.activate(0);
+        app.undo_redo(&ctx, false);
+        assert_eq!((app.views[0].pb.frame, app.views[1].pb.frame), (2, 0));
+        app.undo_redo(&ctx, false);
+        assert_eq!((app.views[0].pb.frame, app.views[1].pb.frame), (0, 0));
+        app.undo_redo(&ctx, true);
+        app.undo_redo(&ctx, true);
+        assert_eq!((app.views[0].pb.frame, app.views[1].pb.frame), (2, 7));
+    }
+
+    #[test]
+    fn same_file_camera_selection_and_range_restore_only_the_original_view() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        show_names(&mut app, 0, "same.tak", 1, &["A", "B"]);
+        shared_view(&mut app, 0, 1, 2);
+        app.views[0].select(0, false);
+        app.views[0].range = Some((1, 2));
+        let original = app.views[1].cam;
+        app.observe(false);
+        app.views[1].cam.yaw += 0.5;
+        app.views[1].select(1, false);
+        app.views[1].range = Some((4, 7));
+        app.observe(true);
+        assert_eq!(app.history.kinds(), ["Camera+Selection+Range"]);
+        app.activate(0);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.views[0].primary, Some(0));
+        assert_eq!(app.views[0].range, Some((1, 2)));
+        assert_eq!(app.views[0].cam, original);
+        assert_eq!(app.views[1].primary, None);
+        assert_eq!(app.views[1].range, None);
+        assert_eq!(app.views[1].cam, original);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[1].primary, Some(1));
+        assert_eq!(app.views[1].range, Some((4, 7)));
+        assert_ne!(app.views[1].cam, original);
+    }
+
+    #[test]
+    fn same_file_history_in_a_hidden_tab_switches_to_its_owner_without_an_extra_action() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        show(&mut app, 0, "same.tak", 1);
+        let shared = app.views[0].shared_file().unwrap();
+        app.observe(false);
+        app.views[0].pb.set_frame(6, 0.0);
+        app.observe(true);
+        let second = another_tab(&mut app);
+        dock::add_view(&mut app.dock, 0, dock::NOMINAL_AREA);
+        app.views[0].show_shared_file(shared, 2, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.views[0].pb.set_frame(3, 0.0);
+        app.observe(false);
+        app.views[0].pb.playing = true;
+        app.layout_tabs.tab_mut(first).unwrap().layout.as_mut().unwrap().views[0].pb.playing = true;
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(app.views[0].pb.frame, 0);
+        assert_eq!(app.layout_tabs.tab(second).unwrap().layout.as_ref().unwrap().views[0].pb.frame, 3);
+        assert!(!app.views[0].pb.playing);
+        assert!(!app.layout_tabs.tab(second).unwrap().layout.as_ref().unwrap().views[0].pb.playing);
+        assert_eq!(app.history.undo.len(), 0);
+        assert_eq!(app.history.redo.len(), 1);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[0].pb.frame, 6);
+        assert_eq!(app.history.kinds(), ["Frame"]);
+    }
+
+    #[test]
+    fn consecutive_tab_switches_merge_and_returning_to_the_start_removes_the_action() {
+        let mut history = History::default();
+        history.push(vec![Part::TabSwitch { before: 1, after: 2 }]);
+        history.push(vec![Part::TabSwitch { before: 2, after: 3 }]);
+        assert!(matches!(history.undo.as_slice(), [action] if matches!(action.as_slice(), [Part::TabSwitch { before: 1, after: 3 }])));
+        history.push(vec![Part::TabSwitch { before: 3, after: 1 }]);
+        assert!(history.undo.is_empty());
+    }
+
+    #[test]
+    fn tab_create_close_and_reopen_replay_stable_ids_and_active_tab() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        app.observe(false);
+        let second = another_tab(&mut app);
+        app.observe(false);
+        app.history.push(vec![Part::TabLifecycle {
+            id: second, before_open: false, after_open: true,
+            before_active: Some(first), after_active: Some(second),
+            snapshot: app.tab_undo_snapshot(second).unwrap(),
+        }]);
+        app.undo_redo(&ctx, false);
+        assert!(app.layout_tabs.tab(second).is_none());
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(app.history.redo.len(), 1);
+        let mut closed = app.layout_tabs.take_closed_tab(second).unwrap();
+        closed.tab.layout.as_mut().unwrap().views[0].pb.playing = true;
+        drop_later(app.layout_tabs.remember_closed(layout_tabs::ClosedItem::Tab(closed)));
+        app.undo_redo(&ctx, true);
+        assert!(app.layout_tabs.tab(second).is_some());
+        assert_eq!(app.layout_tabs.active_id(), Some(second));
+        assert!(!app.views[0].pb.playing);
+        assert_eq!(app.history.kinds(), ["TabLifecycle"]);
+    }
+
+    #[test]
+    fn app_tab_undo_survives_more_than_twenty_closes_independently_of_the_reopen_menu() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let mut ids = vec![app.layout_tabs.active_id().unwrap()];
+        for _ in 0..24 { ids.push(another_tab(&mut app)); }
+        app.observe(false);
+        for &id in &ids {
+            app.switch_layout_tab_internal(id);
+            app.observe(false);
+            let snapshot = app.tab_undo_snapshot(id).unwrap();
+            assert!(app.close_layout_tab_internal(id));
+            app.observe(false);
+            app.history.push(vec![Part::TabLifecycle {
+                id, before_open: true, after_open: false,
+                before_active: Some(id), after_active: app.layout_tabs.active_id(), snapshot,
+            }]);
+        }
+        assert_eq!(app.layout_tabs.closed_len(), layout_tabs::MAX_CLOSED);
+        assert!(app.layout_tabs.tabs().is_empty());
+        for &id in ids.iter().rev() {
+            app.undo_redo(&ctx, false);
+            assert_eq!(app.layout_tabs.active_id(), Some(id));
+            assert!(app.layout_tabs.tab(id).is_some());
+        }
+        assert_eq!(app.layout_tabs.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>(), ids);
+        assert!(app.history.undo.is_empty());
+        assert_eq!(app.history.redo.len(), ids.len());
+        for _ in &ids { app.undo_redo(&ctx, true); }
+        assert!(app.layout_tabs.tabs().is_empty());
+        for _ in &ids { app.undo_redo(&ctx, false); }
+        assert_eq!(app.layout_tabs.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>(), ids);
+        assert!(app.history.undo.is_empty());
+    }
+
+    #[test]
+    fn evicted_tab_undo_rereads_paths_and_restores_document_and_per_view_state() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let path = std::env::temp_dir().join(format!("tak_undo_evicted_tab_{}.tak", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        let text = path.to_string_lossy().into_owned();
+        show(&mut app, 0, &text, 1);
+        app.views[0].pb.set_frame(7, 0.0);
+        app.views[0].cam.yaw += 0.5;
+        app.views[0].select(0, false);
+        app.views[0].range = Some((2, 6));
+        let camera = app.views[0].cam;
+        let document = app.views[0].edit_document.clone().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let stamp = Arc::new(std::sync::Mutex::new(Some((path.clone(), meta.len(), Some(meta.modified().unwrap())))));
+        app.views[0].source_stamp = Some(stamp.clone());
+        let anchor = another_tab(&mut app);
+        app.switch_layout_tab_internal(first);
+        app.observe(false);
+        let snapshot = app.tab_undo_snapshot(first).unwrap();
+        assert!(app.close_layout_tab_internal(first));
+        app.observe(false);
+        app.history.push(vec![Part::TabLifecycle {
+            id: first, before_open: true, after_open: false,
+            before_active: Some(first), after_active: Some(anchor), snapshot,
+        }]);
+        for _ in 0..=layout_tabs::MAX_CLOSED {
+            let id = another_tab(&mut app);
+            app.observe(false);
+            let snapshot = app.tab_undo_snapshot(id).unwrap();
+            assert!(app.close_layout_tab_internal(id));
+            app.observe(false);
+            app.history.push(vec![Part::TabLifecycle {
+                id, before_open: true, after_open: false,
+                before_active: Some(id), after_active: app.layout_tabs.active_id(), snapshot,
+            }]);
+        }
+        assert!(!app.layout_tabs.has_closed_tab(first));
+        for _ in 0..=layout_tabs::MAX_CLOSED { app.undo_redo(&ctx, false); }
+        app.hold_loads = true;
+        app.next_file_id = 50;
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        app.views[0].source_stamp = Some(stamp);
+        let tx = app.views[0].held.take().unwrap();
+        tx.send(crate::views::LoadMsg::Markers(Ok((crate::views::sample_data(&text, &["M"]), vec![])))).unwrap();
+        let loaded = app.views[0].poll_markers().unwrap();
+        app.finish_load(&ctx, 0, loaded);
+        app.views[0].fit_pending = false;
+        app.views[0].fresh = false;
+        app.observe(false);
+        assert!(Arc::ptr_eq(app.views[0].edit_document.as_ref().unwrap(), &document));
+        assert_eq!(app.views[0].pb.frame, 7);
+        assert_eq!(app.views[0].cam, camera);
+        assert_eq!(app.views[0].range, Some((2, 6)));
+        assert_eq!(app.views[0].primary, Some(0));
+        assert!(app.history.undo.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn evicted_tab_undo_at_the_twelve_file_cap_keeps_the_action_and_live_documents() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let path = std::env::temp_dir().join(format!("tak_undo_capped_tab_{}.tak", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        show(&mut app, 0, &path.to_string_lossy(), 1);
+        let anchor = another_tab(&mut app);
+        app.switch_layout_tab_internal(first);
+        app.observe(false);
+        let snapshot = app.tab_undo_snapshot(first).unwrap();
+        assert!(app.close_layout_tab_internal(first));
+        drop_later(app.layout_tabs.take_closed_tab(first));
+        app.observe(false);
+        app.history.push(vec![Part::TabLifecycle {
+            id: first, before_open: true, after_open: false,
+            before_active: Some(first), after_active: Some(anchor), snapshot,
+        }]);
+        for group in 0..3 {
+            if group > 0 { another_tab(&mut app); }
+            for slot in 0..MAX_VIEWS {
+                if !app.open_views().contains(&slot) { dock::add_view(&mut app.dock, slot as u8, dock::NOMINAL_AREA); }
+                let index = group * MAX_VIEWS + slot;
+                show(&mut app, slot, &format!("live_cap_fixture_{index}.tak"), 100 + index);
+            }
+            app.observe(false);
+        }
+        let active = app.layout_tabs.active_id();
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.tabs().len(), 3);
+        assert_eq!(app.layout_tabs.active_id(), active);
+        assert!(app.layout_tabs.tab(first).is_none());
+        assert_eq!(app.history.undo.len(), 1);
+        assert!(app.history.redo.is_empty());
+        assert_eq!(app.open_views(), [0, 1, 2, 3]);
+        assert!(app.views.iter().all(|view| view.data.is_some()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn evicted_tab_undo_reuses_a_hidden_shared_source_and_applies_view_restore_immediately() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        show_names(&mut app, 0, "shared_tab_restore_fixture.tak", 1, &["A", "B"]);
+        app.views[0].pb.set_frame(7, 0.0);
+        app.views[0].cam.yaw += 0.5;
+        app.views[0].select(1, false);
+        app.views[0].armed_label = Some(LabelKey { parent: [8; 16], slot: 2 });
+        app.views[0].range = Some((2, 6));
+        let camera = app.views[0].cam;
+        let shared = app.views[0].shared_file().unwrap();
+        let document = app.views[0].edit_document.clone().unwrap();
+        let second = another_tab(&mut app);
+        dock::add_view(&mut app.dock, 0, dock::NOMINAL_AREA);
+        app.views[0].show_shared_file(shared, 2, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.views[0].pb.set_frame(3, 0.0);
+        app.views[0].select(0, false);
+        app.views[0].range = Some((0, 1));
+        let data = app.views[0].data.clone().unwrap();
+        app.switch_layout_tab_internal(first);
+        app.observe(false);
+        let snapshot = app.tab_undo_snapshot(first).unwrap();
+        assert!(app.close_layout_tab_internal(first));
+        drop_later(app.layout_tabs.take_closed_tab(first));
+        app.observe(false);
+        app.history.push(vec![Part::TabLifecycle {
+            id: first, before_open: true, after_open: false,
+            before_active: Some(first), after_active: Some(second), snapshot,
+        }]);
+        app.hold_loads = true;
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(app.views[0].pb.frame, 7);
+        assert_eq!(app.views[0].cam, camera);
+        assert_eq!(app.views[0].range, Some((2, 6)));
+        assert_eq!(app.views[0].primary, Some(1));
+        assert_eq!(app.views[0].armed_label, Some(LabelKey { parent: [8; 16], slot: 2 }));
+        assert!(Arc::ptr_eq(app.views[0].data.as_ref().unwrap(), &data));
+        assert!(Arc::ptr_eq(app.views[0].edit_document.as_ref().unwrap(), &document));
+        assert!(app.views[0].held.is_none());
+        assert!(app.views[0].restore.is_none());
+        assert!(!app.views[0].fit_pending);
+        let other = &app.layout_tabs.tab(second).unwrap().layout.as_ref().unwrap().views[0];
+        assert_eq!(other.pb.frame, 3);
+        assert_eq!(other.range, Some((0, 1)));
+        assert_eq!(other.primary, Some(0));
+    }
+
+    #[test]
+    fn undoing_tab_creation_cannot_drop_its_only_dirty_document_or_pop_the_action() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let second = another_tab(&mut app);
+        dock::add_view(&mut app.dock, 0, dock::NOMINAL_AREA);
+        show(&mut app, 0, "dirty.tak", 1);
+        app.observe(false);
+        app.commit_marker_edit(0, prepare(&app, 0, 8.0)).unwrap();
+        app.history.push(vec![Part::TabLifecycle {
+            id: second, before_open: false, after_open: true,
+            before_active: Some(first), after_active: Some(second),
+            snapshot: app.tab_undo_snapshot(second).unwrap(),
+        }]);
+        let count = app.history.undo.len();
+        app.undo_redo(&ctx, false);
+        assert!(app.dirty_prompt.is_some());
+        assert_eq!(app.history.undo.len(), count);
+        assert!(app.history.redo.is_empty());
+        assert!(app.layout_tabs.tab(second).is_some());
+        assert!(app.views[0].marker_dirty());
+    }
+
+    #[test]
+    fn tab_lifecycle_can_close_a_dirty_duplicate_when_another_tab_keeps_the_document() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        show(&mut app, 0, "shared.tak", 1);
+        app.observe(false);
+        app.commit_marker_edit(0, prepare(&app, 0, 8.0)).unwrap();
+        let shared = app.views[0].shared_file().unwrap();
+        let second = another_tab(&mut app);
+        dock::add_view(&mut app.dock, 0, dock::NOMINAL_AREA);
+        app.views[0].show_shared_file(shared, 2, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.observe(false);
+        app.history.push(vec![Part::TabLifecycle {
+            id: second, before_open: false, after_open: true,
+            before_active: Some(first), after_active: Some(second),
+            snapshot: app.tab_undo_snapshot(second).unwrap(),
+        }]);
+        app.undo_redo(&ctx, false);
+        assert!(app.dirty_prompt.is_none());
+        assert!(app.layout_tabs.tab(second).is_none());
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert!(app.views[0].marker_dirty());
+        assert_eq!(app.history.kinds(), ["MarkerEdit"]);
+    }
+
+    #[test]
+    fn shared_marker_undo_falls_back_by_document_without_changing_the_surviving_views_selection() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        show_names(&mut app, 0, "shared.tak", 1, &["A", "B"]);
+        app.observe(false);
+        let patch = prepare(&app, 0, 8.0);
+        app.commit_marker_edit(0, patch.clone()).unwrap();
+        let shared = app.views[0].shared_file().unwrap();
+        let second = another_tab(&mut app);
+        dock::add_view(&mut app.dock, 0, dock::NOMINAL_AREA);
+        app.views[0].show_shared_file(shared, 2, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.views[0].select(1, false);
+        app.views[0].range = Some((4, 6));
+        let selection = app.views[0].selection();
+        assert!(app.close_layout_tab_internal(first));
+        app.observe(false);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(second));
+        assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision(), patch.before_revision());
+        assert_eq!(app.views[0].selection(), selection);
+        assert_eq!(app.views[0].range, Some((4, 6)));
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision(), patch.after_revision());
+        assert_eq!(app.views[0].selection(), selection);
+    }
+
+    #[test]
+    fn tab_rename_and_move_use_ids_and_replay_without_extra_actions() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let second = another_tab(&mut app);
+        let third = another_tab(&mut app);
+        app.observe(false);
+        app.layout_tabs.rename(first, "walk").unwrap();
+        app.history.push(vec![Part::TabRename { id: first, before: "tab1".into(), after: "walk".into() }]);
+        assert!(app.layout_tabs.move_tab(third, 0));
+        app.history.push(vec![Part::TabMove { id: third, before: 2, after: 0 }]);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>(), [first, second, third]);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.tab(first).unwrap().name, "tab1");
+        app.undo_redo(&ctx, true);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.layout_tabs.tab(first).unwrap().name, "walk");
+        assert_eq!(app.layout_tabs.tabs()[0].id, third);
+        assert_eq!(app.history.kinds(), ["TabRename", "TabMove"]);
+        assert_eq!(app.layout_tabs.active_id(), Some(third));
+    }
+
+    #[test]
+    fn view_actions_do_not_redirect_to_a_different_file_in_the_same_slot() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        show(&mut app, 0, "first.tak", 1);
+        app.observe(false);
+        app.views[0].pb.set_frame(7, 0.0);
+        app.observe(true);
+        show(&mut app, 0, "replacement.tak", 2);
+        app.views[0].pb.set_frame(3, 0.0);
+        app.observe(false);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.views[0].pb.frame, 3);
+        assert!(app.history.undo.is_empty());
+        assert!(app.history.redo.is_empty());
+        assert!(app.history.note.as_ref().unwrap().0.contains("skipped"));
+    }
+
+    #[test]
+    fn global_options_do_not_restore_another_tabs_graph_positions() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.observe(false);
+        let opacity = app.settings.graph_opacity;
+        app.settings.graph_opacity = 20;
+        app.observe(true);
+        let second = another_tab(&mut app);
+        app.settings.plate_channels[0] = LaneSet::only(2);
+        app.observe(false);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(second));
+        assert_eq!(app.settings.graph_opacity, opacity);
+        assert_eq!(app.settings.plate_channels[0], LaneSet::only(2));
+    }
+
+    #[test]
+    fn local_graph_options_restore_their_owning_tab_only() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let original = app.settings.plate_channels[0];
+        app.observe(false);
+        app.settings.plate_channels[0] = LaneSet::only(2);
+        app.observe(true);
+        let second = another_tab(&mut app);
+        app.settings.plate_channels[0] = LaneSet::only(3);
+        app.observe(false);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(app.settings.plate_channels[0], original);
+        assert_eq!(app.layout_tabs.tab(second).unwrap().layout.as_ref().unwrap().plate_channels[0], LaneSet::only(3));
+    }
+
+    #[test]
+    fn layout_close_undo_consumes_the_exact_retained_view_and_redo_returns_it_once() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let tab = app.layout_tabs.active_id().unwrap();
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        show(&mut app, 0, "left_fixture.tak", 1);
+        show(&mut app, 1, "closed_fixture.tak", 2);
+        app.views[1].pb.set_frame(7, 0.0);
+        app.views[1].cam.yaw += 0.5;
+        app.views[1].select(0, false);
+        app.views[1].range = Some((2, 5));
+        app.views[1].pb.playing = true;
+        let camera = app.views[1].cam;
+        let document = app.views[1].edit_document.clone().unwrap();
+        app.observe(false);
+        app.remember_layout_spot(1);
+        assert!(app.remember_closed_view_for_history(tab, 1));
+        dock::remove_view(&mut app.dock, 1);
+        app.observe(true);
+        assert_eq!(app.layout_tabs.closed_len(), 1);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.open_views(), [0, 1]);
+        assert_eq!(app.layout_tabs.closed_len(), 0);
+        assert_eq!(app.views[1].file_id, 2);
+        assert_eq!(app.views[1].pb.frame, 7);
+        assert!(!app.views[1].pb.playing);
+        assert_eq!(app.views[1].range, Some((2, 5)));
+        assert_eq!(app.views[1].primary, Some(0));
+        assert_eq!(app.views[1].cam, camera);
+        assert!(Arc::ptr_eq(app.views[1].edit_document.as_ref().unwrap(), &document));
+        assert!(app.views[1].loading.is_none());
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.open_views(), [0]);
+        assert_eq!(app.layout_tabs.closed_len(), 1);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.closed_len(), 0);
+        assert_eq!(app.views[1].file_id, 2);
+        assert_eq!(app.views[1].pb.frame, 7);
+        assert_eq!(app.history.redo.len(), 1);
+    }
+
+    #[test]
+    fn close_history_eviction_rebinds_reloaded_view_ids_for_later_undo_redo_cycles() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let path = std::env::temp_dir().join(format!("tak_undo_evicted_view_{}.tak", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        let text = path.to_string_lossy().into_owned();
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        show(&mut app, 0, "kept_fixture.tak", 1);
+        show(&mut app, 1, &text, 2);
+        app.views[1].pb.set_frame(7, 0.0);
+        app.observe(false);
+        drop(app.views[1].clear());
+        dock::remove_view(&mut app.dock, 1);
+        app.observe(true);
+        app.hold_loads = true;
+        app.next_file_id = 10;
+        app.undo_redo(&ctx, false);
+        let tx = app.views[1].held.take().unwrap();
+        tx.send(crate::views::LoadMsg::Markers(Ok((crate::views::sample_data(&text, &["M"]), vec![])))).unwrap();
+        let loaded = app.views[1].poll_markers().unwrap();
+        app.finish_load(&ctx, 1, loaded);
+        app.views[1].fit_pending = false;
+        app.views[1].fresh = false;
+        app.observe(false);
+        let reloaded = app.views[1].file_id;
+        assert_ne!(reloaded, 2);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.layout_tabs.closed_len(), 1);
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.closed_len(), 0);
+        assert_eq!(app.views[1].file_id, reloaded);
+        assert_eq!(app.views[1].pb.frame, 7);
+        assert!(app.views[1].held.is_none());
+        assert!(app.views[1].loading.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn undo_redo_restores_marker_selection_and_armed_label_together() {
@@ -1347,33 +2405,38 @@ mod marker_edit_tests {
     fn close_undo_reopens_same_document_and_its_edit_can_be_undone() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
-        let name = std::thread::current().name().unwrap_or("test").replace(':', "_");
-        let path = std::env::temp_dir().join(format!("tak_phase01_close_{}_{name}.tak", std::process::id()));
-        std::fs::write(&path, b"fixture").unwrap();
-        let path_text = path.to_string_lossy().into_owned();
-        show(&mut app, 0, &path_text, 1);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        show(&mut app, 0, "saved_close.takm", 1);
+        show(&mut app, 1, "kept_close.tak", 2);
         app.observe(false);
         let patch = prepare(&app, 0, 5.0);
         app.commit_marker_edit(0, patch.clone()).unwrap();
         let identity = patch.document_id();
-        drop(app.views[0].clear());
+        let edited = app.views[0].data.as_ref().unwrap().rebuild_markers(&patch.after_snapshot()).unwrap();
+        app.views[0].publish_edited_view(edited).unwrap();
+        // Simulate the completed save state, then use the real close path. A cleared
+        // synthetic view has no worker stamp and cannot prove a disk fallback is fresh.
+        {
+            let mut document = app.views[0].edit_document.as_ref().unwrap().lock().unwrap();
+            let saved = document.snapshot();
+            document.mark_saved(&saved, "saved_close.takm".into()).unwrap();
+        }
+        assert!(!app.views[0].marker_dirty());
+        app.close_view(0);
         app.observe(true);
         assert_eq!(app.history.kinds(), vec!["MarkerEdit", "Layout"]);
-        app.hold_loads = true;
+        assert_eq!(app.layout_tabs.closed_len(), 1);
         app.undo_redo(&ctx, false);
-        let tx = app.views[0].held.take().unwrap();
-        tx.send(crate::views::LoadMsg::Markers(Ok((crate::views::sample_data(&path_text, &["M"]), vec![])))).unwrap();
-        let loaded = app.views[0].poll_markers().unwrap();
-        app.finish_load(&ctx, 0, loaded);
-        app.views[0].fit_pending = false;
-        app.views[0].fresh = false;
+        assert_eq!(app.layout_tabs.closed_len(), 0);
+        assert!(app.views[0].loading.is_none());
         assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().id(), identity);
-        assert_eq!(app.views[0].edit_refresh, Some(patch.after_revision()));
+        assert_eq!(app.views[0].data.as_ref().unwrap().edit_revision, Some(patch.after_revision()));
         assert_eq!(app.views[0].selected.iter().copied().collect::<Vec<_>>(), vec![0]);
         assert_eq!(app.views[0].armed_label, Some(LabelKey { parent: [8; 16], slot: 2 }));
+        assert!(!app.views[0].marker_dirty());
         app.undo_redo(&ctx, false);
         assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision(), patch.before_revision());
-        std::fs::remove_file(path).unwrap();
+        assert!(app.views[0].marker_dirty(), "undoing the saved edit keeps the original savepoint");
     }
 
     #[test]

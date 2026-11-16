@@ -363,6 +363,89 @@ pub fn label_groups(raw: &[u8]) -> Result<Vec<LabelGroup>> {
 // ---------------------------------------------------------------------------------------------
 // Force plates (`scripts/analyze_gait_forceplate.py` `extract_plates`).
 
+/// Structural device identity used by the selective analog reader. Human-facing names are
+/// deliberately excluded: the channel UID must join to exactly one typed device node.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceNode {
+    pub uid: Uid,
+    pub forceplate: bool,
+    /// Declared channel count; absent/invalid metadata disables the bulk marker suffix path.
+    pub channel_count: Option<usize>,
+    /// Geometry order in `extract_plates`, independent of channel/device order.
+    pub plate: Option<usize>,
+}
+
+/// A known class signature is required for selective device decoding. Independently inspect
+/// framed JSON so a new device class cannot silently disappear from that registry. Literal
+/// token coverage also catches malformed unknown device JSON that cannot be parsed safely.
+fn validate_device_node_coverage(nodes: &[u8], records: &[PropRecord]) -> Result<()> {
+    let covered = |at: usize| records.iter().any(|r| r.start + r.sig_len + 2 <= at && at < r.end);
+    for at in find_all(nodes, &utf16("{"), 0) {
+        if at < 2 || covered(at) { continue; }
+        let chars = u16::from_le_bytes([nodes[at - 2], nodes[at - 1]]) as usize;
+        let Some(end) = at.checked_add(chars * 2).filter(|&end| chars >= 2 && end <= nodes.len()) else { continue };
+        let Ok(text) = utf16le_strict(&nodes[at..end]) else { continue };
+        let Ok(value) = parse_json(&text) else { continue };
+        let Ok(props) = props_of(&value, true) else { continue };
+        if props.contains_key("DeviceNode_DeviceType") {
+            return err("unrecognized structural device node signature; full analog read required");
+        }
+    }
+    for at in find_all(nodes, &utf16("DeviceNode_DeviceType"), 0) {
+        if !covered(at) {
+            return err("unrecognized or malformed structural device properties; full analog read required");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
+    let generic = b"class MoCapCore::cDeviceNode<float,16>";
+    let mut signatures: Vec<Vec<u8>> =
+        vec![b"\x0a\x00ForcePlate".to_vec(), b"\x0a\x00F\x00o\x00r\x00c\x00e\x00P\x00l\x00a\x00t\x00e\x00".to_vec()];
+    // Generic device classes are serialized as the same uint16-length ASCII string.
+    let mut signature = (generic.len() as u16).to_le_bytes().to_vec();
+    signature.extend_from_slice(generic);
+    signatures.push(signature);
+    let refs: Vec<&[u8]> = signatures.iter().map(Vec::as_slice).collect();
+    let records = property_records(nodes, &refs)?;
+    validate_device_node_coverage(nodes, &records)?;
+    let (plates, _) = extract_plates(nodes)?;
+    let mut plate = 0;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for record in records {
+        if record.uid == [0; 16] || !seen.insert(record.uid) {
+            return err("missing or duplicate structural analog device UID");
+        }
+        let kind = record.props.get("DeviceNode_DeviceType").map(py_str);
+        let forceplate = match kind.as_deref() {
+            Some("2") => true,
+            Some("1") => false,
+            _ => return err("unknown structural analog device type"),
+        };
+        let has_corners = record.props.keys().any(|k| k.starts_with("DeviceNode_Corner"));
+        if forceplate != has_corners {
+            return err("analog device type and plate geometry disagree");
+        }
+        let geometry = if forceplate {
+            let i = plate;
+            plate += 1;
+            Some(i)
+        } else {
+            None
+        };
+        let channel_count = record.props.get("DeviceNode_ChannelCount")
+            .and_then(|v| super::metadata::python_int(&py_str(v)).ok())
+            .and_then(|v| usize::try_from(v).ok());
+        out.push(DeviceNode { uid: record.uid, forceplate, channel_count, plate: geometry });
+    }
+    if plate != plates.len() {
+        return err("forceplate geometry has no unique structural device UID");
+    }
+    Ok(out)
+}
+
 /// Returns plates plus non-fatal `node_json:` notes. Any recognized-but-invalid plate fails.
 pub fn extract_plates(nodes: &[u8]) -> Result<(Vec<ForcePlate>, Vec<String>)> {
     let needle = utf16("{\n    \"properties\"");

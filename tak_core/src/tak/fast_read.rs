@@ -1,25 +1,22 @@
 
 use super::channels::{channel_dim, CHANNELS_HEADER};
 use super::container::{u16_at, u32_at, utf16le_strict, Container, END, MAGIC};
-use super::{decode_analog, decode_markers, err, AnalogDevice, Result, Take};
+use super::{decode_analog, decode_markers, err, AnalogChannel, AnalogDevice, Result, Take, Uid};
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 /// Largest single positional read; big ranges are cut into pieces of this size.
 const CHUNK: usize = 2 << 20;
 /// Threads for big reads (the WSL share gives ~2x the single-thread speed with 2-8 readers).
 const THREADS: usize = 8;
-/// First read at a channel record (one read usually covers the whole record header).
-const PROBE: u64 = 4096;
-/// Once a run of non-analog records grows past this, the rest of the stream is read in one
-/// parallel bulk read (marker channels sit at the end of `Channels.dat` in Motive files).
-const BULK_AFTER: u64 = 64 << 10;
-
+/// Every supported kind has at least this many header bytes, even with an empty property:
+/// uint16 type length + FloatChannel (12) + version/name length (3) + UID (16) + f32/count (8).
+const MIN_HEADER: u64 = 41;
 /// Stage 1 result.
 pub struct FastRead {
-    /// Markers, assets, plates' geometry, label groups; `analog` empty until stage 2.
+    /// Markers, assets, plates' geometry, label groups, and header-only analog device manifest.
     pub take: Take,
     /// Stage 2 work; None when the analog part is already in `take` (full-read fallback).
     pub analog: Option<AnalogJob>,
@@ -38,6 +35,15 @@ pub struct AnalogJob {
     kept: Vec<(u64, Vec<u8>)>,
     /// Analog record ranges [start, end) in the stream, ascending.
     analog: Vec<(u64, u64)>,
+    records: Arc<Vec<Record>>,
+    manifest: Vec<AnalogDevice>,
+    /// Channel-record indices for each device, in original channel order.
+    device_records: Arc<Vec<Vec<usize>>>,
+    plate_devices: Option<Vec<usize>>,
+    fallback: Option<String>,
+    /// None = unchanged complete decode (the `--dump-fast` path).
+    selected: Option<Vec<usize>>,
+    indices: Vec<usize>,
 }
 
 fn ms(t: Instant) -> f64 {
@@ -69,7 +75,12 @@ pub fn read_take_fast(path: &Path, sha: bool) -> Result<FastRead> {
     let first = if crate::takm::is_takm_path(path) { markers_first_takm(path, sha) } else { markers_first(path, sha) };
     match first {
         Ok(Some(read)) => Ok(read),
-        Ok(None) | Err(_) => {
+        fallback => {
+            let reason = match fallback {
+                Err(e) => e.to_string(),
+                _ => "unsupported container or marker layout".into(),
+            };
+            eprintln!("selective analog fallback ({}): {reason}", path.display());
             let take = super::read_take(path)?;
             Ok(FastRead {
                 take,
@@ -80,10 +91,125 @@ pub fn read_take_fast(path: &Path, sha: bool) -> Result<FastRead> {
     }
 }
 
+/// Refresh demand-only analog work after saving a `.takm`. Rewriting marker streams can
+/// move both the channel stream and its records, invalidating every previously deferred job.
+/// Read only the current stream table, device nodes and channel headers; marker, forceplate
+/// and other analog sample payloads are skipped. Call on the save worker, replacing the old
+/// deferred job. `None` means no non-forceplate devices remain. Ambiguous layout is an error;
+/// this function never calls the full reader or starts an analog sample read.
+pub fn deferred_job_after_save(path: &Path) -> Result<Option<AnalogJob>> {
+    if !crate::takm::is_takm_path(path) {
+        return err("deferred analog metadata refresh requires a .takm file");
+    }
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let index = crate::takm::read_index(&file, len)?;
+    let (Some(nodes), Some(channels)) = (index.unique("Nodes.dat"), index.unique("Channels.dat")) else {
+        return err("deferred analog metadata refresh requires unique Nodes.dat and Channels.dat streams");
+    };
+    if nodes.offset < channels.offset + channels.size && channels.offset < nodes.offset + nodes.size {
+        return err("deferred analog metadata streams overlap");
+    }
+    let size = usize::try_from(nodes.size).map_err(|_| super::TakError("device metadata is too large".into()))?;
+    let mut bytes = vec![0u8; size];
+    read_exact_at(&file, &mut bytes, nodes.offset)?;
+    let typed = super::nodes::analog_device_nodes(&bytes)?;
+    let device_uids = typed.iter().map(|device| device.uid).collect();
+    let map = StreamMap { sector: 0, chain: Vec::new(), len: channels.size, flat: Some(channels.offset) };
+    let Some(walked) = walk_channel_records(&file, &map, &device_uids, None, false)? else {
+        return err("unsupported channel layout during deferred analog metadata refresh");
+    };
+    let (manifest, device_records) = device_manifest(&walked.records)?;
+    let plates = selective_layout_for_nodes(&typed, &walked.records, &device_records)?;
+    let before = (index.tail_start(), None);
+    unchanged(path, before, true)?;
+    let indices = (0..manifest.len()).collect();
+    let job = AnalogJob {
+        path: path.to_path_buf(), before, grows: true, map,
+        kept: Vec::new(), analog: Vec::new(), records: Arc::new(walked.records), manifest,
+        device_records: Arc::new(device_records), plate_devices: Some(plates), fallback: None,
+        selected: None, indices,
+    };
+    Ok(job.split().1)
+}
+
 impl AnalogJob {
-    /// Stage 2: (analog devices, warning) exactly as `read_take` would give them.
+    /// Device positions loaded by this job. Indices remain stable through both stages.
+    pub fn device_indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    /// Forceplate geometry index -> analog device index, established by structural UID.
+    pub fn plate_devices(&self) -> Option<&[usize]> {
+        self.plate_devices.as_deref()
+    }
+
+    /// Why selective reading was disabled; report this when starting the full fallback.
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
+
+    /// Split normal viewer opening into forceplates and one owned, deferred non-plate job.
+    /// Ambiguous files keep the previous full analog read. The unsplit job's `run` always
+    /// decodes the entire original stream, preserving dump parity and validation.
+    pub fn split(mut self) -> (Self, Option<Self>) {
+        if self.selected.is_some() {
+            return (self, None);
+        }
+        let Some(plates) = self.plate_devices.clone() else { return (self, None) };
+        let lazy: Vec<usize> = (0..self.manifest.len()).filter(|i| !plates.contains(i)).collect();
+        self.kept.clear();
+        self.analog.clear();
+        self.indices = plates;
+        self.selected = Some(self.indices.clone());
+        let deferred = if lazy.is_empty() {
+            None
+        } else {
+            Some(Self {
+                path: self.path.clone(),
+                before: self.before,
+                grows: self.grows,
+                map: self.map.clone(),
+                kept: Vec::new(),
+                analog: Vec::new(),
+                records: Arc::clone(&self.records),
+                manifest: self.manifest.clone(),
+                device_records: Arc::clone(&self.device_records),
+                plate_devices: self.plate_devices.clone(),
+                fallback: None,
+                selected: Some(lazy.clone()),
+                indices: lazy,
+            })
+        };
+        (self, deferred)
+    }
+
+    /// Full job: identical to `read_take`. Split job: all device headers in original order,
+    /// with samples filled only for `device_indices()` (all other channels remain empty).
+    /// Split jobs return an error for invalid device data; full jobs keep legacy warnings.
     pub fn run(self) -> Result<(Vec<AnalogDevice>, Option<String>)> {
+        unchanged(&self.path, self.before, self.grows)?;
         let file = File::open(&self.path)?;
+        if let Some(indices) = &self.selected {
+            let mut manifest = self.manifest;
+            for &di in indices {
+                let records = &self.device_records[di];
+                let mut stream = CHANNELS_HEADER.to_vec();
+                stream.extend_from_slice(&(records.len() as u32).to_le_bytes());
+                for &ri in records {
+                    let record = &self.records[ri];
+                    stream.extend(self.map.read(&file, record.start, record.end)?);
+                }
+                let (mut decoded, warning) = decode_analog(&stream);
+                if warning.is_some() || decoded.len() != 1 {
+                    unchanged(&self.path, self.before, self.grows)?;
+                    return err(warning.unwrap_or_else(|| "analog device decode count changed".into()));
+                }
+                manifest[di] = decoded.remove(0);
+            }
+            unchanged(&self.path, self.before, self.grows)?;
+            return Ok((manifest, None));
+        }
         let mut full = vec![0u8; self.map.len as usize];
         for (off, bytes) in &self.kept {
             full[*off as usize..*off as usize + bytes.len()].copy_from_slice(bytes);
@@ -241,7 +367,12 @@ fn markers_from(
 ) -> Result<Option<FastRead>> {
     let (before, grows) = guard;
     let t1 = Instant::now();
-    let Some(walked) = walk_channels(file, &map)? else {
+    // Validate structural device metadata before reading any channel payload. A registry
+    // error must never turn device channels into marker data through a name-only guess.
+    let typed = super::nodes::analog_device_nodes(nodes)?;
+    let device_uids = typed.iter().map(|n| n.uid).collect();
+    let tail_plan = marker_tail_plan(nodes, &typed)?;
+    let Some(walked) = walk_channels(file, &map, &device_uids, tail_plan.as_ref())? else {
         return Ok(None);
     };
     let t_channels = ms(t1);
@@ -249,7 +380,7 @@ fn markers_from(
 
     // Stage-1 stream: the header with the non-analog record count, then those records in order.
     let t2 = Instant::now();
-    let keep: Vec<(u64, u64)> = walked.records.iter().filter(|r| !r.2).map(|r| (r.0, r.1)).collect();
+    let keep: Vec<(u64, u64)> = walked.records.iter().filter(|r| !r.analog).map(|r| (r.start, r.end)).collect();
     let mut stream = Vec::with_capacity(10 + keep.iter().map(|(a, b)| (b - a) as usize).sum::<usize>());
     stream.extend_from_slice(&CHANNELS_HEADER);
     stream.extend_from_slice(&(keep.len() as u32).to_le_bytes());
@@ -259,23 +390,24 @@ fn markers_from(
         };
         stream.extend_from_slice(&bytes[(a - off) as usize..(b - off) as usize]);
     }
-    let take = decode_markers(path, len as usize, nodes, &stream, meta, sha)?;
+    let mut take = decode_markers(path, len as usize, nodes, &stream, meta, sha)?;
     unchanged(path, before, grows)?;
     let t_decode = ms(t2);
 
-    let analog: Vec<(u64, u64)> = walked
-        .records
-        .iter()
-        .filter(|r| r.2 && !walked.kept.iter().any(|(o, v)| *o <= r.0 && r.1 <= *o + v.len() as u64))
-        .map(|r| (r.0, r.1))
-        .collect();
+    let analog = walked.records.iter().filter(|r| r.analog).map(|r| (r.start, r.end)).collect();
+    let (manifest, device_records) = device_manifest(&walked.records).unwrap_or_default();
+    let (plate_devices, fallback) = match selective_layout_for_nodes(&typed, &walked.records, &device_records) {
+        Ok(plates) => (Some(plates), None),
+        Err(e) => (None, Some(e.0)),
+    };
+    // Headers alone are safe to publish; full `run` still reproduces the original decode.
+    take.analog = manifest.clone();
+    let indices = (0..manifest.len()).collect();
     let job = AnalogJob {
-        path: path.to_path_buf(),
-        before,
-        grows,
-        map,
-        kept: walked.kept,
-        analog,
+        path: path.to_path_buf(), before, grows, map, kept: walked.kept, analog,
+        records: Arc::new(walked.records), manifest,
+        device_records: Arc::new(device_records), plate_devices, fallback,
+        selected: None, indices,
     };
     let times = vec![
         ("container", t_container),
@@ -290,13 +422,132 @@ fn markers_from(
     }))
 }
 
-/// Channel records found by `walk_channels`: (start, end, analog) in stream offsets, plus the
-/// stream bytes read so far (the 10-byte header and every non-analog record are inside `kept`).
+#[derive(Clone, Debug)]
+struct Record {
+    start: u64,
+    end: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    data_start: u64,
+    analog: bool,
+    name: String,
+    kind: String,
+    uid: Uid,
+    dim: usize,
+}
+
 struct Walked {
-    records: Vec<(u64, u64, bool)>,
+    records: Vec<Record>,
     kept: Vec<(u64, Vec<u8>)>,
-    /// ms spent in the bulk read of the marker records.
     bulk_ms: f64,
+}
+
+fn device_manifest(records: &[Record]) -> Result<(Vec<AnalogDevice>, Vec<Vec<usize>>)> {
+    let mut devices: Vec<AnalogDevice> = Vec::new();
+    let mut device_records: Vec<Vec<usize>> = Vec::new();
+    for (ri, r) in records.iter().enumerate().filter(|(_, r)| r.analog) {
+        let suffix = r.name.strip_prefix("AnalogChannel").unwrap_or("");
+        let index = super::metadata::python_int(suffix)?;
+        if index == 0 {
+            devices.push(AnalogDevice { channels: Vec::new() });
+            device_records.push(Vec::new());
+        }
+        let Some(d) = devices.last_mut() else { return err("analog channel before AnalogChannel0") };
+        // A single device's channels must have unambiguous consecutive structural indices.
+        if index != d.channels.len() as i64 {
+            return err("ambiguous analog channel numbering");
+        }
+        d.channels.push(AnalogChannel {
+            name: r.name.clone(),
+            kind: r.kind.clone(),
+            dim: r.dim,
+            frames: Vec::new(),
+            values: Vec::new(),
+        });
+        device_records.last_mut().unwrap().push(ri);
+    }
+    Ok((devices, device_records))
+}
+
+#[cfg(test)]
+fn selective_layout(nodes: &[u8], records: &[Record], devices: &[Vec<usize>]) -> Result<Vec<usize>> {
+    selective_layout_for_nodes(&super::nodes::analog_device_nodes(nodes)?, records, devices)
+}
+
+fn selective_layout_for_nodes(typed: &[super::nodes::DeviceNode], records: &[Record], devices: &[Vec<usize>]) -> Result<Vec<usize>> {
+    if records.iter().any(|r| typed.iter().any(|n| n.uid == r.uid) && !r.name.starts_with("AnalogChannel")) {
+        return err("unsupported structural device channel property; full analog read required");
+    }
+    if records.iter().any(|r| r.analog) && devices.is_empty() {
+        return err("analog device headers cannot be grouped unambiguously");
+    }
+    let mut plate_devices = vec![usize::MAX; typed.iter().filter(|n| n.forceplate).count()];
+    let mut used = std::collections::HashSet::new();
+    for (di, rows) in devices.iter().enumerate() {
+        let uid = records[rows[0]].uid;
+        if rows.iter().any(|&ri| records[ri].uid != uid) || !used.insert(uid) {
+            return err("inconsistent or reused analog channel device UID");
+        }
+        let Some(node) = typed.iter().find(|n| n.uid == uid) else {
+            return err("analog channel UID has no recognized structural device node");
+        };
+        if node.channel_count.is_some_and(|n| n != rows.len()) {
+            return err("structural device channel count disagrees with channel records");
+        }
+        if let Some(pi) = node.plate {
+            plate_devices[pi] = di;
+        }
+    }
+    if plate_devices.contains(&usize::MAX) {
+        return err("forceplate geometry has no analog channel device UID match");
+    }
+    Ok(plate_devices)
+}
+
+/// Independent node metadata permits one bulk read after every device's declared channels
+/// has been seen and the remaining record count is exactly the remaining marker UID count.
+struct MarkerTailPlan {
+    channels: std::collections::HashMap<Uid, usize>,
+    markers: std::collections::HashSet<Uid>,
+}
+
+fn marker_tail_plan(nodes: &[u8], devices: &[super::nodes::DeviceNode]) -> Result<Option<MarkerTailPlan>> {
+    let Some(channels) = devices.iter().map(|d| d.channel_count.map(|n| (d.uid,n))).collect::<Option<_>>() else { return Ok(None) };
+    let assets = super::nodes::skeleton_asset_set(nodes)?;
+    let rows = super::nodes::parse_marker_nodes(nodes, &assets)?;
+    let markers: std::collections::HashSet<Uid> = rows.iter().map(|m|m.uid).collect();
+    if markers.len() != rows.len() { return err("duplicate marker UID prevents proving a marker-only suffix"); }
+    Ok((!markers.is_empty()).then_some(MarkerTailPlan { channels, markers }))
+}
+
+fn channel_record(pos: u64, bytes: &[u8], header: usize, data: u64, legacy_analog: bool, devices: &std::collections::HashSet<Uid>) -> Result<Record> {
+    let kind_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    let cur = 2 + kind_len;
+    let chars = u16::from_le_bytes([bytes[cur + 1], bytes[cur + 2]]) as usize;
+    let uid_at = cur + 3 + chars * 2;
+    let kind = String::from_utf8(bytes[2..cur].to_vec()).map_err(|e| super::TakError(e.to_string()))?;
+    let name = utf16le_strict(&bytes[cur + 3..uid_at])?;
+    let uid = super::container::uid_from(&bytes[uid_at..uid_at + 16]);
+    let dim = channel_dim(&kind).unwrap();
+    Ok(Record { start:pos, end:pos + header as u64 + data, data_start:pos + header as u64,
+        analog:legacy_analog || devices.contains(&uid), name, kind, uid, dim })
+}
+
+fn validate_marker_tail(bytes: &[u8], start: u64, count: usize, mut markers: std::collections::HashSet<Uid>, devices: &std::collections::HashSet<Uid>) -> Result<Vec<Record>> {
+    let mut records = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        let Some(remaining) = bytes.get(pos..) else { return err("marker suffix record extends past stream") };
+        let Head::Ok { header, data, analog } = parse_head(remaining) else { return err("invalid marker suffix record header") };
+        let r = channel_record(start + pos as u64, remaining, header, data, analog, devices)?;
+        if r.analog || r.kind != "Vector3fChannel" || r.name != "Translation" || !markers.remove(&r.uid) {
+            return err("marker suffix disagrees with device counts or marker UID inventory; full analog read required");
+        }
+        pos = usize::try_from(r.end - start).map_err(|_| super::TakError("marker suffix length overflow".into()))?;
+        if pos > bytes.len() { return err("truncated marker suffix samples") }
+        records.push(r);
+    }
+    if pos != bytes.len() || !markers.is_empty() { return err("marker suffix record count or marker UID inventory mismatch") }
+    Ok(records)
 }
 
 /// Record header at the start of `buf` (layout of `channels::iter_channel_inventory`).
@@ -347,7 +598,13 @@ fn parse_head(buf: &[u8]) -> Head {
 
 /// Walk the records by their declared lengths, reading only record headers plus the
 /// non-analog records (the analog data is skipped). `None` = unexpected layout.
-fn walk_channels(file: &File, map: &StreamMap) -> Result<Option<Walked>> {
+fn walk_channels(file: &File, map: &StreamMap, device_uids: &std::collections::HashSet<Uid>, tail_plan: Option<&MarkerTailPlan>) -> Result<Option<Walked>> {
+    walk_channel_records(file, map, device_uids, tail_plan, true)
+}
+
+/// Shared header walk. Post-save refresh skips every sample payload, including marker
+/// samples, so it cannot use the marker-only suffix optimization or retained marker runs.
+fn walk_channel_records(file: &File, map: &StreamMap, device_uids: &std::collections::HashSet<Uid>, tail_plan: Option<&MarkerTailPlan>, marker_payloads: bool) -> Result<Option<Walked>> {
     let len = map.len;
     if len < 10 {
         return Ok(None);
@@ -357,79 +614,82 @@ fn walk_channels(file: &File, map: &StreamMap) -> Result<Option<Walked>> {
         return Ok(None);
     }
     let count = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
-    let mut records: Vec<(u64, u64, bool)> = Vec::new();
-    let mut kept: Vec<(u64, Vec<u8>)> = vec![(0, header)];
-    // Bytes read at the latest probe: (stream offset, bytes).
-    let mut window: (u64, Vec<u8>) = (0, Vec::new());
-    // Current run of non-analog records: (start offset, index of its first record).
-    let mut run: Option<(u64, usize)> = None;
+    let mut records = Vec::new();
+    let mut kept = vec![(0, header)];
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut pos = 10u64;
-    // In-memory tail after a bulk read: (stream offset, bytes).
-    let mut tail: Option<(u64, Vec<u8>)> = None;
     let mut bulk_ms = 0.0;
+    let mut device_seen: std::collections::HashMap<Uid, usize> = std::collections::HashMap::new();
+    let mut marker_seen = std::collections::HashSet::new();
+    let mut counts_valid = true;
+    // Read only exactly requested header bytes. A fixed 4 KiB probe can include samples
+    // even for the very first analog channel, and a bulk tail may contain later analogs.
     while records.len() < count {
-        let head = loop {
-            let (base, buf) = match &tail {
-                Some((o, v)) => (*o, v.as_slice()),
-                None => (window.0, window.1.as_slice()),
-            };
-            let have = if pos >= base && pos <= base + buf.len() as u64 {
-                &buf[(pos - base) as usize..]
-            } else {
-                &[][..]
-            };
-            match parse_head(have) {
-                Head::Need(n) if tail.is_none() && pos + (n as u64) <= len => {
-                    let want = (n as u64).max(PROBE).min(len - pos);
-                    window = (pos, map.read(file, pos, pos + want)?);
+        if len - pos < MIN_HEADER { return err("channel record is shorter than every supported header"); }
+        // The minimum across supported structural kinds is safe even for an empty device
+        // property. Unlike a 4 KiB probe it cannot include a supported channel's samples.
+        let mut bytes = map.read(file, pos, pos + MIN_HEADER)?;
+        let (header, data, analog) = loop {
+            match parse_head(&bytes) {
+                Head::Need(n) if pos + n as u64 <= len => {
+                    let old = bytes.len();
+                    bytes.resize(n, 0);
+                    let more = map.read(file, pos + old as u64, pos + n as u64)?;
+                    bytes[old..].copy_from_slice(&more);
                 }
-                Head::Need(_) | Head::Bad => return Ok(None),
-                ok => break ok,
+                Head::Ok { header, data, analog } => break (header, data, analog),
+                Head::Bad => return err("unsupported structural channel type or malformed channel record header"),
+                _ => return err("truncated channel record header"),
             }
         };
-        let Head::Ok { header, data, analog } = head else { return Ok(None) };
         let end = pos + header as u64 + data;
-        if end > len {
-            return Ok(None);
-        }
-        if tail.is_none() {
-            if analog {
-                if let Some((start, _)) = run.take() {
-                    kept.push((start, map.read(file, start, pos)?));
-                }
-            } else {
-                let (start, first) = *run.get_or_insert((pos, records.len()));
-                if end - start > BULK_AFTER {
-                    // Read the rest of the stream at once and walk it again in memory.
-                    let t = Instant::now();
-                    tail = Some((start, map.read(file, start, len)?));
-                    bulk_ms = ms(t);
-                    records.truncate(first);
-                    pos = start;
-                    run = None;
-                    continue;
-                }
+        if end > len { return Ok(None); }
+        let record = channel_record(pos, &bytes, header, data, analog, device_uids)?;
+        if let Some(plan) = tail_plan.filter(|_| marker_payloads) {
+            let remaining_markers: std::collections::HashSet<_> = plan.markers.difference(&marker_seen).copied().collect();
+            let counts_complete = counts_valid && plan.channels.iter().all(|(uid,n)| device_seen.get(uid).copied().unwrap_or(0) == *n);
+            if counts_complete && record.kind == "Vector3fChannel" && record.name == "Translation"
+                && !record.analog && remaining_markers.contains(&record.uid) && count - records.len() == remaining_markers.len() {
+                let t = Instant::now();
+                let tail = map.read(file, pos, len)?;
+                bulk_ms += ms(t);
+                let suffix = validate_marker_tail(&tail,pos,count-records.len(),remaining_markers,device_uids)?;
+                records.extend(suffix);
+                kept.push((pos,tail));
+                pos = len;
+                break;
+            }
+            if record.analog {
+                let seen = device_seen.entry(record.uid).or_default();
+                if !plan.channels.contains_key(&record.uid) || record.name != format!("AnalogChannel{seen}") { counts_valid = false; }
+                *seen += 1;
+            } else if plan.markers.contains(&record.uid) && record.kind == "Vector3fChannel" && record.name == "Translation" {
+                if !marker_seen.insert(record.uid) { counts_valid = false; }
             }
         }
-        records.push((pos, end, analog));
+        if marker_payloads && !record.analog {
+            match ranges.last_mut() {
+                Some((_, b)) if *b == pos => *b = end,
+                _ => ranges.push((pos, end)),
+            }
+        }
+        records.push(record);
         pos = end;
     }
-    if pos != len {
-        return Ok(None);
+    if pos != len { return Ok(None); }
+    // Non-analog runs before the counted/validated suffix retain exact boundary proofs.
+    // Without independent device counts, a large marker run never permits a bulk tail.
+    for (a, b) in ranges {
+        let t = Instant::now();
+        kept.push((a, map.read(file, a, b)?));
+        bulk_ms += ms(t);
     }
-    if let Some((start, _)) = run {
-        kept.push((start, map.read(file, start, len)?));
-    }
-    kept.extend(tail);
-    Ok(Some(Walked {
-        records,
-        kept,
-        bulk_ms,
-    }))
+    Ok(Some(Walked { records, kept, bulk_ms }))
 }
 
 /// Where a stream lies in the file: a regular container stream = its sectors in order (from
 /// `Container::stream_chain`); a `.takm` stream = one piece starting at `flat`.
+#[derive(Clone)]
 struct StreamMap {
     sector: u64,
     chain: Vec<u32>,
@@ -524,6 +784,8 @@ fn fill(file: &File, img: &mut [u8], ss: u64, sectors: &[u32]) -> Result<()> {
 
 /// Positional read of exactly `buf.len()` bytes (no shared file cursor, safe across threads).
 pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> Result<()> {
+    #[cfg(test)]
+    read_trace::record(file, off, buf.len());
     while !buf.is_empty() {
         #[cfg(windows)]
         let n = std::os::windows::fs::FileExt::seek_read(file, buf, off)?;
@@ -566,6 +828,54 @@ fn read_parallel(file: &File, jobs: Vec<(u64, &mut [u8])>) -> Result<()> {
     match failed.into_inner().ok().flatten() {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// Test instrumentation records actual positional-read requests, including parallel reads.
+/// Registering by native file identity lets handles/stages share a trace without conflating
+/// separate copies that happen to have identical lengths and modification timestamps.
+#[cfg(test)]
+mod read_trace {
+    use super::*;
+    type Key = (u64, u64);
+    type Ranges = Arc<Mutex<Vec<(u64, u64)>>>;
+    static ACTIVE: Mutex<Vec<(Key, Ranges)>> = Mutex::new(Vec::new());
+    #[cfg(unix)]
+    fn identity(file: &File) -> std::io::Result<Key> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    fn identity(file: &File) -> std::io::Result<Key> {
+        use std::os::windows::io::AsRawHandle;
+        // std's volume/file-index accessors are unstable. The native structure consists of
+        // 13 DWORDs: attributes, 3 FILETIMEs, volume, size high/low, links, index high/low.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut [u32; 13]) -> i32;
+        }
+        let mut info = [0u32; 13];
+        // SAFETY: this open File owns a valid handle; info has exactly the documented layout
+        // and remains writable for the duration of this synchronous call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((info[7] as u64, (info[11] as u64) << 32 | info[12] as u64))
+    }
+    pub fn start(file: &File) -> Ranges {
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        ACTIVE.lock().unwrap().push((identity(file).expect("trace file identity"), ranges.clone()));
+        ranges
+    }
+    pub fn record(file: &File, off: u64, n: usize) {
+        let key = identity(file).expect("trace read file identity");
+        for (_, ranges) in ACTIVE.lock().unwrap().iter().filter(|(k, _)| *k == key) {
+            ranges.lock().unwrap().push((off, off + n as u64));
+        }
+    }
+    pub fn stop(ranges: &Ranges) {
+        ACTIVE.lock().unwrap().retain(|(_, r)| !Arc::ptr_eq(r, ranges));
     }
 }
 
@@ -671,10 +981,11 @@ mod tests {
         let file = File::open(&dir).unwrap();
         let m = map(chain, stream.len() as u64);
         assert_eq!(m.read(&file, 0, stream.len() as u64).unwrap(), stream);
-        let w = walk_channels(&file, &m).unwrap().expect("walked");
-        let flags: Vec<bool> = w.records.iter().map(|r| r.2).collect();
+        let w = walk_channels(&file, &m, &std::collections::HashSet::new(), None).unwrap().expect("walked");
+        let flags: Vec<bool> = w.records.iter().map(|r| r.analog).collect();
         assert_eq!(flags, [false, true, true, false, false, false]);
-        for &(a, b, analog) in &w.records {
+        for r in &w.records {
+            let (a, b, analog) = (r.start, r.end, r.analog);
             let inside = w.kept.iter().any(|(o, v)| *o <= a && b <= *o + v.len() as u64);
             assert_eq!(inside, !analog, "record {a}..{b}");
             if let Some((o, v)) = w.kept.iter().find(|(o, v)| *o <= a && b <= *o + v.len() as u64) {
@@ -684,4 +995,728 @@ mod tests {
         drop(file);
         let _ = std::fs::remove_file(&dir);
     }
+    fn device_node(uid: Uid, kind: u32, name: &str) -> Vec<u8> {
+        let mut props = vec![
+            serde_json::json!({"name":"NodeName", "value":name}),
+            serde_json::json!({"name":"DeviceNode_DeviceType", "value":kind.to_string()}),
+        ];
+        if kind == 2 {
+            for i in 0..4 {
+                props.push(serde_json::json!({"name":format!("DeviceNode_Corner {i}"), "value":format!("{}, 0, {}", i % 2, i / 2)}));
+            }
+        }
+        let text = format!("{{\n    \"properties\": {}\n}}", serde_json::to_string(&props).unwrap());
+        let text = super::super::nodes::utf16(&text);
+        let kind_name = if kind == 2 { "ForcePlate" } else { "class MoCapCore::cDeviceNode<float,16>" };
+        let mut out = (kind_name.len() as u16).to_le_bytes().to_vec();
+        out.extend(kind_name.as_bytes());
+        out.extend(((text.len() / 2) as u16).to_le_bytes());
+        out.extend(text);
+        out.extend([0u8; 19]);
+        out.extend(uid);
+        out.extend([0u8; 33]);
+        out
+    }
+
+    fn with_uid(mut bytes: Vec<u8>, uid: Uid) -> Vec<u8> {
+        let kind = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let at = kind + 2;
+        let chars = u16::from_le_bytes([bytes[at + 1], bytes[at + 2]]) as usize;
+        let at = at + 3 + 2 * chars;
+        bytes[at..at + 16].copy_from_slice(&uid);
+        bytes
+    }
+
+    fn overlap(reads: &[(u64, u64)], ranges: &[(u64, u64)]) -> u64 {
+        reads.iter().map(|&(a, b)| ranges.iter().map(|&(c, d)| b.min(d).saturating_sub(a.max(c))).sum::<u64>()).sum()
+    }
+
+    #[test]
+    fn exact_headers_and_proven_marker_ranges_never_read_analog_samples() {
+        // EMG comes first and again after >64 KiB of marker bytes. Tiny analog records
+        // catch both the former 4 KiB probe and the unexamined bulk-tail optimization.
+        let recs = [
+            with_uid(record("FloatChannel", "AnalogChannel0", 1, 1), [1; 16]),
+            record("Vector3fChannel", "Translation", 3, 6000),
+            with_uid(record("FloatChannel", "AnalogChannel0", 1, 2), [2; 16]),
+            with_uid(record("FloatChannel", "AnalogChannel0", 1, 3), [3; 16]),
+        ];
+        let mut stream = CHANNELS_HEADER.to_vec();
+        stream.extend((recs.len() as u32).to_le_bytes());
+        for r in &recs {
+            stream.extend(r);
+        }
+        let path = std::env::temp_dir().join(format!("tak_selective_interleave_{}", std::process::id()));
+        std::fs::write(&path, &stream).unwrap();
+        let file = File::open(&path).unwrap();
+        let trace = read_trace::start(&file);
+        let map = StreamMap { sector: 0, chain: Vec::new(), len: stream.len() as u64, flat: Some(0) };
+        let walked = walk_channels(&file, &map, &std::collections::HashSet::new(), None).unwrap().unwrap();
+        let samples: Vec<_> = walked.records.iter().filter(|r| r.analog).map(|r| (r.data_start, r.end)).collect();
+        assert_eq!(overlap(&trace.lock().unwrap(), &samples), 0);
+        let (manifest, groups) = device_manifest(&walked.records).unwrap();
+        // Names actively contradict types; plate is the middle analog device.
+        let mut nodes = device_node([1; 16], 1, "Force Plate deceptive name");
+        nodes.extend(device_node([2; 16], 2, "EMG deceptive name"));
+        nodes.extend(device_node([3; 16], 1, "another ForcePlate"));
+        let plates = selective_layout(&nodes, &walked.records, &groups).unwrap();
+        assert_eq!(plates, [1]);
+        let before = stat_key(&file.metadata().unwrap());
+        let job = AnalogJob {
+            path: path.clone(),
+            before,
+            grows: false,
+            map,
+            kept: walked.kept,
+            analog: walked.records.iter().filter(|r| r.analog).map(|r| (r.start, r.end)).collect(),
+            records: Arc::new(walked.records),
+            manifest,
+            device_records: Arc::new(groups),
+            plate_devices: Some(plates),
+            fallback: None,
+            selected: None,
+            indices: vec![0, 1, 2],
+        };
+        let (startup, lazy) = job.split();
+        assert_eq!(startup.device_indices(), [1]);
+        assert_eq!(lazy.as_ref().unwrap().device_indices(), [0, 2]);
+        let (initial, warning) = startup.run().unwrap();
+        assert!(warning.is_none());
+        assert!(initial[0].channels[0].frames.is_empty());
+        assert_eq!(initial[1].channels[0].frames.len(), 2);
+        assert!(initial[2].channels[0].frames.is_empty());
+        assert_eq!(overlap(&trace.lock().unwrap(), &[samples[0], samples[2]]), 0);
+        trace.lock().unwrap().clear();
+        let (loaded, warning) = lazy.unwrap().run().unwrap();
+        assert!(warning.is_none());
+        assert_eq!(loaded[0].channels[0].frames.len(), 1);
+        assert!(loaded[1].channels[0].frames.is_empty());
+        assert_eq!(loaded[2].channels[0].frames.len(), 3);
+        assert_eq!(overlap(&trace.lock().unwrap(), &[samples[0], samples[2]]), 32);
+        assert_eq!(overlap(&trace.lock().unwrap(), &[samples[1]]), 0);
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn assert_same_analog(a: &[AnalogDevice], b: &[AnalogDevice]) {
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(b) {
+            assert_eq!(a.channels.len(), b.channels.len());
+            for (a, b) in a.channels.iter().zip(&b.channels) {
+                assert_eq!((&a.name, &a.kind, a.dim, &a.frames), (&b.name, &b.kind, b.dim, &b.frames));
+                assert_eq!(
+                    a.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    b.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_tak_selective_read_and_unsplit_dump_match_full_reader() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input");
+        let mut paths = vec![
+            root.join("raw/000000_S01_perturb_20_001.tak"),
+            root.join("raw/000000_S01_perturb_20_004.tak"),
+            root.join("static/000000_S01_static.tak"),
+        ];
+        paths.push(PathBuf::from("/tmp/tak_0328_bench_wsl/gait_1.tak"));
+        if let Some(path) = std::env::var_os("TAK_SELECTIVE_TEST_FILE") { paths.push(PathBuf::from(path)); }
+        for path in paths {
+            let relative = path.display();
+            if !path.exists() {
+                continue;
+            } // Optional local reference data is not distributed.
+            let full = super::super::read_take(&path).unwrap();
+            let read = read_take_fast(&path, true).unwrap();
+            let job = read.analog.expect("reference must use marker-first path");
+            assert!(job.fallback_reason().is_none(), "{relative}: {:?}", job.fallback_reason());
+            let plate_map = job.plate_devices().unwrap().to_vec();
+            let all = job.run().unwrap();
+            assert!(all.1.is_none());
+            assert_same_analog(&full.analog, &all.0);
+            let mut complete = read.take;
+            complete.analog = all.0;
+            assert_eq!(crate::dump::to_json(&full), crate::dump::to_json(&complete), "dump parity: {relative}");
+            let file = File::open(&path).unwrap();
+            let trace = read_trace::start(&file);
+            let read = read_take_fast(&path, false).unwrap();
+            let job = read.analog.unwrap();
+            assert_eq!(read.take.analog.len(), full.analog.len());
+            assert!(read
+                .take
+                .analog
+                .iter()
+                .flat_map(|d| &d.channels)
+                .all(|c| c.frames.is_empty() && c.values.is_empty()));
+            let nonplate_samples: Vec<(u64, u64)> = job
+                .device_records
+                .iter()
+                .enumerate()
+                .filter(|(di, _)| !plate_map.contains(di))
+                .flat_map(|(_, rows)| rows.iter())
+                .flat_map(|&ri| {
+                    let r = &job.records[ri];
+                    job.map.pieces(r.data_start, r.end).into_iter().map(|(off, n)| (off, off + n as u64))
+                })
+                .collect();
+            let (startup, lazy) = job.split();
+            let (mut initial, warning) = startup.run().unwrap();
+            assert!(warning.is_none());
+            assert_eq!(overlap(&trace.lock().unwrap(), &nonplate_samples), 0, "{relative}");
+            let lazy = lazy.expect("reference has non-forceplate analog");
+            let indices = lazy.device_indices().to_vec();
+            let (mut loaded, warning) = lazy.run().unwrap();
+            assert!(warning.is_none());
+            for i in indices {
+                initial[i] = std::mem::replace(&mut loaded[i], AnalogDevice { channels: vec![] });
+            }
+            assert_same_analog(&full.analog, &initial);
+            read_trace::stop(&trace);
+            eprintln!(
+                "selective reference {relative}: {} devices, {} plates, 0 nonplate startup sample bytes",
+                full.analog.len(),
+                plate_map.len()
+            );
+        }
+    }
+
+    #[test]
+    fn structural_ambiguity_falls_back_without_guessing() {
+        let r = Record {
+            start: 0,
+            end: 0,
+            data_start: 0,
+            analog: true,
+            name: "AnalogChannel0".into(),
+            kind: "FloatChannel".into(),
+            uid: [1; 16],
+            dim: 1,
+        };
+        let records = [r];
+        let groups = vec![vec![0]];
+        assert!(selective_layout(&[], &records, &groups).is_err());
+        let mut duplicate = device_node([1; 16], 1, "a");
+        duplicate.extend(device_node([1; 16], 1, "b"));
+        assert!(selective_layout(&duplicate, &records, &groups).is_err());
+        assert!(selective_layout(&device_node([1; 16], 9, "ForcePlate"), &records, &groups).is_err());
+        assert!(selective_layout(&device_node([2; 16], 1, "a"), &records, &groups).is_err());
+        let mut reused = records.to_vec();
+        reused.push(reused[0].clone());
+        assert!(selective_layout(&device_node([1; 16], 1, "a"), &reused, &[vec![0], vec![1]]).is_err());
+    }
+
+    fn test_job(path: &Path, map: StreamMap, nodes: &[u8], grows: bool) -> AnalogJob {
+        let file = File::open(path).unwrap();
+        let typed = super::super::nodes::analog_device_nodes(nodes).unwrap();
+        let device_uids = typed.iter().map(|n| n.uid).collect();
+        let walked = walk_channels(&file, &map, &device_uids, None).unwrap().unwrap();
+        let (manifest, groups) = device_manifest(&walked.records).unwrap_or_default();
+        let (plate_devices, fallback) = match selective_layout(nodes, &walked.records, &groups) {
+            Ok(p) => (Some(p), None),
+            Err(e) => (None, Some(e.0)),
+        };
+        let indices = (0..manifest.len()).collect();
+        AnalogJob {
+            path: path.to_path_buf(),
+            before: stat_key(&file.metadata().unwrap()),
+            grows,
+            map,
+            kept: walked.kept,
+            analog: walked.records.iter().filter(|r| r.analog).map(|r| (r.start, r.end)).collect(),
+            records: Arc::new(walked.records),
+            manifest,
+            device_records: Arc::new(groups),
+            plate_devices,
+            fallback,
+            selected: None,
+            indices,
+        }
+    }
+
+    fn two_device_stream() -> Vec<u8> {
+        let mut stream = CHANNELS_HEADER.to_vec();
+        stream.extend(2u32.to_le_bytes());
+        stream.extend(with_uid(record("FloatChannel", "AnalogChannel0", 1, 2), [1; 16]));
+        stream.extend(with_uid(record("FloatChannel", "AnalogChannel0", 1, 3), [2; 16]));
+        stream
+    }
+
+    fn refresh_channels(marker_samples: usize) -> Vec<u8> {
+        let mut stream = CHANNELS_HEADER.to_vec();
+        stream.extend(3u32.to_le_bytes());
+        stream.extend(with_uid(record("FloatChannel", "AnalogChannel0", 1, 2), [1; 16]));
+        stream.extend(with_uid(record("Vector3fChannel", "Translation", 3, marker_samples), [3; 16]));
+        stream.extend(with_uid(record("FloatChannel", "AnalogChannel0", 1, 3), [2; 16]));
+        stream
+    }
+
+    fn refresh_nodes() -> Vec<u8> {
+        let mut nodes = device_node([1; 16], 2, "EMG misleading plate name");
+        nodes.extend(device_node([2; 16], 1, "ForcePlate misleading device name"));
+        nodes
+    }
+
+    /// A sealed stream-table fixture permits changes in stream order/size without reading
+    /// any original TAK. Its channel bytes use the production decoder's record format.
+    fn write_refresh_takm(path: &Path, streams: &[(&str, &[u8])]) -> crate::takm::Index {
+        use sha2::{Digest, Sha256};
+        let mut bytes = vec![0u8; crate::takm::HEADER_LEN as usize];
+        let mut table_streams = Vec::new();
+        for (index, (name, data)) in streams.iter().enumerate() {
+            table_streams.push(serde_json::json!({"name":name, "index":index, "offset":bytes.len(), "size":data.len()}));
+            bytes.extend_from_slice(data);
+        }
+        let table_at = bytes.len() as u64;
+        let table = serde_json::to_vec(&serde_json::json!({
+            "streams":table_streams, "dropped":[],
+            "source":{"name":"fixture.tak", "size":0, "sha256":"0".repeat(64)},
+            "made_by":"metadata refresh test", "made_at":"2026-11-16T00:00:00Z"
+        })).unwrap();
+        bytes.extend_from_slice(&table);
+        let fixed = bytes.len() as u64;
+        bytes[..8].copy_from_slice(&crate::takm::MAGIC);
+        bytes[8..12].copy_from_slice(&crate::takm::LAYOUT.to_le_bytes());
+        bytes[16..24].copy_from_slice(&table_at.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(table.len() as u64).to_le_bytes());
+        bytes[32..40].copy_from_slice(&fixed.to_le_bytes());
+        let seal = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&seal);
+        std::fs::write(path, bytes).unwrap();
+        crate::takm::read_index_path(path).unwrap()
+    }
+
+    fn refresh_sample_ranges(channels: &[u8], base: u64) -> Vec<(u64, u64)> {
+        super::super::channels::iter_channel_inventory(channels).unwrap().iter()
+            .map(|record| (base + record.data_start as u64, base + record.data_end as u64)).collect()
+    }
+
+    #[test]
+    fn post_save_metadata_refresh_skips_marker_plate_and_emg_sample_bytes() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("tak_refresh_metadata_{}.takm", std::process::id()));
+        let nodes = refresh_nodes();
+        let channels = refresh_channels(6000);
+        let index = write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Channels.dat", &channels)]);
+        let samples = refresh_sample_ranges(&channels, index.unique("Channels.dat").unwrap().offset);
+        let file = File::open(&path).unwrap();
+        let trace = read_trace::start(&file);
+        let lazy = deferred_job_after_save(&path).unwrap().unwrap();
+        assert_eq!(lazy.device_indices(), [1]);
+        assert!(lazy.fallback_reason().is_none());
+        assert_eq!(overlap(&trace.lock().unwrap(), &samples), 0);
+        assert!(trace.lock().unwrap().iter().map(|(start, end)| end - start).sum::<u64>() < 20_000);
+        trace.lock().unwrap().clear();
+        // Appended Comments do not invalidate the refreshed stream positions.
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"Comment tail\r\n").unwrap();
+        let (loaded, warning) = lazy.run().unwrap();
+        assert!(warning.is_none());
+        assert!(loaded[0].channels[0].frames.is_empty());
+        assert_eq!(loaded[1].channels[0].frames, [0, 1, 2]);
+        assert_eq!(overlap(&trace.lock().unwrap(), &[samples[0], samples[1]]), 0);
+        assert_eq!(overlap(&trace.lock().unwrap(), &[samples[2]]), 24);
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_save_refresh_rebuilds_stream_and_record_positions_after_takm_rewrite() {
+        let path = std::env::temp_dir().join(format!("tak_refresh_rewrite_{}.takm", std::process::id()));
+        let nodes = refresh_nodes();
+        let before = refresh_channels(1);
+        write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Channels.dat", &before)]);
+        let stale = deferred_job_after_save(&path).unwrap().unwrap();
+        let old_base = stale.map.flat.unwrap();
+        let old_emg = stale.records[stale.device_records[1][0]].start;
+        // Saving changed marker counts can move the stream and every subsequent record.
+        let after = refresh_channels(37);
+        let padding = vec![0x55; 4096];
+        let index = write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Calibration.dat", &padding), ("Channels.dat", &after)]);
+        let samples = refresh_sample_ranges(&after, index.unique("Channels.dat").unwrap().offset);
+        let file = File::open(&path).unwrap();
+        let trace = read_trace::start(&file);
+        let fresh = deferred_job_after_save(&path).unwrap().unwrap();
+        assert_ne!(fresh.map.flat.unwrap(), old_base);
+        assert_ne!(fresh.records[fresh.device_records[1][0]].start, old_emg);
+        assert_eq!(overlap(&trace.lock().unwrap(), &samples), 0);
+        let (loaded, warning) = fresh.run().unwrap();
+        assert!(warning.is_none());
+        let (reference, warning) = decode_analog(&after);
+        assert!(warning.is_none());
+        assert_same_analog(&loaded[1..], &reference[1..]);
+        assert!(loaded[0].channels[0].frames.is_empty());
+        assert!(stale.run().is_err(), "the old job must not remain usable after offset changes");
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_save_refresh_rejects_ambiguous_layout_without_reading_samples_or_fallback() {
+        let path = std::env::temp_dir().join(format!("tak_refresh_ambiguous_{}.takm", std::process::id()));
+        let channels = two_device_stream();
+        let nodes = refresh_nodes();
+        for (case, streams) in [
+            ("missing device registry", vec![("Nodes.dat", &[][..]), ("Channels.dat", channels.as_slice())]),
+            ("duplicate device registry", vec![("Nodes.dat", nodes.as_slice()), ("Nodes.dat", nodes.as_slice()), ("Channels.dat", channels.as_slice())]),
+            ("duplicate channels", vec![("Nodes.dat", nodes.as_slice()), ("Channels.dat", channels.as_slice()), ("Channels.dat", channels.as_slice())]),
+        ] {
+            let index = write_refresh_takm(&path, &streams);
+            let samples: Vec<_> = index.streams.iter().filter(|stream| stream.name == "Channels.dat")
+                .flat_map(|stream| refresh_sample_ranges(&channels, stream.offset)).collect();
+            let file = File::open(&path).unwrap();
+            let trace = read_trace::start(&file);
+            assert!(deferred_job_after_save(&path).is_err(), "{case}");
+            assert_eq!(overlap(&trace.lock().unwrap(), &samples), 0, "{case}");
+            read_trace::stop(&trace);
+            drop(file);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_save_refresh_returns_none_for_forceplate_only_and_requires_takm() {
+        let path = std::env::temp_dir().join(format!("tak_refresh_plate_only_{}.takm", std::process::id()));
+        let nodes = device_node([1; 16], 2, "plate");
+        let mut channels = CHANNELS_HEADER.to_vec();
+        channels.extend(1u32.to_le_bytes());
+        channels.extend(with_uid(record("FloatChannel", "AnalogChannel0", 1, 3), [1; 16]));
+        let index = write_refresh_takm(&path, &[("Nodes.dat", &nodes), ("Channels.dat", &channels)]);
+        let samples = refresh_sample_ranges(&channels, index.unique("Channels.dat").unwrap().offset);
+        let file = File::open(&path).unwrap();
+        let trace = read_trace::start(&file);
+        assert!(deferred_job_after_save(&path).unwrap().is_none());
+        assert_eq!(overlap(&trace.lock().unwrap(), &samples), 0);
+        assert!(deferred_job_after_save(&path.with_extension("tak")).err().unwrap().0.contains(".takm"));
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unknown_structure_runs_existing_full_analog_fallback() {
+        let stream = two_device_stream();
+        let path = std::env::temp_dir().join(format!("tak_unknown_analog_{}", std::process::id()));
+        std::fs::write(&path, &stream).unwrap();
+        let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
+        let job = test_job(&path, map, &[], false);
+        assert!(job.fallback_reason().unwrap().contains("structural device node"));
+        let (job, lazy) = job.split();
+        assert!(lazy.is_none());
+        let expected = decode_analog(&stream);
+        let actual = job.run().unwrap();
+        assert_eq!(actual.1, expected.1);
+        assert_same_analog(&actual.0, &expected.0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deferred_read_rejects_changed_tak_and_accepts_only_takm_tail_growth() {
+        use std::io::Write;
+        let stream = two_device_stream();
+        let path = std::env::temp_dir().join(format!("tak_lazy_unchanged_{}", std::process::id()));
+        std::fs::write(&path, &stream).unwrap();
+        let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
+        let mut nodes = device_node([1; 16], 2, "plate");
+        nodes.extend(device_node([2; 16], 1, "other"));
+        let strict = test_job(&path, map.clone(), &nodes, false).split().1.unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"tail").unwrap();
+        assert!(strict.run().unwrap_err().0.contains("changed"));
+        std::fs::write(&path, &stream).unwrap();
+        let grows = test_job(&path, map.clone(), &nodes, true).split().1.unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"tail").unwrap();
+        assert!(grows.run().is_ok());
+        let shrinks = test_job(&path, map, &nodes, true).split().1.unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(stream.len() as u64 - 1).unwrap();
+        assert!(shrinks.run().unwrap_err().0.contains("shorter"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn actual_takm_uses_same_selective_layout_and_all_analog_parity() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
+        if !path.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tak_selective_takm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let converted = crate::takm::convert(&path, Some(&dir)).unwrap();
+        let _ = converted;
+        let out = crate::takm::path_for(&path, Some(&dir));
+        let full = super::super::read_take(&out).unwrap();
+        let read = read_take_fast(&out, true).unwrap();
+        let job = read.analog.unwrap();
+        assert!(job.fallback_reason().is_none(), "{:?}", job.fallback_reason());
+        assert_same_analog(&full.analog, &job.run().unwrap().0);
+        let file = File::open(&out).unwrap();
+        let trace = read_trace::start(&file);
+        let read = read_take_fast(&out, false).unwrap();
+        let job = read.analog.unwrap();
+        let nonplate: Vec<_> = job
+            .device_records
+            .iter()
+            .enumerate()
+            .filter(|(di, _)| !job.plate_devices().unwrap().contains(di))
+            .flat_map(|(_, rs)| rs)
+            .flat_map(|&ri| {
+                let r = &job.records[ri];
+                job.map.pieces(r.data_start, r.end).into_iter().map(|(off, n)| (off, off + n as u64))
+            })
+            .collect();
+        let (startup, lazy) = job.split();
+        startup.run().unwrap();
+        assert_eq!(overlap(&trace.lock().unwrap(), &nonplate), 0);
+        lazy.unwrap().run().unwrap();
+        assert!(overlap(&trace.lock().unwrap(), &nonplate) > 0);
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn read_trace_keeps_equal_size_distinct_files_separate() {
+        let dir = std::env::temp_dir().join(format!("tak_read_identity_{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("a"); let second = dir.join("b");
+        std::fs::write(&first, [1u8; 23]).unwrap();
+        std::fs::write(&second, [2u8; 23]).unwrap();
+        let first = File::open(first).unwrap(); let second = std::fs::OpenOptions::new().read(true).write(true).open(second).unwrap();
+        // Same size and mtime cannot serve as a file identity.
+        second.set_times(std::fs::FileTimes::new().set_modified(first.metadata().unwrap().modified().unwrap())).unwrap();
+        assert_eq!(stat_key(&first.metadata().unwrap()), stat_key(&second.metadata().unwrap()));
+        let a = read_trace::start(&first); let b = read_trace::start(&second);
+        read_exact_at(&first,&mut [0u8;3],0).unwrap();
+        read_exact_at(&second,&mut [0u8;5],1).unwrap();
+        assert_eq!(*a.lock().unwrap(),vec![(0,3)]);
+        assert_eq!(*b.lock().unwrap(),vec![(1,6)]);
+        read_trace::stop(&a); read_trace::stop(&b);
+        drop(first); drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn structurally_known_device_with_renamed_channel_skips_samples_and_reports_fallback() {
+        for (kind, property) in [(1, "RenamedEMG"), (2, "RenamedForce")] {
+            let uid = [kind as u8;16];
+            let mut stream = CHANNELS_HEADER.to_vec();
+            stream.extend(2u32.to_le_bytes());
+            stream.extend(record("Vector3fChannel", "Translation", 3, 5000));
+            stream.extend(with_uid(record("FloatChannel", property, 1, 4), uid));
+            let path = std::env::temp_dir().join(format!("tak_renamed_device_{}_{}", std::process::id(), kind));
+            std::fs::write(&path,&stream).unwrap();
+            let file = File::open(&path).unwrap();
+            let trace = read_trace::start(&file);
+            let nodes = device_node(uid,kind,"unrelated human name");
+            let map = StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};
+            let job = test_job(&path,map,&nodes,false);
+            assert!(job.fallback_reason().unwrap().contains("unsupported structural device channel property"));
+            let device = job.records.iter().find(|r|r.uid==uid).unwrap();
+            assert!(device.analog);
+            let samples = [(device.data_start,device.end)];
+            assert_eq!(overlap(&trace.lock().unwrap(),&samples),0);
+            let (full,lazy)=job.split();
+            assert!(lazy.is_none());
+            let expected=decode_analog(&stream);
+            let actual=full.run().unwrap();
+            assert_eq!(actual.1,expected.1);
+            assert_same_analog(&actual.0,&expected.0);
+            assert_eq!(overlap(&trace.lock().unwrap(),&samples),32);
+            read_trace::stop(&trace);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_device_registry_aborts_before_channel_payload_reads() {
+        let stream=two_device_stream();
+        let path=std::env::temp_dir().join(format!("tak_invalid_device_registry_{}",std::process::id()));
+        std::fs::write(&path,&stream).unwrap();
+        let file=File::open(&path).unwrap();
+        let trace=read_trace::start(&file);
+        let mut malformed=device_node([1;16],1,"a");
+        // Corrupt a known-signature JSON block without changing its declared length.
+        let at=malformed.windows(2).position(|w|w==b"{\0").unwrap();
+        malformed[at]=b'!';
+        let mut unknown = device_node([1;16],1,"unknown class");
+        unknown[2] = b'x'; // Valid type-1 JSON, unsupported device class signature.
+        let mut escaped = unknown.clone();
+        let sig_len = u16::from_le_bytes([escaped[0],escaped[1]]) as usize;
+        let length_at = 2 + sig_len;
+        let chars = u16::from_le_bytes([escaped[length_at],escaped[length_at+1]]) as usize;
+        let json_at = length_at + 2;
+        let old_end = json_at + chars * 2;
+        let json = utf16le_strict(&escaped[json_at..old_end]).unwrap().replace("DeviceNode_DeviceType","DeviceNode_\\u0044eviceType");
+        let encoded = super::super::nodes::utf16(&json);
+        escaped[length_at..length_at+2].copy_from_slice(&((encoded.len()/2) as u16).to_le_bytes());
+        escaped.splice(json_at..old_end,encoded);
+        for nodes in [device_node([1;16],9,"unknown kind"),malformed,unknown,escaped] {
+            trace.lock().unwrap().clear();
+            let map=StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};
+            let before=stat_key(&file.metadata().unwrap());
+            let result=markers_from(&path,&file,(before,false),stream.len() as u64,&nodes,&[],map,0.0,false);
+            assert!(result.is_err());
+            assert!(trace.lock().unwrap().is_empty(),"registry rejection must precede channel header/payload reads");
+        }
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn selected_decode_failure_is_an_error_but_full_decode_keeps_legacy_warning() {
+        let mut stream = two_device_stream();
+        let inventory = super::super::channels::iter_channel_inventory(&stream).unwrap();
+        let second_frame = inventory[1].data_start + 8;
+        // Duplicate the second device's frame 0. The first device remains valid.
+        stream[second_frame..second_frame + 4].copy_from_slice(&0u32.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("tak_selective_decode_error_{}", std::process::id()));
+        std::fs::write(&path, &stream).unwrap();
+        let map = StreamMap { sector: 0, chain: vec![], len: stream.len() as u64, flat: Some(0) };
+        let mut nodes = device_node([1;16], 2, "plate");
+        nodes.extend(device_node([2;16], 1, "other"));
+        let legacy = test_job(&path, map.clone(), &nodes, false).run().unwrap();
+        assert!(legacy.0.is_empty());
+        assert!(legacy.1.as_ref().unwrap().contains("Non-increasing channel frames"));
+        let (startup, lazy) = test_job(&path, map.clone(), &nodes, false).split();
+        assert!(startup.run().unwrap().1.is_none());
+        let failure = lazy.unwrap().run().unwrap_err();
+        assert!(failure.0.contains("Non-increasing channel frames"));
+        // A selected stage must also reject an unexpected decoded device count.
+        let mut inconsistent = test_job(&path, map, &nodes, false);
+        Arc::make_mut(&mut inconsistent.device_records)[0].clear();
+        let (startup, _) = inconsistent.split();
+        assert!(startup.run().unwrap_err().0.contains("device decode count changed"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn counted_tail_walk(records: &[Vec<u8>], expected_channels: usize, marker_uids: &[Uid], tag: &str) -> (Result<Option<Walked>>, Vec<(u64,u64)>, Vec<u8>) {
+        let mut stream=CHANNELS_HEADER.to_vec();
+        stream.extend((records.len() as u32).to_le_bytes());
+        for r in records {stream.extend(r);}
+        let path=std::env::temp_dir().join(format!("tak_counted_tail_{}_{}",std::process::id(),tag));
+        std::fs::write(&path,&stream).unwrap();
+        let file=File::open(&path).unwrap();
+        let trace=read_trace::start(&file);
+        let map=StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};
+        let plan=MarkerTailPlan {channels:std::collections::HashMap::from([([1;16],expected_channels)]),markers:marker_uids.iter().copied().collect()};
+        let result=walk_channels(&file,&map,&std::collections::HashSet::from([[1;16]]),Some(&plan));
+        let reads=trace.lock().unwrap().clone();
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        (result,reads,stream)
+    }
+
+    #[test]
+    fn structural_device_counts_allow_bulk_marker_suffix_without_analog_reads() {
+        let mut records=vec![with_uid(record("FloatChannel","AnalogChannel0",1,5),[1;16])];
+        let markers:Vec<Uid>=(2..32).map(|n|[n;16]).collect();
+        records.extend(markers.iter().map(|uid|with_uid(record("Vector3fChannel","Translation",3,100),*uid)));
+        let (walked,reads,_)=counted_tail_walk(&records,1,&markers,"valid");
+        let walked=walked.unwrap().unwrap();
+        assert_eq!(walked.records.len(),31);
+        assert!(reads.len()<15,"bulk suffix should avoid per-marker header roundtrips: {}",reads.len());
+        let analog=&walked.records[0];
+        assert_eq!(overlap(&reads,&[(analog.data_start,analog.end)]),0);
+    }
+
+    #[test]
+    fn interleaved_device_channels_wait_for_declared_count_before_marker_bulk() {
+        let records=[
+            with_uid(record("FloatChannel","AnalogChannel0",1,5),[1;16]),
+            with_uid(record("Vector3fChannel","Translation",3,5000),[2;16]),
+            with_uid(record("FloatChannel","AnalogChannel1",1,7),[1;16]),
+            with_uid(record("Vector3fChannel","Translation",3,2),[3;16]),
+        ];
+        let (walked,reads,_)=counted_tail_walk(&records,2,&[[2;16],[3;16]],"interleaved");
+        let walked=walked.unwrap().unwrap();
+        let samples:Vec<_>=walked.records.iter().filter(|r|r.analog).map(|r|(r.data_start,r.end)).collect();
+        assert_eq!(overlap(&reads,&samples),0);
+    }
+
+    #[test]
+    fn inconsistent_count_proof_or_marker_suffix_is_rejected_explicitly() {
+        let analog=with_uid(record("FloatChannel","AnalogChannel0",1,5),[1;16]);
+        let marker=with_uid(record("Vector3fChannel","Translation",3,5000),[2;16]);
+        let extra_renamed=with_uid(record("FloatChannel","RenamedEMG",1,3),[1;16]);
+        let (bad,_,_)=counted_tail_walk(&[analog.clone(),marker.clone(),extra_renamed],1,&[[2;16],[3;16]],"extra_renamed");
+        assert!(bad.err().unwrap().0.contains("marker suffix"));
+        let (bad,_,_)=counted_tail_walk(&[analog.clone(),marker.clone(),marker.clone()],1,&[[2;16],[3;16]],"duplicate_marker");
+        assert!(bad.err().unwrap().0.contains("marker suffix"));
+        let mut invalid=with_uid(record("Vector3fChannel","Translation",3,2),[3;16]);
+        let kind_len=u16::from_le_bytes([invalid[0],invalid[1]]) as usize;
+        invalid[2+kind_len]=3; // Unsupported record version inside a proposed suffix.
+        let (bad,_,_)=counted_tail_walk(&[analog.clone(),marker.clone(),invalid],1,&[[2;16],[3;16]],"invalid_marker");
+        assert!(bad.err().unwrap().0.contains("marker suffix"));
+        // An extra channel changes the remaining-record count, preventing any bulk proof.
+        // The subsequent manifest/metadata comparison must explicitly select full fallback.
+        let records=[analog,marker,with_uid(record("FloatChannel","AnalogChannel1",1,2),[1;16]),with_uid(record("Vector3fChannel","Translation",3,2),[3;16])];
+        let (walked,reads,_)=counted_tail_walk(&records,1,&[[2;16],[3;16]],"extra_channel");
+        let walked=walked.unwrap().unwrap();
+        let samples:Vec<_>=walked.records.iter().filter(|r|r.analog).map(|r|(r.data_start,r.end)).collect();
+        assert_eq!(overlap(&reads,&samples),0);
+        let (_,groups)=device_manifest(&walked.records).unwrap();
+        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None}];
+        assert!(selective_layout_for_nodes(&typed,&walked.records,&groups).unwrap_err().0.contains("channel count"));
+    }
+
+    #[test]
+    fn duplicate_node_marker_uids_cannot_prove_a_bulk_suffix() {
+        use super::super::nodes::{tests::node,MARKER_SIGNATURES};
+        let mut nodes=node(MARKER_SIGNATURES[0],"a",[2;16],[0;16],0);
+        nodes.extend(node(MARKER_SIGNATURES[0],"a",[2;16],[0;16],0));
+        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None}];
+        let failure=marker_tail_plan(&nodes,&typed).err().unwrap();
+        assert!(failure.0.contains("duplicate marker UID"));
+    }
+
+    #[test]
+    fn minimum_header_probe_skips_samples_for_shortest_supported_device_properties() {
+        let recs=[
+            with_uid(record("FloatChannel","",1,3),[1;16]),
+            with_uid(record("FloatChannel","X",1,2),[1;16]),
+            with_uid(record("Float16Channel","",16,1),[1;16]),
+        ];
+        let mut stream=CHANNELS_HEADER.to_vec();
+        stream.extend((recs.len() as u32).to_le_bytes());
+        for r in recs {stream.extend(r);}
+        let path=std::env::temp_dir().join(format!("tak_minimum_header_{}",std::process::id()));
+        std::fs::write(&path,&stream).unwrap();
+        let file=File::open(&path).unwrap();
+        let trace=read_trace::start(&file);
+        let map=StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};
+        let walked=walk_channels(&file,&map,&std::collections::HashSet::from([[1;16]]),None).unwrap().unwrap();
+        let sample_ranges:Vec<_>=walked.records.iter().map(|r|(r.data_start,r.end)).collect();
+        assert!(walked.records.iter().all(|r|r.analog));
+        assert_eq!(overlap(&trace.lock().unwrap(),&sample_ranges),0);
+        assert_eq!(walked.records[0].data_start-walked.records[0].start,MIN_HEADER);
+        read_trace::stop(&trace);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        for kind in ["FloatChannel","Float16Channel","Vector3fChannel","QuaternionChannel","class MoCapCore::cChannel<struct MoCapCore::sArrayChannelValues<float,16> >"] {
+            let dim=channel_dim(kind).unwrap();
+            let bytes=record(kind,"",dim,0);
+            assert!(bytes.len() as u64>=MIN_HEADER);
+        }
+    }
+
+    #[test]
+    fn unsupported_or_too_short_record_layout_requests_explicit_fallback() {
+        for (tag,bytes) in [("unknown",record("X","",1,4)),("short",vec![0u8;30])] {
+            let mut stream=CHANNELS_HEADER.to_vec();
+            stream.extend(1u32.to_le_bytes());
+            stream.extend(bytes);
+            let path=std::env::temp_dir().join(format!("tak_bad_minimum_header_{}_{}",std::process::id(),tag));
+            std::fs::write(&path,&stream).unwrap();
+            let file=File::open(&path).unwrap();
+            let map=StreamMap {sector:0,chain:vec![],len:stream.len() as u64,flat:Some(0)};
+            let failure=walk_channels(&file,&map,&std::collections::HashSet::new(),None).err().unwrap();
+            assert!(failure.0.contains("unsupported structural channel")||failure.0.contains("shorter than"));
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
 }

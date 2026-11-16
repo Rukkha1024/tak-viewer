@@ -7,6 +7,7 @@ use crate::edit::{DocumentSnapshot, EditError, Revision};
 use crate::marker_sets;
 use crate::tak::{uid_hex, AnalogDevice, ForcePlate, MarkerKind, Take, Trajectory, Uid};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Where a marker / group / stick color comes from. The viewer (`ui/theme.rs`) picks the
 /// actual screen color, so the core never depends on the GUI.
@@ -90,6 +91,8 @@ pub struct PlateView {
     /// Per-frame Fz (mean of valid subsamples), NaN = missing. Units unverified.
     pub fz: Vec<f32>,
     pub fz_abs_max: f32,
+    /// Prepared on the reader, including the no-device display fallback.
+    pub fz_signal: Arc<SignalView>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +101,36 @@ pub struct ChannelView {
     pub dim: usize,
     /// Per-frame mean of the first min(dim, VALID_SUBSAMPLES) values, NaN = missing.
     pub per_frame: Vec<f32>,
+    /// Plot topology prepared by the reader, shared without copying samples on the UI thread.
+    pub signal: Arc<SignalView>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SignalView {
+    pub runs: Arc<Vec<Vec<[f64; 2]>>>,
+    pub gaps: Arc<Vec<(i64, i64)>>,
+}
+
+impl SignalView {
+    pub fn prepare(values: &[f32], start: i64, end: i64) -> Self {
+        let mut runs = Vec::new();
+        let mut run = Vec::new();
+        let mut gaps = Vec::new();
+        let mut gap = None;
+        for (i, &v) in values.iter().enumerate() {
+            let f = start + i as i64;
+            if v.is_finite() {
+                run.push([f as f64, v as f64]);
+                if let Some(a) = gap.take() { gaps.push((a, f - 1)); }
+            } else {
+                if !run.is_empty() { runs.push(std::mem::take(&mut run)); }
+                gap.get_or_insert(f);
+            }
+        }
+        if !run.is_empty() { runs.push(run); }
+        if let Some(a) = gap { gaps.push((a, end)); }
+        Self { runs: Arc::new(runs), gaps: Arc::new(gaps) }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +140,7 @@ pub struct DeviceView {
     pub channels: Vec<ChannelView>,
 }
 
+#[derive(Clone)]
 pub struct ViewData {
     pub take: Take,
     pub markers: Vec<MarkerView>,
@@ -124,6 +158,11 @@ pub struct ViewData {
     /// Force plate forces / EMG are still being read (markers-first open, `tak::fast_read`).
     /// Set by the caller; `attach_analog` clears it.
     pub analog_pending: bool,
+    /// Non-forceplate samples have not been requested / completed yet.
+    pub emg_pending: bool,
+    /// Plate geometry index -> original analog manifest index, when structurally verified.
+    plate_devices: Option<Vec<usize>>,
+    analog_generation: u64,
     /// Marker revision used to build this view; None for the initial read-only display.
     pub edit_revision: Option<Revision>,
 }
@@ -135,20 +174,32 @@ pub struct AnalogTarget {
     start: i64,
     end: i64,
     scale: f32,
+    plate_devices: Option<Vec<usize>>,
 }
 
 /// Force plates / EMG of stage 2, prepared off the drawing thread (`ViewData::attach_prepared`).
+#[derive(Clone)]
 pub struct AnalogPart {
     analog: Vec<AnalogDevice>,
     warning: Option<String>,
     devices: Vec<DeviceView>,
     plates: Vec<PlateView>,
+    selected: Option<Vec<usize>>,
+    initial: bool,
 }
 
 impl AnalogPart {
     pub fn prepare(analog: Vec<AnalogDevice>, warning: Option<String>, target: &AnalogTarget) -> AnalogPart {
-        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale);
-        AnalogPart { analog, warning, devices, plates }
+        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref());
+        AnalogPart { analog, warning, devices, plates, selected: None, initial: true }
+    }
+
+    /// A selective stage carries a complete header manifest; only these indices replace samples.
+    pub fn prepare_selected(analog: Vec<AnalogDevice>, warning: Option<String>, target: &AnalogTarget, selected: Vec<usize>, initial: bool) -> Self {
+        let mut part = Self::prepare(analog, warning, target);
+        part.selected = Some(selected);
+        part.initial = initial;
+        part
     }
 }
 
@@ -273,9 +324,16 @@ fn track(t: &Trajectory, start: i64, end: i64, scale: f32) -> Track {
     Track { span, dense, bounds, in_range, gaps: gap_list, max_gap, segments: segments(&t.frames) }
 }
 
+/// Preserve the original finite-value summation order without allocating one vector per row.
+fn finite_mean(row: &[f32]) -> Option<f32> {
+    let mut count = 0usize;
+    let sum = row.iter().filter(|value| value.is_finite()).inspect(|_| count += 1).sum::<f32>();
+    (count != 0).then(|| sum / count as f32)
+}
+
 /// Analog devices -> per-frame means, and force plates (corners in display units, Fz per frame
 /// from the device of the same index). Shared by `build` and `AnalogPart::prepare`.
-fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32) -> (Vec<DeviceView>, Vec<PlateView>) {
+fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32, plate_devices: Option<&[usize]>) -> (Vec<DeviceView>, Vec<PlateView>) {
     let n = (end - start + 1) as usize;
     let mut devices = Vec::new();
     for (di, d) in analog.iter().enumerate() {
@@ -283,7 +341,8 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
             .channels
             .iter()
             .map(|c| {
-                let mut per_frame = vec![f32::NAN; n];
+                // Header-only channels must not allocate or scan one value per file frame.
+                let mut per_frame = if c.frames.is_empty() { Vec::new() } else { vec![f32::NAN; n] };
                 let valid = c.dim.min(VALID_SUBSAMPLES).max(1);
                 for (k, &f) in c.frames.iter().enumerate() {
                     let f = f as i64;
@@ -291,15 +350,18 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
                         continue;
                     }
                     let row = &c.values[k * c.dim..k * c.dim + valid];
-                    let vals: Vec<f32> = row.iter().copied().filter(|v| v.is_finite()).collect();
-                    if !vals.is_empty() {
-                        per_frame[(f - start) as usize] = vals.iter().sum::<f32>() / vals.len() as f32;
+                    if let Some(mean) = finite_mean(row) {
+                        per_frame[(f - start) as usize] = mean;
                     }
                 }
-                ChannelView { name: c.name.clone(), dim: c.dim, per_frame }
+                let signal = Arc::new(SignalView::prepare(&per_frame, start, end));
+                ChannelView { name: c.name.clone(), dim: c.dim, per_frame, signal }
             })
             .collect();
-        let plate = if di < plates.len() { Some(di) } else { None };
+        let plate = match plate_devices {
+            Some(map) => map.iter().position(|&device| device == di),
+            None => (di < plates.len()).then_some(di),
+        };
         let title = match plate {
             Some(p) => format!("Force plate: {}", plates[p].name),
             None => format!("아날로그 장치 {}", di + 1),
@@ -312,13 +374,15 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
         .enumerate()
         .map(|(pi, p)| {
             let corners = p.corners.map(|c| Vec3::from_arr([c[0] * scale, c[1] * scale, c[2] * scale]));
-            let device = if pi < devices.len() { Some(pi) } else { None };
+            let device = plate_devices.map_or_else(|| (pi < devices.len()).then_some(pi), |map| map.get(pi).copied());
             let fz = device
-                .and_then(|d| devices[d].channels.get(FZ_CHANNEL))
+                .and_then(|d| devices.get(d)).and_then(|d| d.channels.get(FZ_CHANNEL))
                 .map(|c| c.per_frame.clone())
                 .unwrap_or_default();
             let fz_abs_max = fz.iter().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
-            PlateView { name: p.name.clone(), corners, fz, fz_abs_max }
+            let fz_signal = device.and_then(|d| devices.get(d)).and_then(|d| d.channels.get(FZ_CHANNEL))
+                .map(|c| c.signal.clone()).unwrap_or_default();
+            PlateView { name: p.name.clone(), corners, fz, fz_abs_max, fz_signal }
         })
         .collect();
     (devices, plates)
@@ -326,6 +390,10 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
 
 impl ViewData {
     pub fn build(take: Take) -> ViewData {
+        Self::build_with_plate_devices(take, None)
+    }
+
+    pub fn build_with_plate_devices(take: Take, plate_devices: Option<Vec<usize>>) -> ViewData {
         let start = take.start_frame;
         let end = take.end_frame.max(start);
         let frame_count = (end - start + 1) as f32;
@@ -510,7 +578,7 @@ impl ViewData {
         }
 
         let n = (end - start + 1) as usize;
-        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale);
+        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale, plate_devices.as_deref());
 
         // Robust bounds (2–98 percentile per axis) of labeled markers, so stray points do not
         // shrink the initial view.
@@ -574,6 +642,9 @@ impl ViewData {
             occlusion,
             take,
             analog_pending: false,
+            emg_pending: false,
+            plate_devices,
+            analog_generation: 0,
             edit_revision: None,
         }
     }
@@ -581,7 +652,20 @@ impl ViewData {
     /// Rebuild marker-derived display data from an immutable document snapshot. Run on a worker
     /// with an owned Take whose analog stage is complete. Publication must check the revision.
     /// The initial fast open does not call this and does not copy an editable document.
-    pub fn rebuild_edited(mut take: Take, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
+    pub fn rebuild_edited(take: Take, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
+        Self::rebuild_edited_with_layout(take, snapshot, None)
+    }
+
+    /// Run on a worker: retain currently loaded analog stages during marker edit / undo / save.
+    pub fn rebuild_markers(&self, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
+        let mut view = Self::rebuild_edited_with_layout(self.take.clone(), snapshot, self.plate_devices.clone())?;
+        view.analog_pending = self.analog_pending;
+        view.emg_pending = self.emg_pending;
+        view.analog_generation = self.analog_generation;
+        Ok(view)
+    }
+
+    fn rebuild_edited_with_layout(mut take: Take, snapshot: &DocumentSnapshot, plate_devices: Option<Vec<usize>>) -> Result<ViewData, EditError> {
         let input = snapshot.input().ok_or(EditError::NotLoaded)?;
         let mut existing = HashMap::new();
         for track in std::mem::take(&mut take.trajectories) {
@@ -613,15 +697,17 @@ impl ViewData {
             tracks.push(trajectory);
         }
         take.trajectories = tracks;
-        let mut view = ViewData::build(take);
+        let mut view = ViewData::build_with_plate_devices(take, plate_devices);
         view.edit_revision = Some(snapshot.revision());
         Ok(view)
     }
 
     /// What `AnalogPart::prepare` needs from this view data (small: plate corners and the
     /// frame range), so stage 2 can be prepared on another thread.
+    pub fn analog_generation(&self) -> u64 { self.analog_generation }
+
     pub fn analog_target(&self) -> AnalogTarget {
-        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale }
+        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale, plate_devices: self.plate_devices.clone() }
     }
 
     /// Stage 2 of the markers-first open: the analog devices arrive. Gives the same devices and
@@ -639,14 +725,35 @@ impl ViewData {
 
     /// Move prepared stage-2 data into this view and return the previous buffers without
     /// dropping them. The caller can retire that part off the drawing thread.
-    pub fn swap_prepared(&mut self, part: AnalogPart) -> AnalogPart {
-        self.take.warnings.extend(part.warning);
-        self.analog_pending = false;
-        AnalogPart {
-            analog: std::mem::replace(&mut self.take.analog, part.analog),
-            warning: None,
-            devices: std::mem::replace(&mut self.devices, part.devices),
-            plates: std::mem::replace(&mut self.plates, part.plates),
+    pub fn swap_prepared(&mut self, mut part: AnalogPart) -> AnalogPart {
+        self.analog_generation = self.analog_generation.wrapping_add(1);
+        self.take.warnings.extend(part.warning.take());
+        if part.initial { self.analog_pending = false; }
+        if !part.initial || part.selected.is_none() { self.emg_pending = false; }
+        if let Some(selected) = &part.selected {
+            // Full ordered manifests keep device/channel selections stable through both stages.
+            for &i in selected {
+                if i < self.take.analog.len() && i < part.analog.len() && i < self.devices.len() && i < part.devices.len() {
+                    std::mem::swap(&mut self.take.analog[i], &mut part.analog[i]);
+                    std::mem::swap(&mut self.devices[i], &mut part.devices[i]);
+                }
+            }
+            for (pi, plate) in self.plates.iter_mut().enumerate() {
+                let device = self.plate_devices.as_ref().and_then(|map| map.get(pi)).copied().unwrap_or(pi);
+                if selected.contains(&device) {
+                    if let Some(incoming) = part.plates.get_mut(pi) { std::mem::swap(plate, incoming); }
+                }
+            }
+            part
+        } else {
+            AnalogPart {
+                analog: std::mem::replace(&mut self.take.analog, part.analog),
+                warning: None,
+                devices: std::mem::replace(&mut self.devices, part.devices),
+                plates: std::mem::replace(&mut self.plates, part.plates),
+                selected: None,
+                initial: true,
+            }
         }
     }
 
@@ -747,6 +854,74 @@ mod tests {
         assert_eq!(format!("{:?}", later.devices), format!("{:?}", full.devices));
         assert_eq!(format!("{:?}", later.plates), format!("{:?}", full.plates));
         assert_eq!(later.take.warnings, vec!["w".to_owned()]);
+    }
+
+    #[test]
+    fn selective_stages_preserve_ordered_manifest_forceplate_mapping_and_prior_samples() {
+        let device = |base: f32| AnalogDevice { channels: (0..3).map(|i| AnalogChannel {
+            name: format!("AnalogChannel{i}"), kind: "Analog".into(), dim: 1,
+            frames: vec![0, 2], values: vec![base + i as f32, base + i as f32 + 1.0],
+        }).collect() };
+        let full = vec![device(10.0), device(100.0), device(20.0)];
+        let mut manifest = full.clone();
+        for d in &mut manifest { for c in &mut d.channels { c.frames.clear(); c.values.clear(); } }
+        let take = Take {
+            path: "x.tak".into(), file_size: 0, metadata: vec![], frame_rate: 100.0,
+            start_frame: 0, end_frame: 2, trajectories: vec![], assets: vec![], label_groups: vec![],
+            plates: vec![ForcePlate { name: "P1".into(), corners: [[0.0; 3]; 4] }],
+            analog: manifest.clone(), warnings: vec![],
+        };
+        let mut view = ViewData::build_with_plate_devices(take, Some(vec![1]));
+        view.analog_pending = true;
+        view.emg_pending = true;
+        assert_eq!(view.devices.iter().map(|d| d.plate).collect::<Vec<_>>(), vec![None, Some(0), None]);
+        assert!(view.devices.iter().flat_map(|d| &d.channels).all(|c| c.per_frame.is_empty() && c.signal.runs.is_empty()));
+        let target = view.analog_target();
+        let mut initial = manifest.clone(); initial[1] = full[1].clone();
+        view.attach_prepared(AnalogPart::prepare_selected(initial, None, &target, vec![1], true));
+        assert!(!view.analog_pending && view.emg_pending);
+        assert_eq!(view.plates[0].fz[0], 102.0);
+        let force_buffer = view.plates[0].fz.as_ptr();
+        let mut lazy = manifest; lazy[0] = full[0].clone(); lazy[2] = full[2].clone();
+        view.attach_prepared(AnalogPart::prepare_selected(lazy, None, &target, vec![0, 2], false));
+        assert!(!view.emg_pending);
+        assert_eq!(view.plates[0].fz.as_ptr(), force_buffer, "EMG must not replace or drop forceplate buffers");
+        assert_eq!(view.take.analog[0].channels[0].values, vec![10.0, 11.0]);
+        assert_eq!(view.take.analog[1].channels[0].values, vec![100.0, 101.0]);
+        assert_eq!(view.devices[2].channels[0].signal.gaps.as_ref(), &vec![(1, 1)]);
+        assert_eq!(view.devices[2].channels[0].signal.runs.as_ref(), &vec![vec![[0.0, 20.0]], vec![[2.0, 21.0]]]);
+        // Malformed/IO-failed selective decode can contain no devices despite a valid map.
+        let failed = AnalogPart::prepare_selected(vec![], Some("failed".into()), &target, vec![0, 2], false);
+        view.attach_prepared(failed);
+        assert_eq!(view.plates[0].fz.as_ptr(), force_buffer);
+        assert_eq!(view.take.warnings, vec!["failed"]);
+    }
+
+    #[test]
+    fn finite_channel_mean_without_row_allocation_matches_original_bits() {
+        let reference = |row: &[f32]| {
+            let values: Vec<f32> = row.iter().copied().filter(|value| value.is_finite()).collect();
+            (!values.is_empty()).then(|| (values.iter().sum::<f32>() / values.len() as f32).to_bits())
+        };
+        let cases: &[&[f32]] = &[
+            &[], &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            &[0.0], &[-0.0], &[-0.0, -0.0], &[0.0, -0.0],
+            &[1e20, 1.0, -1e20, 3.0], &[f32::MAX, f32::MAX, -f32::MAX],
+            &[f32::from_bits(1), -f32::from_bits(1), f32::MIN_POSITIVE],
+            &[f32::NAN, 2.0, f32::INFINITY, -1.0, f32::NEG_INFINITY, 5.0],
+        ];
+        for row in cases { assert_eq!(finite_mean(row).map(f32::to_bits), reference(row)); }
+        // Include arbitrary exponent/sign/mantissa patterns in every supported subsample count.
+        let mut state = 0x83a9_1c25u32;
+        for len in 1..=VALID_SUBSAMPLES {
+            for _ in 0..1024 {
+                let row: Vec<f32> = (0..len).map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f32::from_bits(state)
+                }).collect();
+                assert_eq!(finite_mean(&row).map(f32::to_bits), reference(&row), "row length {len}");
+            }
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub const EMPTY: &str = "열린 파일이 없어요";
 pub const CHOSEN_VIEW: &str = "고른 화면";
 
 /// One file in the list.
+#[derive(Clone)]
 pub struct Entry {
     pub path: PathBuf,
     pub host: Option<String>,
@@ -40,7 +41,13 @@ pub struct Entry {
 }
 
 /// One view with a file: its own file first, then the file laid over it.
+#[derive(Clone)]
 pub struct Group {
+    /// Stable whole-layout tab id; never the tab's current index.
+    pub tab_id: u64,
+    pub tab_name: String,
+    /// Zero-based reading order among this tab's populated views.
+    pub view_index: usize,
     pub slot: usize,
     pub active: bool,
     pub entries: Vec<Entry>,
@@ -49,15 +56,15 @@ pub struct Group {
 #[derive(Debug, PartialEq)]
 pub enum EditorAction {
     /// Make this view the active one (row click of a view with no file laid over it).
-    Activate(usize),
+    Activate(u64, usize),
     /// Row click of a view with a file laid over it: as a click on that file's name tag
-    /// (slot, 0 = the view's own file / 1 = the laid-over file): the view becomes the active
+    /// (tab id, slot, 0 = the view's own file / 1 = the laid-over file): the view becomes the active
     /// one and that file's markers are hidden / shown.
-    ToggleShown(usize, usize),
+    ToggleShown(u64, usize, usize),
     /// Close this view's file (× on its own file).
-    Close(usize),
+    Close(u64, usize),
     /// Take the file laid over this view off (× on the laid-over file).
-    OverlayOff(usize),
+    OverlayOff(u64, usize),
     /// Add this folder to WORKSPACE (`폴더 추가`).
     AddFolder(PathBuf),
     /// `폴더 추가` while WORKSPACE is full: say why.
@@ -73,9 +80,9 @@ pub fn title(groups: &[Group]) -> String {
     format!("OPEN EDITORS ({})", count(groups))
 }
 
-/// Header of the `i`-th group (0 = first in reading order).
-pub fn group_title(i: usize) -> String {
-    format!("화면 {}", i + 1)
+/// The layout name and its view's reading-order number, also shown for a single group.
+pub fn group_title(group: &Group) -> String {
+    format!("{} · View {}", group.tab_name, group.view_index + 1)
 }
 
 fn name_of(p: &Path) -> String {
@@ -166,14 +173,11 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool) 
         ui.painter().with_clip_rect(r).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, EMPTY, FontId::proportional(12.0), FG_DIM);
         return None;
     }
-    let headers = groups.len() > 1;
     let max_h = (ui.available_height() * 0.5).max(ROW_H * 3.0);
     ScrollArea::vertical().id_salt("open_editors").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-        for (i, g) in groups.iter().enumerate() {
-            if headers {
-                group_header(ui, i, g.active);
-            }
+        for g in groups {
+            group_header(ui, g);
             for (j, e) in g.entries.iter().enumerate() {
                 if let Some(a) = row(ui, g, j, e, ws_full) {
                     action = Some(a);
@@ -184,12 +188,12 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool) 
     action
 }
 
-fn group_header(ui: &mut Ui, i: usize, active: bool) {
+fn group_header(ui: &mut Ui, group: &Group) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), GROUP_H), Sense::hover());
     let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
     let y = r.center().y + 1.0;
-    let shown = p.text(pos2(r.left() + 20.0, y), Align2::LEFT_CENTER, group_title(i), FontId::proportional(11.5), if active { CHOSEN } else { FG });
-    if active {
+    let shown = p.text(pos2(r.left() + 20.0, y), Align2::LEFT_CENTER, group_title(group), FontId::proportional(11.5), if group.active { CHOSEN } else { FG });
+    if group.active {
         p.text(pos2(shown.right() + 6.0, y), Align2::LEFT_CENTER, CHOSEN_VIEW, FontId::proportional(11.0), FG_DIM);
     }
 }
@@ -200,12 +204,12 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<Edi
     let cy = rect.center().y;
     // × and `폴더 추가` are registered after the row, so they get their clicks.
     let x_rect = Rect::from_center_size(pos2(rect.left() + CLOSE_X, cy), vec2(20.0, 20.0));
-    let x_resp = ui.interact(x_rect, ui.id().with(("open_editor_close", g.slot, j)), Sense::click());
+    let x_resp = ui.interact(x_rect, ui.id().with(("open_editor_close", g.tab_id, g.slot, j)), Sense::click());
     let button = e.add_folder.as_ref().map(|dir| {
         let galley = ui.painter().layout_no_wrap(ADD_FOLDER.to_owned(), FontId::proportional(11.0), Color32::WHITE);
         let w = galley.size().x + 12.0;
         let r = Rect::from_min_size(pos2(rect.right() - 6.0 - w, cy - 8.0), vec2(w, 16.0));
-        (dir, r, ui.interact(r, ui.id().with(("open_editor_add", g.slot, j)), Sense::click()))
+        (dir, r, ui.interact(r, ui.id().with(("open_editor_add", g.tab_id, g.slot, j)), Sense::click()))
     });
 
     let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
@@ -273,7 +277,7 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<Edi
     p.with_clip_rect(text_clip).galley(pos2(rect.left() + NAME_X, cy - galley.size().y / 2.0), galley, FG);
 
     if x_resp.clicked() {
-        return Some(if j == 0 { EditorAction::Close(g.slot) } else { EditorAction::OverlayOff(g.slot) });
+        return Some(if j == 0 { EditorAction::Close(g.tab_id, g.slot) } else { EditorAction::OverlayOff(g.tab_id, g.slot) });
     }
     if let Some((dir, _, b)) = button {
         if b.clicked() {
@@ -285,8 +289,8 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool) -> Option<Edi
     }
     // A view with a file laid over it: the row is that file's name tag (1 / 2).
     Some(match e.mark {
-        Some(which) => EditorAction::ToggleShown(g.slot, which),
-        None => EditorAction::Activate(g.slot),
+        Some(which) => EditorAction::ToggleShown(g.tab_id, g.slot, which),
+        None => EditorAction::Activate(g.tab_id, g.slot),
     })
 }
 
@@ -303,8 +307,8 @@ mod tests {
     /// Two views: view 0 (active) with b laid over it, view 2 with c from outside WORKSPACE.
     fn sample() -> Vec<Group> {
         vec![
-            Group { slot: 0, active: true, entries: vec![entry("/w/copy/a.takm", Some(0), false), entry("/w/raw/a.tak", Some(1), false)] },
-            Group { slot: 2, active: false, entries: vec![entry("/x/S02/c.tak", None, true)] },
+            Group { tab_id: 17, tab_name: "tab1".into(), view_index: 0, slot: 0, active: true, entries: vec![entry("/w/copy/a.takm", Some(0), false), entry("/w/raw/a.tak", Some(1), false)] },
+            Group { tab_id: 17, tab_name: "tab1".into(), view_index: 1, slot: 2, active: false, entries: vec![entry("/x/S02/c.tak", None, true)] },
         ]
     }
 
@@ -371,7 +375,7 @@ mod tests {
         run(&ctx, &groups, false, &mut folded, None, false);
         let (out, _) = run(&ctx, &groups, false, &mut folded, None, false);
         let shown: Vec<String> = texts(&out).into_iter().map(|t| t.1).collect();
-        assert_eq!(shown, vec!["OPEN EDITORS (3)", "화면 1", CHOSEN_VIEW, "a.takmcopy", "a.takraw", "화면 2", "c.takS02", ADD_FOLDER]);
+        assert_eq!(shown, vec!["OPEN EDITORS (3)", "tab1 · View 1", CHOSEN_VIEW, "a.takmcopy", "a.takraw", "tab1 · View 2", "c.takS02", ADD_FOLDER]);
         let t = texts(&out);
         assert_eq!(t[1].2, CHOSEN, "the active view's header is blue");
         assert_eq!(t[5].2, FG, "the other one is not");
@@ -384,18 +388,55 @@ mod tests {
     }
 
     #[test]
-    fn one_group_has_no_header_and_no_file_says_so() {
+    fn one_group_keeps_its_tab_header_and_no_file_says_so() {
         let ctx = egui::Context::default();
-        let one = vec![Group { slot: 1, active: true, entries: vec![entry("/w/a.tak", None, false)] }];
+        let one = vec![Group { tab_id: 17, tab_name: "tab1".into(), view_index: 0, slot: 1, active: true, entries: vec![entry("/w/a.tak", None, false)] }];
         let mut folded = false;
         run(&ctx, &one, false, &mut folded, None, false);
         let (out, _) = run(&ctx, &one, false, &mut folded, None, false);
         let shown: Vec<String> = texts(&out).into_iter().map(|t| t.1).collect();
-        assert_eq!(shown, vec!["OPEN EDITORS (1)", "a.takw"]);
+        assert_eq!(shown, vec!["OPEN EDITORS (1)", "tab1 · View 1", CHOSEN_VIEW, "a.takw"]);
         let (out, _) = run(&ctx, &[], false, &mut folded, None, false);
         let t = texts(&out);
         assert_eq!(t.iter().map(|t| t.1.as_str()).collect::<Vec<_>>(), vec!["OPEN EDITORS (0)", EMPTY]);
         assert_eq!(t[1].2, FG_DIM);
+    }
+
+    #[test]
+    fn same_view_slots_in_different_tabs_keep_distinct_click_targets() {
+        let ctx = egui::Context::default();
+        let mut groups = vec![
+            Group { tab_id: 41, tab_name: "walk".into(), view_index: 0, slot: 0, active: false,
+                entries: vec![entry("/w/a.tak", None, false)] },
+            Group { tab_id: 73, tab_name: "tab2".into(), view_index: 0, slot: 0, active: true,
+                entries: vec![entry("/w/b.tak", Some(0), false), entry("/w/c.tak", Some(1), false)] },
+        ];
+        let mut folded = false;
+        for reordered in [false, true] {
+            if reordered { groups.swap(0, 1); }
+            run(&ctx, &groups, false, &mut folded, None, false);
+            let (out, _) = run(&ctx, &groups, false, &mut folded, None, false);
+            assert!(texts(&out).iter().any(|t| t.1 == "walk · View 1"));
+            assert!(texts(&out).iter().any(|t| t.1 == "tab2 · View 1"));
+            for (name, expected) in [
+                ("a.takw", EditorAction::Activate(41, 0)),
+                ("b.takw", EditorAction::ToggleShown(73, 0, 0)),
+                ("c.takw", EditorAction::ToggleShown(73, 0, 1)),
+            ] {
+                let at = at_text(&out, name).center();
+                run(&ctx, &groups, false, &mut folded, Some(at), false);
+                assert_eq!(run(&ctx, &groups, false, &mut folded, Some(at), true).1, Some(expected));
+            }
+            for (name, expected) in [
+                ("a.takw", EditorAction::Close(41, 0)),
+                ("b.takw", EditorAction::Close(73, 0)),
+                ("c.takw", EditorAction::OverlayOff(73, 0)),
+            ] {
+                let at = pos2(CLOSE_X, at_text(&out, name).center().y);
+                run(&ctx, &groups, false, &mut folded, Some(at), false);
+                assert_eq!(run(&ctx, &groups, false, &mut folded, Some(at), true).1, Some(expected));
+            }
+        }
     }
 
     #[test]
@@ -413,12 +454,12 @@ mod tests {
         // A view with a file laid over it: a row = that file's name tag (0 = own, 1 = laid over),
         // also on the name itself and on the mark; without one: only choose the view.
         let copy = at_text(&out, "a.takmcopy");
-        assert_eq!(click(copy.center(), false, &mut folded), Some(EditorAction::ToggleShown(0, 0)));
-        assert_eq!(click(pos2(copy.left() + 2.0, copy.center().y), false, &mut folded), Some(EditorAction::ToggleShown(0, 0)));
-        assert_eq!(click(raw.center(), false, &mut folded), Some(EditorAction::ToggleShown(0, 1)));
-        assert_eq!(click(pos2(MARK_X, raw.center().y), false, &mut folded), Some(EditorAction::ToggleShown(0, 1)));
-        assert_eq!(click(c.center(), false, &mut folded), Some(EditorAction::Activate(2)));
-        assert_eq!(click(pos2(MARK_X, c.center().y), false, &mut folded), Some(EditorAction::Activate(2)));
+        assert_eq!(click(copy.center(), false, &mut folded), Some(EditorAction::ToggleShown(17, 0, 0)));
+        assert_eq!(click(pos2(copy.left() + 2.0, copy.center().y), false, &mut folded), Some(EditorAction::ToggleShown(17, 0, 0)));
+        assert_eq!(click(raw.center(), false, &mut folded), Some(EditorAction::ToggleShown(17, 0, 1)));
+        assert_eq!(click(pos2(MARK_X, raw.center().y), false, &mut folded), Some(EditorAction::ToggleShown(17, 0, 1)));
+        assert_eq!(click(c.center(), false, &mut folded), Some(EditorAction::Activate(17, 2)));
+        assert_eq!(click(pos2(MARK_X, c.center().y), false, &mut folded), Some(EditorAction::Activate(17, 2)));
         // Hidden or still being read: the same (the app does what the name tag does then).
         let mut odd = sample();
         odd[0].entries[1].hidden = true;
@@ -428,12 +469,12 @@ mod tests {
         for (text, which) in [("a.takm …copy", 0), ("a.tak · 숨김raw", 1)] {
             let at = at_text(&o, text).center();
             run(&ctx, &odd, false, &mut folded, Some(at), false);
-            assert_eq!(run(&ctx, &odd, false, &mut folded, Some(at), true).1, Some(EditorAction::ToggleShown(0, which)), "{text}");
+            assert_eq!(run(&ctx, &odd, false, &mut folded, Some(at), true).1, Some(EditorAction::ToggleShown(17, 0, which)), "{text}");
         }
         let x_of = |r: Rect| pos2(CLOSE_X, r.center().y);
-        assert_eq!(click(x_of(at_text(&out, "a.takmcopy")), false, &mut folded), Some(EditorAction::Close(0)));
-        assert_eq!(click(x_of(raw), false, &mut folded), Some(EditorAction::OverlayOff(0)));
-        assert_eq!(click(x_of(c), false, &mut folded), Some(EditorAction::Close(2)));
+        assert_eq!(click(x_of(at_text(&out, "a.takmcopy")), false, &mut folded), Some(EditorAction::Close(17, 0)));
+        assert_eq!(click(x_of(raw), false, &mut folded), Some(EditorAction::OverlayOff(17, 0)));
+        assert_eq!(click(x_of(c), false, &mut folded), Some(EditorAction::Close(17, 2)));
         let add = at_text(&out, ADD_FOLDER).center();
         assert_eq!(click(add, false, &mut folded), Some(EditorAction::AddFolder(PathBuf::from("/x/S02"))));
         // WORKSPACE full: the button is dim and says why instead.
@@ -460,7 +501,7 @@ mod tests {
         assert_eq!(row_text(&e).0, "a.tak …");
         // Narrow: 150 points wide.
         let ctx = egui::Context::default();
-        let groups = vec![Group { slot: 0, active: true, entries: vec![entry("/x/S02/S01_perturb_20_001_very_long_name.takm", None, true)] }];
+        let groups = vec![Group { tab_id: 17, tab_name: "tab1".into(), view_index: 0, slot: 0, active: true, entries: vec![entry("/x/S02/S01_perturb_20_001_very_long_name.takm", None, true)] }];
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(150.0, 300.0));
         let mut folded = false;
         let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
@@ -492,7 +533,7 @@ mod tests {
 
     /// A frame of a single view's rows (outside WORKSPACE, so with the button) at `width` points.
     fn at_width(ctx: &egui::Context, entries: Vec<Entry>, width: f32) -> egui::FullOutput {
-        let groups = vec![Group { slot: 0, active: false, entries }];
+        let groups = vec![Group { tab_id: 17, tab_name: "tab1".into(), view_index: 0, slot: 0, active: false, entries }];
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 300.0));
         let mut folded = false;
         let mut out = None;

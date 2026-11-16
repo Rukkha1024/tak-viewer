@@ -201,7 +201,7 @@ impl LaneCache {
         let dashed = |o: &ViewData, mi: usize| {
             let shift = (data.start_frame - o.start_frame) as f64;
             let mut lanes = same_name(data, mi, o).map_or_else(Vec::new, |k| marker_lanes(o, k));
-            for p in lanes.iter_mut().flat_map(|l| l.runs.iter_mut()).flatten() {
+            for p in lanes.iter_mut().flat_map(|l| std::sync::Arc::make_mut(&mut l.runs).iter_mut()).flatten() {
                 p[0] += shift;
             }
             lanes
@@ -455,13 +455,14 @@ impl PlateCache {
         {
             self.builds += 1;
         }
-        let empty = Vec::new();
-        let per_frame = match plate_device(data, pi) {
-            Some(d) => d.channels.get(ch).map_or(&empty, |c| &c.per_frame),
-            None if ch == FZ_CHANNEL => &data.plates[pi].fz,
-            None => &empty,
+        let (runs, gaps) = match plate_device(data, pi).and_then(|d| d.channels.get(ch)) {
+            Some(channel) => (channel.signal.runs.clone(), channel.signal.gaps.as_ref().clone()),
+            None if ch == FZ_CHANNEL => {
+                let signal = &data.plates[pi].fz_signal;
+                (signal.runs.clone(), signal.gaps.as_ref().clone())
+            }
+            None => (std::sync::Arc::default(), Vec::new()),
         };
-        let (runs, gaps) = runs_and_gaps(per_frame, data.start_frame, data.end_frame);
         let (letter, color) = PLATE_LANES[ch];
         (Lane { letter: letter.to_owned(), color, runs, unit: "" }, gaps)
     }
@@ -483,6 +484,7 @@ fn merged<'a>(lists: impl Iterator<Item = &'a [(i64, i64)]>) -> Vec<(i64, i64)> 
 
 /// Per-frame values (NaN = none, first value at frame `start`) -> runs of (frame, value)
 /// without gaps, and the gaps as (first, last) frame.
+#[cfg(test)]
 fn runs_and_gaps(per_frame: &[f32], start: i64, end: i64) -> (Vec<Vec<[f64; 2]>>, Vec<(i64, i64)>) {
     let mut runs: Vec<Vec<[f64; 2]>> = vec![];
     let mut cur: Vec<[f64; 2]> = vec![];
@@ -525,7 +527,7 @@ fn marker_lanes(data: &ViewData, mi: usize) -> Vec<Lane> {
             runs.push((0..n).map(|j| [t.frames[k + j] as f64, t.xyz[k + j][axis] as f64 * to_mm]).collect());
             k += n;
         }
-        lanes.push(Lane { letter: letter.to_owned(), color, runs, unit: "mm" });
+        lanes.push(Lane { letter: letter.to_owned(), color, runs: runs.into(), unit: "mm" });
     }
     lanes
 }
@@ -632,13 +634,44 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
 #[derive(Default)]
 pub struct DevicesState {
     pub channel: HashMap<usize, usize>,
+    /// Set whenever a non-forceplate header/graph is open; consumed by the file loader.
+    pub request_emg: bool,
+    /// Benchmark forces the same existing header open; ordinary input leaves this unset.
+    pub open_device: Option<usize>,
+    graphs: HashMap<(usize, usize, usize), DeviceGraph>,
 }
 
-pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>) -> Option<Action> {
+struct DeviceGraph {
+    signal: std::sync::Arc<tak_core::view_data::SignalView>,
+    lanes: [Lane; 1],
+    drawn: graph::Drawn,
+}
+
+impl DevicesState {
+    pub fn reset_graphs(&mut self) {
+        self.request_emg = false;
+        self.open_device = None;
+        crate::views::drop_later(Some(std::mem::take(&mut self.graphs)));
+    }
+    pub fn graphs_pending(&self) -> bool {
+        self.graphs.values().any(|g| g.drawn.background_pending())
+    }
+}
+
+impl DeviceGraph {
+    fn new(channel: &tak_core::view_data::ChannelView) -> Self {
+        Self {
+            signal: channel.signal.clone(),
+            lanes: [Lane { letter: channel.name.trim_start_matches("AnalogChannel").to_owned(), color: theme::ACCENT, runs: channel.signal.runs.clone(), unit: "" }],
+            drawn: graph::Drawn::background(),
+        }
+    }
+}
+
+pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>, emg_failure: Option<&str>) -> Option<Action> {
     if data.analog_pending {
         ui.add_space(4.0);
-        ui.label(RichText::new("힘판 힘·EMG를 불러오는 중이에요 (마커를 먼저 보여 줘요).").color(theme::TEXT_DIM));
-        return None;
+        ui.label(RichText::new("힘판 힘을 불러오는 중이에요 (마커를 먼저 보여 줘요).").color(theme::TEXT_DIM));
     }
     if data.plates.is_empty() && data.devices.is_empty() {
         ui.add_space(4.0);
@@ -673,7 +706,8 @@ pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesSt
         ui.label(RichText::new("바닥의 판 색 진하기 = |Fz| ÷ 모든 판 중 최대 |Fz| (단위 미확인)").small().color(theme::TEXT_DIM));
     }
     for (di, d) in data.devices.iter().enumerate() {
-        egui::CollapsingHeader::new(&d.title).id_salt(("device", di)).default_open(d.plate.is_some()).show(ui, |ui| {
+        egui::CollapsingHeader::new(&d.title).id_salt(("device", file_id, di)).default_open(d.plate.is_some()).open(st.open_device.map(|open| di == open || d.plate.is_some())).show(ui, |ui| {
+            if d.plate.is_none() && data.emg_pending { st.request_emg = true; }
             if d.channels.is_empty() {
                 ui.label("채널 없음");
                 return;
@@ -687,9 +721,15 @@ pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesSt
                 }
             });
             let c = &d.channels[*ch];
-            let (runs, gaps) = runs_and_gaps(&c.per_frame, data.start_frame, data.end_frame);
-            let lane = Lane { letter: c.name.trim_start_matches("AnalogChannel").to_owned(), color: theme::ACCENT, runs, unit: "" };
-            if let Some(f) = graph::show(ui, Id::new(("device_graph", file_id, di, *ch)), &[lane], data.start_frame, data.end_frame, frame, &gaps, 110.0, &Look::pane(), None, &[]) {
+            if d.plate.is_none() {
+                if let Some(reason) = emg_failure { ui.label(RichText::new(reason).color(theme::TEXT_DIM)); return; }
+                if data.emg_pending { ui.label(RichText::new("Loading EMG…").color(theme::TEXT_DIM)); return; }
+            }
+            let graph = st.graphs.entry((file_id, di, *ch)).or_insert_with(|| DeviceGraph::new(c));
+            if !std::sync::Arc::ptr_eq(&graph.signal, &c.signal) {
+                crate::views::drop_later(Some(std::mem::replace(graph, DeviceGraph::new(c))));
+            }
+            if let Some(f) = graph::show(ui, Id::new(("device_graph", file_id, di, *ch)), &graph.lanes, data.start_frame, data.end_frame, frame, &graph.signal.gaps, 110.0, &Look::pane(), Some(&mut graph.drawn), &[]) {
                 action = Some(Action::GotoFrame(f));
             }
             ui.label(
@@ -1235,7 +1275,7 @@ fn comment_button(ui: &mut Ui, make: &Result<String, String>) -> bool {
 /// A click on the `Comment` button, also when it is dim: the app then says why nothing happens
 /// (a TAK takes no Comment, `.takm` step ③) and does nothing else.
 fn pressed_even_dim(ui: &Ui, resp: &egui::Response) -> bool {
-    resp.clicked() || (!resp.enabled() && resp.contains_pointer() && ui.input(|i| i.pointer.primary_clicked()))
+    ui.is_enabled() && (resp.clicked() || (!resp.enabled() && resp.contains_pointer() && ui.input(|i| i.pointer.primary_clicked())))
 }
 
 pub const SPEEDS: [f64; 7] = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
@@ -1417,6 +1457,16 @@ mod lane_tests {
     }
 
     #[test]
+    fn missing_forceplate_channels_never_borrow_fz_samples() {
+        let mut data = crate::views::sample_with_plates("a.tak", &["M"]);
+        data.devices.clear();
+        let mut cache = PlateCache::default();
+        let (lanes, _, _) = cache.get(&data, 1, 0, LaneSet::first(3));
+        assert!(lanes[0].runs.is_empty() && lanes[1].runs.is_empty());
+        assert!(!lanes[2].runs.is_empty());
+    }
+
+    #[test]
     fn plate_lanes_are_fx_fy_fz_first_from_channels_0_to_2_and_each_is_built_once() {
         let d = crate::views::sample_with_plates("a.tak", &["M"]);
         assert_eq!(plate_offer(&d, 0), LaneSet::first(6), "P1's device has six channels");
@@ -1428,9 +1478,9 @@ mod lane_tests {
         assert!(lanes.iter().all(|l| l.unit.is_empty()), "no unit: units are not verified");
         // Channel k's values: Fx = channel 0 (= frame), Fy = channel 1 (1000 + frame), Fz =
         // channel 2 with its gap.
-        assert_eq!(lanes[0].runs, vec![(0..10).map(|f| [f as f64, f as f64]).collect::<Vec<_>>()]);
-        assert_eq!(lanes[1].runs, vec![(0..10).map(|f| [f as f64, 1000.0 + f as f64]).collect::<Vec<_>>()]);
-        assert_eq!(lanes[2].runs, vec![vec![[0.0, 100.0], [1.0, 110.0], [2.0, 120.0], [3.0, 130.0]], (6..10).map(|f| [f as f64, 100.0 + 10.0 * f as f64]).collect::<Vec<_>>()]);
+        assert_eq!(lanes[0].runs.as_ref(), &vec![(0..10).map(|f| [f as f64, f as f64]).collect::<Vec<_>>()]);
+        assert_eq!(lanes[1].runs.as_ref(), &vec![(0..10).map(|f| [f as f64, 1000.0 + f as f64]).collect::<Vec<_>>()]);
+        assert_eq!(lanes[2].runs.as_ref(), &vec![vec![[0.0, 100.0], [1.0, 110.0], [2.0, 120.0], [3.0, 130.0]], (6..10).map(|f| [f as f64, 100.0 + 10.0 * f as f64]).collect::<Vec<_>>()]);
         assert_eq!(gaps, &[(4, 5)], "frames without Fz");
         // The next frames use what is kept.
         for _ in 0..5 {

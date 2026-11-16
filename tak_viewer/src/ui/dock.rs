@@ -20,6 +20,8 @@ pub const TAB_H: f32 = 30.0;
 pub enum Pane {
     /// Editor area with no open 3D views; keeps the surrounding pane positions.
     Empty,
+    /// Fixed-height host for the top-level layout tabs, above all 3D views.
+    LayoutTabs,
     /// 3D view of one file; the number is its slot (0..MAX_VIEWS) in `TakViewerApp::views`.
     View(u8),
     Explorer,
@@ -39,6 +41,7 @@ pub enum Pane {
 #[derive(Deserialize)]
 enum SavedPane {
     Empty,
+    LayoutTabs,
     Scene,
     View(u8),
     Explorer,
@@ -55,6 +58,7 @@ impl From<SavedPane> for Pane {
     fn from(p: SavedPane) -> Pane {
         match p {
             SavedPane::Empty => Pane::Empty,
+            SavedPane::LayoutTabs => Pane::LayoutTabs,
             SavedPane::Scene => Pane::View(0),
             SavedPane::View(k) => Pane::View(k),
             SavedPane::Explorer => Pane::Explorer,
@@ -86,6 +90,7 @@ impl Pane {
     pub fn title(self) -> &'static str {
         match self {
             Pane::Empty => "",
+            Pane::LayoutTabs => "",
             Pane::View(_) => "3D 화면",
             Pane::Explorer => "EXPLORER",
             Pane::Labels | Pane::Labeling => "Labeling",
@@ -100,7 +105,7 @@ impl Pane {
     /// Where the pane sits in the first arrangement (None for the 3D views).
     pub fn home(self) -> Option<Side> {
         match self {
-            Pane::View(_) | Pane::Empty => None,
+            Pane::View(_) | Pane::Empty | Pane::LayoutTabs => None,
             Pane::Explorer => Some(Side::Left),
             Pane::Labels | Pane::Labeling | Pane::EditTools | Pane::Selected | Pane::Devices | Pane::Comments => Some(Side::Right),
             Pane::Graph => Some(Side::Bottom),
@@ -285,6 +290,155 @@ fn views_root(tree: &Tree<Pane>) -> NodeIndex {
         }
     }
     NodeIndex(top.unwrap_or(0))
+}
+
+/// The editor's split tree, without the surrounding panels. It is small enough to save with
+/// each top-level layout tab; the view data and view state stay in their own runtime slots.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EditorLayout {
+    Empty,
+    Leaf { slots: Vec<u8>, active: u8 },
+    Horizontal { fraction: f32, left: Box<EditorLayout>, right: Box<EditorLayout> },
+    Vertical { fraction: f32, top: Box<EditorLayout>, bottom: Box<EditorLayout> },
+}
+
+/// Ignore corrupt, repeated or out-of-range slots in a saved layout, collapsing empty splits.
+pub fn valid_editor_layout(layout: &EditorLayout) -> EditorLayout {
+    fn clean(layout: &EditorLayout, seen: &mut [bool; MAX_VIEWS]) -> Option<EditorLayout> {
+        match layout {
+            EditorLayout::Empty => None,
+            EditorLayout::Leaf { slots, active } => {
+                let mut kept = Vec::new();
+                for &slot in slots {
+                    let Some(found) = seen.get_mut(usize::from(slot)) else { continue };
+                    if !*found { *found = true; kept.push(slot); }
+                }
+                if kept.is_empty() { return None; }
+                let chosen = if kept.contains(active) { *active } else { kept[0] };
+                Some(EditorLayout::Leaf { slots: kept, active: chosen })
+            }
+            EditorLayout::Horizontal { fraction, left, right } => {
+                let left = clean(left, seen);
+                let right = clean(right, seen);
+                match (left, right) {
+                    (Some(left), Some(right)) => Some(EditorLayout::Horizontal {
+                        fraction: if fraction.is_finite() { fraction.clamp(0.05, 0.95) } else { 0.5 },
+                        left: Box::new(left), right: Box::new(right),
+                    }),
+                    (left, right) => left.or(right),
+                }
+            }
+            EditorLayout::Vertical { fraction, top, bottom } => {
+                let top = clean(top, seen);
+                let bottom = clean(bottom, seen);
+                match (top, bottom) {
+                    (Some(top), Some(bottom)) => Some(EditorLayout::Vertical {
+                        fraction: if fraction.is_finite() { fraction.clamp(0.05, 0.95) } else { 0.5 },
+                        top: Box::new(top), bottom: Box::new(bottom),
+                    }),
+                    (top, bottom) => top.or(bottom),
+                }
+            }
+        }
+    }
+    clean(layout, &mut [false; MAX_VIEWS]).unwrap_or(EditorLayout::Empty)
+}
+
+/// Extract just the views. A panel between two view leaves stays in the main dock and is
+/// omitted from the tab's tree; the view leaves on its sides remain in the same order.
+pub fn editor_layout(dock: &DockState<Pane>) -> EditorLayout {
+    fn walk(tree: &Tree<Pane>, at: NodeIndex) -> Option<EditorLayout> {
+        if at.0 >= tree.len() { return None; }
+        match &tree[at] {
+            Node::Empty => None,
+            Node::Leaf { tabs, active, .. } => {
+                let slots: Vec<u8> = tabs.iter().filter_map(|p| match p { Pane::View(k) => Some(*k), _ => None }).collect();
+                if slots.is_empty() {
+                    return tabs.contains(&Pane::Empty).then_some(EditorLayout::Empty);
+                }
+                let chosen = tabs.get(active.0).and_then(|p| match p { Pane::View(k) => Some(*k), _ => None }).unwrap_or(slots[0]);
+                Some(EditorLayout::Leaf { slots, active: chosen })
+            }
+            Node::Horizontal { fraction, .. } | Node::Vertical { fraction, .. } => {
+                let left = walk(tree, at.left());
+                let right = walk(tree, at.right());
+                match (left, right) {
+                    (None, None) => None,
+                    (Some(one), None) | (None, Some(one)) => Some(one),
+                    (Some(left), Some(right)) => Some(match &tree[at] {
+                        Node::Horizontal { .. } => EditorLayout::Horizontal { fraction: *fraction, left: Box::new(left), right: Box::new(right) },
+                        _ => EditorLayout::Vertical { fraction: *fraction, top: Box::new(left), bottom: Box::new(right) },
+                    }),
+                }
+            }
+        }
+    }
+    walk(dock.main_surface(), NodeIndex::root()).unwrap_or(EditorLayout::Empty)
+}
+
+/// Replace only the view tree, leaving all side/bottom panels and their state in the dock.
+/// The last view becomes the existing `Empty` placeholder before new splits are installed.
+pub fn set_editor_layout(dock: &mut DockState<Pane>, layout: &EditorLayout) {
+    for slot in views(dock) { remove_view(dock, slot); }
+    let Some((surface, node, _)) = dock.find_tab(&Pane::Empty) else { return };
+    if surface != SurfaceIndex::main() { return; }
+    fn put(tree: &mut Tree<Pane>, node: NodeIndex, layout: &EditorLayout) {
+        match layout {
+            EditorLayout::Empty => {}
+            EditorLayout::Leaf { slots, active } => {
+                if let Node::Leaf { tabs, active: selected, .. } = &mut tree[node] {
+                    let Some(at) = tabs.iter().position(|p| *p == Pane::Empty) else { return };
+                    let mut unique = Vec::new();
+                    for &slot in slots {
+                        if usize::from(slot) < MAX_VIEWS && !unique.contains(&slot) { unique.push(slot); }
+                    }
+                    if unique.is_empty() { return; }
+                    tabs.splice(at..=at, unique.iter().copied().map(Pane::View));
+                    *selected = TabIndex(at + unique.iter().position(|slot| slot == active).unwrap_or(0));
+                }
+            }
+            EditorLayout::Horizontal { fraction, left, right } => {
+                let [a, b] = tree.split_right(node, fraction.clamp(0.05, 0.95), vec![Pane::Empty]);
+                put(tree, a, left);
+                put(tree, b, right);
+            }
+            EditorLayout::Vertical { fraction, top, bottom } => {
+                let [a, b] = tree.split_below(node, fraction.clamp(0.05, 0.95), vec![Pane::Empty]);
+                put(tree, a, top);
+                put(tree, b, bottom);
+            }
+        }
+    }
+    put(dock.main_surface_mut(), node, &valid_editor_layout(layout));
+}
+
+/// Add a small, non-closeable row above the whole editor, never above the side panels.
+/// Older saved docks have no row; adding it here migrates them without rearranging panels.
+pub fn ensure_layout_strip(dock: &mut DockState<Pane>, active: u8) {
+    if has(dock, Pane::LayoutTabs) { return; }
+    let tree = dock.main_surface_mut();
+    let root = views_root(tree);
+    tree.split_above(root, 0.05, vec![Pane::LayoutTabs]);
+    focus_view(dock, active);
+}
+
+/// Keep the host row one tab-bar high when the window or a side panel is resized.
+pub fn size_layout_strip(dock: &mut DockState<Pane>) {
+    let Some((surface, node, _)) = dock.find_tab(&Pane::LayoutTabs) else { return };
+    if surface != SurfaceIndex::main() || node.0 == 0 || node.0 % 2 == 0 { return; }
+    let parent = NodeIndex((node.0 - 1) / 2);
+    if let Node::Vertical { rect, fraction } = &mut dock[surface][parent] {
+        if rect.height().is_finite() && rect.height() > TAB_H * 2.0 {
+            *fraction = (TAB_H / rect.height()).clamp(0.0, 0.5);
+        }
+    }
+}
+
+/// Screen rectangle for the strip. `None` until the dock has been drawn at least once.
+pub fn layout_strip_rect(dock: &DockState<Pane>) -> Option<Rect> {
+    let (surface, node, _) = dock.find_tab(&Pane::LayoutTabs)?;
+    let rect = dock[surface][node].rect()?;
+    (rect.is_positive() && rect.is_finite()).then_some(rect)
 }
 
 /// Put a new 3D view next to the others: the biggest view is cut in half. The second view
@@ -727,7 +881,10 @@ pub fn shape(dock: &DockState<Pane>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let tree = |t: &Tree<Pane>, h: &mut std::collections::hash_map::DefaultHasher| {
-        for n in t.iter() {
+        // egui_dock may retain unused trailing slots after rebuilding a split. Those slots
+        // do not change the visible tree and must not manufacture a new undo action.
+        let used = t.iter().enumerate().filter(|(_, n)| !matches!(n, Node::Empty)).map(|(i, _)| i + 1).last().unwrap_or(0);
+        for (index, n) in t.iter().take(used).enumerate() {
             match n {
                 Node::Empty => 0u8.hash(h),
                 Node::Leaf { tabs, active, .. } => {
@@ -737,7 +894,11 @@ pub fn shape(dock: &DockState<Pane>) -> u64 {
                 }
                 Node::Vertical { fraction, .. } => {
                     2u8.hash(h);
-                    fraction.to_bits().hash(h);
+                    // The strip has a fixed height. Its fraction changes on a window resize,
+                    // which must not create an undo action.
+                    let left = NodeIndex(index).left();
+                    let fixed_strip = left.0 < t.len() && t[left].tabs().is_some_and(|tabs| tabs.contains(&Pane::LayoutTabs));
+                    if !fixed_strip { fraction.to_bits().hash(h); }
                 }
                 Node::Horizontal { fraction, .. } => {
                     3u8.hash(h);
@@ -919,6 +1080,39 @@ pub(crate) fn view_rects(dock: &DockState<Pane>, area: Rect) -> Vec<(u8, Rect)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_layout_round_trip_keeps_split_and_the_surrounding_panels() {
+        let original = default_layout_for(&[0, 1, 2]);
+        let layout = editor_layout(&original);
+        let mut another = default_layout_for(&[3]);
+        show(&mut another, Pane::Graph);
+        set_editor_layout(&mut another, &layout);
+        assert_eq!(editor_layout(&another), layout);
+        assert_eq!(views(&another), vec![0, 1, 2]);
+        for pane in [Pane::Explorer, Pane::Labeling, Pane::EditTools, Pane::Selected, Pane::Devices, Pane::Graph] {
+            assert!(has(&another, pane), "panel {pane:?} must remain");
+        }
+        set_editor_layout(&mut another, &EditorLayout::Empty);
+        assert!(views(&another).is_empty());
+        assert!(has(&another, Pane::Empty));
+        assert!(has(&another, Pane::Graph));
+    }
+
+    #[test]
+    fn editor_layout_keeps_views_that_share_a_leaf() {
+        let mut original = default_layout_for(&[0]);
+        let (node, _) = original.main_surface().find_tab(&Pane::View(0)).unwrap();
+        if let Node::Leaf { tabs, active, .. } = &mut original.main_surface_mut()[node] {
+            tabs.push(Pane::View(2));
+            *active = TabIndex(1);
+        }
+        let layout = editor_layout(&original);
+        let mut another = default_layout_for(&[1]);
+        set_editor_layout(&mut another, &layout);
+        assert_eq!(editor_layout(&another), layout);
+        assert_eq!(views(&another), vec![0, 2]);
+    }
 
     fn order(p: &Pane) -> usize {
         match p {

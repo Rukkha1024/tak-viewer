@@ -104,10 +104,32 @@ pub struct RemoteTake {
     analog_pending: bool,
     marker_channels: Vec<u8>,
     channel_order: Vec<bool>,
+    plate_devices: Option<Vec<usize>>,
+    device_types: Option<Vec<u8>>,
+    fallback_reason: Option<String>,
+    initial_read: bool,
+    channel_manifest: Vec<Vec<(String, String, usize)>>,
 }
 impl RemoteTake {
     pub fn analog_pending(&self) -> bool {
         self.analog_pending
+    }
+    pub fn plate_devices(&self) -> Option<&[usize]> { self.plate_devices.as_deref() }
+    pub fn fallback_reason(&self) -> Option<&str> { self.fallback_reason.as_deref() }
+    pub fn lazy_analog_pending(&self) -> bool {
+        self.analog_pending && self.device_types.as_ref().is_some_and(|kinds| kinds.contains(&1))
+    }
+    pub fn initial_analog_pending(&self) -> bool {
+        self.analog_pending && !self.initial_read && self.device_types.as_ref().is_none_or(|kinds| kinds.contains(&2))
+    }
+    pub fn initial_device_indices(&self) -> Vec<usize> {
+        match &self.device_types {
+            Some(kinds) => kinds.iter().enumerate().filter_map(|(i, k)| (*k == 2).then_some(i)).collect(),
+            None => (0..self.take.analog.len()).collect(),
+        }
+    }
+    pub fn lazy_device_indices(&self) -> Vec<usize> {
+        self.device_types.as_ref().map(|kinds| kinds.iter().enumerate().filter_map(|(i, k)| (*k == 1).then_some(i)).collect()).unwrap_or_default()
     }
 }
 
@@ -178,8 +200,8 @@ impl RemoteSession {
     }
     pub fn open(&mut self, path: &str, cancel: &CancelToken) -> Result<RemoteTake> {
         let (header, mut blocks) = self.transport.request(json!({"op":"open","path":path,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes}), cancel)?;
-        if blocks.len() != 4 {
-            return Err("Invalid marker response: expected four blocks".into());
+        if !matches!(blocks.len(), 4 | 5) {
+            return Err("Invalid marker response: expected four or five blocks".into());
         }
         let identity = source_identity(&header)?;
         let file_size = header["file_size"]
@@ -204,7 +226,7 @@ impl RemoteSession {
         if cancel.is_cancelled() {
             return Err("SSH request cancelled".into());
         }
-        let channel_order = header["channel_order"]
+        let mut channel_order = header["channel_order"]
             .as_array()
             .ok_or("Missing channel order")?
             .iter()
@@ -219,17 +241,61 @@ impl RemoteSession {
             return Err("Invalid channel order".into());
         }
         if !analog_pending {
-            let (_, warning) = crate::tak::decode_analog(&blocks[2]);
+            let (analog, warning) = crate::tak::decode_analog(&blocks[2]);
+            if header["full_fallback"] == true { take.analog = analog; }
             take.warnings.extend(warning);
         }
-        let marker_channels = if analog_pending {
+        let mut plate_devices = None;
+        let mut device_types = None;
+        let mut fallback_reason = header["analog_fallback"].as_str().map(str::to_owned);
+        if blocks.len() == 5 {
+            let inventory = crate::tak::channels::iter_channel_inventory(&blocks[4]).map_err(|e| e.to_string())?;
+            if inventory.len() != channel_order.iter().filter(|is_analog| **is_analog).count()
+                || inventory.iter().any(|record| record.n_samples != 0) {
+                return Err("Invalid analog header manifest".into());
+            }
+            let (manifest, warning) = crate::tak::decode_analog(&blocks[4]);
+            if warning.is_some() && header["device_types"].is_array() {
+                return Err("Invalid analog header manifest".into());
+            }
+            take.analog = manifest;
+            match (header["device_types"].as_array(), header["plate_devices"].as_array()) {
+                (Some(kinds), Some(plates)) => {
+                    let kinds = kinds.iter().map(|k| k.as_u64().filter(|k| matches!(k, 1 | 2)).map(|k| k as u8).ok_or("Invalid analog device type".to_owned())).collect::<Result<Vec<_>>>()?;
+                    let plates = plates.iter().map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()).filter(|i| *i < kinds.len()).ok_or("Invalid forceplate device index".to_owned())).collect::<Result<Vec<_>>>()?;
+                    if kinds.len() != take.analog.len() || plates.len() != take.plates.len()
+                        || plates.iter().any(|i| kinds[*i] != 2)
+                        || plates.iter().copied().collect::<std::collections::HashSet<_>>().len() != plates.len()
+                        || kinds.iter().filter(|k| **k == 2).count() != plates.len() {
+                        fallback_reason = Some("Forceplate geometry/device mapping is ambiguous".into());
+                    } else {
+                        plate_devices = Some(plates);
+                        device_types = Some(kinds);
+                    }
+                }
+                (None, None) => {
+                    fallback_reason = Some(header["analog_fallback"].as_str().unwrap_or("Unknown analog device structure").to_owned());
+                }
+                _ => return Err("Incomplete analog device classification".into()),
+            }
+        }
+        let comments = std::mem::take(&mut blocks[3]);
+        let mut marker_channels = if analog_pending {
             std::mem::take(&mut blocks[2])
         } else {
             Vec::new()
         };
+        if !analog_pending { channel_order = Vec::new(); }
+        if analog_pending && device_types.as_ref().is_some_and(|kinds| !kinds.contains(&2)) {
+            let (_, warning) = crate::tak::decode_analog(&marker_channels);
+            take.warnings.extend(warning);
+            marker_channels = Vec::new();
+            channel_order = Vec::new();
+        }
         if cancel.is_cancelled() {
             return Err("SSH request cancelled".into());
         }
+        let channel_manifest = take.analog.iter().map(|d| d.channels.iter().map(|c| (c.name.clone(), c.kind.clone(), c.dim)).collect()).collect();
         Ok(RemoteTake {
             marker_channels,
             channel_order,
@@ -239,18 +305,37 @@ impl RemoteSession {
                 path: path.into(),
                 identity,
             },
-            comments: blocks.pop().unwrap(),
+            comments,
             analog_pending,
+            plate_devices,
+            device_types,
+            fallback_reason,
+            initial_read: false,
+            channel_manifest,
         })
     }
+    /// Startup stage: forceplate samples only, or the previous full read on ambiguity.
+    pub fn read_initial_analog(&mut self, loaded: &mut RemoteTake, cancel: &CancelToken) -> Result<()> {
+        if !loaded.initial_analog_pending() { return Ok(()); }
+        self.read_selected_analog(loaded, "forceplates", cancel)
+    }
+    /// Explicit full read used by --ssh-dump and callers requiring all analog samples.
     pub fn read_analog(&mut self, loaded: &mut RemoteTake, cancel: &CancelToken) -> Result<()> {
+        self.read_selected_analog(loaded, "all", cancel)
+    }
+    /// On-access stage. Forceplate samples already delivered to the view are not downloaded again.
+    pub fn read_lazy_analog(&mut self, loaded: &mut RemoteTake, cancel: &CancelToken) -> Result<()> {
+        if !loaded.lazy_analog_pending() { return Ok(()); }
+        self.read_selected_analog(loaded, "non_forceplates", cancel)
+    }
+    fn read_selected_analog(&mut self, loaded: &mut RemoteTake, selection: &str, cancel: &CancelToken) -> Result<()> {
         if loaded.source.host != self.host {
             return Err("Remote source belongs to another SSH host".into());
         }
         if !loaded.analog_pending {
             return Ok(());
         }
-        let (header, blocks) = self.transport.request(json!({"op":"analog","path":loaded.source.path,"expected_identity":loaded.source.identity,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes}), cancel)?;
+        let (header, blocks) = self.transport.request(json!({"op":"analog","selection":selection,"path":loaded.source.path,"expected_identity":loaded.source.identity,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes}), cancel)?;
         if blocks.len() != 1 {
             return Err("Invalid analog response: expected one block".into());
         }
@@ -260,15 +345,41 @@ impl RemoteSession {
         if cancel.is_cancelled() {
             return Err("SSH request cancelled".into());
         }
-        let channels =
-            restore_channels(&loaded.marker_channels, &blocks[0], &loaded.channel_order)?;
-        let (analog, warning) = crate::tak::decode_analog(&channels);
+        let restored;
+        let channels = if loaded.marker_channels.is_empty() && loaded.channel_order.is_empty() {
+            &blocks[0]
+        } else {
+            restored = restore_channels(&loaded.marker_channels, &blocks[0], &loaded.channel_order)?;
+            &restored
+        };
+        let (mut analog, warning) = crate::tak::decode_analog(channels);
+        if selection != "all" && loaded.device_types.is_some() {
+            if let Some(reason) = &warning {
+                return Err(format!("Selective analog decode failed: {reason}"));
+            }
+            if analog.len() != loaded.channel_manifest.len()
+                || analog.iter().zip(&loaded.channel_manifest).any(|(device, headers)| {
+                    device.channels.len() != headers.len()
+                        || device.channels.iter().zip(headers).any(|(c, (name, kind, dim))| c.name != *name || c.kind != *kind || c.dim != *dim)
+                }) {
+                return Err("Selective analog response does not match the initial device manifest".into());
+            }
+        }
         if cancel.is_cancelled() {
             return Err("SSH request cancelled".into());
         }
+        if selection != "all" && analog.len() == loaded.take.analog.len() {
+            if let Some(kinds) = &loaded.device_types {
+                for (i, kind) in kinds.iter().enumerate() {
+                    let selected = if selection == "forceplates" { *kind == 2 } else { *kind == 1 };
+                    if !selected { std::mem::swap(&mut analog[i], &mut loaded.take.analog[i]); }
+                }
+            }
+        }
         loaded.take.analog = analog;
         loaded.take.warnings.extend(warning);
-        loaded.analog_pending = false;
+        loaded.initial_read = true;
+        loaded.analog_pending = selection == "forceplates" && loaded.device_types.as_ref().is_some_and(|kinds| kinds.contains(&1));
         loaded.marker_channels = Vec::new();
         loaded.channel_order = Vec::new();
         Ok(())

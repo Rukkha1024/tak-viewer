@@ -660,6 +660,7 @@ pub struct Done {
     pub result: Result<(), String>,
     pub conflict: Option<crate::takm::CommentConflict>,
     pub cancelled: bool,
+    pub source_stamp: Option<crate::takm::CommentWriteStamp>,
 }
 
 enum Job {
@@ -742,6 +743,7 @@ impl Writer {
                 let one = std::slice::from_ref(&event);
                 let key = crate::takm::path_lock_key(&path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
                 let mut conflict = None;
+                let mut source_stamp = None;
                 let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     Err("Comment write cancelled".into())
                 } else if let Some(e) = &registration_error {
@@ -749,9 +751,9 @@ impl Writer {
                 } else if let Some(reason) = failed.get(&key) {
                     Err(reason.clone())
                 } else if crate::takm::is_takm_path(&path) {
-                    match crate::takm::append_events_guarded(&path, one, Some(&cancelled)) {
-                        Ok(Some(found)) => { conflict = Some(found); Err("Comment changed in another window".into()) }
-                        Ok(None) => Ok(()),
+                    match crate::takm::append_events_guarded_stamped(&path, one, Some(&cancelled)) {
+                        Ok((Some(found), _)) => { conflict = Some(found); Err("Comment changed in another window".into()) }
+                        Ok((None, stamp)) => { source_stamp = stamp; Ok(()) },
                         Err(e) => Err(e.to_string()),
                     }
                 } else {
@@ -763,7 +765,7 @@ impl Writer {
                         failed.entry(key).or_insert_with(|| format!("{}: {reason}", path.display()));
                     }
                 }
-                let _ = done_tx.send(Done { tag, path, event, result, conflict, cancelled: was_cancelled });
+                let _ = done_tx.send(Done { tag, path, event, result, conflict, cancelled: was_cancelled, source_stamp });
                 wake();
             }
         });
@@ -1241,7 +1243,8 @@ mod tests {
         assert!(append(&tak, &[ev(Kind::Add, 1, &["M"], 0, 0)]).is_err());
         assert!(!tak.exists());
         assert!(check_target(&dir.join("x.comments.csv")).is_ok(), "outside any repository");
-        assert_eq!(file_label(Path::new(r"C:\d\a.tak"), 33_121_234), "a.tak|33121234");
+        let native_take = if cfg!(windows) { Path::new(r"C:\d\a.tak") } else { Path::new("/d/a.tak") };
+        assert_eq!(file_label(native_take, 33_121_234), "a.tak|33121234");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

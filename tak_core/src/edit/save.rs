@@ -249,7 +249,11 @@ fn serialize_markers(snapshot: &DocumentSnapshot, nodes: &[u8], channels: &[u8])
                 rebuilt.extend_from_slice(&u32::try_from(t.samples.len()).map_err(error)?.to_le_bytes());
                 for s in t.samples.iter() { rebuilt.extend_from_slice(&s.0); }
             }
-        } else { rebuilt.extend_from_slice(&channels[rec.start..rec.end]); }
+        } else {
+            // Analog and all other non-marker records remain opaque, including records the
+            // viewer has never opened. Saving must not depend on decoded display samples.
+            rebuilt.extend_from_slice(&channels[rec.start..rec.end]);
+        }
     }
     if seen != present { return Err(EditError::UnsupportedLayout); }
     for t in &new_tracks {
@@ -454,10 +458,13 @@ mod tests {
     struct Fixture { dir: PathBuf, tak: PathBuf, doc: EditDocument }
     impl Fixture {
         fn new(name: &str) -> Self {
+            Self::from_bytes(name, &crate::sample_tak::sample_tak())
+        }
+        fn from_bytes(name: &str, bytes: &[u8]) -> Self {
             let dir = std::env::temp_dir().join(format!("tak_2c_{name}_{}_{}", std::process::id(), TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
             std::fs::create_dir_all(&dir).unwrap();
             let tak = dir.join("test.tak");
-            std::fs::write(&tak, crate::sample_tak::sample_tak()).unwrap();
+            std::fs::write(&tak, bytes).unwrap();
             let (input, _) = PreparedInput::read_from_path(&tak).unwrap();
             let mut doc = EditDocument::unloaded(tak.clone());
             doc.install_prepared(doc.revision(), input).unwrap();
@@ -492,6 +499,96 @@ mod tests {
         let out = f.dir.join("saved.takm");
         let outcome = TakmSave.save(f.request(&f.tak, &out)).unwrap();
         (out, outcome)
+    }
+
+    fn raw_analog_records(data: &SourceData) -> Vec<Vec<u8>> {
+        let channels = &data.streams[unique_stream(&data.streams, "Channels.dat").unwrap()].bytes;
+        tak::channels::iter_channel_inventory(channels).unwrap().into_iter()
+            .filter(|r| r.name.starts_with("AnalogChannel"))
+            .map(|r| channels[r.start..r.end].to_vec()).collect()
+    }
+
+    fn assert_reopened_tracks(path: &Path, expected: &DocumentSnapshot) {
+        let (input, take) = PreparedInput::read_from_path(path).unwrap();
+        assert!(take.analog.is_empty(), "save validation or reopening decoded analog samples");
+        let mut doc = EditDocument::unloaded(path.to_path_buf());
+        doc.install_prepared(doc.revision(), input).unwrap();
+        let reopened = doc.snapshot();
+        assert_eq!(reopened.track_order(), expected.track_order());
+        for track in expected.tracks() {
+            let actual = reopened.track(&track.uid).unwrap();
+            assert_eq!(actual.samples, track.samples);
+            assert_eq!(actual.label, track.label);
+        }
+    }
+
+    #[test]
+    fn unopened_plate_and_emg_bytes_survive_marker_edits_save_and_save_as() {
+        let mut f = Fixture::from_bytes("opaque_analog", &crate::sample_tak::sample_tak_with_devices());
+        let original = std::fs::read(&f.tak).unwrap();
+        let analog = raw_analog_records(&source_data(&f.tak).unwrap());
+        assert_eq!(analog.len(), 8); // Six force channels and two EMG channels.
+        let (_, take) = PreparedInput::read_from_path(&f.tak).unwrap();
+        assert!(take.analog.is_empty());
+        assert_eq!(tak::read_take(&f.tak).unwrap().analog.len(), 2);
+        let output = f.dir.join("edited.takm");
+        f.edit(1.25);
+        TakmSave.save(f.request(&f.tak, &output)).unwrap();
+        assert_reopened_tracks(&output, &f.doc.snapshot());
+        assert_eq!(raw_analog_records(&source_data(&output).unwrap()), analog);
+        f.doc.mark_saved(&f.doc.snapshot(), output.clone()).unwrap();
+        f.edit(-0.5);
+        TakmSave.save(f.request(&output, &output)).unwrap();
+        assert_reopened_tracks(&output, &f.doc.snapshot());
+        assert_eq!(raw_analog_records(&source_data(&output).unwrap()), analog);
+        let save_as = f.dir.join("edited_as.takm");
+        TakmSave.save(f.request(&output, &save_as)).unwrap();
+        assert_reopened_tracks(&save_as, &f.doc.snapshot());
+        assert_eq!(raw_analog_records(&source_data(&save_as).unwrap()), analog);
+        assert_eq!(std::fs::read(&f.tak).unwrap(), original);
+    }
+
+    #[test]
+    fn interleaved_undecodable_emg_stays_opaque_during_edit_and_save() {
+        let mut f = Fixture::from_bytes("interleaved_analog", &crate::sample_tak::sample_tak_with_devices());
+        let mut source = source_data(&f.tak).unwrap();
+        let ci = unique_stream(&source.streams, "Channels.dat").unwrap();
+        let channels = &source.streams[ci].bytes;
+        let inventory = tak::channels::iter_channel_inventory(channels).unwrap();
+        assert_eq!(inventory.len(), 11);
+        let mut records: Vec<_> = inventory.iter().map(|r| channels[r.start..r.end].to_vec()).collect();
+        let emg = &inventory[6];
+        let data_start = emg.data_start - emg.start;
+        // Invalid EMG frame order is accepted as opaque bytes by marker editing. An analog
+        // decode would reject it and add a warning. Odd float payloads must also stay exact.
+        records[6][data_start + 8..data_start + 12].copy_from_slice(&0u32.to_le_bytes());
+        for (sample, bits) in [(0, 0x7fc1_2345u32), (1, 0x8000_0000), (2, 0x7f80_0000)] {
+            let at = data_start + sample * 8 + 4;
+            records[6][at..at + 4].copy_from_slice(&bits.to_le_bytes());
+        }
+        let mut mixed = channels[..10].to_vec();
+        for i in [0, 1, 8, 2, 3, 9, 4, 5, 6, 7, 10] { mixed.extend_from_slice(&records[i]); }
+        let (decoded, warning) = tak::decode_analog(&mixed);
+        assert!(decoded.is_empty());
+        assert!(warning.unwrap().contains("Non-increasing channel frames"));
+        source.streams[ci].bytes = mixed;
+        let analog = raw_analog_records(&source);
+        let path = f.dir.join("interleaved.takm");
+        let mut file = File::create(&path).unwrap();
+        write_takm(&mut file, &mut source, &mut |_| Ok(())).unwrap();
+        drop(file);
+        let original = std::fs::read(&path).unwrap();
+        let (input, take) = PreparedInput::read_from_path(&path).unwrap();
+        assert!(take.analog.is_empty());
+        assert!(!take.warnings.iter().any(|w| w.contains("analog channels not loaded")));
+        f.doc = EditDocument::unloaded(path.clone());
+        f.doc.install_prepared(f.doc.revision(), input).unwrap();
+        f.edit(0.75);
+        let output = f.dir.join("interleaved_edited.takm");
+        TakmSave.save(f.request(&path, &output)).unwrap();
+        assert_reopened_tracks(&output, &f.doc.snapshot());
+        assert_eq!(raw_analog_records(&source_data(&output).unwrap()), analog);
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]

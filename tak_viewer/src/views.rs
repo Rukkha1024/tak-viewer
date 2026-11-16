@@ -1,6 +1,6 @@
 //! The 3D views: up to `MAX_VIEWS` files side by side (like VS Code editor groups). A `View`
-//! holds everything about one open file: its data, camera, frame, selection and its load.
-//! Views are not linked: each has its own frame and camera (user: no frame matching).
+//! holds one file's camera, frame, selection and its load. Repeated local-file views share
+//! marker data, the editable document and Comments; each keeps its own frame and camera.
 //! A view may carry a second file laid over its 3D (`Overlay`, plan step 7): not a view of its
 //! own, it follows that view's frame and camera and is drawn as white rings only.
 //! `Spot` = where a file was being viewed (frame, camera, selected marker names, chosen force
@@ -15,19 +15,99 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tak_core::comments::{self, Comments};
 use tak_core::geom::{v3, Vec3};
 use tak_core::playback::Playback;
 use tak_core::view_data::{AnalogPart, ViewData};
-use tak_core::edit::{DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
+use tak_core::edit::{DocumentId, DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
 
-/// Shared only between the view and layout history, never with the `Arc<ViewData>` used by analog.
+/// One editable document per local file, shared by its views and layout history.
 pub type EditSession = Arc<Mutex<EditDocument>>;
 /// Captured by the initial marker reader before it opens the file.
 pub type SourceStamp = Arc<Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>>;
+
+/// A closed document may keep its undo identity, but never supplies fresh-open display data.
+/// Copy the old stamp before starting the new reader, which captures an independent stamp.
+pub struct RetainedDocument {
+    document: EditSession,
+    stamp: Option<(PathBuf, u64, Option<SystemTime>)>,
+    source_stamp: Option<SourceStamp>,
+}
+
+impl RetainedDocument {
+    pub fn new(document: EditSession, source_stamp: Option<SourceStamp>) -> Self {
+        let stamp = source_stamp.as_ref().and_then(|stamp| stamp.lock().ok().and_then(|stamp| stamp.clone()));
+        Self { document, stamp, source_stamp }
+    }
+}
+
+/// Live file state shared by repeated views. Cloning the handle never copies marker samples.
+/// A hidden tab consumes its latest generation only when activated or explicitly notified.
+#[derive(Clone)]
+pub struct SharedFile(Arc<Mutex<SharedFileState>>);
+
+struct SharedFileState {
+    generation: u64,
+    data: Arc<ViewData>,
+    document: EditSession,
+    source_stamp: Option<SourceStamp>,
+    comments: SharedComments,
+    emg_demand: bool,
+    emg_wake: Option<(DocumentId, Sender<DocumentId>)>,
+    editor_wake: Option<(DocumentId, Sender<DocumentId>)>,
+}
+
+/// File contents and write status only. Drawing caches, picked rows and reserved ID pools
+/// belong to each view; copying a reserved pool would issue the same Comment ID twice.
+#[derive(Clone, PartialEq)]
+struct SharedComments {
+    list: Comments,
+    target: Option<Result<PathBuf, String>>,
+    skipped: usize,
+    label: Option<String>,
+    pending: usize,
+    pending_since: Option<Instant>,
+    failed: Option<String>,
+    saved_at: Option<f64>,
+}
+
+impl SharedComments {
+    fn capture(state: &CommentState) -> Self {
+        Self {
+            list: state.list.clone(), target: state.target.clone(), skipped: state.skipped,
+            label: state.label.clone(), pending: state.pending, pending_since: state.pending_since,
+            failed: state.failed.clone(), saved_at: state.saved_at,
+        }
+    }
+
+    fn matches(&self, state: &CommentState) -> bool {
+        self.list == state.list && self.target == state.target && self.skipped == state.skipped
+            && self.label == state.label && self.pending == state.pending
+            && self.pending_since == state.pending_since && self.failed == state.failed
+            && self.saved_at == state.saved_at
+    }
+
+    fn install(self, state: &mut CommentState) {
+        if state.target != self.target {
+            state.id_pool = None;
+            drop_later(state.id_rx.take());
+            state.id_error = None;
+        }
+        state.list = self.list;
+        state.target = self.target;
+        state.skipped = self.skipped;
+        state.label = self.label;
+        state.pending = self.pending;
+        state.pending_since = self.pending_since;
+        state.failed = self.failed;
+        state.saved_at = self.saved_at;
+        state.blocks = Default::default();
+        state.spans = Default::default();
+    }
+}
 
 pub const MAX_VIEWS: usize = 4;
 /// Remembered files (`Spot`), most recent first.
@@ -199,22 +279,106 @@ pub fn drop_later<T: Send + 'static>(old: Option<T>) {
     }
 }
 
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    match (tak_core::takm::canonical_target(a), tak_core::takm::canonical_target(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// The second file laid over a view's 3D (plan step 7, Explorer "이 화면에 얹기"): its markers
 /// are drawn as white rings at the view's frame with the view's camera. Display only: no
 /// selection, Labels, graphs or comments of its own. Accepted only when its frame count and
 /// frame rate are the view's (`overlay_mismatch`).
 pub struct Overlay {
     pub path: PathBuf,
-    pub data: ViewData,
+    pub data: Arc<ViewData>,
+    /// A non-drawing view keeps the canonical document and the one set of file workers.
+    /// It can hand those workers to a primary view or another overlay before closing.
+    owner: Box<View>,
+    shown_document: Option<DocumentId>,
 }
 
-/// A second file being read for a view's overlay (markers only; no force plates, no comments).
+impl Overlay {
+    /// Synthetic/already prepared marker data. Normal disk loads use `from_reader` so their
+    /// source stamp, Comment read and deferred device jobs survive an overlay-to-view open.
+    pub fn from_data(path: PathBuf, data: ViewData) -> Self {
+        let (_tx, rx) = channel();
+        Self::from_reader(path, data, rx, Box::new(View::default()))
+    }
+
+    fn from_reader(path: PathBuf, data: ViewData, rx: Receiver<LoadMsg>, mut owner: Box<View>) -> Self {
+        drop_later(owner.show(data, rx, 0, 1.0, 0.0));
+        owner.shared_file();
+        let shown_document = owner.document_id();
+        Self { path, data: owner.data.as_ref().expect("shown overlay data").clone(), owner, shown_document }
+    }
+
+    fn from_shared(_path: PathBuf, shared: SharedFile) -> Result<Self, String> {
+        let mut owner = Box::new(View::default());
+        drop_later(owner.show_shared_file(shared, 0, 1.0, 0.0));
+        let data = owner.data.as_ref().cloned().ok_or_else(|| "공유 중인 파일을 열 수 없어요".to_owned())?;
+        let shown_document = owner.document_id();
+        Ok(Self { path: data.take.path.clone(), data, owner, shown_document })
+    }
+
+    pub fn document_id(&self) -> Option<DocumentId> { self.owner.document_id() }
+
+    pub fn marker_dirty(&self) -> bool { self.owner.marker_dirty() }
+
+    pub fn shared_file(&mut self) -> Option<SharedFile> { self.owner.shared_file() }
+
+    pub fn owner(&self) -> &View { &self.owner }
+
+    pub fn owner_mut(&mut self) -> &mut View { &mut self.owner }
+
+    pub fn transfer_work_to(&mut self, target: &mut View) -> bool {
+        if self.owner.shares_document(target) {
+            return !self.owner.owns_shared_file_work() || self.owner.transfer_shared_loads(target);
+        }
+        if let Some(other) = target.overlay.as_mut() {
+            if self.owner.shares_document(&other.owner) {
+                return !self.owner.owns_shared_file_work() || self.owner.transfer_shared_loads(&mut other.owner);
+            }
+        }
+        false
+    }
+
+    /// Save/rename and marker publications change the same Arc used by the overlay scene.
+    /// An unchanged generation does no marker walk and does not rebuild drawing caches.
+    fn sync_shared(&mut self) -> bool {
+        self.owner.sync_shared();
+        let Some(data) = self.owner.data.as_ref() else { return false };
+        let document = self.owner.document_id();
+        let document_changed = self.shown_document != document;
+        if Arc::ptr_eq(data, &self.data) && !document_changed { return false; }
+        let markers_changed = document_changed || self.data.edit_revision != data.edit_revision || self.path != data.take.path;
+        self.shown_document = document;
+        self.path = data.take.path.clone();
+        drop_later(Some(std::mem::replace(&mut self.data, data.clone())));
+        markers_changed
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        // A transferred worker has a fresh cancellation token in this retired owner.
+        self.owner.cancel_load();
+    }
+}
+
+/// An overlay load, an existing shared file, or a wait for the app's already running reader.
 pub struct OverlayLoad {
     pub path: PathBuf,
+    /// Canonical identity captured when this pending overlay was admitted.
+    pub identity: Option<PathBuf>,
     pub rx: Receiver<LoadMsg>,
     /// Put back by undo / redo: its arrival is no new action (`app_undo.rs`).
     pub quiet: bool,
     pub started: Instant,
+    source: Option<Box<View>>,
+    shared: Option<SharedFile>,
+    waiting_shared: bool,
     /// Tests: the sending end of a load started with `hold_overlay` (no reading thread).
     #[cfg(test)]
     pub held: Option<std::sync::mpsc::Sender<LoadMsg>>,
@@ -235,29 +399,6 @@ pub fn overlay_mismatch(a: &ViewData, b: &ViewData) -> Option<String> {
     (!why.is_empty()).then(|| format!("얹을 수 없어요: {}", why.join(", ")))
 }
 
-/// Read a file's markers on a background thread for an overlay (no force plates, no comment
-/// file). Counts as a marker load, so force plates of other files wait for it.
-fn read_markers(ctx: &egui::Context, path: PathBuf) -> Receiver<LoadMsg> {
-    let (tx, rx) = channel();
-    let ctx2 = ctx.clone();
-    MARKER_LOADS.fetch_add(1, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let fast = tak_core::tak::fast_read::read_take_fast(&path, false).map_err(|e| e.to_string())?;
-            let t = Instant::now();
-            let data = ViewData::build(fast.take);
-            let mut steps = fast.times;
-            steps.push(("view", ms_since(t)));
-            Ok((data, steps))
-        }))
-        .unwrap_or_else(|_| Err("읽는 중 내부 오류(panic)가 났어요.".to_owned()));
-        MARKER_LOADS.fetch_sub(1, Ordering::SeqCst);
-        let _ = tx.send(LoadMsg::Markers(read));
-        ctx2.request_repaint();
-    });
-    rx
-}
-
 /// A finished marker load, handed to the app (`TakViewerApp::finish_load`).
 pub struct Loaded {
     pub path: PathBuf,
@@ -266,7 +407,12 @@ pub struct Loaded {
 }
 
 pub struct View {
+    pub editor_revision: u64,
+    #[cfg(test)]
+    pub background_work_checks: std::cell::Cell<usize>,
     pub data: Option<Arc<ViewData>>,
+    shared_file: Option<SharedFile>,
+    shared_generation: u64,
     /// Lazy, per-file marker document; preparing raw records never delays markers-first open.
     pub edit_document: Option<EditSession>,
     pub restore_edit_document: Option<EditSession>,
@@ -278,6 +424,11 @@ pub struct View {
     pub edit_selection: Option<EditSelection>,
     pub armed_label: Option<LabelKey>,
     pub source_stamp: Option<SourceStamp>,
+    /// Canonical identity of the data still displayed while another file is loading.
+    shown_identity: Option<PathBuf>,
+    /// Identity bound to an admitted primary read or shared-reader wait.
+    pending_identity: Option<PathBuf>,
+    fresh_open_candidate: Option<RetainedDocument>,
     /// Typed remote address. The path inside ViewData is an opaque memory identity only.
     pub remote: Option<crate::ssh::RemoteLocation>,
     pub remote_warning: Option<String>,
@@ -323,8 +474,20 @@ pub struct View {
     pub heat: HeatCache,
     /// File being read; its markers are not here yet.
     pub loading: Option<(PathBuf, Receiver<LoadMsg>)>,
+    /// Another view owns the first read of this target. The coordinator attaches its live
+    /// shared handle when markers arrive; no reader or poll receiver is allocated here.
+    waiting_shared: Option<PathBuf>,
     /// Force plates / EMG of the shown file still coming: (file_id, messages).
     pub analog_rx: Option<(usize, Receiver<LoadMsg>)>,
+    /// Deferred local job: owning it performs no file read.
+    lazy_job_rx: Option<Receiver<(Option<tak_core::tak::fast_read::AnalogJob>, Option<String>)>>,
+    lazy_job: Option<tak_core::tak::fast_read::AnalogJob>,
+    pub emg_rx: Option<(usize, Receiver<LoadMsg>)>,
+    pub emg_requested: bool,
+    pub emg_failure: Option<String>,
+    pub analog_fallback: Option<String>,
+    analog_queue: Vec<AnalogPart>,
+    analog_merge: Option<Receiver<(Arc<ViewData>, ViewData, AnalogPart)>>,
     /// Set when the file being read is no longer wanted.
     load_cancel: Arc<AtomicBool>,
     /// Put the file being read here once its markers arrive (remembered `Spot`).
@@ -363,7 +526,12 @@ pub struct View {
 impl Default for View {
     fn default() -> Self {
         View {
+            editor_revision: 0,
+            #[cfg(test)]
+            background_work_checks: std::cell::Cell::new(0),
             data: None,
+            shared_file: None,
+            shared_generation: 0,
             edit_document: None,
             restore_edit_document: None,
             restore_edit_selection: None,
@@ -372,6 +540,9 @@ impl Default for View {
             edit_selection: None,
             armed_label: None,
             source_stamp: None,
+            shown_identity: None,
+            pending_identity: None,
+            fresh_open_candidate: None,
             remote: None,
             remote_warning: None,
             remote_loading: None,
@@ -394,7 +565,16 @@ impl Default for View {
             plate_lanes: PlateCache::default(),
             heat: HeatCache::default(),
             loading: None,
+            waiting_shared: None,
             analog_rx: None,
+            lazy_job_rx: None,
+            lazy_job: None,
+            emg_rx: None,
+            emg_requested: false,
+            emg_failure: None,
+            analog_fallback: None,
+            analog_queue: Vec::new(),
+            analog_merge: None,
             load_cancel: Arc::new(AtomicBool::new(false)),
             restore: None,
             open_started: None,
@@ -416,6 +596,344 @@ impl Default for View {
 }
 
 impl View {
+    fn stamp_identity(stamp: Option<&SourceStamp>) -> Option<PathBuf> {
+        stamp?.lock().ok()?.as_ref().map(|(path, _, _)| path.clone())
+    }
+
+    /// The identity of this view's already admitted source. This lookup never touches disk.
+    /// A replacement keeps the old displayed identity separate from the incoming one.
+    pub fn bound_identity(&self, path: &Path) -> Option<PathBuf> {
+        if self.loading.as_ref().is_some_and(|(target, _)| target == path)
+            || self.waiting_shared.as_deref() == Some(path) {
+            return self.pending_identity.clone().or_else(|| Self::stamp_identity(self.source_stamp.as_ref()));
+        }
+        if self.path() == Some(path) {
+            return if self.loading.is_some() || self.waiting_shared.is_some() {
+                self.shown_identity.clone()
+            } else {
+                Self::stamp_identity(self.source_stamp.as_ref()).or_else(|| self.shown_identity.clone())
+            };
+        }
+        if let Some(shared) = &self.shared_file {
+            if let Ok(state) = shared.0.lock() {
+                if state.data.take.path == path {
+                    return Self::stamp_identity(state.source_stamp.as_ref());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn overlay_bound_identity(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(load) = &self.overlay_load {
+            if load.path == path {
+                return load.identity.clone().or_else(|| load.source.as_ref().and_then(|view| view.bound_identity(path)));
+            }
+        }
+        self.overlay.as_ref().filter(|overlay| overlay.path == path)
+            .and_then(|overlay| overlay.owner.bound_identity(path))
+    }
+
+    pub fn set_pending_identity(&mut self, identity: PathBuf) { self.pending_identity = Some(identity); }
+
+    pub fn set_overlay_pending_identity(&mut self, identity: PathBuf) {
+        if let Some(load) = &mut self.overlay_load { load.identity = Some(identity); }
+    }
+
+    /// Candidate for an ordinary disk open after its final live reference was closed.
+    /// The controller separately excludes app-owned pending edits/saves.
+    pub fn retained_document(&self) -> Option<RetainedDocument> {
+        if self.remote.is_some() || self.remote_loading.is_some() || self.loading.is_some()
+            || self.waiting_shared.is_some() || self.edit_refresh.is_some() || self.marker_dirty() {
+            return None;
+        }
+        Some(RetainedDocument::new(self.edit_document.clone()?, self.source_stamp.clone()))
+    }
+
+    pub fn fresh_open_document(&self) -> Option<EditSession> {
+        self.fresh_open_candidate.as_ref().map(|candidate| candidate.document.clone())
+    }
+
+    pub fn fresh_open_source_stamp(&self) -> Option<SourceStamp> {
+        self.fresh_open_candidate.as_ref().and_then(|candidate| candidate.source_stamp.clone())
+    }
+
+    /// Set only after starting the new load: every new load/cancellation clears an old candidate.
+    pub fn set_fresh_open_candidate(&mut self, candidate: Option<RetainedDocument>) {
+        drop_later(std::mem::replace(&mut self.fresh_open_candidate, candidate));
+    }
+
+    pub fn set_overlay_fresh_open_candidate(&mut self, candidate: Option<RetainedDocument>) {
+        if let Some(load) = self.overlay_load.as_mut() {
+            let source = load.source.get_or_insert_with(|| Box::new(View::default()));
+            source.set_fresh_open_candidate(candidate);
+        }
+    }
+
+    /// Return the canonical file handle when another view needs this file. Ordinary one-view
+    /// opens keep the zero-copy analog path and allocate no shared-state wrapper.
+    pub fn shared_file(&mut self) -> Option<SharedFile> {
+        if self.loading.is_some() || self.remote_loading.is_some()
+            || self.waiting_shared.is_some() { return None; }
+        if self.shared_file.is_none() {
+            self.shared_file = Some(SharedFile(Arc::new(Mutex::new(SharedFileState {
+                generation: 0,
+                data: self.data.clone()?,
+                document: self.edit_document.clone()?,
+                source_stamp: self.source_stamp.clone(),
+                comments: SharedComments::capture(&self.comments),
+                emg_demand: false,
+                emg_wake: None,
+                editor_wake: None,
+            }))));
+            self.shared_generation = 0;
+        }
+        self.sync_shared();
+        self.shared_file.clone()
+    }
+
+    pub fn shares_document(&self, other: &View) -> bool {
+        self.edit_document.as_ref().zip(other.edit_document.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    }
+
+    pub fn document_id(&self) -> Option<DocumentId> {
+        self.edit_document.as_ref()?.lock().ok().map(|doc| doc.id())
+    }
+
+    /// Current canonical local target, including a save/rename not yet consumed by a hidden
+    /// view. Loading and remote addresses retain the same precedence as `target()`.
+    pub fn shared_target(&self) -> Option<PathBuf> {
+        if self.loading.is_some() || self.remote_loading.is_some() || self.remote.is_some()
+            || self.waiting_shared.is_some() {
+            return self.target().map(Path::to_path_buf);
+        }
+        self.shared_file.as_ref().and_then(|shared| shared.0.lock().ok()
+            .map(|state| state.data.take.path.clone()))
+            .or_else(|| self.target().map(Path::to_path_buf))
+    }
+
+    /// Open an already loaded file without disk work. Playback, camera, selection, ID pools
+    /// and controls stay independent. Pending reads remain owned by the original view.
+    pub fn show_shared_file(&mut self, shared: SharedFile, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
+        let (data, document, stamp, comments, generation) = {
+            let state = shared.0.lock().ok()?;
+            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+        };
+        let restore = self.restore.take();
+        let restore_range = self.restore_range.take();
+        self.cancel_load();
+        self.restore = restore;
+        self.restore_range = restore_range;
+        self.restore_edit_document = Some(document);
+        self.source_stamp = stamp;
+        self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
+        let (_tx, rx) = channel();
+        let old = self.show_shared(data, rx, file_id, speed, now);
+        // A follower never invents an analog receiver or reloads the Comment tail.
+        self.analog_rx = None;
+        self.comments_rx = None;
+        comments.install(&mut self.comments);
+        self.shared_file = Some(shared);
+        self.shared_generation = generation;
+        // The canonical data already represents this document's current revision.
+        if self.data.as_ref().is_some_and(|data| data.edit_revision == self.edit_refresh) {
+            self.edit_refresh = None;
+        }
+        old
+    }
+
+    /// Reopening a retained view must join the file already open now, while keeping its own
+    /// camera, frame, selected UIDs, range, picked Comment, overlays and read-only metadata.
+    /// False leaves the view untouched: an independent unsaved document or unfinished open
+    /// cannot be discarded by a layout restore. App-owned marker/save jobs are guarded by
+    /// the controller before calling this method.
+    pub fn adopt_shared_preserving_state(&mut self, shared: SharedFile, now: f64) -> bool {
+        let (data, document, stamp, comments, generation) = {
+            let Ok(state) = shared.0.lock() else { return false };
+            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+        };
+        if self.edit_document.as_ref().is_some_and(|own| Arc::ptr_eq(own, &document)) {
+            self.sync_shared_file(&shared);
+            return true;
+        }
+        if self.loading.is_some() || self.remote_loading.is_some() || self.waiting_shared.is_some()
+            || self.marker_dirty() || self.comments.pending > 0
+            || self.comments.failed.is_some() { return false; }
+        let Some(path) = self.path() else { return false };
+        if !same_file_path(path, &data.take.path) { return false; }
+        let selection = self.uid_selection();
+        let frame = self.pb.frame;
+        let plate_name = self.plate.and_then(|index| self.data.as_ref()?.plates.get(index).map(|plate| plate.name.clone()));
+        self.cancel_load();
+        drop_later(self.edit_document.replace(document));
+        self.edit_refresh = None;
+        self.edit_selection = Some(selection);
+        self.install_shared_data(data);
+        self.source_stamp = stamp;
+        self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
+        comments.install(&mut self.comments);
+        if let Some(data) = self.data.as_ref() {
+            self.pb.first = data.start_frame;
+            self.pb.last = data.end_frame.max(data.start_frame);
+            self.pb.rate = data.take.frame_rate;
+            self.plate = plate_name.and_then(|name| data.plates.iter().position(|plate| plate.name == name));
+        }
+        self.pb.set_frame(frame, now);
+        if let Some((a, b)) = self.range {
+            self.range = Some(panels::ordered_range(a, b, self.pb.first, self.pb.last));
+        }
+        drop_later(self.shared_file.replace(shared));
+        self.shared_generation = generation;
+        true
+    }
+
+    /// Publish after a file mutation (Comment change/ack, analog arrival, marker rebuild or
+    /// save). A stale view cannot replace a newer publication: it consumes that publication
+    /// instead and returns false. The app must sync before accepting input on an old tab.
+    pub fn publish_shared_file(&mut self) -> bool {
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        let Some(shared) = self.shared_file.clone() else { return true };
+        let Some(data) = self.data.as_ref() else { return false };
+        let Some(document) = self.edit_document.as_ref() else { return false };
+        let Ok(mut state) = shared.0.lock() else { return false };
+        if !Arc::ptr_eq(document, &state.document) { return false; }
+        if self.shared_generation != state.generation {
+            drop(state);
+            self.sync_shared_file(&shared);
+            return false;
+        }
+        let data_changed = !Arc::ptr_eq(data, &state.data);
+        let comments_changed = !state.comments.matches(&self.comments);
+        if data_changed || comments_changed {
+            if data_changed { drop_later(Some(std::mem::replace(&mut state.data, data.clone()))); }
+            if !data.emg_pending { state.emg_demand = false; }
+            if comments_changed { state.comments = SharedComments::capture(&self.comments); }
+            state.source_stamp = self.source_stamp.clone();
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if let Some((document, wake)) = &state.editor_wake { let _ = wake.send(*document); }
+        self.shared_generation = state.generation;
+        true
+    }
+
+    /// Consume the latest shared publication, preserving this view's frame/camera and marker
+    /// selection by UID. The handle always reads live state, so an old handle cannot roll back
+    /// a save, rename, Comment write, or marker edit.
+    pub fn sync_shared_file(&mut self, shared: &SharedFile) -> bool {
+        let (data, stamp, comments, generation) = {
+            let Ok(state) = shared.0.lock() else { return false };
+            if !self.edit_document.as_ref().is_some_and(|doc| Arc::ptr_eq(doc, &state.document)) { return false; }
+            if self.shared_file.as_ref().is_some_and(|own| Arc::ptr_eq(&own.0, &shared.0))
+                && self.shared_generation == state.generation { return false; }
+            (state.data.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+        };
+        if !self.data.as_ref().is_some_and(|current| Arc::ptr_eq(current, &data)) {
+            self.install_shared_data(data);
+        }
+        comments.install(&mut self.comments);
+        if self.picked.is_some_and(|id| self.comments.list.get(id).is_none()) { self.picked = None; }
+        self.source_stamp = stamp;
+        self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
+        drop_later(self.shared_file.replace(shared.clone()));
+        self.shared_generation = generation;
+        true
+    }
+
+    pub fn sync_shared(&mut self) -> bool {
+        let primary = self.shared_file.clone().is_some_and(|shared| self.sync_shared_file(&shared));
+        let overlay = self.overlay.as_mut().is_some_and(Overlay::sync_shared);
+        if overlay { drop_later(Some(std::mem::take(&mut self.lanes))); }
+        primary || overlay
+    }
+
+    /// File workers only, independent of whether this view is drawn. An idle hidden view needs
+    /// no polling; a lazy EMG owner wakes when any sibling explicitly requests its channels.
+    pub fn file_work_pending(&self) -> bool {
+        #[cfg(test)] self.background_work_checks.set(self.background_work_checks.get() + 1);
+        self.remote_loading.is_some() || self.loading.is_some() || self.analog_work_pending()
+            || self.comments_rx.is_some() || self.comments.id_rx.is_some() || self.lazy_job_rx.is_some()
+            || self.overlay.as_ref().is_some_and(|overlay| overlay.owner.file_work_pending())
+            || (self.lazy_job.is_some() && self.shared_file.as_ref()
+                .is_some_and(|shared| shared.0.lock().ok().is_some_and(|state| state.emg_demand)))
+    }
+
+    /// Finish an ID reservation that began while visible without launching another one.
+    pub fn poll_started_comment_ids(&mut self) {
+        let Some(rx) = self.comments.id_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(ids)) => { self.comments.id_pool = Some(ids); self.comments.id_error = None; self.comments.id_rx = None; }
+            Ok(Err(reason)) => { self.comments.id_error = Some(reason); self.comments.id_rx = None; }
+            Err(TryRecvError::Disconnected) => {
+                self.comments.id_error = Some("Comment ID preparation stopped.".into()); self.comments.id_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Hidden OPEN EDITORS rows subscribe only after this file is actually shared.
+    pub fn subscribe_editor_updates(&self, wake: &Sender<DocumentId>) {
+        let Some(document) = self.document_id() else { return };
+        let Some(shared) = self.shared_file.as_ref() else { return };
+        if let Ok(mut state) = shared.0.lock() { state.editor_wake = Some((document, wake.clone())); };
+    }
+
+    pub fn notify_editor_updates(&mut self) {
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        if let Some(shared) = &self.shared_file {
+            if let Ok(state) = shared.0.lock() {
+                if let Some((document, wake)) = &state.editor_wake { let _ = wake.send(*document); }
+            }
+        }
+    }
+
+    /// Subscribe the owning app while this view has a deferred reader. Setting demand and
+    /// sending its wake happen under the same shared lock. A late subscription replays an
+    /// existing demand, so hiding or handing off the owner cannot lose a channel request.
+    pub fn subscribe_emg_work(&mut self, wake: &Sender<DocumentId>) {
+        if self.lazy_job.is_none() && self.lazy_job_rx.is_none() { return; }
+        let Some(document) = self.document_id() else { return };
+        let Some(shared) = self.shared_file() else { return };
+        if let Ok(mut state) = shared.0.lock() {
+            state.emg_wake = Some((document, wake.clone()));
+            if state.emg_demand { let _ = wake.send(document); }
+        };
+    }
+
+    pub fn owns_shared_file_work(&self) -> bool {
+        self.analog_rx.is_some() || self.lazy_job_rx.is_some() || self.lazy_job.is_some()
+            || self.emg_rx.is_some() || self.analog_merge.is_some() || !self.analog_queue.is_empty()
+            || self.comments_rx.is_some()
+    }
+
+    /// Before closing a load owner that has another view of this file, move its outstanding
+    /// reads and deferred EMG job there. No file is read again and clearing the old view cannot
+    /// cancel the transferred worker. Marker/save jobs live in MarkerUi and move with it.
+    pub fn transfer_shared_loads(&mut self, target: &mut View) -> bool {
+        if !self.shares_document(target) { return false; }
+        self.publish_shared_file();
+        if let Some(shared) = self.shared_file.clone() { target.sync_shared_file(&shared); }
+        if self.analog_rx.is_none() && self.lazy_job_rx.is_none() && self.lazy_job.is_none()
+            && self.emg_rx.is_none() && self.analog_merge.is_none() && self.analog_queue.is_empty()
+            && self.comments_rx.is_none() { return false; }
+        // The app gives reads one owner; refuse merging independently running workers.
+        if target.analog_rx.is_some() || target.lazy_job_rx.is_some() || target.lazy_job.is_some()
+            || target.emg_rx.is_some() || target.analog_merge.is_some() || !target.analog_queue.is_empty()
+            || target.comments_rx.is_some() { return false; }
+        target.analog_rx = self.analog_rx.take().map(|(_, rx)| (target.file_id, rx));
+        target.emg_rx = self.emg_rx.take().map(|(_, rx)| (target.file_id, rx));
+        target.lazy_job_rx = self.lazy_job_rx.take();
+        target.lazy_job = self.lazy_job.take();
+        target.analog_merge = self.analog_merge.take();
+        target.analog_queue = std::mem::take(&mut self.analog_queue);
+        target.comments_rx = self.comments_rx.take();
+        target.load_cancel = std::mem::replace(&mut self.load_cancel, Arc::new(AtomicBool::new(false)));
+        target.emg_requested = self.emg_requested;
+        target.emg_failure = self.emg_failure.clone();
+        target.analog_fallback = self.analog_fallback.clone();
+        true
+    }
+
     pub fn marker_dirty(&self) -> bool {
         self.edit_document.as_ref().is_some_and(|session| session.lock().map_or(true, |doc| doc.is_dirty()))
     }
@@ -427,18 +945,53 @@ impl View {
 
     /// The file being read, else the file on screen.
     pub fn target(&self) -> Option<&Path> {
-        self.remote_loading.as_ref().map(|(_, _, p)| p.as_path()).or_else(|| self.loading.as_ref().map(|(p, _)| p.as_path())).or_else(|| self.path())
+        self.remote_loading.as_ref().map(|(_, _, p)| p.as_path()).or(self.waiting_shared.as_deref())
+            .or_else(|| self.loading.as_ref().map(|(p, _)| p.as_path())).or_else(|| self.path())
+    }
+
+    /// Wait for the app's existing reader of `path`; the currently displayed file remains
+    /// intact until show_shared_file succeeds. The app resolves or clears waiters by event.
+    pub fn wait_for_shared(&mut self, path: PathBuf, restore: Option<Spot>) {
+        if self.data.is_some() && self.loading.is_none() && self.waiting_shared.is_none() {
+            self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.shown_identity.take());
+        }
+        self.cancel_load();
+        self.waiting_shared = Some(path);
+        self.restore = restore;
+        self.open_started = Some(Instant::now());
+        self.markers_ms = None;
+        self.analog_ms = None;
+    }
+
+    pub fn waiting_shared_path(&self) -> Option<&Path> { self.waiting_shared.as_deref() }
+
+    /// The owner failed or closed before publishing. Keep the previous visible file.
+    pub fn clear_shared_wait(&mut self) -> Option<PathBuf> {
+        let path = self.waiting_shared.take()?;
+        self.pending_identity = None;
+        self.restore = None;
+        self.restore_range = None;
+        Some(path)
     }
 
     /// Markers, the comment file, force plates or the overlay's markers still coming.
     pub fn busy(&self) -> bool {
-        self.remote_loading.is_some() || self.loading.is_some() || self.analog_rx.is_some() || self.comments_rx.is_some() || self.overlay_load.is_some()
+        self.remote_loading.is_some() || self.loading.is_some() || self.waiting_shared.is_some() || self.analog_rx.is_some() || self.emg_rx.is_some() || self.analog_merge.is_some() || !self.analog_queue.is_empty() || self.comments_rx.is_some() || self.overlay_load.is_some() || self.devices.graphs_pending()
+            || self.overlay.as_ref().is_some_and(|overlay| overlay.owner.busy())
     }
 
     /// The laid-over file on screen.
     pub fn overlay_path(&self) -> Option<&Path> {
         self.overlay.as_ref().map(|o| o.path.as_path())
     }
+
+    pub fn overlay_shared_target(&self) -> Option<PathBuf> {
+        self.overlay.as_ref().and_then(|overlay| overlay.owner.shared_target())
+    }
+
+    pub fn overlay_owner(&self) -> Option<&View> { self.overlay.as_ref().map(Overlay::owner) }
+
+    pub fn overlay_owner_mut(&mut self) -> Option<&mut View> { self.overlay.as_mut().map(Overlay::owner_mut) }
 
     /// The laid-over file being read, else the one on screen (what counts for "at most 4 files").
     pub fn overlay_target(&self) -> Option<&Path> {
@@ -450,15 +1003,67 @@ impl View {
         self.overlay_path().into_iter().chain(self.overlay_load.as_ref().map(|l| l.path.as_path()))
     }
 
-    /// Read `path` for this view's overlay (markers only, background thread). The overlay on
-    /// screen stays until the new one arrives and fits.
+    /// A ready overlay also supplies the canonical file identity for ordinary view opens.
+    pub fn shared_overlay_file(&mut self, path: &Path) -> Option<SharedFile> {
+        let overlay = self.overlay.as_mut()?;
+        overlay.sync_shared();
+        if overlay.path != path && !same_file_path(&overlay.path, path) { return None; }
+        overlay.shared_file()
+    }
+
+    /// The actual reader, excluding a follower which is waiting for this file elsewhere.
+    pub fn overlay_reading_path(&self) -> Option<&Path> {
+        self.overlay_load.as_ref().filter(|load| !load.waiting_shared && load.shared.is_none()).map(|load| load.path.as_path())
+    }
+
+    pub fn overlay_waiting_shared_path(&self) -> Option<&Path> {
+        self.overlay_load.as_ref().filter(|load| load.waiting_shared).map(|load| load.path.as_path())
+    }
+
+    pub fn attach_overlay_shared(&mut self, path: &Path, shared: SharedFile) -> bool {
+        let Some(load) = self.overlay_load.as_mut().filter(|load| load.waiting_shared && (load.path == path || same_file_path(&load.path, path))) else { return false };
+        load.shared = Some(shared);
+        load.waiting_shared = false;
+        true
+    }
+
+    pub fn start_shared_overlay(&mut self, path: PathBuf, shared: SharedFile, quiet: bool) {
+        self.wait_overlay_shared(path, quiet);
+        let load = self.overlay_load.as_mut().expect("created shared overlay wait");
+        load.shared = Some(shared);
+        load.waiting_shared = false;
+    }
+
+    pub fn wait_overlay_shared(&mut self, path: PathBuf, quiet: bool) {
+        self.cancel_overlay_load();
+        let (_tx, rx) = channel();
+        self.overlay_load = Some(OverlayLoad {
+            path, identity: None, rx, quiet, started: Instant::now(), source: None, shared: None, waiting_shared: true,
+            #[cfg(test)] held: None,
+        });
+    }
+
+    pub fn cancel_overlay_load(&mut self) {
+        if let Some(mut load) = self.overlay_load.take() {
+            if let Some(source) = &mut load.source { source.cancel_load(); }
+            drop_later(Some(load));
+        }
+    }
+
+    /// Markers appear first; preserve the one reader's forceplate, Comment and lazy EMG jobs
+    /// so opening this same file in a primary view never requires another full marker read.
     pub fn start_overlay(&mut self, ctx: &egui::Context, path: PathBuf, quiet: bool) {
-        let rx = read_markers(ctx, path.clone());
+        self.cancel_overlay_load();
+        let mut source = Box::new(View::default());
+        source.start_load(ctx, path.clone(), None);
+        let (_, rx) = source.loading.take().expect("overlay reader started");
         self.overlay_load = Some(OverlayLoad {
             path,
+            identity: None,
             rx,
             quiet,
             started: Instant::now(),
+            source: Some(source), shared: None, waiting_shared: false,
             #[cfg(test)]
             held: None,
         });
@@ -467,34 +1072,96 @@ impl View {
     /// Tests: like `start_overlay`, but the test sends the markers through `held`.
     #[cfg(test)]
     pub fn hold_overlay(&mut self, path: PathBuf, quiet: bool) {
+        self.cancel_overlay_load();
         let (tx, rx) = channel();
-        self.overlay_load = Some(OverlayLoad { path, rx, quiet, started: Instant::now(), held: Some(tx) });
+        self.overlay_load = Some(OverlayLoad { path, identity: None, rx, quiet, started: Instant::now(), held: Some(tx), source: None, shared: None, waiting_shared: false });
     }
 
     /// The overlay's markers, once they are in and this view shows its own file (not while
     /// that is being read: the two are compared on arrival). (file, data or why not, quiet).
-    pub fn poll_overlay(&mut self) -> Option<(PathBuf, Result<ViewData, String>, bool)> {
-        if self.loading.is_some() || self.data.is_none() {
+    pub fn poll_overlay(&mut self) -> Option<(PathBuf, Result<Overlay, String>, bool)> {
+        if self.loading.is_some() || self.waiting_shared.is_some() || self.data.is_none() {
             return None;
         }
-        let msg = match self.overlay_load.as_ref()?.rx.try_recv() {
+        let pending = self.overlay_load.as_ref()?;
+        if pending.waiting_shared { return None; }
+        if let Some(shared) = pending.shared.clone() {
+            let load = self.overlay_load.take()?;
+            let result = Overlay::from_shared(load.path.clone(), shared);
+            if result.is_ok() { self.overlay_ms = Some(ms_since(load.started)); }
+            return Some((load.path, result, load.quiet));
+        }
+        let msg = match pending.rx.try_recv() {
             Ok(LoadMsg::Markers(r)) => r.map(|(d, _)| d),
             Ok(LoadMsg::Analog(..)) | Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => Err("읽기가 중간에 끝났어요".to_owned()),
         };
-        let load = self.overlay_load.take()?;
+        let mut load = self.overlay_load.take()?;
         if msg.is_ok() {
             self.overlay_ms = Some(ms_since(load.started));
         }
-        Some((load.path, msg, load.quiet))
+        let path = load.path;
+        let mut source = load.source.take().unwrap_or_else(|| Box::new(View::default()));
+        if let Some(identity) = load.identity.take() { source.set_pending_identity(identity); }
+        let result = match msg {
+            Ok(data) => Ok(Overlay::from_reader(path.clone(), data, load.rx, source)),
+            Err(error) => {
+                source.cancel_load();
+                drop_later(Some((source, load.rx)));
+                Err(error)
+            }
+        };
+        Some((path, result, load.quiet))
     }
 
-    /// Take the overlay off (and stop reading one): both files shown again. Returns its data,
+    /// Take the overlay off (and stop reading one): both files shown again. Returns its owner,
     /// to be freed off the drawing thread.
-    pub fn take_overlay(&mut self) -> Option<ViewData> {
-        self.overlay_load = None;
+    pub fn take_overlay(&mut self) -> Option<Overlay> {
+        self.cancel_overlay_load();
         self.shown = [true; 2];
-        self.overlay.take().map(|o| o.data)
+        self.overlay.take()
+    }
+
+    /// Handoff before removing this overlay. A primary view or overlay sharing its document
+    /// receives the only running file workers. Marker edit/save jobs remain app-owned.
+    pub fn transfer_overlay_work_to(&mut self, target: &mut View) -> bool {
+        self.overlay.as_mut().is_some_and(|overlay| overlay.transfer_work_to(target))
+    }
+
+    /// A surviving overlay can keep file readers alive when its final primary view closes.
+    /// The caller still moves MarkerUi jobs separately or guards that close until they end.
+    pub fn transfer_primary_work_to_overlay(&mut self, target: &mut View) -> bool {
+        let Some(overlay) = target.overlay.as_mut() else { return false };
+        if !self.shares_document(&overlay.owner) { return false; }
+        !self.owns_shared_file_work() || self.transfer_shared_loads(&mut overlay.owner)
+    }
+
+    pub fn overlay_document_id(&self) -> Option<DocumentId> { self.overlay.as_ref()?.document_id() }
+
+    pub fn overlay_marker_dirty(&self) -> bool { self.overlay.as_ref().is_some_and(Overlay::marker_dirty) }
+
+    pub fn overlay_analog_work_pending(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|overlay| overlay.owner.analog_work_pending()
+            || overlay.owner.data.as_ref().is_some_and(|data| data.analog_pending))
+    }
+
+    /// Poll already-running jobs even during a save, but only start EMG with the
+    /// controller's document-wide permission. Save workers wait for those existing jobs.
+    pub fn poll_overlay_file_work(&mut self, ctx: &egui::Context) {
+        self.poll_overlay_file_work_gated(ctx, false);
+    }
+
+    pub fn poll_overlay_file_work_gated(&mut self, ctx: &egui::Context, allow_emg: bool) {
+        let changed = if let Some(overlay) = self.overlay.as_mut() {
+            if overlay.owner.file_work_pending() {
+                overlay.owner.poll_started_comment_ids();
+                overlay.owner.poll_comments();
+                overlay.owner.poll_analog();
+                if allow_emg { overlay.owner.request_emg(ctx); }
+            }
+            overlay.sync_shared()
+        } else { false };
+        if changed { drop_later(Some(std::mem::take(&mut self.lanes))); }
     }
 
     /// The overlay's frame shown with this view's frame: the same place from the first frame
@@ -508,11 +1175,25 @@ impl View {
     /// force plates / EMG once no file's markers are loading any more. A load this view started
     /// before is cancelled.
     pub fn start_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>) {
+        if self.data.is_some() && self.loading.is_none() && self.waiting_shared.is_none() {
+            self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.shown_identity.take());
+        }
+        self.waiting_shared = None;
+        self.set_fresh_open_candidate(None);
         drop_later(self.restore_edit_document.take());
         self.restore_edit_selection = None;
         self.restore_picked = None;
         let (tx, rx) = channel();
         let (comments_tx, comments_rx) = channel();
+        let (lazy_tx, lazy_rx) = channel();
+        drop_later(self.lazy_job.take());
+        drop_later(self.lazy_job_rx.replace(lazy_rx));
+        drop_later(self.emg_rx.take());
+        self.emg_requested = false;
+        self.emg_failure = None;
+        self.analog_fallback = None;
+        drop_later(Some(std::mem::take(&mut self.analog_queue)));
+        drop_later(self.analog_merge.take());
         let ctx2 = ctx.clone();
         let p = path.clone();
         let stamp: SourceStamp = Arc::new(Mutex::new(None));
@@ -524,18 +1205,28 @@ impl View {
         std::thread::spawn(move || {
             let panic_msg = || "읽는 중 내부 오류(panic)가 났어요.".to_owned();
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Ok(meta) = std::fs::metadata(&p) {
-                    if let Ok(mut initial) = stamp.lock() {
-                        *initial = Some((p.clone(), meta.len(), meta.modified().ok()));
+                if let Ok(identity) = tak_core::takm::canonical_target(&p) {
+                    if let Ok(meta) = std::fs::metadata(&identity) {
+                        if let Ok(mut initial) = stamp.lock() {
+                            *initial = Some((identity, meta.len(), meta.modified().ok()));
+                        }
                     }
                 }
                 let fast = tak_core::tak::fast_read::read_take_fast(&p, false).map_err(|e| e.to_string())?;
                 let t = Instant::now();
-                let mut data = ViewData::build(fast.take);
-                data.analog_pending = fast.analog.is_some();
+                let mapping = fast.analog.as_ref().and_then(|j| j.plate_devices()).map(<[usize]>::to_vec);
+                let fallback = fast.analog.as_ref().and_then(|j| j.fallback_reason()).map(str::to_owned)
+                    .or_else(|| fast.times.iter().any(|(stage, _)| *stage == "full read (fallback)")
+                        .then(|| "파일 구조를 안전하게 나누어 읽을 수 없어요".to_owned()));
+                let (initial, lazy) = fast.analog.map(|job| { let (first, lazy) = job.split(); (Some(first), lazy) }).unwrap_or((None, None));
+                let mut data = ViewData::build_with_plate_devices(fast.take, mapping);
+                data.analog_pending = initial.is_some();
+                data.emg_pending = lazy.is_some();
+                if let Some(reason) = &fallback { data.take.warnings.push(format!("장치를 확실히 나누지 못해 아날로그를 모두 읽어요: {reason}")); }
+                let _ = lazy_tx.send((lazy, fallback));
                 let mut steps = fast.times;
                 steps.push(("view", ms_since(t)));
-                Ok((data, steps, fast.analog))
+                Ok((data, steps, initial))
             }))
             .unwrap_or_else(|_| Err(panic_msg()));
             MARKER_LOADS.fetch_sub(1, Ordering::SeqCst);
@@ -567,7 +1258,9 @@ impl View {
             }
             let t = Instant::now();
             let analog = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                job.run().map(|(analog, warning)| AnalogPart::prepare(analog, warning, &target)).map_err(|e| e.to_string())
+                let indices = job.device_indices().to_vec();
+                let selective = job.plate_devices().is_some();
+                job.run().map(|(analog, warning)| if selective { AnalogPart::prepare_selected(analog, warning, &target, indices, true) } else { AnalogPart::prepare(analog, warning, &target) }).map_err(|e| e.to_string())
             }))
             .unwrap_or_else(|_| Err(panic_msg()));
             let _ = tx.send(LoadMsg::Analog(analog, ms_since(t)));
@@ -595,13 +1288,24 @@ impl View {
 
     /// Stop reading (the view closes or shows another file).
     pub fn cancel_load(&mut self) {
+        self.waiting_shared = None;
+        self.pending_identity = None;
+        self.set_fresh_open_candidate(None);
         self.load_cancel.store(true, Ordering::SeqCst);
         drop_later(self.restore_edit_document.take());
         self.restore_edit_selection = None;
         self.restore_picked = None;
         self.remote_loading = None;
-        self.loading = None;
-        self.analog_rx = None;
+        drop_later(self.loading.take());
+        drop_later(self.analog_rx.take());
+        drop_later(self.lazy_job_rx.take());
+        drop_later(self.lazy_job.take());
+        drop_later(self.emg_rx.take());
+        drop_later(self.analog_merge.take());
+        drop_later(Some(std::mem::take(&mut self.analog_queue)));
+        self.emg_requested = false;
+        self.emg_failure = None;
+        self.analog_fallback = None;
         self.comments_rx = None;
         self.restore = None;
         self.restore_range = None;
@@ -615,6 +1319,7 @@ impl View {
             Err(TryRecvError::Disconnected) => Err("읽기가 중간에 끝났어요".to_owned()),
         };
         let (path, rx) = self.loading.take()?;
+        if msg.is_err() { self.set_fresh_open_candidate(None); }
         self.markers_ms = self.open_started.map(ms_since);
         Some(Loaded { path, result: msg, rx })
     }
@@ -626,9 +1331,36 @@ impl View {
     }
 
     pub fn show_shared(&mut self, data: Arc<ViewData>, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
+        self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.pending_identity.take());
+        self.pending_identity = None;
+        let mut verified_restore = false;
+        if let Some(candidate) = self.fresh_open_candidate.take() {
+            let current = self.source_stamp.as_ref().and_then(|stamp| stamp.lock().ok().and_then(|stamp| stamp.clone()));
+            // Unknown timestamps cannot prove freshness. Comparing captured values performs
+            // no filesystem work on the drawing thread, including for hidden/overlay loads.
+            let unchanged = candidate.stamp.as_ref().zip(current.as_ref()).is_some_and(|(old, new)| {
+                old.2.is_some() && new.2.is_some() && old == new
+            });
+            if unchanged {
+                verified_restore = true;
+                self.restore_edit_document = Some(candidate.document);
+                // Existing undo snapshots keep this handle. Later own saves/Comment appends
+                // must advance the same stamp rather than strand those snapshots on an old one.
+                self.source_stamp = candidate.source_stamp;
+            }
+            else { drop_later(Some(candidate)); }
+        }
+        self.waiting_shared = None;
+        self.shared_file = None;
+        self.shared_generation = 0;
         self.remote = None;
         self.remote_warning = None;
         self.remote_loading = None;
+        drop_later(self.emg_rx.take());
+        drop_later(self.analog_merge.take());
+        drop_later(Some(std::mem::take(&mut self.analog_queue)));
+        self.emg_requested = false;
+        self.emg_failure = None;
         let mut pb = Playback::new(data.start_frame, data.end_frame, data.take.frame_rate);
         pb.speed = speed;
         self.pb = pb;
@@ -643,7 +1375,7 @@ impl View {
         self.fresh = true;
         self.file_id = file_id;
         let path = &data.take.path;
-        let restored = self.restore_edit_document.take().filter(|session| session.lock().ok().is_some_and(|doc| doc.source_path() == path || doc.save_path() == Some(path.as_path())));
+        let restored = self.restore_edit_document.take().filter(|session| verified_restore || session.lock().ok().is_some_and(|doc| doc.source_path() == path || doc.save_path() == Some(path.as_path())));
         let restored_selection = if restored.is_some() { self.restore_edit_selection.take() } else { self.restore_edit_selection = None; None };
         let session = restored.unwrap_or_else(|| Arc::new(Mutex::new(EditDocument::unloaded(path.clone()))));
         self.edit_refresh = session.lock().ok().and_then(|doc| {
@@ -652,7 +1384,11 @@ impl View {
         drop_later(self.edit_document.replace(session));
         self.edit_selection = restored_selection;
         self.armed_label = None;
+        drop_later(self.analog_rx.take());
         self.analog_rx = data.analog_pending.then_some((file_id, rx));
+        if !data.analog_pending { self.analog_ms = self.markers_ms; }
+        self.devices.reset_graphs();
+        drop_later(Some(std::mem::take(&mut self.plate_lanes)));
         self.labels.reset(&data, file_id);
         let old = self.data.replace(data);
         match self.restore.take() {
@@ -671,6 +1407,7 @@ impl View {
 
     /// The comment file of the shown file arrived (it comes right after the markers).
     pub fn poll_comments(&mut self) {
+        self.sync_shared();
         if self.loading.is_some() || self.data.is_none() {
             return;
         }
@@ -682,29 +1419,175 @@ impl View {
         };
         self.comments_rx = None;
         self.comments.take_load(load);
+        self.publish_shared_file();
     }
 
-    /// Force plates / EMG arrived (or failed: then a warning, like `read_take`).
-    pub fn poll_analog(&mut self) {
-        let Some((id, rx)) = &self.analog_rx else { return };
-        let msg = match rx.try_recv() {
-            Ok(m) => Some(m),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => None,
-        };
-        let id = *id;
-        self.analog_rx = None;
-        let (result, took) = match msg {
-            Some(LoadMsg::Analog(r, took)) => (r, took),
-            _ => (Err("읽기가 중간에 끝났어요".to_owned()), 0.0),
-        };
-        self.load_steps.push(("analog", took));
-        self.analog_ms = self.open_started.map(ms_since);
-        if let Some(d) = self.data.as_mut().filter(|_| id == self.file_id).and_then(Arc::get_mut) {
-            match result {
-                Ok(part) => d.attach_prepared(part),
-                Err(e) => d.attach_analog(Vec::new(), Some(format!("analog channels not loaded: {e}"))),
+    /// Apply a prepared chunk without copying samples or dropping large buffers on the UI.
+    /// A shared view is copied on a worker; it is never silently skipped by Arc::get_mut.
+    pub fn queue_analog(&mut self, part: AnalogPart) {
+        self.sync_shared();
+        self.analog_queue.push(part);
+        self.attach_queued_analog();
+        self.publish_shared_file();
+    }
+
+    fn attach_queued_analog(&mut self) {
+        if self.analog_merge.is_some() { return; }
+        let Some(part) = self.analog_queue.pop() else { return };
+        let Some(data) = self.data.as_mut() else { drop_later(Some(part)); return };
+        if let Some(data) = Arc::get_mut(data) {
+            drop_later(Some(data.swap_prepared(part)));
+            // There are at most the two stages, never one job per frame or channel.
+            self.attach_queued_analog();
+        } else {
+            let source = data.clone();
+            let (tx, rx) = channel();
+            self.analog_merge = Some(rx);
+            std::thread::spawn(move || {
+                let mut updated = source.as_ref().clone();
+                drop(updated.swap_prepared(part.clone()));
+                let _ = tx.send((source, updated, part));
+            });
+        }
+    }
+
+    pub fn analog_work_pending(&self) -> bool {
+        self.analog_rx.is_some() || self.emg_rx.is_some() || self.analog_merge.is_some() || !self.analog_queue.is_empty()
+    }
+
+    /// A save may move Channels.dat ranges. Retire only the old deferred reader and its
+    /// delivery channel; loaded samples, running analog jobs and user demand stay intact.
+    pub fn clear_deferred_emg_reader(&mut self) {
+        let job = self.lazy_job.take();
+        let receiver = self.lazy_job_rx.take();
+        if job.is_some() || receiver.is_some() { drop_later(Some((job, receiver))); }
+    }
+
+    /// Own the freshly indexed post-save job without reading samples. The controller clears
+    /// sibling readers and drains active jobs before installing one owner on the saver.
+    /// Already loaded EMG needs no reader and is never rearmed or erased here.
+    pub fn install_deferred_emg_reader(&mut self, job: tak_core::tak::fast_read::AnalogJob) {
+        self.clear_deferred_emg_reader();
+        if !self.data.as_ref().is_some_and(|data| data.emg_pending) {
+            drop_later(Some(job));
+            return;
+        }
+        self.lazy_job = Some(job);
+        // A still-active receiver keeps its ownership; never launch a second EMG worker.
+        self.emg_requested = self.emg_rx.is_some();
+        self.emg_failure = None;
+        // A restored clean view may have retired an old reader via cancel_load().
+        if self.load_cancel.load(Ordering::SeqCst) {
+            self.load_cancel = Arc::new(AtomicBool::new(false));
+        }
+    }
+
+    /// A visible non-forceplate header/channel/graph requests this once per shown file.
+    pub fn request_emg(&mut self, ctx: &egui::Context) {
+        self.sync_shared();
+        if self.remote.is_some() || self.loading.is_some() { return; }
+        if self.devices.request_emg && self.data.as_ref().is_some_and(|data| data.emg_pending) {
+            if let Some(shared) = &self.shared_file {
+                if let Ok(mut state) = shared.0.lock() {
+                    if !state.emg_demand {
+                        state.emg_demand = true;
+                        if let Some((document, wake)) = &state.emg_wake { let _ = wake.send(*document); }
+                    }
+                }
             }
+        }
+        if let Some(rx) = &self.lazy_job_rx {
+            match rx.try_recv() {
+                Ok((job, fallback)) => {
+                    self.lazy_job = job;
+                    self.analog_fallback = fallback;
+                    self.lazy_job_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.lazy_job_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if !self.data.as_ref().is_some_and(|d| d.emg_pending) {
+            self.devices.request_emg = false;
+            return;
+        }
+        let requested = self.devices.request_emg || self.shared_file.as_ref()
+            .is_some_and(|shared| shared.0.lock().ok().is_some_and(|state| state.emg_demand));
+        if !requested || self.emg_requested { return; }
+        let Some(job) = self.lazy_job.take() else { return };
+        if let Some(shared) = &self.shared_file {
+            if let Ok(mut state) = shared.0.lock() { state.emg_demand = false; }
+        }
+        self.devices.request_emg = false;
+        self.emg_requested = true;
+        let target = self.data.as_ref().unwrap().analog_target();
+        let indices = job.device_indices().to_vec();
+        let (tx, rx) = channel();
+        self.emg_rx = Some((self.file_id, rx));
+        let wake = ctx.clone();
+        let cancel = self.load_cancel.clone();
+        std::thread::spawn(move || {
+            while MARKER_LOADS.load(Ordering::SeqCst) > 0 && !cancel.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(5)); }
+            if cancel.load(Ordering::SeqCst) { return; }
+            let t = Instant::now();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                job.run().map(|(analog, warning)| AnalogPart::prepare_selected(analog, warning, &target, indices, false)).map_err(|e| e.to_string())
+            })).unwrap_or_else(|_| Err("EMG 읽는 중 내부 오류가 났어요.".into()));
+            let _ = tx.send(LoadMsg::Analog(result, ms_since(t)));
+            wake.request_repaint();
+        });
+    }
+
+    /// Forceplate startup and explicitly requested EMG arrive independently.
+    pub fn poll_analog(&mut self) {
+        self.sync_shared();
+        let previous_data = self.data.as_ref().map(Arc::as_ptr);
+        for initial in [true, false] {
+            let receiver = if initial { &mut self.analog_rx } else { &mut self.emg_rx };
+            let Some((id, rx)) = receiver else { continue };
+            let msg = match rx.try_recv() {
+                Ok(msg) => Some(msg),
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => None,
+            };
+            let id = *id;
+            drop_later(receiver.take());
+            let (result, took) = match msg {
+                Some(LoadMsg::Analog(result, took)) => (result, took),
+                _ => (Err("읽기가 중간에 끝났어요".into()), 0.0),
+            };
+            if id != self.file_id { drop_later(Some(result)); continue; }
+            self.load_steps.push((if initial { "analog" } else { "emg" }, took));
+            if initial { self.analog_ms = self.open_started.map(ms_since); }
+            match result {
+                Ok(part) => self.queue_analog(part),
+                Err(reason) => {
+                    if !initial { self.emg_failure = Some(format!("EMG를 읽지 못했어요: {reason}")); }
+                    if let Some(data) = &self.data {
+                        self.queue_analog(AnalogPart::prepare_selected(Vec::new(), Some(format!("아날로그를 읽지 못했어요: {reason}")), &data.analog_target(), Vec::new(), initial));
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.analog_merge {
+            if let Ok((source, updated, retry)) = rx.try_recv() {
+                self.analog_merge = None;
+                if self.data.as_ref().is_some_and(|current| Arc::ptr_eq(current, &source)) {
+                    drop_later(self.data.replace(Arc::new(updated)));
+                    drop_later(Some(retry));
+                } else {
+                    // Marker edits/save can finish during a lazy read; merge into the latest data.
+                    self.analog_queue.push(retry);
+                    drop_later(Some(updated));
+                }
+                drop_later(Some(source));
+            }
+        }
+        self.attach_queued_analog();
+        if previous_data != self.data.as_ref().map(Arc::as_ptr) {
+            self.plate = self.plate.filter(|&plate| self.data.as_ref()
+                .is_some_and(|data| data.analog_pending || plate < data.plates.len()));
+            self.publish_shared_file();
         }
     }
 
@@ -819,11 +1702,14 @@ impl View {
         let mut old = std::mem::take(self);
         drop_later(old.edit_document.take());
         drop_later(old.restore_edit_document.take());
-        old.data
+        let data = old.data.take();
+        drop_later(Some(old));
+        data
     }
 
     /// Commit or undo a prepared patch; the expensive view rebuild is requested separately.
     pub fn apply_marker_patch(&mut self, patch: &EditPatch, redo: bool) -> Result<(), EditError> {
+        self.sync_shared();
         let session = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?;
         let mut document = session.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
         document.apply(patch, redo)?;
@@ -833,6 +1719,7 @@ impl View {
         self.apply_uid_selection(&selection);
         self.edit_refresh = Some(revision);
         self.edit_selection = Some(selection);
+        self.notify_editor_updates();
         Ok(())
     }
 
@@ -850,7 +1737,7 @@ impl View {
         self.edit_selection.clone().unwrap_or_else(|| self.uid_selection())
     }
 
-    fn apply_uid_selection(&mut self, selection: &EditSelection) {
+    pub fn apply_uid_selection(&mut self, selection: &EditSelection) {
         self.armed_label = selection.armed_label;
         let Some(data) = &self.data else { return };
         self.selected = data.markers.iter().enumerate().filter_map(|(i, m)| selection.selected.contains(&m.uid).then_some(i)).collect();
@@ -862,7 +1749,7 @@ impl View {
 
     /// Snapshot for an off-thread rebuild. Wait for analog before sharing or replacing its view.
     pub fn edit_refresh_snapshot(&self) -> Option<DocumentSnapshot> {
-        if self.analog_rx.is_some() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return None; }
+        if self.analog_work_pending() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return None; }
         let desired = self.edit_refresh?;
         let document = self.edit_document.as_ref()?.lock().ok()?;
         (document.revision() == desired).then(|| document.snapshot())
@@ -871,12 +1758,31 @@ impl View {
     /// Publish a worker-built view only for the latest document revision. Reset all marker
     /// caches together and retire the old buffers off-thread; the view keeps its file identity.
     pub fn publish_edited_view(&mut self, data: ViewData) -> Result<(), EditError> {
-        if self.analog_rx.is_some() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return Err(EditError::Other("아날로그를 읽는 중이에요".into())); }
-        let expected = self.edit_refresh.ok_or(EditError::StaleRevision)?;
-        let document = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
-        if document.revision() != expected || data.edit_revision != Some(expected) { return Err(EditError::StaleRevision); }
-        if data.take.path != document.source_path() && document.save_path() != Some(data.take.path.as_path()) { return Err(EditError::WrongDocument); }
-        drop(document);
+        self.sync_shared();
+        if self.analog_work_pending() || self.data.as_ref().is_some_and(|d| d.analog_pending) { drop_later(Some(data)); return Err(EditError::Other("아날로그를 읽는 중이에요".into())); }
+        let validate = || -> Result<(), EditError> {
+            if self.data.as_ref().is_some_and(|current| current.analog_generation() != data.analog_generation()) {
+                return Err(EditError::StaleRevision);
+            }
+            let expected = self.edit_refresh.ok_or(EditError::StaleRevision)?;
+            let document = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
+            if document.revision() != expected || data.edit_revision != Some(expected) { return Err(EditError::StaleRevision); }
+            // A worker-verified reopen may bind this document to another spelling of the
+            // same source. Rebuilds retain the currently shown path; unrelated paths still fail.
+            if data.take.path != document.source_path() && document.save_path() != Some(data.take.path.as_path())
+                && self.data.as_ref().map(|shown| shown.take.path.as_path()) != Some(data.take.path.as_path()) {
+                return Err(EditError::WrongDocument);
+            }
+            Ok(())
+        };
+        if let Err(error) = validate() { drop_later(Some(data)); return Err(error); }
+        self.install_shared_data(Arc::new(data));
+        self.edit_refresh = None;
+        self.publish_shared_file();
+        Ok(())
+    }
+
+    fn install_shared_data(&mut self, data: Arc<ViewData>) {
         let filter = self.labels.filter.clone();
         let folds = self.data.as_ref().map(|old| panels::fold_keys(old, &self.labels.collapsed)).unwrap_or_default();
         let old_groups: std::collections::HashSet<_> = self.data.as_ref().map(|old| (0..old.groups.len())
@@ -891,10 +1797,13 @@ impl View {
         let selection = self.edit_selection.take().unwrap_or_else(|| self.uid_selection());
         drop_later(Some(std::mem::take(&mut self.lanes)));
         drop_later(Some(std::mem::take(&mut self.heat)));
-        drop_later(self.data.replace(Arc::new(data)));
+        drop_later(self.data.replace(data));
         self.apply_uid_selection(&selection);
-        self.edit_refresh = None;
-        Ok(())
+        self.plate = self.plate.filter(|&plate| self.data.as_ref()
+            .is_some_and(|data| data.analog_pending || plate < data.plates.len()));
+        if self.data.as_ref().is_some_and(|data| data.edit_revision == self.edit_refresh) {
+            self.edit_refresh = None;
+        }
     }
 
     /// Current selection in click order. Public set/primary assignments and older snapshots
@@ -1139,6 +2048,499 @@ mod tests {
         view
     }
 
+    fn overlay_host() -> View {
+        let mut view = View::default();
+        let (_tx, rx) = channel();
+        view.show(sample_data("host.tak", &["A", "B", "C", "D"]), rx, 7, 1.0, 0.0);
+        view
+    }
+
+    fn editable_selection_view() -> View {
+        use tak_core::edit::{DocumentInput, RawSample, RawTrack, RecordBytes};
+        let view = selection_view();
+        let tracks = view.data.as_ref().unwrap().take.trajectories.iter().map(|track| RawTrack {
+            uid: track.uid, name: track.name.clone(), label: None,
+            records: RecordBytes { node: Arc::from([1]), translation_header: Arc::from([2]), serialization_verified: true },
+            samples: track.frames.iter().zip(&track.xyz).map(|(&frame, &xyz)| RawSample::new(frame, xyz)).collect::<Vec<_>>().into(),
+        }).collect();
+        {
+            let mut document = view.edit_document.as_ref().unwrap().lock().unwrap();
+            let revision = document.revision();
+            document.install_input(revision, DocumentInput {
+                streams: Vec::new().into(), nodes_prefix: Arc::from([]), channels_prefix: Arc::from([]),
+                tracks, labels: Vec::new(), first_frame: 0, last_frame: 9,
+            }).unwrap();
+        }
+        view
+    }
+
+    #[test]
+    fn shared_overlay_consumes_marker_edit_publications_and_keeps_the_dirty_document_alive() {
+        let mut owner = editable_selection_view();
+        let mut host = overlay_host();
+        host.start_shared_overlay("selection.tak".into(), owner.shared_file().unwrap(), false);
+        let (_, overlay, quiet) = host.poll_overlay().unwrap();
+        assert!(!quiet);
+        host.overlay = Some(overlay.unwrap());
+        assert!(Arc::ptr_eq(owner.data.as_ref().unwrap(), &host.overlay.as_ref().unwrap().data));
+        assert_eq!(owner.document_id(), host.overlay_document_id());
+        owner.select(0, false);
+        let snapshot = owner.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = tak_core::edit::delete::delete_samples(&snapshot, &tak_core::edit::delete::DeleteRequest {
+            selection: owner.edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        owner.apply_marker_patch(&patch, true).unwrap();
+        assert!(host.overlay_marker_dirty(), "dirty status reads the same document before a marker rebuild");
+        let updated = owner.data.as_ref().unwrap().rebuild_markers(&patch.after_snapshot()).unwrap();
+        owner.publish_edited_view(updated).unwrap();
+        host.sync_shared();
+        assert!(!host.overlay.as_ref().unwrap().data.markers[0].present(0));
+        let document = host.overlay_document_id();
+        drop(owner);
+        assert!(host.overlay_marker_dirty(), "the final overlay reference still needs Save/Discard/Cancel");
+        let overlay_owner = host.overlay_owner_mut().unwrap();
+        assert_eq!(overlay_owner.document_id(), document);
+        let snapshot = overlay_owner.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let destination = PathBuf::from("overlay_saved.takm");
+        overlay_owner.edit_document.as_ref().unwrap().lock().unwrap().mark_saved(&snapshot, destination.clone()).unwrap();
+        let mut saved = overlay_owner.data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        saved.take.path = destination.clone();
+        overlay_owner.edit_refresh = Some(snapshot.revision());
+        overlay_owner.publish_edited_view(saved).unwrap();
+        host.sync_shared();
+        assert!(!host.overlay_marker_dirty());
+        assert_eq!(host.overlay_shared_target(), Some(destination));
+        assert_eq!(host.overlay_document_id(), document);
+    }
+
+    #[test]
+    fn overlay_only_file_opens_as_primary_without_reading_or_copying_markers() {
+        let mut host = overlay_host();
+        host.overlay = Some(Overlay::from_data("selection.tak".into(), sample_data("selection.tak", &["A"])));
+        let (tx, rx) = channel();
+        let cancel = host.overlay_owner_mut().unwrap().load_cancel.clone();
+        host.overlay_owner_mut().unwrap().analog_rx = Some((0, rx));
+        let shared = host.shared_overlay_file(Path::new("selection.tak")).unwrap();
+        let mut primary = View::default();
+        primary.show_shared_file(shared, 12, 1.0, 0.0);
+        assert!(Arc::ptr_eq(&host.overlay.as_ref().unwrap().data, primary.data.as_ref().unwrap()));
+        assert!(primary.loading.is_none() && primary.comments_rx.is_none());
+        assert!(host.transfer_overlay_work_to(&mut primary));
+        assert!(host.overlay_owner().unwrap().analog_rx.is_none());
+        assert!(Arc::ptr_eq(&cancel, &primary.load_cancel));
+        let (id, moved_rx) = primary.analog_rx.as_ref().unwrap();
+        assert_eq!(*id, 12);
+        tx.send(LoadMsg::Analog(Err("sent through original reader".into()), 0.0)).unwrap();
+        assert!(matches!(moved_rx.try_recv(), Ok(LoadMsg::Analog(Err(reason), _)) if reason == "sent through original reader"));
+        host.take_overlay();
+        assert!(!primary.load_cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn primary_reader_can_survive_in_an_overlay_and_transfer_back() {
+        let mut owner = selection_view();
+        let mut host = overlay_host();
+        let shared = owner.shared_file().unwrap();
+        host.start_shared_overlay("selection.tak".into(), shared.clone(), false);
+        host.overlay = Some(host.poll_overlay().unwrap().1.unwrap());
+        let (_tx, rx) = channel();
+        owner.analog_rx = Some((owner.file_id, rx));
+        let cancel = owner.load_cancel.clone();
+        assert!(owner.transfer_primary_work_to_overlay(&mut host));
+        assert!(owner.analog_rx.is_none());
+        assert!(host.overlay_owner().unwrap().analog_rx.is_some());
+        let mut next = View::default();
+        next.show_shared_file(shared, 44, 1.0, 0.0);
+        assert!(host.transfer_overlay_work_to(&mut next));
+        assert!(next.analog_rx.is_some());
+        assert!(Arc::ptr_eq(&cancel, &next.load_cancel));
+    }
+
+    #[test]
+    fn overlay_waiter_has_no_reader_and_keeps_previous_overlay_until_shared_attach() {
+        let mut host = overlay_host();
+        host.overlay = Some(Overlay::from_data("old.tak".into(), sample_data("old.tak", &["M"])));
+        host.wait_overlay_shared("selection.tak".into(), true);
+        assert_eq!(host.overlay_reading_path(), None);
+        assert_eq!(host.overlay_waiting_shared_path(), Some(Path::new("selection.tak")));
+        assert!(host.poll_overlay().is_none());
+        assert_eq!(host.overlay_path(), Some(Path::new("old.tak")));
+        let mut owner = selection_view();
+        assert!(host.attach_overlay_shared(Path::new("selection.tak"), owner.shared_file().unwrap()));
+        let (path, overlay, quiet) = host.poll_overlay().unwrap();
+        assert!(quiet);
+        assert_eq!(path, Path::new("selection.tak"));
+        assert!(Arc::ptr_eq(owner.data.as_ref().unwrap(), &overlay.unwrap().data));
+    }
+
+    #[test]
+    fn retained_closed_view_adopts_fresh_document_preserving_view_state_and_overlay() {
+        let mut retained = selection_view();
+        retained.file_id = 78;
+        retained.pb.set_frame(6, 0.0);
+        retained.cam.yaw = 1.25;
+        retained.range = Some((2, 8));
+        retained.picked = Some(91);
+        retained.select(2, false);
+        retained.select(0, true);
+        let selected = retained.edit_selection_state();
+        retained.remote = Some(crate::ssh::RemoteLocation { host: "readonly-server".into(), path: "selection.tak".into() });
+        retained.remote_warning = Some("read only".into());
+        retained.overlay = Some(Overlay::from_data("second.tak".into(), sample_data("second.tak", &["M"])));
+        retained.shown = [false, true];
+        let overlay = retained.overlay.as_ref().unwrap().data.clone();
+        let previous_document = retained.document_id();
+        let mut fresh = selection_view();
+        let mut fresh_take = sample_take("selection.tak", &["A", "B", "C", "D"]);
+        fresh_take.trajectories.rotate_left(1);
+        fresh.data = Some(Arc::new(ViewData::build(fresh_take)));
+        let shared = fresh.shared_file().unwrap();
+        assert!(retained.adopt_shared_preserving_state(shared, 4.0));
+        assert_ne!(retained.document_id(), previous_document);
+        assert!(retained.shares_document(&fresh));
+        assert!(Arc::ptr_eq(retained.data.as_ref().unwrap(), fresh.data.as_ref().unwrap()));
+        assert_eq!(retained.file_id, 78);
+        assert_eq!(retained.pb.frame, 6);
+        assert_eq!(retained.cam.yaw, 1.25);
+        assert_eq!(retained.range, Some((2, 8)));
+        assert_eq!(retained.picked, Some(91));
+        assert_eq!(retained.edit_selection_state(), selected);
+        assert_eq!(retained.remote.as_ref().unwrap().host, "readonly-server");
+        assert_eq!(retained.remote_warning.as_deref(), Some("read only"));
+        assert_eq!(retained.shown, [false, true]);
+        assert!(Arc::ptr_eq(&retained.overlay.as_ref().unwrap().data, &overlay));
+    }
+
+    #[test]
+    fn retained_overlay_owner_can_adopt_but_independent_dirty_documents_cannot_be_erased() {
+        let mut host = overlay_host();
+        host.overlay = Some(Overlay::from_data("selection.tak".into(), sample_data("selection.tak", &["A"])));
+        let mut fresh = selection_view();
+        assert!(host.overlay_owner_mut().unwrap().adopt_shared_preserving_state(fresh.shared_file().unwrap(), 1.0));
+        host.sync_shared();
+        assert_eq!(host.overlay_document_id(), fresh.document_id());
+        assert!(Arc::ptr_eq(&host.overlay.as_ref().unwrap().data, fresh.data.as_ref().unwrap()));
+        let mut dirty = editable_selection_view();
+        dirty.select(0, false);
+        let snapshot = dirty.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = tak_core::edit::delete::delete_samples(&snapshot, &tak_core::edit::delete::DeleteRequest {
+            selection: dirty.edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        dirty.apply_marker_patch(&patch, true).unwrap();
+        let old_document = dirty.document_id();
+        let old_data = dirty.data.as_ref().unwrap().clone();
+        assert!(!dirty.adopt_shared_preserving_state(fresh.shared_file().unwrap(), 1.0));
+        assert_eq!(dirty.document_id(), old_document);
+        assert!(dirty.marker_dirty());
+        assert!(Arc::ptr_eq(&old_data, dirty.data.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn retained_discarded_document_adopts_even_with_a_clean_deferred_marker_refresh() {
+        let mut retained = editable_selection_view();
+        retained.select(0, false);
+        retained.pb.set_frame(5, 0.0);
+        let snapshot = retained.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = tak_core::edit::delete::delete_samples(&snapshot, &tak_core::edit::delete::DeleteRequest {
+            selection: retained.edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        retained.apply_marker_patch(&patch, true).unwrap();
+        let edited = retained.data.as_ref().unwrap().rebuild_markers(&patch.after_snapshot()).unwrap();
+        retained.publish_edited_view(edited).unwrap();
+        assert!(!retained.data.as_ref().unwrap().markers[0].present(0));
+        {
+            let mut document = retained.edit_document.as_ref().unwrap().lock().unwrap();
+            document.discard_unsaved();
+            retained.edit_refresh = Some(document.revision());
+        }
+        assert!(!retained.marker_dirty());
+        assert!(retained.edit_refresh.is_some(), "closed views do not run their deferred rebuild");
+        let mut fresh = selection_view();
+        assert!(retained.adopt_shared_preserving_state(fresh.shared_file().unwrap(), 1.0));
+        assert!(retained.shares_document(&fresh));
+        assert_eq!(retained.pb.frame, 5);
+        assert!(retained.edit_refresh.is_none());
+        assert!(retained.data.as_ref().unwrap().markers[0].present(0));
+    }
+
+    #[test]
+    fn overlay_emg_demand_is_not_started_while_controller_gates_a_save() {
+        let ctx = egui::Context::default();
+        let mut host = overlay_host();
+        let mut data = sample_data("lazy_overlay.tak", &["M"]);
+        data.emg_pending = true;
+        host.overlay = Some(Overlay::from_data("lazy_overlay.tak".into(), data));
+        let (_tx, rx) = channel();
+        let owner = host.overlay_owner_mut().unwrap();
+        owner.lazy_job_rx = Some(rx);
+        owner.devices.request_emg = true;
+        let shared = owner.shared_file().unwrap();
+        host.poll_overlay_file_work_gated(&ctx, false);
+        assert!(!shared.0.lock().unwrap().emg_demand);
+        assert!(!host.overlay_owner().unwrap().emg_requested);
+        host.poll_overlay_file_work_gated(&ctx, true);
+        assert!(shared.0.lock().unwrap().emg_demand);
+    }
+
+    #[test]
+    fn clearing_deferred_emg_preserves_loaded_data_active_jobs_and_demand() {
+        let mut view = selection_view();
+        let data = view.data.as_ref().unwrap().clone();
+        let (_tx, lazy_rx) = channel();
+        let (_analog_tx, analog_rx) = channel();
+        let (_emg_tx, emg_rx) = channel();
+        view.lazy_job_rx = Some(lazy_rx);
+        view.analog_rx = Some((view.file_id, analog_rx));
+        view.emg_rx = Some((view.file_id, emg_rx));
+        view.devices.request_emg = true;
+        view.emg_requested = true;
+        view.emg_failure = Some("old read error".into());
+        let cancel = view.load_cancel.clone();
+        view.clear_deferred_emg_reader();
+        assert!(view.lazy_job.is_none() && view.lazy_job_rx.is_none());
+        assert!(view.analog_rx.is_some() && view.emg_rx.is_some());
+        assert!(view.devices.request_emg && view.emg_requested);
+        assert_eq!(view.emg_failure.as_deref(), Some("old read error"));
+        assert!(Arc::ptr_eq(&data, view.data.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&cancel, &view.load_cancel));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn installing_post_save_deferred_emg_reader_is_lazy_and_only_rearms_pending_data() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
+        if !path.exists() { return; }
+        let read = tak_core::tak::fast_read::read_take_fast(&path, false).unwrap();
+        let (_, job) = read.analog.expect("fixture has device metadata").split();
+        let job = job.expect("fixture has deferred EMG");
+        let mut pending = sample_data("saved.takm", &["M"]);
+        pending.emg_pending = true;
+        let (_tx, rx) = channel();
+        let mut view = View::default();
+        view.show(pending, rx, 91, 1.0, 0.0);
+        let data = view.data.as_ref().unwrap().clone();
+        let (_lazy_tx, lazy_rx) = channel();
+        view.lazy_job_rx = Some(lazy_rx);
+        view.emg_requested = true;
+        view.emg_failure = Some("stale offsets".into());
+        view.load_cancel.store(true, Ordering::SeqCst);
+        view.install_deferred_emg_reader(job);
+        assert!(view.lazy_job.is_some() && view.lazy_job_rx.is_none());
+        assert!(!view.emg_requested && view.emg_failure.is_none() && view.emg_rx.is_none());
+        assert!(!view.load_cancel.load(Ordering::SeqCst));
+        assert!(Arc::ptr_eq(&data, view.data.as_ref().unwrap()));
+        let job = view.lazy_job.take().unwrap();
+        let (_emg_tx, emg_rx) = channel();
+        view.emg_rx = Some((view.file_id, emg_rx));
+        view.install_deferred_emg_reader(job);
+        assert!(view.emg_requested && view.emg_rx.is_some(), "an active read cannot be duplicated");
+        let job = view.lazy_job.take().unwrap();
+        let mut loaded = selection_view();
+        let loaded_data = loaded.data.as_ref().unwrap().clone();
+        loaded.emg_requested = true;
+        loaded.emg_failure = Some("kept status".into());
+        loaded.install_deferred_emg_reader(job);
+        assert!(loaded.lazy_job.is_none() && loaded.emg_rx.is_none());
+        assert!(loaded.emg_requested);
+        assert_eq!(loaded.emg_failure.as_deref(), Some("kept status"));
+        assert!(Arc::ptr_eq(&loaded_data, loaded.data.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn repeated_views_share_data_document_and_source_but_keep_view_state_and_id_pools() {
+        let mut owner = selection_view();
+        owner.pb.set_frame(6, 0.0);
+        owner.select(2, false);
+        owner.comments.id_pool = Some(100..=200);
+        owner.source_stamp = Some(Arc::new(Mutex::new(None)));
+        let shared = owner.shared_file().unwrap();
+        let mut other = View::default();
+        other.show_shared_file(shared, 2, 0.5, 0.0);
+        assert!(Arc::ptr_eq(owner.data.as_ref().unwrap(), other.data.as_ref().unwrap()));
+        assert!(owner.shares_document(&other));
+        assert!(Arc::ptr_eq(owner.source_stamp.as_ref().unwrap(), other.source_stamp.as_ref().unwrap()));
+        assert_eq!(owner.pb.frame, 6);
+        assert_eq!(other.pb.frame, 0);
+        assert!(other.selected.is_empty());
+        assert!(other.comments.id_pool.is_none(), "reserved IDs must not be issued by both views");
+        assert_eq!(owner.comments.id_pool.as_mut().unwrap().next(), Some(100));
+        other.pb.set_frame(3, 0.0);
+        other.select(0, false);
+        assert_eq!(owner.pb.frame, 6);
+        assert_eq!(owner.primary, Some(2));
+        assert_ne!(owner.file_id, other.file_id, "UI and writer tags remain per view");
+    }
+
+    #[test]
+    fn shared_waiter_keeps_previous_view_until_attach_without_a_second_reader() {
+        let mut previous = selection_view();
+        previous.pb.set_frame(4, 0.0);
+        previous.select(1, false);
+        let visible = previous.data.clone().unwrap();
+        previous.wait_for_shared("new.tak".into(), None);
+        assert_eq!(previous.target(), Some(Path::new("new.tak")));
+        assert_eq!(previous.shared_target(), Some(PathBuf::from("new.tak")));
+        assert_eq!(previous.waiting_shared_path(), Some(Path::new("new.tak")));
+        assert_eq!(previous.path(), Some(Path::new("selection.tak")));
+        assert!(Arc::ptr_eq(previous.data.as_ref().unwrap(), &visible));
+        assert!(previous.loading.is_none() && previous.comments_rx.is_none());
+        assert!(previous.busy());
+        assert!(!previous.file_work_pending(), "a waiter owns no polling work");
+        assert!(previous.shared_file().is_none(), "old visible data cannot satisfy the new target");
+        assert_eq!(previous.clear_shared_wait(), Some(PathBuf::from("new.tak")));
+        assert_eq!(previous.target(), previous.path());
+        assert_eq!((previous.pb.frame, previous.primary), (4, Some(1)));
+
+        let mut owner = View::default();
+        let (_tx, rx) = channel();
+        owner.show(sample_data("new.tak", &["M"]), rx, 3, 1.0, 0.0);
+        owner.pb.set_frame(6, 0.0);
+        let restore = owner.spot();
+        previous.wait_for_shared("new.tak".into(), restore);
+        previous.show_shared_file(owner.shared_file().unwrap(), 4, 1.0, 0.0);
+        assert!(previous.waiting_shared_path().is_none());
+        assert_eq!(previous.path(), Some(Path::new("new.tak")));
+        assert_eq!(previous.pb.frame, 6);
+        assert!(previous.shares_document(&owner));
+    }
+
+    #[test]
+    fn shared_marker_edit_undo_and_save_change_one_document_in_every_view() {
+        use tak_core::edit::{DocumentInput, RawSample, RawTrack, RecordBytes};
+        let mut owner = selection_view();
+        let tracks = owner.data.as_ref().unwrap().take.trajectories.iter().map(|track| RawTrack {
+            uid: track.uid, name: track.name.clone(), label: None,
+            records: RecordBytes { node: Arc::from([1]), translation_header: Arc::from([2]), serialization_verified: true },
+            samples: track.frames.iter().zip(&track.xyz).map(|(&frame, &xyz)| RawSample::new(frame, xyz)).collect::<Vec<_>>().into(),
+        }).collect();
+        {
+            let mut doc = owner.edit_document.as_ref().unwrap().lock().unwrap();
+            let revision = doc.revision();
+            doc.install_input(revision, DocumentInput {
+                streams: Vec::new().into(), nodes_prefix: Arc::from([]), channels_prefix: Arc::from([]),
+                tracks, labels: Vec::new(), first_frame: 0, last_frame: 9,
+            }).unwrap();
+        }
+        let shared = owner.shared_file().unwrap();
+        let mut other = View::default();
+        other.show_shared_file(shared, 2, 1.0, 0.0);
+        owner.select(0, false);
+        other.select(2, false);
+        let other_selection = other.edit_selection_state();
+        let snapshot = owner.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let patch = tak_core::edit::delete::delete_samples(&snapshot, &tak_core::edit::delete::DeleteRequest {
+            selection: owner.edit_selection_state(), range: None, current_frame: 0,
+        }).unwrap().patch.unwrap();
+        owner.apply_marker_patch(&patch, true).unwrap();
+        assert!(owner.marker_dirty() && other.marker_dirty());
+        let updated = owner.data.as_ref().unwrap().rebuild_markers(&patch.after_snapshot()).unwrap();
+        owner.publish_edited_view(updated).unwrap();
+        other.sync_shared();
+        assert!(!other.data.as_ref().unwrap().markers[0].present(0));
+        assert_eq!(other.edit_selection_state(), other_selection);
+
+        owner.apply_marker_patch(&patch, false).unwrap();
+        let snapshot = owner.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let restored = owner.data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        owner.publish_edited_view(restored).unwrap();
+        other.sync_shared();
+        assert!(!owner.marker_dirty() && !other.marker_dirty());
+        assert!(other.data.as_ref().unwrap().markers[0].present(0));
+
+        owner.apply_marker_patch(&patch, true).unwrap();
+        let snapshot = owner.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let destination = PathBuf::from("saved.takm");
+        owner.edit_document.as_ref().unwrap().lock().unwrap().mark_saved(&snapshot, destination.clone()).unwrap();
+        let mut saved = owner.data.as_ref().unwrap().rebuild_markers(&snapshot).unwrap();
+        saved.take.path = destination.clone();
+        owner.publish_edited_view(saved).unwrap();
+        other.sync_shared();
+        assert_eq!(other.path(), Some(destination.as_path()));
+        assert!(!owner.marker_dirty() && !other.marker_dirty());
+        assert!(Arc::ptr_eq(owner.data.as_ref().unwrap(), other.data.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn shared_publications_keep_latest_comments_write_status_and_remap_selection_by_uid() {
+        let mut owner = selection_view();
+        let shared = owner.shared_file().unwrap();
+        let mut other = View::default();
+        other.show_shared_file(shared.clone(), 2, 1.0, 0.0);
+        other.select(2, false);
+        other.select(0, true);
+        let selection = other.edit_selection_state();
+        other.pb.set_frame(7, 0.0);
+        let comment = comments::Comment { id: 9, markers: vec![], start: 2, end: 3, comment_type: String::new(), text: "latest".into() };
+        owner.comments.list.apply(&comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new()));
+        owner.comments.pending = 1;
+        owner.comments.pending_since = Some(Instant::now());
+        assert!(owner.publish_shared_file());
+        other.comments.pending = 88;
+        assert!(!other.publish_shared_file(), "stale local metadata cannot erase a newer Comment");
+        assert_eq!(other.comments.list.get(9), Some(&comment));
+        assert_eq!(other.comments.pending, 1);
+
+        let revision = owner.edit_document.as_ref().unwrap().lock().unwrap().revision();
+        let mut take = sample_take("selection.tak", &["A", "B", "C", "D"]);
+        take.trajectories.rotate_left(1);
+        let mut updated = ViewData::build(take);
+        updated.edit_revision = Some(revision);
+        owner.edit_refresh = Some(revision);
+        owner.publish_edited_view(updated).unwrap();
+        assert!(other.sync_shared_file(&shared), "the old handle reads its latest publication");
+        assert!(Arc::ptr_eq(owner.data.as_ref().unwrap(), other.data.as_ref().unwrap()));
+        assert_eq!(other.edit_selection_state(), selection);
+        assert_eq!(other.pb.frame, 7);
+        assert_eq!(other.data.as_ref().unwrap().markers[other.primary.unwrap()].uid, [1; 16]);
+        assert!(!other.sync_shared(), "an unchanged generation needs no cache or selection work");
+
+        owner.comments.pending = 0;
+        owner.comments.pending_since = None;
+        owner.comments.saved_at = Some(2.0);
+        owner.comments.target = Some(Ok("saved.takm".into()));
+        assert!(owner.publish_shared_file());
+        other.comments.id_pool = Some(400..=500);
+        other.sync_shared();
+        assert_eq!(other.comments.pending, 0);
+        assert_eq!(other.comments.saved_at, Some(2.0));
+        assert_eq!(other.comments.target, Some(Ok("saved.takm".into())));
+        assert!(other.comments.id_pool.is_none(), "a save to another path invalidates old reservations");
+    }
+
+    #[test]
+    fn closing_shared_load_owner_hands_off_receivers_and_does_not_cancel_analog() {
+        use tak_core::tak::{AnalogChannel, AnalogDevice};
+        let mut data = sample_data("shared.tak", &["M"]);
+        data.analog_pending = true;
+        let target = data.analog_target();
+        let (tx, rx) = channel();
+        let mut owner = View::default();
+        owner.show(data, rx, 1, 1.0, 0.0);
+        let cancellation = owner.load_cancel.clone();
+        let (lazy_tx, lazy_rx) = channel();
+        owner.lazy_job_rx = Some(lazy_rx);
+        let shared = owner.shared_file().unwrap();
+        let mut other = View::default();
+        other.show_shared_file(shared, 2, 1.0, 0.0);
+        assert!(other.analog_rx.is_none());
+        assert!(owner.transfer_shared_loads(&mut other));
+        assert!(owner.analog_rx.is_none() && other.analog_rx.is_some());
+        drop_later(owner.clear());
+        assert!(!cancellation.load(Ordering::SeqCst));
+        lazy_tx.send((None, None)).unwrap();
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        tx.send(LoadMsg::Analog(Ok(AnalogPart::prepare(analog, None, &target)), 1.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while other.analog_work_pending() {
+            other.poll_analog();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!other.data.as_ref().unwrap().analog_pending);
+        assert_eq!(other.data.as_ref().unwrap().take.analog[0].channels[0].values, [42.0]);
+        assert!(other.lazy_job_rx.as_ref().unwrap().try_recv().is_ok(), "deferred EMG ownership survived");
+    }
+
     #[test]
     fn selection_order_survives_ctrl_deselection_reselection_and_undo_snapshots() {
         let mut view = selection_view();
@@ -1277,6 +2679,116 @@ mod tests {
         view.poll_analog();
         assert!(!view.data.as_ref().unwrap().analog_pending);
         assert_eq!(view.data.as_ref().unwrap().take.analog[0].channels[0].values, vec![42.0]);
+    }
+
+    #[test]
+    fn shared_display_does_not_drop_a_late_analog_result_or_overwrite_newer_markers() {
+        use tak_core::tak::{AnalogChannel, AnalogDevice};
+        let mut data = sample_data("shared.tak", &["M"]);
+        data.analog_pending = true;
+        let target = data.analog_target();
+        let (_tx, rx) = channel();
+        let mut view = View::default();
+        view.show(data, rx, 77, 1.0, 0.0);
+        let shared = view.data.as_ref().unwrap().clone();
+        view.analog_rx = None;
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        view.queue_analog(AnalogPart::prepare(analog, None, &target));
+        assert!(view.analog_merge.is_some(), "shared data must be merged on a worker");
+        // Simulate a marker view finishing while that worker owns the previous Arc.
+        let mut newer = sample_data("shared.tak", &["NEWER"]);
+        newer.analog_pending = true;
+        drop_later(view.data.replace(Arc::new(newer)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.analog_work_pending() {
+            view.poll_analog();
+            assert!(Instant::now() < deadline, "late result must be retried against the new view");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(view.data.as_ref().unwrap().markers[0].name, "NEWER");
+        assert!(!view.data.as_ref().unwrap().analog_pending);
+        assert_eq!(view.data.as_ref().unwrap().take.analog[0].channels[0].values, vec![42.0]);
+        assert!(shared.analog_pending && shared.take.analog.is_empty(), "other readers retain their immutable snapshot");
+    }
+
+    #[test]
+    fn marker_rebuild_started_before_emg_cannot_revert_the_completed_load() {
+        use tak_core::tak::{AnalogChannel, AnalogDevice};
+        let mut data = sample_data("edited.tak", &["M"]);
+        data.emg_pending = true;
+        let mut stale = data.clone();
+        let (_tx, rx) = channel();
+        let mut view = View::default();
+        view.show(data, rx, 3, 1.0, 0.0);
+        let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
+        view.edit_refresh = Some(revision);
+        stale.edit_revision = Some(revision);
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        let part = AnalogPart::prepare(analog, None, &view.data.as_ref().unwrap().analog_target());
+        view.queue_analog(part);
+        assert!(matches!(view.publish_edited_view(stale), Err(EditError::StaleRevision)));
+        assert_eq!(view.edit_refresh, Some(revision), "normal refresh must retry from the completed analog stage");
+        assert!(!view.data.as_ref().unwrap().emg_pending);
+        assert_eq!(view.data.as_ref().unwrap().take.analog[0].channels[0].values, vec![42.0]);
+        let mut fresh = view.data.as_ref().unwrap().as_ref().clone();
+        fresh.edit_revision = Some(revision);
+        view.publish_edited_view(fresh).unwrap();
+        assert!(view.edit_refresh.is_none());
+        assert_eq!(view.data.as_ref().unwrap().take.analog[0].channels[0].values, vec![42.0]);
+    }
+
+    #[test]
+    fn actual_local_emg_is_requested_once_and_cancellation_reopen_rebuilds_deferred_job() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
+        if !path.exists() { return; }
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let load = |view: &mut View, id| {
+            view.start_load(&ctx, path.clone(), None);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(loaded) = view.poll_markers() {
+                    let (data, _) = loaded.result.unwrap();
+                    drop_later(view.show(data, loaded.rx, id, 1.0, 0.0));
+                    break;
+                }
+                assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));
+            }
+            while view.analog_work_pending() {
+                view.poll_analog();
+                assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));
+            }
+            view.request_emg(&ctx); // collect the owned deferred job without requesting samples
+        };
+        load(&mut view, 1);
+        let nonplate = view.data.as_ref().unwrap().devices.iter().position(|d| d.plate.is_none()).unwrap();
+        assert!(view.data.as_ref().unwrap().emg_pending);
+        assert!(view.data.as_ref().unwrap().take.analog[nonplate].channels.iter().all(|c| c.values.is_empty()));
+        assert!(!view.emg_requested && view.lazy_job.is_some());
+        // Closing before access discards the old job. A reopen creates a new owned lazy job.
+        drop_later(view.clear());
+        load(&mut view, 2);
+        assert!(view.lazy_job.is_some() && !view.emg_requested);
+        view.devices.request_emg = true;
+        view.request_emg(&ctx);
+        assert!(view.emg_requested && view.emg_rx.is_some() && view.lazy_job.is_none());
+        for _ in 0..20 { view.devices.request_emg = true; view.request_emg(&ctx); }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while view.analog_work_pending() {
+            view.poll_analog();
+            assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!view.data.as_ref().unwrap().emg_pending);
+        assert!(view.data.as_ref().unwrap().take.analog[nonplate].channels.iter().any(|c| !c.values.is_empty()));
+        assert_eq!(view.load_steps.iter().filter(|(name, _)| *name == "emg").count(), 1);
+        for _ in 0..10 { view.devices.request_emg = true; view.request_emg(&ctx); view.poll_analog(); }
+        assert_eq!(view.load_steps.iter().filter(|(name, _)| *name == "emg").count(), 1);
+        // Closing during a fresh request cannot let its late result change the next file.
+        drop_later(view.clear()); load(&mut view, 3);
+        view.devices.request_emg = true; view.request_emg(&ctx);
+        assert!(view.emg_rx.is_some());
+        drop_later(view.clear()); load(&mut view, 4);
+        assert!(view.data.as_ref().unwrap().emg_pending && !view.emg_requested && view.lazy_job.is_some());
     }
 
     #[test]

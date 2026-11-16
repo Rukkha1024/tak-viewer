@@ -13,6 +13,8 @@
 //! `--headless` (with `--capture` or `--screenshot`) runs the same app without a window and paints
 //! the pictures on the CPU (`headless.rs`, `soft_render.rs`): works without a desktop.
 //! `--version` prints the program version (`version.rs`) and exits.
+//! `--bench-load <file.tak|file.takm>…` retains up to twelve marker/forceplate display models
+//! without rendering; reports phase times and native process memory (`bench_load.rs`).
 //! Several copies may run at once (the user's windows next to agent runs, `instances.rs`).
 //! Where no window can be shown (Windows session 0), `--capture`/`--screenshot` run headless by
 //! themselves and a plain window run stops with exit 2 instead of waiting forever unseen.
@@ -20,6 +22,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bench_load;
+mod bench_timing;
 mod camera;
 mod capture;
 mod headless;
@@ -70,6 +74,16 @@ fn main() -> eframe::Result<()> {
     if headless {
         args.retain(|a| a != "--headless");
     }
+    if args.iter().any(|a| a == "--bench-load") {
+        let files = match bench_load::parse(&args[1..]) {
+            Ok(files) => files.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect(),
+            Err(error) => {
+                eprintln!("{error}\n{}", bench_load::USAGE);
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(bench_load::run(files));
+    }
     if args.iter().any(|a| a == "--bench") {
         // `--bench [frames] <file.tak>…`: open speed and frame time, up to 4 files side by side
         // (`headless::bench`, never a window).
@@ -87,12 +101,25 @@ fn main() -> eframe::Result<()> {
             headless::BENCH_HOVER.store(true, std::sync::atomic::Ordering::Relaxed);
             args.remove(i);
         }
+        // Exercise real lazy non-forceplate/device graph access while frames keep running.
+        if let Some(i) = args.iter().position(|a| a == "--bench-emg") {
+            headless::BENCH_EMG.store(true, std::sync::atomic::Ordering::Relaxed);
+            args.remove(i);
+        }
+        if let Some(i) = args.iter().position(|a| a == "--bench-trace") {
+            headless::BENCH_TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+            args.remove(i);
+        }
         let rest: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--bench").collect();
         let frames = rest.first().and_then(|a| a.parse::<usize>().ok());
         let files: Vec<PathBuf> =
             rest.iter().skip(usize::from(frames.is_some())).map(|a| workspace::resolve_path(a)).collect();
         if files.is_empty() {
-            eprintln!("usage: tak_viewer --bench [frames] <file.tak> [more.tak …] [--overlay <b.tak> …] [--bench-select N] [--bench-hover] (files and overlays up to 4)");
+            eprintln!("usage: tak_viewer --bench [frames] <file.tak> [more.tak …] [--overlay <b.tak> …] [--bench-select N] [--bench-hover] [--bench-emg] [--bench-trace] (up to 4 views, one overlay per view)");
+            std::process::exit(2);
+        }
+        if let Err(error) = bench_load::validate_ui_count(files.len(), overlays.len()) {
+            eprintln!("{error}");
             std::process::exit(2);
         }
         std::process::exit(headless::bench(files, overlays, frames.unwrap_or(300), [1600.0, 960.0]));

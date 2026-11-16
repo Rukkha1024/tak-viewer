@@ -4,19 +4,33 @@ use super::{dock::Pane, theme};
 use eframe::egui::{self, FontId, RichText, Sense, Ui};
 
 pub const EDITOR_HINT: &str = "Open a file from the Explorer (or drop a .tak / .takm here)";
+pub const REOPEN_HINT: &str = "Ctrl+Shift+T   Reopen the last closed view or tab";
 
 /// Keep a neutral editor canvas when the last file is closed, without a 3D scene or deck.
 pub fn editor(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::PANEL_BG_DARK);
-    let text = ui.painter().layout(
+    editor_at(ui, rect);
+}
+
+/// Cover the empty dock leaf's otherwise-unused internal tab row too.
+pub fn editor_at(ui: &Ui, rect: egui::Rect) {
+    let mut painter = ui.painter().clone();
+    painter.set_clip_rect(rect.intersect(ui.ctx().screen_rect()));
+    painter.rect_filled(rect, 0.0, theme::PANEL_BG_DARK);
+    let text = painter.layout(
         EDITOR_HINT.to_owned(),
         FontId::proportional(13.0),
         theme::TEXT_DIM,
         (rect.width() - 48.0).max(1.0),
     );
-    ui.painter()
-        .galley(rect.center() - text.size() / 2.0, text, theme::TEXT_DIM);
+    let extra = painter.layout(
+        REOPEN_HINT.to_owned(), FontId::proportional(11.0), theme::TEXT_DIM,
+        (rect.width() - 48.0).max(1.0),
+    );
+    let height = text.size().y + 8.0 + extra.size().y;
+    let top = rect.center().y - height / 2.0;
+    painter.galley(egui::pos2(rect.center().x - text.size().x / 2.0, top), text.clone(), theme::TEXT_DIM);
+    painter.galley(egui::pos2(rect.center().x - extra.size().x / 2.0, top + text.size().y + 8.0), extra, theme::TEXT_DIM);
 }
 
 fn panel_hint(pane: Pane) -> &'static str {
@@ -72,7 +86,8 @@ mod tests {
                 canvas.contains_rect(bounds),
                 "{width}: {bounds:?} in {canvas:?}"
             );
-            assert!(bounds.center().distance(canvas.center()) < 0.1);
+            assert!((bounds.center().x - canvas.center().x).abs() < 0.1);
+            assert!(bounds.center().y < canvas.center().y);
             assert_eq!(
                 hint.galley.elided, false,
                 "the hint wraps instead of losing words"

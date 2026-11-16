@@ -10,10 +10,12 @@ use std::sync::Arc;
 fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string()) }
 
 impl PreparedInput {
-    /// Read and validate source records on a worker, returning an owned Take for rebuilding
-    /// the display. TAKM seals are checked. Strictly unsupported or ambiguous data is refused;
+    /// Read and validate source records on a worker, returning a markers-only Take for rebuilding
+    /// the display. The caller retains the live view's analog data and deferred jobs. TAKM seals
+    /// are checked. Strictly unsupported or ambiguous data is refused;
     /// lenient-only node records can be displayed but are marked ineligible for modification.
-    /// A full TAK is read on demand here, never during the initial markers-first path.
+    /// A full TAK is read on demand here, never during the initial markers-first path. Analog
+    /// record bytes may be copied and their boundaries checked, but their samples are not decoded.
     pub fn read_from_path(path: &Path) -> Result<(PreparedInput, Take), EditError> {
         let before = std::fs::metadata(path).map_err(error)?;
         let before_stamp = (before.len(), before.modified().ok());
@@ -51,10 +53,7 @@ impl PreparedInput {
         };
         let after = std::fs::metadata(path).map_err(error)?;
         if (after.len(), after.modified().ok()) != before_stamp { return Err(EditError::Other("원본 파일이 읽는 중 바뀌었어요".into())); }
-        let mut take = tak::decode_markers(path, before.len() as usize, &nodes_bytes, &channel_bytes, &meta_bytes, false).map_err(error)?;
-        let (analog, warning) = tak::decode_analog(&channel_bytes);
-        take.analog = analog;
-        take.warnings.extend(warning);
+        let take = tak::decode_markers(path, before.len() as usize, &nodes_bytes, &channel_bytes, &meta_bytes, false).map_err(error)?;
         let assets = nodes::skeleton_asset_set(&nodes_bytes).map_err(error)?;
         let marker_nodes = nodes::parse_marker_nodes(&nodes_bytes, &assets).map_err(error)?;
         let properties = nodes::property_records(&nodes_bytes, &nodes::MARKER_SIGNATURES).map_err(error)?;
@@ -108,6 +107,31 @@ impl PreparedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_preparation_leaves_plate_and_emg_samples_unopened_for_tak_and_takm() {
+        let dir = std::env::temp_dir().join(format!("tak_edit_opaque_analog_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tak_path = dir.join("mixed.tak");
+        std::fs::write(&tak_path, crate::sample_tak::sample_tak_with_devices()).unwrap();
+        let full = tak::read_take(&tak_path).unwrap();
+        assert_eq!(full.plates.len(), 1);
+        assert_eq!(full.analog.iter().map(|d| d.channels.len()).collect::<Vec<_>>(), vec![6, 2]);
+        assert!(full.analog.iter().flat_map(|d| &d.channels).all(|c| !c.values.is_empty()));
+        let takm_path = crate::takm::convert(&tak_path, None).unwrap().out;
+        for path in [&tak_path, &takm_path] {
+            let (input, take) = PreparedInput::read_from_path(path).unwrap();
+            assert!(take.analog.is_empty(), "edit preparation decoded analog samples: {}", path.display());
+            assert_eq!(take.plates.len(), full.plates.len());
+            assert_eq!(take.assets.len(), full.assets.len());
+            let mut shown = full.clone();
+            shown.path = path.clone();
+            assert!(input.matches_shown_take(&shown));
+            assert_eq!(take.warnings, full.warnings);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn source_loader_keeps_raw_samples_and_installs_without_sharing_view_data() {
         let path = std::env::temp_dir().join(format!("tak_phase01_loader_{}.tak", std::process::id()));

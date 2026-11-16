@@ -33,6 +33,8 @@ pub enum WsAction {
     Open(PathBuf),
     /// Open in a new 3D view next to the others (Ctrl+click, right-click menu).
     OpenSide(PathBuf),
+    /// Open in a new whole-layout tab.
+    OpenNewTab(PathBuf),
     /// Add a folder to the saved list (folder picker).
     PickFolder,
     /// Add a folder or open a file by pasting a path.
@@ -667,6 +669,10 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                         }
                         if ui.button("옆 화면에 열기  (Ctrl+클릭)").clicked() {
                             action = Some(WsAction::OpenSide(file.path.clone()));
+                            ui.close_menu();
+                        }
+                        if ui.button("Open in New Tab").clicked() {
+                            action = Some(WsAction::OpenNewTab(file.path.clone()));
                             ui.close_menu();
                         }
                         // Plan step 7: both files in one 3D (acts on the active view).

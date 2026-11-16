@@ -20,17 +20,28 @@ END = 0xFFFFFFFE
 FREE = 0xFFFFFFFF
 
 
-def channel(name, frames):
+def channel(name, frames, uid=bytes(16)):
     kind = b"FloatChannel"
     name = name.encode("utf-16le")
     return (struct.pack("<H", len(kind)) + kind + b"\x04"
-            + struct.pack("<H", len(name) // 2) + name + bytes(20)
+            + struct.pack("<H", len(name) // 2) + name + uid + bytes(4)
             + struct.pack("<I", len(frames))
             + b"".join(struct.pack("<II", frame, 0x7FC01234) for frame in frames))
 
 
 def channels(records):
     return HEADER + struct.pack("<I", len(records)) + b"".join(records)
+
+
+def device_node(uid, kind):
+    properties = [{"name": "NodeName", "value": "same misleading name"},
+                  {"name": "DeviceNode_DeviceType", "value": kind}]
+    if kind == 2:
+        properties.extend({"name": "DeviceNode_Corner " + str(i), "value": "0,0,1"} for i in range(4))
+    text = json.dumps(dict(properties=properties), indent=4).encode("utf-16le")
+    signature = b"class MoCapCore::cDeviceNode<float,16>"
+    return (struct.pack("<H", len(signature)) + signature + struct.pack("<H", len(text) // 2)
+            + text + bytes(19) + uid)
 
 
 def compound(streams):
@@ -192,7 +203,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(header["format"], "tak")
         self.assertTrue(header["has_analog"])
         self.assertEqual(len(header["identity"]), 10)
-        expected = [b"nodes", b"metadata", channels([self.marker]), b""]
+        expected = [b"nodes", b"metadata", channels([self.marker]), b"", channels([channel("AnalogChannel0", [])])]
         self.assertEqual(blocks, expected)
         self.assertEqual([hashlib.md5(b).hexdigest() for b in blocks],
                          [hashlib.md5(b).hexdigest() for b in expected])
@@ -200,11 +211,151 @@ class HelperTests(unittest.TestCase):
                          expected_identity=header["identity"], max_bytes=100000, probe_bytes=128))
         self.assertTrue(result["ok"], result)
         self.assertEqual(analog, [channels([self.analog])])
+
+    def test_selective_reads_never_touch_emg_samples_until_explicit_access(self):
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("selective_ssh_helper", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        emg_uid, plate_uid = bytes([21]) * 16, bytes([22]) * 16
+        emg = channel("AnalogChannel0", [0, 2, 8], emg_uid)
+        plate = channel("AnalogChannel0", [0, 2, 8], plate_uid)
+        manifest = channels([channel("AnalogChannel0", [], emg_uid), channel("AnalogChannel0", [], plate_uid)])
+        streams = {"Nodes.dat": device_node(plate_uid, 2) + device_node(emg_uid, 1),
+                   "MetaData.dat": b"metadata", "Channels.dat": channels([emg, self.marker, plate])}
+        for make in [compound, mini_compound, fragmented_compound, takm]:
+            with self.subTest(container=make.__name__):
+                raw = make(streams)
+                self.path.write_bytes(raw)
+                # Obtain the physical sample ranges independently before tracing.
+                source = helper.Source(str(self.path), 65536)
+                record = next(r for r in source.records if r["uid"] == emg_uid)
+                protected = source.streams["Channels.dat"].pieces(record["data"], record["count"] * record["stride"])
+                source.file.close()
+                seen = []
+                original = helper.Reader.read
+                def traced(reader, offset, length):
+                    if any(offset < start + size and start < offset + length for start, size in protected):
+                        seen.append((offset, length))
+                    return original(reader, offset, length)
+                server = helper.Server()
+                request = dict(path=str(self.path), max_bytes=100000, probe_bytes=65536)
+                try:
+                    with patch.object(helper.Reader, "read", traced):
+                        header, blocks = server.dispatch(dict(request, op="open"))
+                        self.assertEqual(header["device_types"], [1, 2])
+                        self.assertEqual(header["plate_devices"], [1])
+                        self.assertIsNone(header["analog_fallback"])
+                        self.assertEqual(blocks[4], manifest)
+                        self.assertEqual(seen, [], "marker open read EMG samples")
+                        request["expected_identity"] = header["identity"]
+                        _, plate_blocks = server.dispatch(dict(request, op="analog", selection="forceplates"))
+                        self.assertEqual(plate_blocks, [channels([channel("AnalogChannel0", [], emg_uid), plate])])
+                        self.assertEqual(seen, [], "forceplate stage read EMG samples")
+                        _, emg_blocks = server.dispatch(dict(request, op="analog", selection="non_forceplates"))
+                        self.assertTrue(seen, "on-access stage never read EMG samples")
+                        self.assertEqual(emg_blocks, [channels([emg, channel("AnalogChannel0", [], plate_uid)])])
+                        _, full_blocks = server.dispatch(dict(request, op="analog", selection="all"))
+                        self.assertEqual(full_blocks, [channels([emg, plate])])
+                finally:
+                    server.close()
+
+    def test_unknown_device_structure_reports_full_read_fallback(self):
+        header, _ = self.open()
+        self.assertIsNone(header["device_types"])
+        self.assertTrue(header["analog_fallback"])
+        _, blocks = self.request(dict(op="analog", path=str(self.path), selection="forceplates",
+                                      expected_identity=header["identity"], max_bytes=100000, probe_bytes=128))
+        self.assertEqual(blocks, [channels([self.analog])])
         self.assertEqual(self.request(dict(op="close"))[0], dict(ok=True, lengths=[]))
         result, analog = self.request(dict(op="analog", path=str(self.path),
                          expected_identity=header["identity"], max_bytes=100000, probe_bytes=128))
         self.assertTrue(result["ok"], result)
         self.assertEqual(analog, [channels([self.analog])])
+
+    def test_nonstandard_property_with_device_uid_is_skipped_then_falls_back(self):
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("nonstandard_ssh_helper", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        uid = bytes([31]) * 16
+        unknown = channel("UnrecognizedEMGProperty", [0, 3, 7], uid)
+        streams = {"Nodes.dat": device_node(uid, 1), "MetaData.dat": b"metadata",
+                   "Channels.dat": channels([unknown, self.marker])}
+        self.path.write_bytes(compound(streams))
+        source = helper.Source(str(self.path), 65536)
+        record = next(r for r in source.records if r["uid"] == uid)
+        protected = source.streams["Channels.dat"].pieces(record["data"], record["count"] * record["stride"])
+        source.file.close()
+        seen = []
+        original = helper.Reader.read
+        def traced(reader, offset, length):
+            if any(offset < start + size and start < offset + length for start, size in protected):
+                seen.append((offset, length))
+            return original(reader, offset, length)
+        server = helper.Server()
+        try:
+            with patch.object(helper.Reader, "read", traced):
+                request = dict(path=str(self.path), max_bytes=100000, probe_bytes=65536)
+                header, blocks = server.dispatch(dict(request, op="open"))
+                self.assertIsNone(header["device_types"])
+                self.assertEqual(header["analog_fallback"], "unsupported structural device channel property")
+                self.assertEqual(header["channel_order"], [True, False])
+                self.assertEqual(blocks[2], channels([self.marker]))
+                self.assertEqual(blocks[4], channels([channel("UnrecognizedEMGProperty", [], uid)]))
+                self.assertFalse(seen, "unknown device property samples leaked into marker open")
+                _, analog = server.dispatch(dict(request, op="analog", selection="forceplates",
+                                                  expected_identity=header["identity"]))
+                self.assertTrue(seen)
+                self.assertEqual(analog, [channels([unknown])])
+        finally:
+            server.close()
+
+    def test_invalid_or_unknown_registry_decides_full_fallback_before_sample_read(self):
+        import importlib.util
+        import io
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("registry_ssh_helper", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        uid = bytes([41]) * 16
+        valid = device_node(uid, 1)
+        unknown = valid.replace(b"cDeviceNode", b"cUnknownNode")
+        escaped_text = json.dumps(dict(properties=[{"name":"DeviceNode_DeviceType", "value":1}]))
+        escaped_text = escaped_text.replace("DeviceNode_DeviceType", r"\u0044eviceNode_DeviceType").encode("utf-16le")
+        escaped = b"unknown class" + struct.pack("<H", len(escaped_text) // 2) + escaped_text + bytes(19) + uid
+        cases = [device_node(uid, 9), valid + valid, unknown, escaped,
+                 valid.replace('"properties"'.encode("utf-16le"), '"propertie!"'.encode("utf-16le"))]
+        for nodes in cases:
+            with self.subTest(nodes=nodes[:32]):
+                signal = channel("UnknownDeviceProperty", [0, 3, 7], uid)
+                streams = {"Nodes.dat":nodes, "MetaData.dat":b"metadata",
+                           "Channels.dat":channels([signal, self.marker])}
+                self.path.write_bytes(compound(streams))
+                source = helper.Source(str(self.path), 65536)
+                record = next(r for r in source.records if r["uid"] == uid)
+                protected = source.streams["Channels.dat"].pieces(record["data"], record["count"] * record["stride"])
+                source.file.close()
+                seen, diagnostic = [], io.StringIO()
+                original = helper.Reader.read
+                def traced(reader, offset, length):
+                    if any(offset < start + size and start < offset + length for start, size in protected):
+                        self.assertIn("full-read fallback", diagnostic.getvalue())
+                        seen.append((offset, length))
+                    return original(reader, offset, length)
+                server = helper.Server()
+                try:
+                    with patch.object(helper.Reader, "read", traced), patch.object(helper.sys, "stderr", diagnostic):
+                        header, blocks = server.dispatch(dict(op="open", path=str(self.path), max_bytes=100000, probe_bytes=65536))
+                        self.assertTrue(header["full_fallback"])
+                        self.assertTrue(header["analog_fallback"])
+                        self.assertFalse(header["has_analog"])
+                        self.assertEqual(blocks[2], streams["Channels.dat"])
+                        self.assertTrue(seen)
+                finally:
+                    server.close()
 
     def test_mini_stream_and_fragmented_regular_ranges(self):
         for make in [mini_compound, lambda streams: mini_compound(streams, 512), fragmented_compound]:
@@ -214,7 +365,7 @@ class HelperTests(unittest.TestCase):
                 self.path.write_bytes(make(self.streams))
                 header, blocks = self.open()
                 self.assertTrue(header["ok"], header)
-                self.assertEqual(blocks, [b"nodes", b"metadata", channels([marker]), b""])
+                self.assertEqual(blocks, [b"nodes", b"metadata", channels([marker]), b"", channels([channel("AnalogChannel0", [])])])
 
     def test_oversized_request_recovers_and_analog_budget_is_enforced(self):
         header, _ = self.request(b" " * ((1 << 20) + 1))
@@ -259,7 +410,7 @@ class HelperTests(unittest.TestCase):
         header, blocks = self.open()
         self.assertTrue(header["ok"], header)
         self.assertEqual(header["format"], "takm")
-        self.assertEqual(blocks[-1], tail)
+        self.assertEqual(blocks[3], tail)
         raw = bytearray(self.path.read_bytes())
         struct.pack_into("<I", raw, 8, 8)
         self.path.write_bytes(raw)

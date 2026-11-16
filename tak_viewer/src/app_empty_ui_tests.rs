@@ -141,36 +141,37 @@ fn empty_ui_file_shortcuts_and_panel_toggles_leave_the_editor_empty() {
 }
 
 #[test]
-fn empty_ui_reopening_a_file_restores_the_default_panels_and_live_content() {
+fn empty_ui_reopening_a_file_preserves_shared_panels_and_restores_live_content() {
     let ctx = egui::Context::default();
     let mut app = empty_ui_after_close(&ctx);
     app.show_pane(Pane::Graph);
     app.show_pane(Pane::Comments);
-    app.toggle_side(Side::Left);
-    app.toggle_side(Side::Right);
+    // Move the existing device pane, rather than create a duplicate of a hidden pane.
+    dock::hide(&mut app.dock, Pane::Devices);
     let window = app.dock.add_window(vec![Pane::Devices]);
     app.dock
         .get_window_state_mut(window)
         .unwrap()
-        .set_position(egui::pos2(400.0, 150.0));
+        .set_position(egui::pos2(400.0, 150.0))
+        .set_size(egui::vec2(700.0, 420.0));
+    app.toggle_side(Side::Left);
+    app.toggle_side(Side::Right);
+    app.settings.graph_opacity = 37;
+    let hidden = app.hidden.clone();
+    let graph_float = app.settings.graph_float;
+    let window_state = ron::to_string(app.dock.get_window_state(window).unwrap()).unwrap();
     app.hold_loads = true;
     app.open_in(&ctx, 0, "reopened.tak".into());
     assert_eq!(app.open_views(), vec![0]);
     assert!(!dock::has(&app.dock, Pane::Empty));
-    assert_eq!(app.hidden, dock::Hidden::default());
-    for pane in [
-        Pane::Explorer,
-        Pane::Labeling,
-        Pane::EditTools,
-        Pane::Selected,
-        Pane::Devices,
-    ] {
-        assert!(
-            app.dock.main_surface().find_tab(&pane).is_some(),
-            "{pane:?} returned to its default place"
-        );
-    }
-    assert!(!dock::has(&app.dock, Pane::Comments) && !dock::has(&app.dock, Pane::Graph));
+    assert_eq!(app.hidden, hidden, "opening a file preserves the shared hidden sides");
+    assert_eq!(app.settings.graph_float, graph_float);
+    assert_eq!(app.settings.graph_opacity, 37);
+    assert!(dock::has(&app.dock, Pane::Graph));
+    assert!(app.hidden.right.as_ref().is_some_and(|stash| stash.leaves.iter().any(|leaf| leaf.tabs.contains(&Pane::Comments))));
+    assert_eq!(app.dock.find_tab(&Pane::Devices).unwrap().0, window);
+    assert_eq!(ron::to_string(app.dock.get_window_state(window).unwrap()).unwrap(), window_state,
+        "the detached device pane retains its position and size");
     assert_eq!(
         app.dock
             .iter_all_tabs()
@@ -188,9 +189,15 @@ fn empty_ui_reopening_a_file_restores_the_default_panels_and_live_content() {
     );
     let out = empty_ui_output(&ctx, &mut app);
     assert!(text_rects(&out, crate::ui::empty::EDITOR_HINT).is_empty());
-    assert_eq!(text_rects(&out, "QuickLabel Mode  D").len(), 1);
     assert!(app.views[0].scene_rect.is_positive());
+    // Reveal the preserved shared sides to verify the panes now use the reopened file.
+    app.toggle_side(Side::Left);
+    app.toggle_side(Side::Right);
+    app.show_pane(Pane::Labeling);
+    let out = empty_ui_output(&ctx, &mut app);
+    assert_eq!(text_rects(&out, "QuickLabel Mode  D").len(), 1);
     app.views[0].select(0, false);
+    app.show_pane(Pane::Selected);
     let out = empty_ui_output(&ctx, &mut app);
     assert!(
         text_rects(&out, "이름").len() >= 1,

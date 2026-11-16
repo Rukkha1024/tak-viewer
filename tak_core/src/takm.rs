@@ -424,8 +424,12 @@ pub(crate) fn place_new(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     // Windows filesystems without hard links while preserving create-if-absent semantics.
     #[link(name = "kernel32")]
     unsafe extern "system" { fn MoveFileW(from: *const u16, to: *const u16) -> i32; }
-    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Rust fs accepts long local/UNC paths, while raw Win32 calls require the extended
+    // path prefix. Resolve the missing destination through its existing parent too.
+    let from_path = std::fs::canonicalize(tmp)?;
+    let to_path = canonical_target(dest)?;
+    let from: Vec<u16> = from_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to_path.as_os_str().encode_wide().chain(Some(0)).collect();
     if unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) } != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 /// Put the finished temporary file at `out` without ever replacing a file that is there.
@@ -682,6 +686,18 @@ pub fn append_events(path: &Path, events: &[comments::Event]) -> Result<()> {
 /// Compare the view's base under the same lock as the append. Cancellation is checked after
 /// lock acquisition, so a discarded write waiting on a lock cannot later alter the file.
 pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Option<CommentConflict>> {
+    append_events_guarded_stamped(path, events, cancelled).map(|(conflict, _)| conflict)
+}
+
+/// Metadata observed under the same file lock before and after our append. The viewer
+/// accepts this transition only when its known source stamp still equals `before`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentWriteStamp {
+    pub before: (PathBuf, u64, Option<SystemTime>),
+    pub after: (PathBuf, u64, Option<SystemTime>),
+}
+
+pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<(Option<CommentConflict>, Option<CommentWriteStamp>)> {
     if let Some(root) = path.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root) {
         if in_repo_input(path, &root) { return err("input/ 폴더 안 파일에는 쓰지 않아요"); }
     }
@@ -690,6 +706,8 @@ pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled:
     let _lock = lock_path(&target)?;
     if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
     let mut file = OpenOptions::new().read(true).append(true).open(&target)?;
+    let before = file.metadata()?;
+    let before = (target.clone(), before.len(), before.modified().ok());
     let (_, mut tail) = tail_bytes(&file)?;
     for event in events {
         if event.operation.as_ref().is_some_and(|id| comments::parse(&String::from_utf8_lossy(&tail))
@@ -700,7 +718,7 @@ pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled:
             let live = comments::parse(&String::from_utf8_lossy(&tail)).comments();
             let latest = live.get(event.id).cloned();
             if live.id_is_ambiguous(event.id) || latest.as_ref() != Some(expected) {
-                return Ok(Some(CommentConflict { id: event.id, latest }));
+                return Ok((Some(CommentConflict { id: event.id, latest }), None));
             }
         }
         let encoded = comments::encode(event);
@@ -731,7 +749,9 @@ pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled:
         tail.extend_from_slice(&out);
     }
     file.flush()?;
-    Ok(None)
+    let after = file.metadata()?;
+    let after = (target, after.len(), after.modified().ok());
+    Ok((None, Some(CommentWriteStamp { before, after })))
 }
 
 /// Check the fixed part against its SHA-256 (reads the whole fixed part).
@@ -792,6 +812,35 @@ mod tests {
 
     fn file_sha(p: &Path) -> String {
         sha256_hex(&std::fs::read(p).unwrap())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conversion_and_create_if_absent_support_paths_longer_than_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+        let root = TempDir::new("windows_long_paths");
+        let mut dir = root.0.clone();
+        while dir.as_os_str().encode_wide().count() < 300 {
+            dir.push("long_path_component_for_conversion_and_atomic_move");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.tak");
+        let original = sample_tak();
+        std::fs::write(&source, &original).unwrap();
+        let made = convert(&source, None).unwrap();
+        verify_fixed(&made.out).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let destination = std::fs::read(&made.out).unwrap();
+        assert!(convert(&source, None).is_err(), "conversion must still refuse an existing destination");
+        let tmp = dir.join("another.part");
+        std::fs::write(&tmp, b"replacement").unwrap();
+        assert_eq!(place_new(&tmp, &made.out).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&made.out).unwrap(), destination, "the final atomic move must never overwrite");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"replacement");
+        let new_destination = dir.join("new_destination.takm");
+        place_new(&tmp, &new_destination).unwrap();
+        assert_eq!(std::fs::read(new_destination).unwrap(), b"replacement");
+        assert!(!tmp.exists());
     }
 
     #[test]

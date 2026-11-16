@@ -9,52 +9,260 @@
 use super::*;
 use crate::ui::open_editors::{EditorAction, Entry, Group};
 
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use tak_core::edit::DocumentId;
+
+struct CachedGroups {
+    version: u64,
+    documents: Vec<DocumentId>,
+    groups: Vec<Group>,
+}
+
+/// Hidden rows are presentation data. A frame may draw their cached rows, but does not
+/// inspect the hidden View, rebuild a dock or query its document until an event invalidates it.
+pub(super) struct EditorCache {
+    tabs: HashMap<layout_tabs::TabId, CachedGroups>,
+    document_tabs: HashMap<DocumentId, BTreeSet<layout_tabs::TabId>>,
+    invalid: HashSet<layout_tabs::TabId>,
+    roots: Vec<PathBuf>,
+    update_tx: Sender<DocumentId>,
+    update_rx: Receiver<DocumentId>,
+    #[cfg(test)]
+    pub(super) rebuilds: HashMap<layout_tabs::TabId, usize>,
+}
+
+impl Default for EditorCache {
+    fn default() -> Self {
+        let (update_tx, update_rx) = channel();
+        Self {
+            tabs: HashMap::new(),
+            document_tabs: HashMap::new(),
+            invalid: HashSet::new(),
+            roots: Vec::new(),
+            update_tx,
+            update_rx,
+            #[cfg(test)]
+            rebuilds: HashMap::new(),
+        }
+    }
+}
+
+impl EditorCache {
+    pub(super) fn invalidate(&mut self, tab: layout_tabs::TabId) {
+        self.invalid.insert(tab);
+    }
+    fn remove(&mut self, tab: layout_tabs::TabId) {
+        if let Some(old) = self.tabs.remove(&tab) {
+            for document in old.documents {
+                if let Some(tabs) = self.document_tabs.get_mut(&document) {
+                    tabs.remove(&tab);
+                    if tabs.is_empty() {
+                        self.document_tabs.remove(&document);
+                    }
+                }
+            }
+        }
+        self.invalid.remove(&tab);
+    }
+}
+
 impl TakViewerApp {
-    /// Each view on screen with a file, in `order` (reading order): its file (on screen or being
-    /// read) and the file laid over it.
+    /// Every tab's populated views, in tab order and then reading order, including hidden
+    /// layouts. Each file occurrence remains a row even when it shares its document.
     pub(super) fn editor_groups(&self, order: &[usize]) -> Vec<Group> {
-        order
-            .iter()
-            .filter_map(|&k| {
-                let v = &self.views[k];
-                let own = v.target()?;
-                let over = v.overlay_target();
-                let entry = |path: &Path, i: usize| Entry {
-                    path: path.to_path_buf(),
-                    host: if i == 0 { v.remote_loading.as_ref().map(|(_, l, _)| l.host.clone()).or_else(|| v.remote.as_ref().map(|l| l.host.clone())) } else { None },
-                    mark: over.map(|_| i),
-                    // Keys 1 / 2 hide a file only while one is laid over the view.
-                    hidden: v.overlay.is_some() && !v.shown[i],
-                    loading: if i == 0 { v.loading.is_some() } else { v.overlay_load.is_some() },
-                    dirty: i == 0 && v.marker_dirty(),
-                    add_folder: if i == 0 && (v.remote.is_some() || v.remote_loading.is_some()) { None } else { self.folder_outside_workspace(path) },
+        let mut cache = self.editor_cache.borrow_mut();
+        if cache.roots != self.workspace.roots() {
+            cache.roots = self.workspace.roots().to_vec();
+            let tabs: Vec<_> = cache.tabs.keys().copied().collect();
+            cache.invalid.extend(tabs);
+        }
+        while let Ok(document) = cache.update_rx.try_recv() {
+            let tabs = cache
+                .document_tabs
+                .get(&document)
+                .cloned()
+                .unwrap_or_default();
+            cache.invalid.extend(tabs);
+        }
+        let mut groups = Vec::new();
+        for tab in self.layout_tabs.tabs() {
+            if Some(tab.id) == self.layout_tabs.active_id() {
+                cache.remove(tab.id);
+                groups.extend(self.editor_view_groups(tab.id, &tab.name, &self.views, order, true));
+                continue;
+            }
+            let version = self.layout_tabs.payload_version(tab.id);
+            if cache.invalid.contains(&tab.id)
+                || cache
+                    .tabs
+                    .get(&tab.id)
+                    .map_or(true, |cached| cached.version != version)
+            {
+                cache.remove(tab.id);
+                let Some(runtime) = tab.layout.as_ref() else {
+                    continue;
                 };
-                let mut entries = vec![entry(own, 0)];
-                entries.extend(over.map(|p| entry(p, 1)));
-                Some(Group { slot: k, active: k == self.active, entries })
-            })
-            .collect()
+                let mut dock = dock::scene_only(0);
+                dock::set_editor_layout(&mut dock, &runtime.layout);
+                let ordered: Vec<_> = dock::views_reading_order(&dock)
+                    .into_iter()
+                    .map(usize::from)
+                    .collect();
+                let cached_groups =
+                    self.editor_view_groups(tab.id, &tab.name, &runtime.views, &ordered, false);
+                let mut documents = Vec::new();
+                for view in &runtime.views {
+                    view.subscribe_editor_updates(&cache.update_tx);
+                    if let Some(document) = view.document_id() {
+                        documents.push(document);
+                    }
+                    if let Some(owner) = view.overlay_owner() {
+                        owner.subscribe_editor_updates(&cache.update_tx);
+                        if let Some(document) = owner.document_id() {
+                            documents.push(document);
+                        }
+                    }
+                }
+                let mut seen = HashSet::new();
+                documents.retain(|document| seen.insert(*document));
+                for &document in &documents {
+                    cache
+                        .document_tabs
+                        .entry(document)
+                        .or_default()
+                        .insert(tab.id);
+                }
+                cache.tabs.insert(
+                    tab.id,
+                    CachedGroups {
+                        version,
+                        documents,
+                        groups: cached_groups,
+                    },
+                );
+                #[cfg(test)]
+                {
+                    *cache.rebuilds.entry(tab.id).or_default() += 1;
+                }
+            }
+            if let Some(cached) = cache.tabs.get(&tab.id) {
+                groups.extend(cached.groups.iter().cloned());
+            }
+        }
+        let closed: Vec<_> = cache
+            .tabs
+            .keys()
+            .filter(|&&tab| self.layout_tabs.tab(tab).is_none())
+            .copied()
+            .collect();
+        for tab in closed {
+            cache.remove(tab);
+        }
+        groups
+    }
+
+    fn editor_view_groups(
+        &self,
+        tab_id: layout_tabs::TabId,
+        tab_name: &str,
+        views: &[View; MAX_VIEWS],
+        order: &[usize],
+        active: bool,
+    ) -> Vec<Group> {
+        let mut groups = Vec::new();
+        for &slot in order {
+            let Some(view) = views.get(slot) else {
+                continue;
+            };
+            let Some(own) = view.shared_target() else {
+                continue;
+            };
+            let over = if view.overlay_load.is_some() {
+                view.overlay_target().map(Path::to_path_buf)
+            } else {
+                view.overlay_shared_target()
+            };
+            let entry = |path: &Path, index: usize| Entry {
+                path: path.to_path_buf(),
+                host: if index == 0 {
+                    view.remote_loading
+                        .as_ref()
+                        .map(|(_, location, _)| location.host.clone())
+                        .or_else(|| view.remote.as_ref().map(|location| location.host.clone()))
+                } else {
+                    None
+                },
+                mark: over.as_ref().map(|_| index),
+                hidden: view.overlay.is_some() && !view.shown[index],
+                loading: if index == 0 {
+                    view.loading.is_some()
+                } else {
+                    view.overlay_load.is_some()
+                },
+                dirty: if index == 0 {
+                    view.marker_dirty()
+                } else {
+                    view.overlay_marker_dirty()
+                },
+                add_folder: if index == 0
+                    && (view.remote.is_some() || view.remote_loading.is_some())
+                {
+                    None
+                } else {
+                    self.folder_outside_workspace(path)
+                },
+            };
+            let mut entries = vec![entry(&own, 0)];
+            entries.extend(over.as_ref().map(|path| entry(path, 1)));
+            groups.push(Group {
+                tab_id,
+                tab_name: tab_name.to_owned(),
+                view_index: groups.len(),
+                slot,
+                active: active && slot == self.active,
+                entries,
+            });
+        }
+        groups
     }
 
     /// The folder of `file` when no WORKSPACE folder holds it (path comparison, the folder
     /// itself or any folder above it counts).
     fn folder_outside_workspace(&self, file: &Path) -> Option<PathBuf> {
         let dir = file.parent().filter(|d| d.is_absolute())?;
-        self.workspace.root_of(file).is_none().then(|| dir.to_path_buf())
+        self.workspace
+            .root_of(file)
+            .is_none()
+            .then(|| dir.to_path_buf())
     }
 
     /// What a click in OPEN EDITORS asked for (applied after drawing).
     pub(super) fn editor_action(&mut self, ctx: &egui::Context, a: EditorAction) {
+        if self.dirty_prompt.is_some() {
+            return;
+        }
         match a {
-            EditorAction::Activate(k) => self.activate(k),
+            EditorAction::Activate(tab, k) => {
+                self.activate_editor_view(tab, k);
+            }
             // As a click on name tag `which + 1`: its press chooses the view (`pressed_view`),
             // then `name_tag_click`.
-            EditorAction::ToggleShown(k, which) => {
-                self.activate(k);
-                self.name_tag_click(k, which, false);
+            EditorAction::ToggleShown(tab, k, which) => {
+                if self.activate_editor_view(tab, k) {
+                    self.name_tag_click(k, which, false);
+                }
             }
-            EditorAction::Close(k) => self.close_editor(k),
-            EditorAction::OverlayOff(k) => self.overlay_off(k),
+            EditorAction::Close(tab, k) => {
+                if self.activate_editor_view(tab, k) {
+                    self.close_editor(k);
+                }
+            }
+            EditorAction::OverlayOff(tab, k) => {
+                if self.activate_editor_view(tab, k) {
+                    self.overlay_off(k);
+                }
+            }
             EditorAction::AddFolder(dir) => {
                 self.open_workspace(dir);
             }
@@ -65,8 +273,172 @@ impl TakViewerApp {
         }
     }
 
+    /// A queued click owns a stable tab id, so moving or closing another tab cannot redirect
+    /// it to an unrelated view with the same slot. Ignore stale rows for closed tabs/views.
+    fn activate_editor_view(&mut self, tab: u64, slot: usize) -> bool {
+        let Some(target) = self.layout_tabs.tab(tab) else {
+            return false;
+        };
+        let views = if self.layout_tabs.active_id() == Some(tab) {
+            Some(&self.views)
+        } else {
+            target.layout.as_ref().map(|runtime| &runtime.views)
+        };
+        if !views
+            .and_then(|views| views.get(slot))
+            .is_some_and(|view| view.target().is_some())
+        {
+            return false;
+        }
+        self.switch_layout_tab(tab);
+        if self.layout_tabs.active_id() != Some(tab) {
+            return false;
+        }
+        self.activate(slot);
+        true
+    }
+
     /// × on a view's file: the same close and dirty prompt as its tab ✕ and Ctrl+W.
     pub(super) fn close_editor(&mut self, slot: usize) {
         self.close_view(slot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join("open_editors").join(name)
+    }
+
+    fn show_file(view: &mut View, name: &str) {
+        let path = editor_path(name);
+        let path = path.to_str().unwrap();
+        let (_, rx) = std::sync::mpsc::channel();
+        view.show(views::sample_data(path, &["M"]), rx, 10, 1.0, 0.0);
+    }
+
+    fn app_with_hidden_views(ctx: &egui::Context) -> (TakViewerApp, u64, u64) {
+        let mut app = TakViewerApp::build(ctx, None, vec![], None, None);
+        app.set_command_run();
+        let first = app.layout_tabs.active_id().unwrap();
+        show_file(&mut app.views[2], "top.tak");
+        show_file(&mut app.views[0], "bottom.tak");
+        dock::set_editor_layout(
+            &mut app.dock,
+            &dock::EditorLayout::Vertical {
+                fraction: 0.5,
+                top: Box::new(dock::EditorLayout::Leaf {
+                    slots: vec![2],
+                    active: 2,
+                }),
+                bottom: Box::new(dock::EditorLayout::Leaf {
+                    slots: vec![0],
+                    active: 0,
+                }),
+            },
+        );
+        app.activate(2);
+        app.views[2].overlay = Some(views::Overlay::from_data(
+            editor_path("over.tak"),
+            views::sample_data(editor_path("over.tak").to_str().unwrap(), &["M"]),
+        ));
+        app.views[2].shown[1] = false;
+        let second = app.new_layout_tab();
+        show_file(&mut app.views[0], "active.tak");
+        dock::set_editor_layout(
+            &mut app.dock,
+            &dock::EditorLayout::Leaf {
+                slots: vec![0],
+                active: 0,
+            },
+        );
+        app.activate(0);
+        (app, first, second)
+    }
+
+    #[test]
+    fn open_editors_include_hidden_layouts_in_tab_then_view_reading_order() {
+        let ctx = egui::Context::default();
+        let (app, first, second) = app_with_hidden_views(&ctx);
+        let groups = app.editor_groups(&[0]);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| (g.tab_id, g.slot, g.view_index, g.active))
+                .collect::<Vec<_>>(),
+            vec![
+                (first, 2, 0, false),
+                (first, 0, 1, false),
+                (second, 0, 0, true)
+            ]
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(crate::ui::open_editors::group_title)
+                .collect::<Vec<_>>(),
+            vec!["tab1 · View 1", "tab1 · View 2", "tab2 · View 1"]
+        );
+        assert_eq!(groups[0].entries.len(), 2);
+        assert_eq!(
+            groups[0].entries[1].path,
+            editor_path("over.tak")
+        );
+        assert_eq!(
+            (groups[0].entries[1].mark, groups[0].entries[1].hidden),
+            (Some(1), true)
+        );
+        assert!(groups[0].entries[1].add_folder.is_some());
+    }
+
+    #[test]
+    fn open_editors_actions_switch_to_stable_tab_before_view_and_overlay_actions() {
+        let ctx = egui::Context::default();
+        let (mut app, first, second) = app_with_hidden_views(&ctx);
+        assert!(app.layout_tabs.move_tab(first, 1));
+        app.editor_action(&ctx, EditorAction::ToggleShown(first, 2, 1));
+        assert_eq!((app.layout_tabs.active_id(), app.active), (Some(first), 2));
+        assert!(app.views[2].shown[1]);
+        assert_eq!(
+            app.views[0].target(),
+            Some(editor_path("bottom.tak").as_path())
+        );
+        app.editor_action(&ctx, EditorAction::Activate(second, 0));
+        assert_eq!(
+            app.views[0].target(),
+            Some(editor_path("active.tak").as_path())
+        );
+        app.editor_action(&ctx, EditorAction::OverlayOff(first, 2));
+        assert_eq!((app.layout_tabs.active_id(), app.active), (Some(first), 2));
+        assert!(app.views[2].overlay_target().is_none());
+    }
+
+    #[test]
+    fn open_editors_close_hidden_view_then_its_final_tab_without_touching_other_tabs() {
+        let ctx = egui::Context::default();
+        let (mut app, first, second) = app_with_hidden_views(&ctx);
+        app.editor_action(&ctx, EditorAction::Close(first, 2));
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert!(app.views[2].target().is_none());
+        assert_eq!(
+            app.views[0].target(),
+            Some(editor_path("bottom.tak").as_path())
+        );
+        app.editor_action(&ctx, EditorAction::Close(first, 0));
+        assert!(app.layout_tabs.tab(first).is_none());
+        assert_eq!(app.layout_tabs.active_id(), Some(second));
+        assert_eq!(
+            app.views[0].target(),
+            Some(editor_path("active.tak").as_path())
+        );
+        app.editor_action(&ctx, EditorAction::Close(first, 0));
+        app.editor_action(&ctx, EditorAction::Activate(second, MAX_VIEWS));
+        assert_eq!((app.layout_tabs.active_id(), app.active), (Some(second), 0));
+        assert_eq!(
+            app.views[0].target(),
+            Some(editor_path("active.tak").as_path())
+        );
     }
 }

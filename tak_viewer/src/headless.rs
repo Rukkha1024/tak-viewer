@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, pos2, vec2, Color32, Event, RawInput, Rect, ViewportCommand, ViewportId, ViewportInfo};
 
 use crate::app::TakViewerApp;
+use crate::bench_load::ProcessMemory;
+use crate::bench_timing::{BenchTrace, FrameTiming};
 use crate::capture::CapturePlan;
 use crate::shot::AutoShot;
 use crate::soft_render::{self, Textures};
@@ -57,6 +59,26 @@ pub static BENCH_SELECT: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// curve (or none) every second frame, the worst case for the hover's thick curves.
 pub static BENCH_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `--bench-emg`: access a real deferred non-forceplate device/graph after startup, keeping
+/// frames running until its read, attachment and background graph preparation are complete.
+pub static BENCH_EMG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Native per-phase wall/CPU diagnostics; no syscalls or trace allocations while disabled.
+pub static BENCH_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const NO_DEFERRED_EMG: &str = "--bench-emg를 적용할 수 없어요. 열린 파일에 나중에 읽도록 미뤄 둔 근전도·기타 아날로그 장치가 없어요. 근전도 읽기 성능은 측정하지 않았어요.";
+
+fn require_deferred_emg(state: &crate::app::BenchState) -> Result<(), &'static str> {
+    if state.views.iter().any(|view| view.lazy_analog) { Ok(()) } else { Err(NO_DEFERRED_EMG) }
+}
+
+fn emg_frame_ready(state: &crate::app::BenchState, pending: bool) -> Result<bool, String> {
+    if let Some((view, reason)) = state.views.iter().find_map(|view| view.emg_failure.as_ref().map(|reason| (view, reason))) {
+        return Err(format!("--bench-emg: {}: 근전도 읽기가 실패해 성능 측정을 마치지 못했어요. {reason}", view.file));
+    }
+    Ok(!pending)
+}
+
 pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [f32; 2]) -> i32 {
     let ctx = egui::Context::default();
     let start = Instant::now();
@@ -68,6 +90,8 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         let out = ctx.run(frame_input(screen, start, vec![]), |ctx| app.frame(ctx));
         let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
     }
+    let memory_baseline = ProcessMemory::sample();
+    let mut memory_by_file: std::collections::HashMap<String, (Option<ProcessMemory>, Option<ProcessMemory>)> = std::collections::HashMap::new();
     let started = ms(start);
     let opened = Instant::now();
     app.bench_open(&ctx, &files);
@@ -75,6 +99,9 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         app.overlay_args(&ctx, &overlays);
     }
     let (mut markers, mut analog) = (None, None);
+    let (mut emg_started, mut emg_ready, mut emg_memory) = (None, None, None);
+    let mut emg_views = 0;
+    let mut emg_loading: Vec<f64> = Vec::new();
     // Views with a force plate chosen while playing (plate graph floating).
     let mut plate_views = 0;
     let (mut loading, mut playing): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
@@ -83,6 +110,7 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     // Playing frames until every graph was complete (v0.27.0 speed fix: the markers past a
     // frame's graph work come in the next frames, `graph::spend`).
     let mut complete: Option<usize> = None;
+    let mut trace = BenchTrace::new(BENCH_TRACE.load(std::sync::atomic::Ordering::Relaxed), frames);
     loop {
         if opened.elapsed() > TIMEOUT {
             eprintln!("bench: stopped after {} s", TIMEOUT.as_secs());
@@ -91,12 +119,31 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         if analog.is_some() && BENCH_HOVER.load(std::sync::atomic::Ordering::Relaxed) {
             app.bench_hover(playing.len());
         }
+        let emg_was_pending = emg_started.is_some() && app.bench_emg_pending();
+        let since_open_ms = if trace.enabled() { ms(opened) } else { 0.0 };
+        let cpu_start = trace.cpu_mark();
         let t = Instant::now();
         let out = ctx.run(frame_input(screen, start, vec![]), |ctx| app.frame(ctx));
         let ui_took = ms(t);
-        let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let cpu_ui = trace.cpu_mark();
+        let shapes = out.shapes.len();
+        let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let primitive_count = primitives.len();
+        drop(primitives);
         let took = ms(t);
+        let cpu_end = trace.cpu_mark();
+        if trace.enabled() {
+            let phase = if analog.is_none() { "startup" } else if emg_started.is_some() && emg_ready.is_none() { "emg" } else { "playing" };
+            let mut record = FrameTiming::new(loading.len() + playing.len(), phase, since_open_ms, shapes, primitive_count, ui_took, took, [cpu_start, cpu_ui, cpu_end]);
+            record.ui_passes = out.platform_output.num_completed_passes;
+            trace.push(record);
+        }
         let st = app.bench_state();
+        for view in &st.views {
+            let memory = memory_by_file.entry(view.file.clone()).or_default();
+            if view.markers_ms.is_some() && memory.0.is_none() { memory.0 = ProcessMemory::sample(); }
+            if view.analog_ms.is_some() && memory.1.is_none() { memory.1 = ProcessMemory::sample(); }
+        }
         if let Some(e) = st.error {
             eprintln!("bench: {e}");
             return 1;
@@ -105,13 +152,25 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             markers = Some(ms(opened));
         }
         if analog.is_some() {
+            if emg_started.is_some() {
+                let emg_pending = app.bench_emg_pending();
+                let ready = match emg_frame_ready(&st, emg_pending) {
+                    Ok(ready) => ready,
+                    Err(reason) => { eprintln!("bench: {reason}"); return 1; }
+                };
+                if emg_was_pending || emg_pending { emg_loading.push(took); }
+                if ready && emg_ready.is_none() {
+                    emg_ready = emg_started.map(ms);
+                    emg_memory = ProcessMemory::sample();
+                }
+            }
             // `graph_put_off` is about the frame before this one.
             if complete.is_none() && !playing.is_empty() && !app.graph_put_off {
                 complete = Some(playing.len());
             }
             playing.push(took);
             playing_ui.push(ui_took);
-            if playing.len() >= frames.max(1) {
+            if playing.len() >= frames.max(1) && (emg_started.is_none() || emg_ready.is_some()) {
                 break;
             }
             continue;
@@ -120,6 +179,18 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         if markers.is_some() && !st.analog_pending && !st.overlay_pending {
             analog = Some(ms(opened));
             plate_views = app.bench_play(start.elapsed().as_secs_f64());
+            if BENCH_EMG.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Err(reason) = require_deferred_emg(&st) {
+                    eprintln!("bench: {reason}");
+                    return 2;
+                }
+                emg_started = Some(Instant::now());
+                emg_views = app.bench_emg(&ctx);
+                if emg_views == 0 {
+                    eprintln!("bench: {NO_DEFERRED_EMG}");
+                    return 2;
+                }
+            }
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -128,18 +199,26 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     let stats = |v: &[f64]| (v.iter().sum::<f64>() / v.len().max(1) as f64, v.iter().cloned().fold(0.0, f64::max));
     println!("bench: {} file(s), window {}x{}", st.views.len(), size[0], size[1]);
     println!("  app start (no file): {started:.0} ms");
+    println!("  memory: actual whole-process resident/working set; per-file readiness samples overlap across files");
+    println!("  no-file app baseline: {}", ProcessMemory::describe(memory_baseline));
     for v in &st.views {
         let steps: Vec<String> = v.steps.iter().map(|(k, x)| format!("{k} {x:.1}")).collect();
         println!("  {}", v.file);
         println!("    markers on screen: {:.1} ms after open", v.markers_ms.unwrap_or(f64::NAN));
-        println!("    force plates / EMG: {:.1} ms after open", v.analog_ms.unwrap_or(f64::NAN));
+        println!("    forceplates ready: {:.1} ms after open (EMG remains lazy unless fallback)", v.analog_ms.unwrap_or(f64::NAN));
+        println!("    lazy analog awaiting access: {}", v.lazy_analog);
+        if let Some(reason) = &v.fallback { println!("    analog full-read fallback: {reason}"); }
+        if let Some(memory) = memory_by_file.get(&v.file) {
+            println!("    process at markers: {}", ProcessMemory::describe(memory.0));
+            println!("    process at forceplates: {}", ProcessMemory::describe(memory.1));
+        }
         println!("    steps (ms): {}", steps.join(", "));
         if let Some((file, ms)) = &v.overlay {
             println!("    laid over it: {file}, on screen {:.1} ms after asking", ms.unwrap_or(f64::NAN));
         }
     }
     println!("  all markers on screen: {:.1} ms after open", markers.unwrap_or(f64::NAN));
-    println!("  all force plates / EMG: {:.1} ms after open", analog.unwrap_or(f64::NAN));
+    println!("  all forceplates ready: {:.1} ms after open (EMG remains lazy unless fallback)", analog.unwrap_or(f64::NAN));
     let (avg, max) = stats(&loading);
     println!("  while loading {} frames: avg {avg:.2} ms, max {max:.2} ms per frame", loading.len());
     let selected = match BENCH_SELECT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -164,7 +243,74 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     let (avg, max) = stats(&playing);
     let (ui_avg, _) = stats(&playing_ui);
     println!("  playing {} frames: avg {avg:.2} ms, max {max:.2} ms per frame (app UI {ui_avg:.2} + tessellation {:.2})", playing.len(), avg - ui_avg);
+    if emg_started.is_some() {
+        let (avg, max) = stats(&emg_loading);
+        println!("  lazy EMG access (--bench-emg), {emg_views} device view(s): read + attachment + device graph ready {:.1} ms after request; {} loading/graph frame(s): avg {avg:.2} ms, max {max:.2} ms", emg_ready.unwrap_or(f64::NAN), emg_loading.len());
+        println!("  process after EMG/device graph ready: {}", ProcessMemory::describe(emg_memory));
+    }
+    println!("  total after playing (all views held): {}", ProcessMemory::describe(ProcessMemory::sample()));
+    trace.print();
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{BenchState, BenchView};
+
+    fn ready_state(files: &[(&str, bool, Option<&str>)]) -> BenchState {
+        BenchState {
+            loaded: true, analog_pending: false, overlay_pending: false, error: None,
+            views: files.iter().map(|(file, lazy, fallback)| BenchView {
+                file: (*file).to_owned(), markers_ms: Some(20.0), analog_ms: Some(40.0),
+                lazy_analog: *lazy, fallback: fallback.map(str::to_owned), emg_failure: None, steps: vec![], overlay: None,
+            }).collect(),
+        }
+    }
+
+    #[test]
+    fn emg_benchmark_rejects_files_without_a_deferred_nonplate_job() {
+        for state in [ready_state(&[]), ready_state(&[("markers_only.tak", false, None)]), ready_state(&[("fallback.tak", false, Some("ambiguous device structure"))])] {
+            let reason = require_deferred_emg(&state).expect_err("EMG cannot be measured without a deferred device");
+            assert!(reason.contains("측정하지 않았어요"));
+        }
+    }
+
+    #[test]
+    fn emg_benchmark_allows_a_real_deferred_job_among_other_files() {
+        let state = ready_state(&[("markers_only.tak", false, None), ("emg.tak", true, None)]);
+        assert!(require_deferred_emg(&state).is_ok());
+    }
+
+    #[test]
+    fn emg_benchmark_does_not_treat_failed_read_as_ready_when_pending_clears() {
+        let mut state = ready_state(&[("good.tak", false, None), ("failed_emg.tak", false, None)]);
+        state.views[1].emg_failure = Some("deferred file read failed".to_owned());
+        let reason = emg_frame_ready(&state, false).expect_err("cleared pending after failure is not successful readiness");
+        assert!(reason.contains("failed_emg.tak"));
+        assert!(reason.contains("deferred file read failed"));
+    }
+
+    #[test]
+    fn emg_benchmark_waits_until_a_successful_read_is_ready() {
+        let state = ready_state(&[("emg.tak", true, None)]);
+        assert!(!emg_frame_ready(&state, true).unwrap());
+        assert!(emg_frame_ready(&state, false).unwrap());
+    }
+
+    #[test]
+    fn emg_benchmark_returns_nonzero_for_a_real_marker_only_file() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tak_bench_emg_no_deferred_{}_{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("markers_only.tak");
+        std::fs::write(&path, tak_core::sample_tak::sample_tak()).unwrap();
+        let previous = BENCH_EMG.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let code = bench(vec![path], vec![], 1, [900.0, 600.0]);
+        BENCH_EMG.store(previous, std::sync::atomic::Ordering::Relaxed);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(code, 2, "an inapplicable EMG measurement must not report success");
+    }
 }
 
 /// Returns the process exit code: 0 = done, 1 = failed or timed out.
