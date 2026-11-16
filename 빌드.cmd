@@ -1,15 +1,42 @@
 @echo off
-rem TAK viewer: build again after code changes. Double-click this file.
+rem TAK viewer: pull the current branch, then build. Double-click this file.
 rem Option /nopause = do not wait for a key at the end (for agents).
 rem Open viewers may stay open: a running tak_viewer.exe is renamed aside (Windows allows
 rem renaming a running exe) and keeps running; the new build takes the usual name.
 chcp 65001 >nul
 setlocal
 
+rem cmd.exe reads batch files as it goes. Parse this whole block before pulling,
+rem then call the updated file so a pull can safely replace this script too.
+if not defined TAK_VIEWER_BUILD_UPDATED (
+  "%SystemRoot%\System32\where.exe" git >nul 2>nul
+  if errorlevel 1 (
+    echo Git을 찾지 못했어요. Git for Windows를 설치한 뒤 다시 실행하세요.
+    goto :fail
+  )
+  if not exist "%~dp0.git" (
+    echo Git 저장소가 아니에요. ZIP 대신 git clone으로 받은 폴더에서 실행하세요.
+    goto :fail
+  )
+  echo 최신 코드를 확인하고 받는 중이에요...
+  git -C "%~dp0." pull --ff-only
+  if errorlevel 1 (
+    echo.
+    echo 업데이트 실패. 빌드를 중단했어요. 위쪽의 Git 오류를 확인하세요.
+    echo 인터넷 연결, 추적 브랜치 설정, 로컬 수정 충돌 여부를 확인하세요.
+    goto :fail
+  )
+  set "TAK_VIEWER_BUILD_UPDATED=1"
+  call "%~f0" %*
+  if errorlevel 1 goto :exit_failure
+  goto :exit_success
+)
+set "TAK_VIEWER_BUILD_UPDATED="
+
 if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 "%SystemRoot%\System32\where.exe" cargo >nul 2>nul
 if errorlevel 1 (
-  echo Rust 빌드 도구^(cargo^)를 찾지 못했어요. README.md "처음 설치"를 보세요.
+  echo Rust 빌드 도구^(cargo^)를 찾지 못했어요. README.md "설치와 빌드"를 보세요.
   goto :fail
 )
 
@@ -25,7 +52,7 @@ for %%D in ("%REL%" "%REL%\deps") do (
 )
 
 echo 빌드 중이에요. 처음에는 몇 분 걸려요...
-cargo build --release --manifest-path "%~dp0Cargo.toml"
+cargo build --release --locked --manifest-path "%~dp0Cargo.toml"
 if errorlevel 1 (
   echo.
   echo 빌드 실패. 위쪽의 error 줄을 확인하세요.
@@ -42,10 +69,12 @@ echo 완료: %REL%\tak_viewer.exe
 if defined MOVED echo 켜 둔 뷰어는 예전 버전 그대로 돌아요. 껐다 켜면 새 버전이에요.
 echo 실행 파일: "%REL%\tak_viewer.exe"
 if /I not "%~1"=="/nopause" pause
+:exit_success
 exit /b 0
 
 :fail
 if /I not "%~1"=="/nopause" pause
+:exit_failure
 exit /b 1
 
 rem call :aside <folder> <name>
