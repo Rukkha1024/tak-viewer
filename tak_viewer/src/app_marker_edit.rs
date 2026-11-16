@@ -1,0 +1,2519 @@
+//! Viewer-side state and dispatch for the two marker-editing panels.
+use super::*;
+use crate::ui::edit_tools::{self, EditToolsAction, EditToolsState, TrackChoice};
+use crate::ui::labeling::{
+    self, AssetChoice, LabelGroup, LabelRow, LabelingAction, LabelingMode, LabelingState,
+    UnlabeledRow,
+};
+use std::collections::HashSet;
+use std::sync::{mpsc, Arc};
+use tak_core::edit::delete::{delete_samples, DeleteRequest};
+use tak_core::edit::fill::{FillMethod, FillRequest, FillScope as CoreFillScope, NumericalFill};
+use tak_core::edit::label::{
+    CreationStreams, LabelEditor, LabelRequest, LabelScope, UnlabelRequest,
+};
+use tak_core::edit::save::{self, FileVersion, SaveOutcome, SaveRequest, TakmSave};
+use tak_core::edit::smooth::{NumericalSmooth, SmoothRequest, SmoothScope as CoreSmoothScope};
+use tak_core::edit::{
+    DocumentId, DocumentSnapshot, EditError, EditPatch, EditSelection, LabelKey, PreparedInput,
+    Revision,
+};
+use tak_core::tak::{MarkerKind, Uid};
+use tak_core::view_data::GroupKind;
+
+#[derive(Default)]
+pub(super) struct MarkerUi {
+    file_id: usize,
+    pub(super) labeling: LabelingState,
+    tools: EditToolsState,
+    job: Option<MarkerJob>,
+    save: Option<SaveJob>,
+    save_started: Option<Instant>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PanelSetting {
+    Mode(LabelingMode),
+    Increment(bool),
+    Backward(bool),
+    Forward(bool),
+    Asset(Option<Uid>),
+    Interpolation(FillMethod),
+    MaxGap(String),
+    MaxFrequency(String),
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedSession {
+    _original_version: FileVersion,
+    current_version: FileVersion,
+    creation: Arc<CreationStreams>,
+}
+
+#[derive(Clone)]
+enum MarkerCommand {
+    Label(LabelRequest),
+    Unlabel(UnlabelRequest),
+    Delete(DeleteRequest),
+    Fill {
+        method: FillMethod,
+        scope: CoreFillScope,
+        range: Option<(u32, u32)>,
+        max_gap: u32,
+        selection: EditSelection,
+    },
+    Smooth {
+        scope: CoreSmoothScope,
+        range: Option<(u32, u32)>,
+        cutoff: f64,
+        rate: f64,
+        selection: EditSelection,
+    },
+}
+impl MarkerCommand {
+    fn selection(&self) -> &EditSelection {
+        match self {
+            Self::Label(r) => &r.selection,
+            Self::Unlabel(r) => &r.selection,
+            Self::Delete(r) => &r.selection,
+            Self::Fill { selection, .. } | Self::Smooth { selection, .. } => selection,
+        }
+    }
+}
+
+struct Prepared {
+    input: PreparedInput,
+    session: PreparedSession,
+}
+struct EditDone {
+    patch: Option<EditPatch>,
+    view: Option<tak_core::view_data::ViewData>,
+    message: String,
+}
+enum MarkerJob {
+    Prepare {
+        document: DocumentId,
+        revision: Revision,
+        command: MarkerCommand,
+        rx: mpsc::Receiver<Result<Prepared, String>>,
+    },
+    Edit {
+        document: DocumentId,
+        selection: EditSelection,
+        rx: mpsc::Receiver<Result<EditDone, String>>,
+    },
+    Refresh {
+        document: DocumentId,
+        revision: Revision,
+        rx: mpsc::Receiver<Result<tak_core::view_data::ViewData, String>>,
+    },
+}
+
+#[derive(Clone)]
+pub(super) enum PendingTransition {
+    Open {
+        slot: usize,
+        path: PathBuf,
+    },
+    Remote {
+        slot: usize,
+        location: crate::ssh::RemoteLocation,
+        cached: bool,
+    },
+    CloseView {
+        slot: usize,
+    },
+    SwitchTakm {
+        tak: PathBuf,
+        takm: PathBuf,
+    },
+    Undo {
+        redo: bool,
+    },
+    Exit,
+}
+pub(super) struct DirtyPrompt {
+    slot: usize,
+    transition: PendingTransition,
+    saving: bool,
+    retrying_comments: bool,
+    pub(super) started: Instant,
+}
+
+struct SaveIntent {
+    destination: Option<PathBuf>,
+    close_after: bool,
+}
+struct Saved {
+    outcome: SaveOutcome,
+    snapshot: DocumentSnapshot,
+    view: tak_core::view_data::ViewData,
+    comments: views::CommentsLoad,
+}
+enum SaveFailure {
+    ChoosePath,
+    Other(String),
+}
+enum SaveJob {
+    Waiting(SaveIntent),
+    Running {
+        document: DocumentId,
+        close_after: bool,
+        rx: mpsc::Receiver<SaveMessage>,
+        reserved: Option<PathBuf>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+enum SaveMessage {
+    Reserve(PathBuf, mpsc::Sender<bool>),
+    Done(Result<Saved, SaveFailure>),
+}
+
+fn edit_error(error: EditError) -> String {
+    match error {
+        EditError::FileChangedOnDisk => "File changed on disk".into(),
+        EditError::Other(message) => message,
+        other => format!("{other:?}"),
+    }
+}
+
+pub(super) fn trace_timing(label: &str, start: Instant) {
+    if std::env::var_os("TAK_EDIT_TIMING").is_some() {
+        eprintln!(
+            "marker timing · {label} · {:.2} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+fn run_marker_command(
+    snapshot: &DocumentSnapshot,
+    session: &PreparedSession,
+    command: MarkerCommand,
+) -> Result<(Option<EditPatch>, String), String> {
+    match command {
+        MarkerCommand::Delete(request) => {
+            let outcome = delete_samples(snapshot, &request).map_err(edit_error)?;
+            Ok((outcome.patch, outcome.result.message))
+        }
+        MarkerCommand::Label(request) => {
+            let outcome = if snapshot.track_uids_for_label(&request.target).is_empty() {
+                let proof = session.creation.verify(snapshot).map_err(edit_error)?;
+                LabelEditor::with_creation(&proof)
+                    .label_with_outcome(snapshot, &request)
+                    .map_err(edit_error)?
+            } else {
+                LabelEditor::new()
+                    .label_with_outcome(snapshot, &request)
+                    .map_err(edit_error)?
+            };
+            let message = outcome
+                .patch
+                .as_ref()
+                .map(|p| p.result.message.clone())
+                .unwrap_or_else(|| "Label · No samples in scope".into());
+            Ok((outcome.patch, message))
+        }
+        MarkerCommand::Unlabel(request) => {
+            let proof = session.creation.verify(snapshot).map_err(edit_error)?;
+            let outcome = LabelEditor::with_creation(&proof)
+                .unlabel_with_outcome(snapshot, &request)
+                .map_err(edit_error)?;
+            let message = outcome
+                .patch
+                .as_ref()
+                .map(|p| p.result.message.clone())
+                .unwrap_or_else(|| {
+                    let reasons = outcome
+                        .skipped
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{}: {}",
+                                tak_core::tak::uid_hex(&s.uid),
+                                s.reason.message_ko()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    format!(
+                        "Unlabel · 0 tracks · {} skipped · {reasons}",
+                        outcome.skipped.len()
+                    )
+                });
+            Ok((outcome.patch, message))
+        }
+        MarkerCommand::Fill {
+            method,
+            scope,
+            range,
+            max_gap,
+            selection,
+        } => {
+            let request =
+                FillRequest::for_scope(snapshot, method, scope, range, max_gap, selection)
+                    .map_err(edit_error)?;
+            let outcome = NumericalFill
+                .fill_detailed(snapshot, &request)
+                .map_err(edit_error)?;
+            let mut message = if outcome.patch.is_none() {
+                format!(
+                    "Fill · No eligible gaps · {} skipped",
+                    outcome.result.skipped
+                )
+            } else {
+                outcome.result.message.clone()
+            };
+            for skip in &outcome.skipped {
+                message.push_str(&format!(
+                    " · {} {}–{}: {}",
+                    tak_core::tak::uid_hex(&skip.uid),
+                    skip.first,
+                    skip.last,
+                    skip.reason
+                ));
+            }
+            if request.method == FillMethod::PatternBased
+                && request.references.len() == 2
+                && outcome.patch.is_some()
+            {
+                message.push_str(" · 2 refs (twist estimated)");
+            }
+            Ok((outcome.patch, message))
+        }
+        MarkerCommand::Smooth {
+            scope,
+            range,
+            cutoff,
+            rate,
+            selection,
+        } => {
+            let request = SmoothRequest::for_scope(snapshot, scope, range, cutoff, rate, selection)
+                .map_err(edit_error)?;
+            let outcome = NumericalSmooth
+                .smooth_detailed(snapshot, &request)
+                .map_err(edit_error)?;
+            let mut message = outcome.result.message.clone();
+            for skip in &outcome.skipped {
+                message.push_str(&format!(
+                    " · {} {}–{}: {}",
+                    tak_core::tak::uid_hex(&skip.uid),
+                    skip.first,
+                    skip.last,
+                    skip.reason
+                ));
+            }
+            Ok((outcome.patch, message))
+        }
+    }
+}
+
+fn visible_labels(state: &LabelingState) -> Vec<LabelKey> {
+    labeling::visible_labels(state)
+}
+
+fn increment_order(state: &LabelingState, target: LabelKey) -> Vec<LabelKey> {
+    let mut order = visible_labels(state);
+    if !order.contains(&target) { order.insert(0, target); }
+    order
+}
+
+impl TakViewerApp {
+    pub(super) fn select_pattern_for_capture(&mut self, slot: usize) {
+        self.refresh_marker_ui(slot);
+        self.marker_ui[slot].tools.interpolation = FillMethod::PatternBased;
+    }
+    fn same_local_path(a: &Path, b: &Path) -> bool {
+        match (
+            tak_core::takm::canonical_target(a),
+            tak_core::takm::canonical_target(b),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        }
+    }
+
+    pub(super) fn save_destination_reserved(&self, path: &Path) -> bool {
+        self.marker_ui.iter().any(|ui| matches!(&ui.save,
+            Some(SaveJob::Running { reserved: Some(dest), .. }) if Self::same_local_path(path, dest)))
+    }
+
+    fn save_destination_open_elsewhere(&self, slot: usize, path: &Path) -> bool {
+        self.open_views().into_iter().any(|k| {
+            (k != slot
+                && self.views[k]
+                    .target()
+                    .is_some_and(|p| Self::same_local_path(p, path)))
+                || self.views[k]
+                    .overlay_target()
+                    .is_some_and(|p| Self::same_local_path(p, path))
+                || self.views[k]
+                    .overlay_paths()
+                    .any(|p| Self::same_local_path(p, path))
+        })
+    }
+    pub(super) fn quick_label_available(&self, ctx: &egui::Context, slot: usize) -> bool {
+        self.comment_edit.is_none()
+            && self.hold.is_none()
+            && self.dirty_prompt.is_none()
+            && !ctx.memory(|m| m.any_popup_open())
+            && self.marker_ui[slot].job.is_none()
+            && !self.marker_saving(slot)
+            && self.views[slot].edit_refresh.is_none()
+    }
+
+    fn panel_setting(&self, slot: usize, value: &PanelSetting) -> PanelSetting {
+        let ui = &self.marker_ui[slot];
+        match value {
+            PanelSetting::Mode(_) => PanelSetting::Mode(ui.labeling.mode),
+            PanelSetting::Increment(_) => PanelSetting::Increment(ui.labeling.increment),
+            PanelSetting::Backward(_) => PanelSetting::Backward(ui.labeling.backward),
+            PanelSetting::Forward(_) => PanelSetting::Forward(ui.labeling.forward),
+            PanelSetting::Asset(_) => PanelSetting::Asset(ui.labeling.asset_filter),
+            PanelSetting::Interpolation(_) => PanelSetting::Interpolation(ui.tools.interpolation),
+            PanelSetting::MaxGap(_) => PanelSetting::MaxGap(ui.tools.max_gap.clone()),
+            PanelSetting::MaxFrequency(_) => {
+                PanelSetting::MaxFrequency(ui.tools.max_frequency.clone())
+            }
+        }
+    }
+
+    pub(super) fn apply_panel_setting(&mut self, slot: usize, value: &PanelSetting) {
+        if self.marker_ui[slot].file_id != self.views[slot].file_id {
+            self.refresh_marker_ui(slot);
+        }
+        let ui = &mut self.marker_ui[slot];
+        match value {
+            PanelSetting::Mode(v) => ui.labeling.mode = *v,
+            PanelSetting::Increment(v) => ui.labeling.increment = *v,
+            PanelSetting::Backward(v) => ui.labeling.backward = *v,
+            PanelSetting::Forward(v) => ui.labeling.forward = *v,
+            PanelSetting::Asset(v) => ui.labeling.asset_filter = *v,
+            PanelSetting::Interpolation(v) => ui.tools.interpolation = *v,
+            PanelSetting::MaxGap(v) => ui.tools.max_gap = v.clone(),
+            PanelSetting::MaxFrequency(v) => ui.tools.max_frequency = v.clone(),
+        }
+    }
+
+    fn change_panel_setting(&mut self, slot: usize, after: PanelSetting) {
+        let before = self.panel_setting(slot, &after);
+        if before == after {
+            return;
+        }
+        self.observe(true);
+        self.apply_panel_setting(slot, &after);
+        if !self.no_persist {
+            if let Some(file) = self.views[slot].path().map(Path::to_path_buf) {
+                self.history.push(vec![undo::Part::PanelSetting {
+                    file,
+                    before,
+                    after,
+                }]);
+            }
+        }
+    }
+
+    pub(super) fn guard_dirty(&mut self, slot: usize, transition: PendingTransition) -> bool {
+        if self.dirty_prompt.is_some() {
+            return true;
+        }
+        if self.views.get(slot).is_some_and(View::marker_dirty)
+            || self.comments_unsaved(slot)
+            || self.marker_saving(slot)
+            || self.marker_ui.get(slot).is_some_and(|ui| ui.job.is_some())
+        {
+            self.dirty_prompt = Some(DirtyPrompt {
+                slot,
+                transition,
+                saving: self.marker_saving(slot),
+                retrying_comments: false,
+                started: self.views[slot].comments.pending_since.into_iter()
+                    .chain(self.marker_saving(slot).then_some(self.marker_ui[slot].save_started).flatten())
+                    .min().unwrap_or_else(Instant::now),
+            });
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn cancel_pending_marker_job(&mut self, slot: usize) {
+        if let Some(ui) = self.marker_ui.get_mut(slot) {
+            drop_later(ui.job.take());
+        }
+    }
+
+    pub(super) fn request_exit(&mut self, ctx: &egui::Context) {
+        if let Some(slot) = self.open_views().into_iter().find(|&k| {
+            self.views[k].marker_dirty()
+                || self.comments_unsaved(k)
+                || self.marker_saving(k)
+                || self.marker_ui[k].job.is_some()
+        }) {
+            self.guard_dirty(slot, PendingTransition::Exit);
+        } else {
+            self.exit_approved = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    pub(super) fn poll_exit_wait(&mut self, ctx: &egui::Context) {
+        if !self.exit_waiting_comments {
+            return;
+        }
+        if self.comment_registration.is_some()
+            || self.comment_outstanding > 0
+            || !self.comment_waiting.is_empty()
+        {
+            ctx.request_repaint_after(Duration::from_millis(30));
+            return;
+        }
+        self.exit_waiting_comments = false;
+        if let Some(reason) = self
+            .comment_registration_error
+            .as_ref()
+            .or_else(|| self.views.iter().find_map(|v| v.comments.failed.as_ref()))
+        {
+            self.notice = Some(format!("Comment를 저장하지 못해 닫지 않았어요: {reason}"));
+            return;
+        }
+        self.request_exit(ctx);
+    }
+
+    fn finish_transition(&mut self, ctx: &egui::Context, transition: PendingTransition) {
+        match transition {
+            PendingTransition::Open { slot, path } => self.open_in(ctx, slot, path),
+            PendingTransition::Remote {
+                slot,
+                location,
+                cached,
+            } => self.open_remote_in(ctx, slot, location, cached),
+            PendingTransition::CloseView { slot } => self.close_view(slot),
+            PendingTransition::SwitchTakm { tak, takm } => {
+                self.switch_to_takm(ctx, &tak, &takm);
+            }
+            PendingTransition::Undo { redo } => self.undo_redo(ctx, redo),
+            PendingTransition::Exit => self.request_exit(ctx),
+        }
+    }
+
+    pub(super) fn discard_pending_transition(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self.dirty_prompt.as_ref().map(|prompt| prompt.slot) else {
+            return;
+        };
+        self.cancel_pending_marker_job(slot);
+        let tag = self.views[slot].file_id;
+        if let Some(SaveJob::Running { cancelled, .. }) = self.marker_ui[slot].save.take() {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.marker_ui[slot].save_started = None;
+        let old_waiting = self.comment_waiting.len();
+        self.comment_waiting.retain(|(id, _, _)| *id != tag);
+        self.comment_outstanding = self.comment_outstanding.saturating_sub(old_waiting - self.comment_waiting.len());
+        if let Some(writer) = &self.comment_writer { writer.cancel_tag(tag); }
+        self.views[slot].comments.pending = 0;
+        self.views[slot].comments.pending_since = None;
+        let paths: Vec<_> = self
+            .comment_failed
+            .iter()
+            .filter(|(id, _, _)| *id == tag)
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        self.comment_failed.retain(|(id, _, _)| *id != tag);
+        if let Some(writer) = &self.comment_writer {
+            for path in paths {
+                writer.retry(path);
+            }
+        }
+        self.views[slot].comments.failed = None;
+        let result = if self.views[slot].marker_dirty() {
+            self.discard_marker_edits(slot)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            self.takm_note = Some((edit_error(error), ctx.input(|i| i.time)));
+        } else if let Some(prompt) = self.dirty_prompt.take() {
+            self.finish_transition(ctx, prompt.transition);
+        }
+    }
+
+    pub(super) fn dirty_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &self.dirty_prompt else {
+            return;
+        };
+        let slot = prompt.slot;
+        let saving = prompt.saving || self.marker_saving(slot);
+        let computing =
+            self.marker_ui[slot].job.is_some() || self.views[slot].edit_refresh.is_some();
+        let pending_comments = self.views[slot].comments.pending > 0;
+        let stalled = (saving || pending_comments) && prompt.started.elapsed() >= Duration::from_secs(10);
+        if saving || pending_comments { ctx.request_repaint_after(Duration::from_millis(250)); }
+        let name = self.views[slot]
+            .path()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut choice = 0;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Save changes to {name}?"));
+                ui.label("Discard loses unsaved Comments and marker edits. A write already in progress may still finish.");
+                if stalled { ui.label("Saving has waited more than 10 seconds."); }
+                if saving {
+                    ui.label("Saving changes…");
+                } else if pending_comments {
+                    ui.label("Waiting for Comment writes…");
+                } else if computing {
+                    ui.label("Waiting for the edit. You can discard it.");
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !saving && !computing && !pending_comments,
+                            egui::Button::new("Save"),
+                        )
+                        .clicked()
+                    {
+                        choice = 1;
+                    }
+                    if ui.button("Discard").clicked()
+                    {
+                        choice = 2;
+                    }
+                    if ui.button("Cancel").clicked()
+                    {
+                        choice = 3;
+                    }
+                });
+            });
+        match choice {
+            1 if self.comments_unsaved(slot) => self.retry_comments_and_transition(ctx, slot),
+            1 if self.views[slot].marker_dirty() => self.save_markers(ctx, slot, false, true),
+            1 => {
+                if let Some(prompt) = self.dirty_prompt.take() {
+                    self.finish_transition(ctx, prompt.transition);
+                }
+            }
+            2 => self.discard_pending_transition(ctx),
+            3 => {
+                self.dirty_prompt = None;
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn comments_unsaved(&self, slot: usize) -> bool {
+        self.views.get(slot).is_some_and(|view| {
+            view.comments.pending > 0
+                || view.comments.failed.is_some()
+                || self
+                    .comment_failed
+                    .iter()
+                    .any(|(tag, _, _)| *tag == view.file_id)
+        })
+    }
+
+    pub(super) fn retry_comments_and_transition(&mut self, ctx: &egui::Context, slot: usize) {
+        let tag = self.views[slot].file_id;
+        if self.comment_registration_error.take().is_some() {
+            drop_later(self.comment_writer.take());
+            self.comment_registration = None;
+        }
+        self.ensure_comment_writer(ctx);
+        let mut retry = Vec::new();
+        self.comment_failed.retain(|entry| {
+            if entry.0 == tag {
+                retry.push(entry.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.views[slot].comments.failed = None;
+        if let Some(prompt) = &mut self.dirty_prompt {
+            prompt.saving = true;
+            prompt.retrying_comments = true;
+            prompt.started = Instant::now();
+        }
+        let mut cleared = HashSet::new();
+        for (_, path, event) in retry {
+            if cleared.insert(path.clone()) {
+                if let Some(writer) = &self.comment_writer {
+                    writer.retry(path.clone());
+                }
+            }
+            self.send_comment(ctx, slot, path, event);
+        }
+        ctx.request_repaint_after(Duration::from_millis(30));
+    }
+
+    pub(super) fn poll_comment_retry_transition(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self
+            .dirty_prompt
+            .as_ref()
+            .filter(|p| p.retrying_comments)
+            .map(|p| p.slot)
+        else {
+            return;
+        };
+        if self.views[slot].comments.pending > 0 {
+            return;
+        }
+        if self.marker_job_running(slot) || self.views[slot].edit_refresh.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+            return;
+        }
+        if let Some(prompt) = &mut self.dirty_prompt {
+            prompt.retrying_comments = false;
+        }
+        if self.comments_unsaved(slot) {
+            if let Some(prompt) = &mut self.dirty_prompt {
+                prompt.saving = false;
+            }
+        } else if self.views[slot].marker_dirty() {
+            self.save_markers(ctx, slot, false, true);
+        } else if let Some(prompt) = self.dirty_prompt.take() {
+            self.finish_transition(ctx, prompt.transition);
+        }
+    }
+
+    pub(super) fn marker_saving(&self, slot: usize) -> bool {
+        self.marker_ui.get(slot).is_some_and(|ui| ui.save.is_some())
+    }
+
+    pub(super) fn marker_job_running(&self, slot: usize) -> bool {
+        self.marker_ui.get(slot).is_some_and(|ui| ui.job.is_some())
+    }
+
+    fn choose_marker_save_path(&self, slot: usize) -> Option<PathBuf> {
+        let path = self.views[slot].path()?;
+        let name = path
+            .file_stem()
+            .map(|s| format!("{}.takm", s.to_string_lossy()))
+            .unwrap_or_else(|| "edited.takm".into());
+        rfd::FileDialog::new()
+            .set_title("다른 이름으로 저장")
+            .set_file_name(&name)
+            .add_filter("TAKM", &["takm"])
+            .save_file()
+    }
+
+    pub(super) fn save_markers(
+        &mut self,
+        ctx: &egui::Context,
+        slot: usize,
+        save_as: bool,
+        close_after: bool,
+    ) {
+        let view = &self.views[slot];
+        if view.remote.is_some()
+            || self.no_persist
+            || view.data.is_none()
+            || view.edit_refresh.is_some()
+            || self.marker_ui[slot].job.is_some()
+            || self.marker_saving(slot)
+            || self.comment_edit.is_some()
+            || self.hold.is_some()
+        {
+            self.takm_note = Some((
+                "지금은 저장할 수 없어요. 진행 중인 작업을 마쳐 주세요.".into(),
+                ctx.input(|i| i.time),
+            ));
+            return;
+        }
+        if view.comments.failed.is_some() {
+            self.takm_note = Some((
+                "Comment 저장에 실패해 마커 저장을 중단했어요.".into(),
+                ctx.input(|i| i.time),
+            ));
+            return;
+        }
+        let Some(session) = &view.edit_document else {
+            return;
+        };
+        if !session
+            .lock()
+            .ok()
+            .is_some_and(|doc| doc.snapshot().is_loaded())
+        {
+            self.takm_note = Some(("저장할 마커 편집이 없어요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
+        let destination = if save_as {
+            let Some(path) = self.choose_marker_save_path(slot) else {
+                return;
+            };
+            Some(path)
+        } else {
+            None
+        };
+        self.ensure_comment_writer(ctx);
+        self.marker_ui[slot].save = Some(SaveJob::Waiting(SaveIntent {
+            destination,
+            close_after,
+        }));
+        self.marker_ui[slot].save_started = Some(Instant::now());
+        if close_after {
+            if let Some(prompt) = &mut self.dirty_prompt {
+                prompt.saving = true;
+                prompt.started = Instant::now();
+            }
+        }
+        self.takm_note = Some(("저장 준비 중이에요.".into(), ctx.input(|i| i.time)));
+        ctx.request_repaint_after(Duration::from_millis(30));
+    }
+
+    pub(super) fn poll_marker_saves(&mut self, ctx: &egui::Context) {
+        for slot in self.open_views() {
+            let Some(job) = self.marker_ui[slot].save.take() else {
+                continue;
+            };
+            match job {
+                SaveJob::Waiting(intent) => {
+                    if self.comment_registration.is_some() {
+                        self.marker_ui[slot].save = Some(SaveJob::Waiting(intent));
+                        ctx.request_repaint_after(Duration::from_millis(30));
+                        continue;
+                    }
+                    if let Some(reason) = &self.comment_registration_error {
+                        self.takm_note = Some((format!("Save · {reason}"), ctx.input(|i| i.time)));
+                        if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                        continue;
+                    }
+                    let Some(barrier) = self
+                        .comment_writer
+                        .as_ref()
+                        .and_then(|writer| writer.barrier().ok())
+                    else {
+                        self.takm_note = Some((
+                            "Save · Comment 저장 대기 실패".into(),
+                            ctx.input(|i| i.time),
+                        ));
+                        if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                        continue;
+                    };
+                    let view = &self.views[slot];
+                    let Some(data) = view.data.clone() else {
+                        continue;
+                    };
+                    let Some((document, snapshot, source)) =
+                        view.edit_document.as_ref().and_then(|s| {
+                            s.lock().ok().map(|doc| {
+                                (
+                                    doc.id(),
+                                    doc.snapshot(),
+                                    doc.save_path().unwrap_or(doc.source_path()).to_path_buf(),
+                                )
+                            })
+                        })
+                    else {
+                        continue;
+                    };
+                    let Some(session) = self.marker_sessions.get(&document).cloned() else {
+                        continue;
+                    };
+                    let other_paths: Vec<_> = self
+                        .open_views()
+                        .into_iter()
+                        .filter(|&k| k != slot)
+                        .flat_map(|k| {
+                            self.views[k]
+                                .target()
+                                .into_iter()
+                                .chain(self.views[k].overlay_paths())
+                                .map(Path::to_path_buf)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let destination = intent.destination;
+                    let close_after = intent.close_after;
+                    let (tx, rx) = mpsc::channel();
+                    let wake = ctx.clone();
+                    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let worker_cancelled = cancelled.clone();
+                    std::thread::spawn(move || {
+                        let started = Instant::now();
+                        let run = || -> Result<Saved, SaveFailure> {
+                            barrier
+                                .recv()
+                                .map_err(|e| SaveFailure::Other(e.to_string()))?
+                                .map_err(SaveFailure::Other)?;
+                            if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                return Err(SaveFailure::Other("Save cancelled".into()));
+                            }
+                            let new_default =
+                                destination.is_none() && tak_core::tak::is_take_path(&source);
+                            let destination = match destination {
+                                Some(path) => path,
+                                None if tak_core::takm::in_input(&source) => {
+                                    return Err(SaveFailure::ChoosePath)
+                                }
+                                None => save::default_destination(&source, &other_paths)
+                                    .map_err(|e| SaveFailure::Other(edit_error(e)))?,
+                            };
+                            let expected_destination =
+                                if std::fs::canonicalize(&destination).ok().as_deref()
+                                    == Some(session.current_version.path())
+                                {
+                                    session.current_version.clone()
+                                } else {
+                                    FileVersion::capture(&destination)
+                                        .map_err(|e| SaveFailure::Other(edit_error(e)))?
+                                };
+                            if new_default && expected_destination.exists() {
+                                return Err(SaveFailure::Other(
+                                    "저장할 이름이 방금 사용되어 다시 시도해야 해요.".into(),
+                                ));
+                            }
+                            let target = expected_destination.path().to_path_buf();
+                            // Ask the UI to check its current views and reserve this path until
+                            // the replacement finishes. Opens and overlays honor the reservation.
+                            let (reply, wait) = mpsc::channel();
+                            tx.send(SaveMessage::Reserve(target.clone(), reply))
+                                .map_err(|e| SaveFailure::Other(e.to_string()))?;
+                            wake.request_repaint();
+                            if !wait.recv_timeout(Duration::from_secs(30)).unwrap_or(false) {
+                                return Err(SaveFailure::Other(
+                                    "The destination is open in another view.".into(),
+                                ));
+                            }
+                            let mut take = data.take.clone();
+                            take.path = target;
+                            let mut updated =
+                                tak_core::view_data::ViewData::rebuild_edited(take, &snapshot)
+                                    .map_err(|e| SaveFailure::Other(edit_error(e)))?;
+                            let outcome = TakmSave
+                                .save_cancellable(SaveRequest {
+                                    snapshot: snapshot.clone(),
+                                    source,
+                                    destination,
+                                    expected_source: session.current_version.clone(),
+                                    expected_destination,
+                                }, &worker_cancelled)
+                                .map_err(|e| SaveFailure::Other(edit_error(e)))?;
+                            updated.take.path = outcome.destination.clone();
+                            if let Ok(meta) = std::fs::metadata(&outcome.destination) {
+                                updated.take.file_size = meta.len();
+                            }
+                            let comments = views::CommentsLoad::read(&outcome.destination);
+                            Ok(Saved {
+                                outcome,
+                                snapshot,
+                                view: updated,
+                                comments,
+                            })
+                        };
+                        let result = run();
+                        trace_timing("save", started);
+                        let _ = tx.send(SaveMessage::Done(result));
+                        wake.request_repaint();
+                    });
+                    self.marker_ui[slot].save = Some(SaveJob::Running {
+                        document,
+                        close_after,
+                        rx,
+                        reserved: None,
+                        cancelled,
+                    });
+                }
+                SaveJob::Running {
+                    document,
+                    close_after,
+                    rx,
+                    reserved,
+                    cancelled,
+                } => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.marker_ui[slot].save = Some(SaveJob::Running {
+                            document,
+                            close_after,
+                            rx,
+                            reserved,
+                            cancelled,
+                        })
+                    }
+                    Ok(SaveMessage::Reserve(path, reply)) => {
+                        let allowed = !self.save_destination_open_elsewhere(slot, &path)
+                            && !self.save_destination_reserved(&path);
+                        let _ = reply.send(allowed);
+                        self.marker_ui[slot].save = Some(SaveJob::Running {
+                            document,
+                            close_after,
+                            rx,
+                            reserved: allowed.then_some(path),
+                            cancelled,
+                        });
+                    }
+                    Err(_) => {
+                        self.takm_note = Some((
+                            "Save · 저장 작업이 중단됐어요.".into(),
+                            ctx.input(|i| i.time),
+                        ));
+                        if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                    }
+                    Ok(SaveMessage::Done(Err(SaveFailure::Other(reason)))) => {
+                        self.takm_note = Some((format!("Save · {reason}"), ctx.input(|i| i.time)));
+                        if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                    }
+                    Ok(SaveMessage::Done(Err(SaveFailure::ChoosePath))) => {
+                        if let Some(path) = self.choose_marker_save_path(slot) {
+                            self.marker_ui[slot].save = Some(SaveJob::Waiting(SaveIntent {
+                                destination: Some(path),
+                                close_after,
+                            }));
+                        } else if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                    }
+                    Ok(SaveMessage::Done(Ok(saved))) => {
+                        let same = self.views[slot].edit_document.as_ref().is_some_and(|s| {
+                            s.lock().ok().is_some_and(|d| {
+                                d.id() == document && d.revision() == saved.snapshot.revision()
+                            })
+                        });
+                        if !same {
+                            drop_later(Some(saved));
+                            self.takm_note = Some((
+                                "저장 중 편집 상태가 바뀌어 파일을 닫지 않았어요.".into(),
+                                ctx.input(|i| i.time),
+                            ));
+                            if let Some(prompt) = &mut self.dirty_prompt {
+                                prompt.saving = false;
+                            }
+                            continue;
+                        }
+                        let old = self.views[slot].path().map(Path::to_path_buf);
+                        let destination = saved.outcome.destination.clone();
+                        if let Some(session) = self.views[slot].edit_document.as_ref() {
+                            if let Ok(mut doc) = session.lock() {
+                                let _ = doc.mark_saved(&saved.snapshot, destination.clone());
+                            }
+                        }
+                        if let Some(session) = self.marker_sessions.get_mut(&document) {
+                            session.current_version = saved.outcome.version.clone();
+                        }
+                        self.views[slot].edit_refresh = Some(saved.snapshot.revision());
+                        if let Err(error) = self.publish_marker_view(slot, saved.view) {
+                            self.takm_note = Some((
+                                format!("Save · {}", edit_error(error)),
+                                ctx.input(|i| i.time),
+                            ));
+                            if let Some(prompt) = &mut self.dirty_prompt {
+                                prompt.saving = false;
+                            }
+                            continue;
+                        }
+                        self.views[slot].comments.take_load(saved.comments);
+                        self.views[slot].comments.blocks = Default::default();
+                        self.views[slot].comments.spans = Default::default();
+                        if let Some(old) = old {
+                            self.rebind_saved_history(&old, &destination, document);
+                        }
+                        self.takm_note = Some((
+                            format!(
+                                "Save · {}",
+                                destination
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                            ),
+                            ctx.input(|i| i.time),
+                        ));
+                        if close_after && !self.views[slot].marker_dirty() {
+                            if let Some(prompt) = self.dirty_prompt.take() {
+                                self.finish_transition(ctx, prompt.transition);
+                            }
+                        } else if let Some(prompt) = &mut self.dirty_prompt {
+                            prompt.saving = false;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn start_marker_command(&mut self, ctx: &egui::Context, slot: usize, command: MarkerCommand) {
+        let now = ctx.input(|i| i.time);
+        let view = &self.views[slot];
+        if self.no_persist
+            || self.dirty_prompt.is_some()
+            || self.hold.is_some()
+            || self.comment_edit.is_some()
+            || view.remote.is_some()
+            || view.remote_loading.is_some()
+            || view.loading.is_some()
+            || view.edit_refresh.is_some()
+            || self.marker_ui[slot].job.is_some()
+            || self.marker_saving(slot)
+        {
+            self.takm_note = Some(("지금은 마커를 편집할 수 없어요.".into(), now));
+            return;
+        }
+        if view.analog_rx.is_some() || view.data.as_ref().is_some_and(|data| data.analog_pending) {
+            self.takm_note = Some(("파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요.".into(), now));
+            return;
+        }
+        let Some(document) = view.edit_document.clone() else {
+            return;
+        };
+        let Some(data) = view.data.clone() else {
+            return;
+        };
+        let Ok(doc) = document.lock() else { return };
+        let (id, revision, loaded) = (doc.id(), doc.revision(), doc.snapshot().is_loaded());
+        let path = doc.source_path().to_path_buf();
+        drop(doc);
+        if loaded {
+            self.start_prepared_command(ctx, slot, id, command);
+            return;
+        }
+        let stamp = view.source_stamp.clone();
+        let (tx, rx) = mpsc::channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let prepare = || -> Result<Prepared, String> {
+                let expected = stamp
+                    .as_ref()
+                    .and_then(|s| s.lock().ok()?.clone())
+                    .ok_or("파일을 처음 연 시각을 확인할 수 없어요.")?;
+                let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+                if expected != (path.clone(), meta.len(), meta.modified().ok()) {
+                    return Err("파일을 연 뒤 원본이 바뀌었어요. 다시 열어 주세요.".into());
+                }
+                let before = FileVersion::capture(&path).map_err(edit_error)?;
+                let (input, _) = PreparedInput::read_from_path(&path).map_err(edit_error)?;
+                if !input.matches_shown_take(&data.take) {
+                    return Err("화면의 마커와 원본이 달라요. 다시 열어 주세요.".into());
+                }
+                let creation =
+                    Arc::new(CreationStreams::read_from_path(&path).map_err(edit_error)?);
+                let after = FileVersion::capture(&path).map_err(edit_error)?;
+                let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+                if before != after || expected != (path.clone(), meta.len(), meta.modified().ok()) {
+                    return Err("원본을 읽는 동안 파일이 바뀌었어요. 다시 열어 주세요.".into());
+                }
+                Ok(Prepared {
+                    input,
+                    session: PreparedSession {
+                        _original_version: before.clone(),
+                        current_version: before,
+                        creation,
+                    },
+                })
+            };
+            let result = prepare();
+            trace_timing("prepare", started);
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+        self.marker_ui[slot].job = Some(MarkerJob::Prepare {
+            document: id,
+            revision,
+            command,
+            rx,
+        });
+        self.takm_note = Some(("마커 편집 자료를 준비하는 중이에요.".into(), now));
+    }
+
+    fn start_prepared_command(
+        &mut self,
+        ctx: &egui::Context,
+        slot: usize,
+        id: DocumentId,
+        command: MarkerCommand,
+    ) {
+        let Some(session) = self.marker_sessions.get(&id).cloned() else {
+            self.takm_note = Some((
+                "원본 편집 정보를 찾을 수 없어요. 다시 열어 주세요.".into(),
+                ctx.input(|i| i.time),
+            ));
+            return;
+        };
+        let view = &self.views[slot];
+        let Some(snapshot) = view
+            .edit_document
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|d| d.snapshot()))
+        else {
+            return;
+        };
+        let Some(data) = view.data.clone() else {
+            return;
+        };
+        let selection = command.selection().clone();
+        let (tx, rx) = mpsc::channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result =
+                run_marker_command(&snapshot, &session, command).and_then(|(patch, message)| {
+                    trace_timing("edit calculation", started);
+                    let rebuilding = Instant::now();
+                    let new_view = match &patch {
+                        Some(patch) => Some(
+                            tak_core::view_data::ViewData::rebuild_edited(
+                                data.take.clone(),
+                                &patch.after_snapshot(),
+                            )
+                            .map_err(edit_error)?,
+                        ),
+                        None => None,
+                    };
+                    trace_timing("edit view rebuild", rebuilding);
+                    Ok(EditDone {
+                        patch,
+                        view: new_view,
+                        message,
+                    })
+                });
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+        self.marker_ui[slot].job = Some(MarkerJob::Edit {
+            document: id,
+            selection,
+            rx,
+        });
+    }
+
+    pub(super) fn poll_marker_jobs(&mut self, ctx: &egui::Context) {
+        for slot in self.open_views() {
+            if self.marker_ui[slot].file_id != self.views[slot].file_id {
+                let old = std::mem::take(&mut self.marker_ui[slot]);
+                self.marker_ui[slot].file_id = self.views[slot].file_id;
+                drop_later(Some(old));
+            }
+            let Some(job) = self.marker_ui[slot].job.take() else {
+                self.start_marker_refresh(ctx, slot);
+                continue;
+            };
+            match job {
+                MarkerJob::Prepare {
+                    document,
+                    revision,
+                    command,
+                    rx,
+                } => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.marker_ui[slot].job = Some(MarkerJob::Prepare {
+                            document,
+                            revision,
+                            command,
+                            rx,
+                        })
+                    }
+                    Err(_) => {
+                        self.takm_note =
+                            Some(("편집 자료 준비가 중단됐어요.".into(), ctx.input(|i| i.time)))
+                    }
+                    Ok(Err(reason)) => self.takm_note = Some((reason, ctx.input(|i| i.time))),
+                    Ok(Ok(prepared)) => {
+                        let same = self.views[slot].edit_document.as_ref().is_some_and(|s| {
+                            s.lock()
+                                .ok()
+                                .is_some_and(|d| d.id() == document && d.revision() == revision)
+                        });
+                        if !same || self.views[slot].edit_selection_state() != *command.selection()
+                        {
+                            drop_later(Some(prepared));
+                            self.takm_note = Some((
+                                "선택이나 파일이 바뀌어 편집을 취소했어요.".into(),
+                                ctx.input(|i| i.time),
+                            ));
+                            continue;
+                        }
+                        let installed = self.views[slot]
+                            .edit_document
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .ok()
+                            .and_then(|mut d| d.install_prepared(revision, prepared.input).ok())
+                            .is_some();
+                        if installed {
+                            self.marker_sessions.insert(document, prepared.session);
+                            self.start_prepared_command(ctx, slot, document, command);
+                        }
+                    }
+                },
+                MarkerJob::Edit {
+                    document,
+                    selection,
+                    rx,
+                } => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.marker_ui[slot].job = Some(MarkerJob::Edit {
+                            document,
+                            selection,
+                            rx,
+                        })
+                    }
+                    Err(_) => {
+                        self.takm_note =
+                            Some(("마커 편집이 중단됐어요.".into(), ctx.input(|i| i.time)))
+                    }
+                    Ok(Err(reason)) => self.takm_note = Some((reason, ctx.input(|i| i.time))),
+                    Ok(Ok(done)) => {
+                        let same = self.views[slot]
+                            .edit_document
+                            .as_ref()
+                            .is_some_and(|s| s.lock().ok().is_some_and(|d| d.id() == document));
+                        if !same || self.views[slot].edit_selection_state() != selection {
+                            drop_later(Some(done));
+                            self.takm_note = Some((
+                                "선택이나 파일이 바뀌어 편집을 취소했어요.".into(),
+                                ctx.input(|i| i.time),
+                            ));
+                            continue;
+                        }
+                        if let Some(patch) = done.patch {
+                            match self.commit_marker_edit(slot, Arc::new(patch)) {
+                                Ok(()) => {
+                                    if let Some(view) = done.view {
+                                        if let Err(error) = self.publish_marker_view(slot, view) {
+                                            self.takm_note =
+                                                Some((edit_error(error), ctx.input(|i| i.time)));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    drop_later(done.view);
+                                    self.takm_note =
+                                        Some((edit_error(error), ctx.input(|i| i.time)));
+                                    continue;
+                                }
+                            }
+                        }
+                        self.takm_note = Some((done.message, ctx.input(|i| i.time)));
+                    }
+                },
+                MarkerJob::Refresh {
+                    document,
+                    revision,
+                    rx,
+                } => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.marker_ui[slot].job = Some(MarkerJob::Refresh {
+                            document,
+                            revision,
+                            rx,
+                        })
+                    }
+                    Err(_) => {
+                        self.takm_note =
+                            Some(("마커 화면 갱신이 중단됐어요.".into(), ctx.input(|i| i.time)))
+                    }
+                    Ok(Err(reason)) => self.takm_note = Some((reason, ctx.input(|i| i.time))),
+                    Ok(Ok(data)) => {
+                        let same = self.views[slot].edit_document.as_ref().is_some_and(|s| {
+                            s.lock()
+                                .ok()
+                                .is_some_and(|d| d.id() == document && d.revision() == revision)
+                        });
+                        if same {
+                            let _ = self.publish_marker_view(slot, data);
+                        } else {
+                            drop_later(Some(data));
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn start_marker_refresh(&mut self, ctx: &egui::Context, slot: usize) {
+        let view = &self.views[slot];
+        let Some(snapshot) = view.edit_refresh_snapshot() else {
+            return;
+        };
+        let Some(data) = view.data.clone() else {
+            return;
+        };
+        let (document, revision) = (snapshot.document_id(), snapshot.revision());
+        let (tx, rx) = mpsc::channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result =
+                tak_core::view_data::ViewData::rebuild_edited(data.take.clone(), &snapshot)
+                    .map_err(edit_error);
+            trace_timing("undo/redo view rebuild", started);
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+        self.marker_ui[slot].job = Some(MarkerJob::Refresh {
+            document,
+            revision,
+            rx,
+        });
+    }
+
+    fn refresh_marker_ui(&mut self, slot: usize) {
+        let view = &self.views[slot];
+        let Some(data) = &view.data else { return };
+        let ui = &mut self.marker_ui[slot];
+        if ui.file_id != view.file_id {
+            *ui = MarkerUi {
+                file_id: view.file_id,
+                ..MarkerUi::default()
+            };
+        }
+        let assets: Vec<_> = data
+            .take
+            .assets
+            .iter()
+            .map(|a| AssetChoice {
+                uid: a.uid,
+                name: a.name.clone(),
+            })
+            .chain(data.take.label_groups.iter().map(|a| AssetChoice {
+                uid: a.uid,
+                name: a.name.clone(),
+            }))
+            .collect();
+        if ui
+            .labeling
+            .asset_filter
+            .is_some_and(|id| !assets.iter().any(|asset| asset.uid == id))
+        {
+            ui.labeling.asset_filter = None;
+        }
+        let mut groups = Vec::new();
+        let mut unlabeled = Vec::new();
+        let mut seen = HashSet::new();
+        let mut selected_labeled_count = 0;
+        for (gi, group) in data.groups.iter().enumerate() {
+            let mut rows = Vec::new();
+            let mut parents = HashSet::new();
+            for &index in &group.members {
+                let Some(m) = data.markers.get(index) else {
+                    continue;
+                };
+                let selected = view.selected.contains(&index);
+                if m.kind == MarkerKind::Unlabeled || group.kind == GroupKind::Unlabeled {
+                    if m.n_samples == 0 {
+                        continue;
+                    }
+                    unlabeled.push(UnlabeledRow {
+                        uid: m.uid,
+                        name: m.name.clone(),
+                        fill_pct: m.fill_pct,
+                        present: m.present(view.pb.frame),
+                        selected,
+                        primary: view.primary == Some(index),
+                    });
+                    continue;
+                }
+                let key = m
+                    .parent
+                    .filter(|p| *p != [0; 16])
+                    .zip(m.slot)
+                    .map(|(parent, slot)| LabelKey { parent, slot });
+                if let Some(key) = key {
+                    parents.insert(key.parent);
+                    seen.insert(key);
+                }
+                if selected && key.is_some() {
+                    selected_labeled_count += 1;
+                }
+                rows.push(LabelRow {
+                    key,
+                    track_uid: Some(m.uid),
+                    name: m.name.clone(),
+                    color: theme::color(m.color),
+                    fill_pct: m.fill_pct,
+                    present: m.present(view.pb.frame),
+                    selected,
+                    primary: view.primary == Some(index),
+                });
+            }
+            if rows.is_empty() && !matches!(group.kind, GroupKind::AssetTemplate | GroupKind::LabelGroup) {
+                continue;
+            }
+            let asset_uid = group
+                .asset
+                .and_then(|i| data.take.assets.get(i).map(|a| a.uid))
+                .or_else(|| (parents.len() == 1).then(|| *parents.iter().next().unwrap()));
+            let id = gi as u64;
+            groups.push(LabelGroup {
+                id,
+                asset_uid,
+                title: match group.kind {
+                    GroupKind::AssetExtra => group.asset.and_then(|i| data.take.assets.get(i))
+                        .map(|asset| format!("{} · Extra Markers", asset.name))
+                        .unwrap_or_else(|| "Extra Markers".into()),
+                    GroupKind::OtherParent => asset_uid.map(|uid| format!("Other Parent {}", &tak_core::tak::uid_hex(&uid)[..8]))
+                        .unwrap_or_else(|| "Other Parent".into()),
+                    GroupKind::Unknown => "Unknown Membership".into(),
+                    _ => group.title.clone(),
+                },
+                collapsed: view.labels.collapsed.contains(&(id as usize)),
+                labels: rows,
+            });
+        }
+        let declarations = data
+            .take
+            .assets
+            .iter()
+            .flat_map(|asset| {
+                asset.model.iter().flat_map(move |model| {
+                    model
+                        .constraints
+                        .iter()
+                        .filter(|c| c.primary)
+                        .map(move |c| {
+                            (
+                                LabelKey {
+                                    parent: asset.uid,
+                                    slot: c.slot,
+                                },
+                                c.name.clone(),
+                            )
+                        })
+                })
+            })
+            .chain(data.take.label_groups.iter().flat_map(|group| {
+                group.labels.iter().map(move |(name, slot)| {
+                    (
+                        LabelKey {
+                            parent: group.uid,
+                            slot: *slot as i32,
+                        },
+                        name.clone(),
+                    )
+                })
+            }));
+        for (key, name) in declarations {
+            if !seen.insert(key) {
+                continue;
+            }
+            let index = groups
+                .iter()
+                .position(|group| group.asset_uid == Some(key.parent)
+                    && (data.groups.get(group.id as usize).is_some_and(|g| matches!(g.kind, GroupKind::AssetTemplate | GroupKind::LabelGroup))
+                        || group.id == panels::declared_group_id(&key.parent) as u64))
+                .unwrap_or_else(|| {
+                    let id = panels::declared_group_id(&key.parent) as u64;
+                    let title = assets
+                        .iter()
+                        .find(|a| a.uid == key.parent)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "Labels".to_owned());
+                    groups.push(LabelGroup {
+                        id,
+                        asset_uid: Some(key.parent),
+                        title,
+                        collapsed: view.labels.collapsed.contains(&(id as usize)),
+                        labels: Vec::new(),
+                    });
+                    groups.len() - 1
+                });
+            groups[index].labels.push(LabelRow {
+                key: Some(key),
+                track_uid: None,
+                name,
+                color: theme::TEXT_DIM,
+                fill_pct: 0.0,
+                present: false,
+                selected: false,
+                primary: false,
+            });
+        }
+        ui.labeling.assets = assets;
+        ui.labeling.filter = view.labels.filter.clone();
+        ui.labeling.groups = groups;
+        ui.labeling.unlabeled = unlabeled;
+        ui.labeling.armed = view.armed_label;
+        ui.labeling.selected_labeled_count = selected_labeled_count;
+        ui.labeling.blocked_reason = if view.remote.is_some() {
+            Some("원격 파일은 편집할 수 없어요.".to_owned())
+        } else if self.dirty_prompt.is_some()
+            || ui.job.is_some()
+            || ui.save.is_some()
+            || view.edit_refresh.is_some()
+            || view.loading.is_some()
+        {
+            Some("마커 작업이 끝날 때까지 기다려 주세요.".to_owned())
+        } else {
+            None
+        };
+        ui.tools.selected_tracks = view
+            .ordered_selection()
+            .into_iter()
+            .filter_map(|index| data.markers.get(index))
+            .map(|m| TrackChoice {
+                uid: m.uid,
+                name: m.name.clone(),
+            })
+            .collect();
+        ui.tools.editable_track_count = data.markers.len();
+        ui.tools.range = view
+            .range
+            .and_then(|(a, b)| Some((u32::try_from(a).ok()?, u32::try_from(b).ok()?)));
+        ui.tools.sample_rate_hz = Some(data.take.frame_rate);
+        ui.tools.blocked_reason = ui.labeling.blocked_reason.clone();
+    }
+
+    pub(super) fn labeling_tab(&mut self, ui: &mut egui::Ui) {
+        let slot = self.active;
+        if self.views[slot].data.is_none() {
+            ui.label("파일을 열면 여기에 나와요.");
+            return;
+        }
+        self.refresh_marker_ui(slot);
+        let target = self.views[slot].labels.scroll_to.take().and_then(|index| {
+            self.views[slot].data.as_ref()?.markers.get(index).map(|m| m.uid)
+        });
+        if target.is_some() {
+            self.marker_ui[slot].labeling.scroll_to_track = target;
+        }
+        let action = labeling::show(ui, &self.marker_ui[slot].labeling);
+        self.marker_ui[slot].labeling.scroll_to = None;
+        self.marker_ui[slot].labeling.scroll_to_track = None;
+        if let Some(action) = action {
+            self.labeling_action(ui.ctx(), slot, action);
+        }
+    }
+
+    pub(super) fn edit_tools_tab(&mut self, ui: &mut egui::Ui) {
+        let slot = self.active;
+        if self.views[slot].data.is_none() {
+            ui.label("파일을 열면 여기에 나와요.");
+            return;
+        }
+        self.refresh_marker_ui(slot);
+        if let Some(action) = edit_tools::show(ui, &self.marker_ui[slot].tools) {
+            self.tools_action(ui.ctx(), slot, action);
+        }
+    }
+
+    fn labeling_action(&mut self, ctx: &egui::Context, slot: usize, action: LabelingAction) {
+        if let LabelingAction::SetFilter(filter) = action {
+            self.views[slot].labels.filter = filter;
+            return;
+        }
+        if let LabelingAction::ToggleGroup(id) = action {
+            self.observe(true);
+            let folds = &mut self.views[slot].labels.collapsed;
+            if !folds.remove(&(id as usize)) {
+                folds.insert(id as usize);
+            }
+            self.refresh_marker_ui(slot);
+            self.observe(true);
+            return;
+        }
+        if action == LabelingAction::RemoveMarker {
+            self.delete_selected(ctx, slot);
+            return;
+        }
+        if action == LabelingAction::Unlabel {
+            self.unlabel_selected(ctx, slot);
+            return;
+        }
+        let setting = match &action {
+            LabelingAction::SetMode(v) => Some(PanelSetting::Mode(*v)),
+            LabelingAction::SetIncrement(v) => Some(PanelSetting::Increment(*v)),
+            LabelingAction::SetBackward(v) if *v || self.marker_ui[slot].labeling.forward => {
+                Some(PanelSetting::Backward(*v))
+            }
+            LabelingAction::SetForward(v) if *v || self.marker_ui[slot].labeling.backward => {
+                Some(PanelSetting::Forward(*v))
+            }
+            LabelingAction::SetBackward(_) | LabelingAction::SetForward(_) => return,
+            LabelingAction::SetAssetFilter(v) => Some(PanelSetting::Asset(*v)),
+            _ => None,
+        };
+        if let Some(value) = setting {
+            self.change_panel_setting(slot, value);
+            return;
+        }
+        let ui = &mut self.marker_ui[slot].labeling;
+        let view = &mut self.views[slot];
+        match action {
+            LabelingAction::SetMode(_)
+            | LabelingAction::SetIncrement(_)
+            | LabelingAction::SetBackward(_)
+            | LabelingAction::SetForward(_)
+            | LabelingAction::SetAssetFilter(_) => unreachable!(),
+            LabelingAction::ToggleGroup(_) | LabelingAction::SetFilter(_) => unreachable!(),
+            LabelingAction::StepLabel { forward } => {
+                let keys = visible_labels(ui);
+                let next = match view.armed_label.and_then(|key| keys.iter().position(|k| *k == key)) {
+                    Some(i) => {
+                        if forward {
+                            i.checked_add(1).filter(|n| *n < keys.len())
+                        } else {
+                            i.checked_sub(1)
+                        }
+                    },
+                    None if forward => (!keys.is_empty()).then_some(0),
+                    None => keys.len().checked_sub(1),
+                };
+                if let Some(key) = next.map(|i| keys[i]) {
+                    view.armed_label = Some(key);
+                    ui.scroll_to = Some(key);
+                    let track = ui
+                        .groups
+                        .iter()
+                        .flat_map(|g| &g.labels)
+                        .find(|row| row.key == Some(key))
+                        .and_then(|row| row.track_uid);
+                    if let Some(index) = track.and_then(|uid| {
+                        view.data
+                            .as_ref()?
+                            .markers
+                            .iter()
+                            .position(|m| m.uid == uid)
+                    }) {
+                        view.select(index, false);
+                    }
+                }
+            }
+            LabelingAction::SelectLabel {
+                key,
+                track_uid,
+                additive,
+            } => {
+                view.armed_label = key;
+                if let (Some(uid), Some(data)) = (track_uid, &view.data) {
+                    if let Some(index) = data.markers.iter().position(|m| m.uid == uid) {
+                        view.select(index, additive);
+                    }
+                }
+            }
+            LabelingAction::SelectUnlabeled { uid, additive } => {
+                if let Some(index) = view
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.markers.iter().position(|m| m.uid == uid))
+                {
+                    view.select(index, additive);
+                }
+            }
+            LabelingAction::Unlabel | LabelingAction::RemoveMarker => {}
+        }
+    }
+
+    fn tools_action(&mut self, ctx: &egui::Context, slot: usize, action: EditToolsAction) {
+        match action {
+            EditToolsAction::SetInterpolation(value) => {
+                self.change_panel_setting(slot, PanelSetting::Interpolation(value))
+            }
+            EditToolsAction::SetMaxGap(value) => {
+                self.change_panel_setting(slot, PanelSetting::MaxGap(value))
+            }
+            EditToolsAction::SetMaxFrequency(value) => {
+                self.change_panel_setting(slot, PanelSetting::MaxFrequency(value))
+            }
+            EditToolsAction::Fill(scope) => {
+                let method = self.marker_ui[slot].tools.interpolation;
+                self.fill_markers(ctx, slot, scope, method);
+            }
+            EditToolsAction::Smooth(scope) => self.smooth_markers(ctx, slot, scope),
+        }
+    }
+
+    fn unlabel_selected(&mut self, ctx: &egui::Context, slot: usize) {
+        self.refresh_marker_ui(slot);
+        if let Some(reason) = self.marker_ui[slot].labeling.unlabel_reason() {
+            self.takm_note = Some((format!("Unlabel · {reason}"), ctx.input(|i| i.time)));
+            return;
+        }
+        let view = &self.views[slot];
+        let state = &self.marker_ui[slot].labeling;
+        let selection = view.edit_selection_state();
+        let Ok(current_frame) = u32::try_from(view.pb.frame) else {
+            return;
+        };
+        let request = UnlabelRequest {
+            tracks: selection.selected.iter().copied().collect(),
+            current_frame,
+            scope: LabelScope::SelectedOrAll {
+                range: self.marker_ui[slot].tools.range,
+            },
+            backward: state.backward,
+            forward: state.forward,
+            selection,
+        };
+        self.start_marker_command(ctx, slot, MarkerCommand::Unlabel(request));
+    }
+
+    pub(super) fn delete_selected(&mut self, ctx: &egui::Context, slot: usize) {
+        let view = &self.views[slot];
+        let selection = view.edit_selection_state();
+        if selection.selected.is_empty() {
+            self.takm_note = Some(("Delete · Select markers".into(), ctx.input(|i| i.time)));
+            return;
+        }
+        let Ok(current_frame) = u32::try_from(view.pb.frame) else { return };
+        let range = view.range.and_then(|(a, b)| Some((u32::try_from(a).ok()?, u32::try_from(b).ok()?)));
+        let request = DeleteRequest { selection, range, current_frame };
+        self.start_marker_command(ctx, slot, MarkerCommand::Delete(request));
+    }
+
+    pub(super) fn label_sample(&mut self, ctx: &egui::Context, slot: usize, source: Uid) {
+        self.refresh_marker_ui(slot);
+        let view = &self.views[slot];
+        let ui = &self.marker_ui[slot].labeling;
+        let Some(target) = view.armed_label else {
+            return;
+        };
+        let Ok(current_frame) = u32::try_from(view.pb.frame) else {
+            return;
+        };
+        let request = LabelRequest {
+            source,
+            target,
+            current_frame,
+            scope: LabelScope::SelectedOrAll {
+                range: self.marker_ui[slot].tools.range,
+            },
+            backward: ui.backward,
+            forward: ui.forward,
+            increment: ui.increment,
+            visible_labels: increment_order(ui, target),
+            selection: view.edit_selection_state(),
+        };
+        self.start_marker_command(ctx, slot, MarkerCommand::Label(request));
+    }
+
+    fn fill_markers(
+        &mut self,
+        ctx: &egui::Context,
+        slot: usize,
+        scope: edit_tools::FillScope,
+        method: FillMethod,
+    ) {
+        self.refresh_marker_ui(slot);
+        let tools = &self.marker_ui[slot].tools;
+        if let Some(reason) = tools.fill_reason_for(scope, method) {
+            self.takm_note = Some((format!("Fill · {reason}"), ctx.input(|i| i.time)));
+            return;
+        }
+        let scope = match scope {
+            edit_tools::FillScope::SelectedRange => CoreFillScope::Selected,
+            edit_tools::FillScope::SelectedTracksAllFrames => CoreFillScope::All,
+            edit_tools::FillScope::Everything => CoreFillScope::Everything,
+        };
+        let command = MarkerCommand::Fill {
+            method,
+            scope,
+            range: tools.range,
+            max_gap: tools.parsed_max_gap().unwrap(),
+            selection: self.views[slot].edit_selection_state(),
+        };
+        self.start_marker_command(ctx, slot, command);
+    }
+
+    fn smooth_markers(&mut self, ctx: &egui::Context, slot: usize, scope: edit_tools::SmoothScope) {
+        self.refresh_marker_ui(slot);
+        let tools = &self.marker_ui[slot].tools;
+        if let Some(reason) = tools.smooth_reason(scope) {
+            self.takm_note = Some((format!("Smooth · {reason}"), ctx.input(|i| i.time)));
+            return;
+        }
+        let scope = match scope {
+            edit_tools::SmoothScope::SelectedRange => CoreSmoothScope::Selection,
+            edit_tools::SmoothScope::SelectedTracksAllFrames => CoreSmoothScope::Track,
+            edit_tools::SmoothScope::AllTracksSelectedRange => CoreSmoothScope::AllInRange,
+            edit_tools::SmoothScope::AllTracksAllFrames => CoreSmoothScope::AllTracks,
+        };
+        let command = MarkerCommand::Smooth {
+            scope,
+            range: tools.range,
+            cutoff: tools.parsed_ui_cutoff().unwrap(),
+            rate: tools.sample_rate_hz.unwrap(),
+            selection: self.views[slot].edit_selection_state(),
+        };
+        self.start_marker_command(ctx, slot, command);
+    }
+
+    pub(super) fn marker_keys(&mut self, ctx: &egui::Context) {
+        if self.hold.is_some() || self.comment_edit.is_some() || ctx.memory(|m| m.any_popup_open())
+        {
+            return;
+        }
+        if !ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: Key::D | Key::Q | Key::S | Key::A | Key::C | Key::X | Key::Delete,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        }) {
+            return;
+        }
+        let slot = self.active;
+        self.refresh_marker_ui(slot);
+        if exact_key(ctx, Key::Delete, false, false, false) {
+            let comments_focused = self.dock.find_active_focused().is_some_and(|(_, pane)| *pane == Pane::Comments);
+            if !comments_focused && self.views[slot].picked.is_none() {
+                self.delete_selected(ctx, slot);
+            }
+        }
+        if exact_key(ctx, Key::D, false, true, false) {
+            self.unlabel_selected(ctx, slot);
+        }
+        if exact_key(ctx, Key::D, false, false, false) {
+            let mode = if self.marker_ui[slot].labeling.mode == LabelingMode::QuickLabel {
+                LabelingMode::Select
+            } else {
+                LabelingMode::QuickLabel
+            };
+            self.labeling_action(ctx, slot, LabelingAction::SetMode(mode));
+        }
+        if exact_key(ctx, Key::Q, false, false, false) {
+            self.labeling_action(ctx, slot, LabelingAction::SetMode(LabelingMode::Select));
+        }
+        if exact_key(ctx, Key::S, false, false, false) {
+            self.labeling_action(ctx, slot, LabelingAction::StepLabel { forward: true });
+        }
+        if exact_key(ctx, Key::A, false, false, false) {
+            self.labeling_action(ctx, slot, LabelingAction::StepLabel { forward: false });
+        }
+        if exact_key(ctx, Key::C, false, true, false) {
+            self.fill_markers(
+                ctx,
+                slot,
+                edit_tools::FillScope::SelectedRange,
+                FillMethod::PatternBased,
+            );
+        }
+        if exact_key(ctx, Key::C, false, false, false) {
+            self.fill_markers(
+                ctx,
+                slot,
+                edit_tools::FillScope::SelectedRange,
+                FillMethod::Cubic,
+            );
+        }
+        if exact_key(ctx, Key::X, true, false, true) {
+            self.smooth_markers(ctx, slot, edit_tools::SmoothScope::AllTracksAllFrames);
+        }
+        if exact_key(ctx, Key::X, false, true, false) {
+            self.smooth_markers(ctx, slot, edit_tools::SmoothScope::AllTracksSelectedRange);
+        }
+        if exact_key(ctx, Key::X, false, false, false) {
+            self.smooth_markers(ctx, slot, edit_tools::SmoothScope::SelectedRange);
+        }
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+
+
+
+    fn labeling_data(path: &str) -> tak_core::view_data::ViewData {
+        let mut take = views::sample_take(path, &["A", "B", "Extra", "Unlabeled 4"]);
+        for (i, track) in take.trajectories[..3].iter_mut().enumerate() {
+            track.kind = MarkerKind::OtherParent;
+            track.parent_uid = Some(if i < 2 { [7; 16] } else { [8; 16] });
+            track.slot = Some(i as i32 + 1);
+        }
+        tak_core::view_data::ViewData::build(take)
+    }
+
+    fn labeling_app(ctx: &egui::Context) -> TakViewerApp {
+        let mut app = TakViewerApp::build(ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(labeling_data("labeling.tak"), rx, 10, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.refresh_marker_ui(0);
+        app.observe(false);
+        app
+    }
+
+    #[test]
+    fn merged_panel_selection_undo_restores_click_order_primary_and_armed_label() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let choose = |app: &mut TakViewerApp, index: usize, additive| {
+            let marker = &app.views[0].data.as_ref().unwrap().markers[index];
+            let action = LabelingAction::SelectLabel {
+                key: marker.parent.zip(marker.slot).map(|(parent, slot)| LabelKey { parent, slot }),
+                track_uid: Some(marker.uid), additive,
+            };
+            app.labeling_action(&ctx, 0, action);
+            app.observe(true);
+        };
+        choose(&mut app, 1, false);
+        choose(&mut app, 0, true);
+        let armed = app.views[0].armed_label;
+        assert_eq!(app.views[0].ordered_selection(), [1, 0]);
+        assert_eq!(app.views[0].primary, Some(0), "last click is the Pattern target");
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.views[0].ordered_selection(), [1]);
+        assert_eq!(app.views[0].primary, Some(1));
+        assert_ne!(app.views[0].armed_label, armed);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.views[0].ordered_selection(), [1, 0]);
+        assert_eq!(app.views[0].armed_label, armed);
+        choose(&mut app, 0, true);
+        assert_eq!(app.views[0].ordered_selection(), [1]);
+        assert_eq!(app.views[0].primary, Some(1));
+    }
+
+    #[test]
+    fn merged_panel_folds_share_undo_and_survive_a_reordered_view_rebuild() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        app.labeling_action(&ctx, 0, LabelingAction::ToggleGroup(0));
+        assert!(app.views[0].labels.collapsed.contains(&0));
+        assert!(app.marker_ui[0].labeling.groups[0].collapsed);
+        assert_eq!(app.history.undo.len(), 1, "one shared fold action");
+        app.labeling_action(&ctx, 0, LabelingAction::SetFilter("Extra".into()));
+        app.refresh_marker_ui(0);
+        app.observe(true);
+        assert_eq!(app.history.undo.len(), 1, "search is not a global undo action");
+        let revision = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
+        let mut rebuilt = labeling_data("labeling.tak");
+        rebuilt.groups.swap(0, 1);
+        for (group, entry) in rebuilt.groups.iter().enumerate() {
+            for &index in &entry.members { rebuilt.markers[index].group = group; }
+        }
+        rebuilt.edit_revision = Some(revision);
+        app.views[0].edit_refresh = Some(revision);
+        app.views[0].publish_edited_view(rebuilt).unwrap();
+        app.refresh_marker_ui(0);
+        app.observe(true);
+        assert!(app.views[0].labels.collapsed.contains(&1));
+        assert!(!app.views[0].labels.collapsed.contains(&0));
+        assert_eq!(app.history.undo.len(), 1, "automatic reordering is not another fold action");
+        app.undo_redo(&ctx, false);
+        app.refresh_marker_ui(0);
+        assert!(!app.views[0].labels.collapsed.contains(&1));
+        assert!(!app.marker_ui[0].labeling.groups[1].collapsed);
+        assert_eq!(app.views[0].labels.filter, "Extra");
+        app.undo_redo(&ctx, true);
+        app.refresh_marker_ui(0);
+        assert!(app.views[0].labels.collapsed.contains(&1));
+        assert!(app.marker_ui[0].labeling.groups[1].collapsed);
+        assert!(!app.views[0].labels.collapsed.contains(&0));
+    }
+
+    #[test]
+    fn hidden_armed_label_enters_filtered_results_at_each_end_and_increments_to_first() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let keys: Vec<_> = app.marker_ui[0].labeling.groups.iter().flat_map(|g| &g.labels).filter_map(|row| row.key).collect();
+        let hidden = keys[2];
+        for forward in [true, false] {
+            app.views[0].armed_label = Some(hidden);
+            app.views[0].labels.filter = "".into();
+            app.refresh_marker_ui(0);
+            app.marker_ui[0].labeling.asset_filter = Some([7; 16]);
+            app.labeling_action(&ctx, 0, LabelingAction::StepLabel { forward });
+            assert_eq!(app.views[0].armed_label, Some(keys[if forward { 0 } else { 1 }]));
+        }
+        let ui = &mut app.marker_ui[0].labeling;
+        ui.asset_filter = None;
+        ui.filter = "B".into();
+        assert_eq!(increment_order(ui, hidden), [hidden, keys[1]]);
+        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden), hidden).unwrap(), Some(keys[1]));
+        ui.filter = "no match".into();
+        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden), hidden).unwrap(), None);
+    }
+
+    #[test]
+    fn declaration_only_group_fold_survives_first_track_appearance_disappearance_and_undo() {
+        let ctx = egui::Context::default();
+        let make = |actual: bool| {
+            let mut take = views::sample_take("declarations.tak", &["Unlabeled 1"]);
+            take.label_groups.push(tak_core::tak::LabelGroup {
+                uid: [7; 16], name: "Labels".into(), labels: vec![("A".into(), 1), ("B".into(), 2)], member_rgb: vec![],
+            });
+            if actual {
+                let mut track = take.trajectories[0].clone();
+                track.uid = [2; 16]; track.name = "A".into(); track.kind = MarkerKind::OtherParent;
+                track.parent_uid = Some([7; 16]); track.slot = Some(1);
+                take.trajectories.push(track);
+            }
+            tak_core::view_data::ViewData::build(take)
+        };
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(make(false), rx, 10, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.refresh_marker_ui(0);
+        app.observe(false);
+        let id = app.marker_ui[0].labeling.groups[0].id;
+        assert_eq!(app.marker_ui[0].labeling.groups.len(), 1);
+        assert_eq!(app.marker_ui[0].labeling.groups[0].labels.len(), 2);
+        app.labeling_action(&ctx, 0, LabelingAction::ToggleGroup(id));
+        assert_eq!(app.history.undo.len(), 1);
+        for actual in [true, false, true] {
+            let revision = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
+            let mut rebuilt = make(actual);
+            rebuilt.edit_revision = Some(revision);
+            app.views[0].edit_refresh = Some(revision);
+            app.views[0].publish_edited_view(rebuilt).unwrap();
+            app.refresh_marker_ui(0);
+            app.observe(true);
+            assert_eq!(app.history.undo.len(), 1, "appearance/disappearance adds no folding action");
+            assert_eq!(app.marker_ui[0].labeling.groups.len(), 1);
+            assert!(app.marker_ui[0].labeling.groups[0].collapsed);
+            app.undo_redo(&ctx, false);
+            app.refresh_marker_ui(0);
+            assert!(!app.marker_ui[0].labeling.groups[0].collapsed);
+            app.undo_redo(&ctx, true);
+            app.refresh_marker_ui(0);
+            assert!(app.marker_ui[0].labeling.groups[0].collapsed);
+        }
+    }
+
+    #[test]
+    fn missing_primary_declarations_stay_out_of_the_assets_extra_marker_group() {
+        let ctx = egui::Context::default();
+        let mut take = views::sample_take("extra_only.tak", &["Extra"]);
+        take.assets.push(tak_core::tak::SkeletonAsset {
+            uid: [7; 16], name: "Asset".into(), markerset_name: None,
+            model: Some(tak_core::tak::SkeletonModel { serialization_version: 1, template_code: 1, joints: vec![],
+                constraints: vec![tak_core::tak::Constraint { joint_id: 0, slot_raw: 1, slot: 1, name: "Primary".into(), local: [0.0; 3], enabled: true, primary: true }] }),
+            sticks: vec![], marker_colors: vec![],
+        });
+        let track = &mut take.trajectories[0];
+        track.kind = MarkerKind::SkeletonExtra; track.asset_uid = Some([7; 16]);
+        track.parent_uid = Some([7; 16]); track.slot = Some(-1);
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(tak_core::view_data::ViewData::build(take), rx, 10, 1.0, 0.0);
+        app.refresh_marker_ui(0);
+        let groups = &app.marker_ui[0].labeling.groups;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].labels.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), ["Primary"]);
+        assert_eq!(groups[1].labels.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), ["Extra"]);
+        assert!(groups[1].title.ends_with("Extra Markers"));
+    }
+
+    #[test]
+    fn merged_panel_uses_view_selection_scroll_and_resets_for_a_new_file() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        app.views[0].labels.filter = "A".into();
+        app.views[0].labels.collapsed.insert(0);
+        app.marker_ui[0].labeling.mode = LabelingMode::Select;
+        app.refresh_marker_ui(0);
+        assert_eq!(app.marker_ui[0].labeling.filter, "A");
+        assert!(app.marker_ui[0].labeling.groups[0].collapsed);
+        for index in [2, 3] {
+            app.views[0].select(index, false);
+            assert_eq!(app.views[0].labels.scroll_to, Some(index));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.labeling_tab(ui));
+            });
+            assert_eq!(app.views[0].labels.scroll_to, None);
+            assert_eq!(app.marker_ui[0].labeling.scroll_to_track, None, "one-shot scroll consumed");
+        }
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(labeling_data("new.tak"), rx, 11, 1.0, 0.0);
+        app.refresh_marker_ui(0);
+        assert!(app.views[0].labels.filter.is_empty());
+        assert!(!app.views[0].labels.collapsed.contains(&0));
+        assert!(app.marker_ui[0].labeling.filter.is_empty());
+        assert_eq!(app.marker_ui[0].labeling.mode, LabelingMode::QuickLabel);
+        assert!(app.views[0].labels.collapsed.contains(&2), "unlabeled retains its default fold");
+    }
+
+    #[test]
+    fn panel_settings_undo_redo_and_merge_each_field() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(views::sample_data("settings.tak", &["M"]), rx, 10, 1.0, 0.0);
+        app.views[0].fresh = false;
+        app.views[0].fit_pending = false;
+        app.refresh_marker_ui(0);
+        app.observe(false);
+        let changes = [
+            PanelSetting::Mode(LabelingMode::Select),
+            PanelSetting::Increment(false),
+            PanelSetting::Backward(false),
+            PanelSetting::Forward(false),
+            PanelSetting::Asset(Some([3; 16])),
+            PanelSetting::Interpolation(FillMethod::PatternBased),
+            PanelSetting::MaxGap("70".into()),
+            PanelSetting::MaxFrequency("5".into()),
+        ];
+        for value in changes {
+            let before = app.panel_setting(0, &value);
+            app.change_panel_setting(0, value.clone());
+            app.undo_redo(&ctx, false);
+            assert_eq!(app.panel_setting(0, &value), before);
+            app.undo_redo(&ctx, true);
+            assert_eq!(app.panel_setting(0, &value), value);
+        }
+        app.change_panel_setting(0, PanelSetting::MaxGap("7".into()));
+        app.change_panel_setting(0, PanelSetting::MaxGap("71".into()));
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.marker_ui[0].tools.max_gap, "70");
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.marker_ui[0].tools.max_gap, "71");
+    }
+
+    #[test]
+    fn first_job_blocks_close_replace_and_exit_until_a_choice() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(views::sample_data("pending.tak", &["M"]), rx, 10, 1.0, 0.0);
+        let document = app.views[0].edit_document.as_ref().unwrap().lock().unwrap();
+        let (id, revision) = (document.id(), document.revision());
+        drop(document);
+        let (_job_tx, job_rx) = mpsc::channel();
+        app.marker_ui[0].job = Some(MarkerJob::Refresh {
+            document: id,
+            revision,
+            rx: job_rx,
+        });
+        assert!(!app.quick_label_available(&ctx, 0));
+        app.close_editor(0);
+        assert!(app.dirty_prompt.is_some());
+        app.dirty_prompt = None;
+        app.open_in(&ctx, 0, "other.tak".into());
+        assert!(app.dirty_prompt.is_some());
+        assert!(app.views[0].loading.is_none());
+        app.dirty_prompt = None;
+        app.request_exit(&ctx);
+        assert!(app.dirty_prompt.is_some());
+        assert!(!app.exit_approved);
+        app.discard_pending_transition(&ctx);
+        assert!(app.marker_ui[0].job.is_none());
+        assert!(app.exit_approved);
+        let popup = egui::Id::new("phase4b_popup");
+        ctx.memory_mut(|memory| memory.open_popup(popup));
+        assert!(!app.quick_label_available(&ctx, 0));
+        ctx.memory_mut(|memory| memory.close_popup());
+    }
+
+    #[test]
+    fn ctrl_w_waits_for_a_running_marker_job_then_discard_closes_its_view() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        let (_tx, rx) = mpsc::channel();
+        app.views[1].show(views::sample_data("pending.tak", &["M"]), rx, 10, 1.0, 0.0);
+        app.activate(1);
+        let document = app.views[1].edit_document.as_ref().unwrap().lock().unwrap();
+        let (id, revision) = (document.id(), document.revision());
+        drop(document);
+        let (_job_tx, job_rx) = mpsc::channel();
+        app.marker_ui[1].job = Some(MarkerJob::Refresh { document: id, revision, rx: job_rx });
+        let event = egui::Event::Key { key: Key::W, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers { ctrl: true, command: true, ..Modifiers::NONE } };
+        let _ = ctx.run(egui::RawInput { events: vec![event], ..Default::default() }, |ctx| app.handle_keys(ctx, 0.0));
+        assert_eq!(app.dirty_prompt.as_ref().unwrap().slot, 1);
+        assert!(matches!(app.dirty_prompt.as_ref().unwrap().transition, PendingTransition::CloseView { slot: 1 }));
+        assert_eq!(app.open_views(), vec![0, 1]);
+        assert!(app.marker_ui[1].job.is_some());
+        app.discard_pending_transition(&ctx);
+        assert_eq!(app.open_views(), vec![0]);
+        assert!(app.marker_ui[1].job.is_none());
+        assert!(app.views[1].target().is_none());
+    }
+
+    #[test]
+    fn last_close_waits_for_save_completion_and_failure_keeps_the_view_open() {
+        let ctx = egui::Context::default();
+        let mut app = labeling_app(&ctx);
+        let id = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().id();
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document: id, close_after: true, rx, reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        app.close_view(0);
+        assert!(app.dirty_prompt.as_ref().unwrap().saving);
+        for _ in 0..3 { app.poll_marker_saves(&ctx); }
+        assert_eq!(app.open_views(), vec![0]);
+        assert!(app.marker_saving(0), "an incomplete worker result cannot close the view");
+        tx.send(SaveMessage::Done(Err(SaveFailure::Other("test write failure".into())))).unwrap_or_else(|_| panic!("save receiver disappeared"));
+        app.poll_marker_saves(&ctx);
+        assert_eq!(app.open_views(), vec![0]);
+        assert!(app.views[0].data.is_some());
+        assert!(!app.marker_saving(0));
+        assert!(!app.dirty_prompt.as_ref().unwrap().saving);
+        assert!(app.takm_note.as_ref().unwrap().0.contains("test write failure"));
+    }
+
+    #[test]
+    fn empty_unlabeled_tracks_are_hidden_from_the_labeling_list() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let mut take = views::sample_take("empty.tak", &["Unlabeled 1", "Unlabeled 2"]);
+        take.trajectories[0].frames.clear();
+        take.trajectories[0].xyz.clear();
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(tak_core::view_data::ViewData::build(take), rx, 10, 1.0, 0.0);
+        app.refresh_marker_ui(0);
+        assert_eq!(
+            app.marker_ui[0]
+                .labeling
+                .unlabeled
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Unlabeled 2"]
+        );
+    }
+
+    #[test]
+    fn save_reservation_checks_current_views_and_blocks_later_opens() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(views::sample_data("source.tak", &["M"]), rx, 10, 1.0, 0.0);
+        let document = app.views[0]
+            .edit_document
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .id();
+        let target = std::env::temp_dir().join(format!("phase4b_view_{}.takm", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        app.marker_ui[0].save = Some(SaveJob::Running {
+            document,
+            close_after: false,
+            rx,
+            reserved: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let (_load_tx, load_rx) = mpsc::channel();
+        app.views[1].show(
+            views::sample_data(target.to_str().unwrap(), &["N"]),
+            load_rx,
+            11,
+            1.0,
+            0.0,
+        );
+        let (answer, result) = mpsc::channel();
+        tx.send(SaveMessage::Reserve(target.clone(), answer))
+            .unwrap();
+        app.poll_marker_saves(&ctx);
+        assert!(
+            !result.recv().unwrap(),
+            "a view opened after save started blocks replacement"
+        );
+        drop(app.views[1].clear());
+        let (answer, result) = mpsc::channel();
+        tx.send(SaveMessage::Reserve(target.clone(), answer))
+            .unwrap();
+        app.poll_marker_saves(&ctx);
+        assert!(result.recv().unwrap());
+        assert!(app.save_destination_reserved(&target));
+        app.hold_loads = true;
+        app.open_in(&ctx, 1, target.clone());
+        assert!(
+            app.views[1].loading.is_none(),
+            "reserved destination cannot be opened while saving"
+        );
+        app.start_overlay(&ctx, 1, target, false);
+        assert!(app.views[1].overlay_target().is_none());
+    }
+
+    #[test]
+    fn exact_shortcuts_do_not_alias_shift_or_alt() {
+        let ctx = egui::Context::default();
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            command: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let events = [
+            (Modifiers::SHIFT, Key::C),
+            (ctrl_alt, Key::Z),
+            (Modifiers::SHIFT, Key::OpenBracket),
+        ]
+        .into_iter()
+        .map(|(modifiers, key)| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        })
+        .collect();
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            assert!(!exact_key(ctx, Key::C, false, false, false));
+            assert!(exact_key(ctx, Key::C, false, true, false));
+            assert!(!exact_key(ctx, Key::Z, false, false, false));
+            assert!(exact_key(ctx, Key::Z, true, false, true));
+            assert!(!exact_key(ctx, Key::OpenBracket, false, false, false));
+        });
+    }
+
+    #[test]
+    fn delete_key_respects_comment_context_modifiers_and_hold() {
+        fn app(ctx: &egui::Context) -> TakViewerApp {
+            let mut app = TakViewerApp::build(ctx, None, vec![], None, None);
+            let (_tx, rx) = mpsc::channel();
+            app.views[0].show(views::sample_data("delete-key.tak", &["M"]), rx, 10, 1.0, 0.0);
+            app.views[0].select(0, false);
+            app
+        }
+        fn press(ctx: &egui::Context, app: &mut TakViewerApp, modifiers: Modifiers) {
+            let event = egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers };
+            let _ = ctx.run(egui::RawInput { events: vec![event], ..Default::default() }, |ctx| app.handle_keys(ctx, 0.0));
+        }
+        let ctx = egui::Context::default();
+        let mut selected_comment = app(&ctx);
+        selected_comment.views[0].picked = Some(4);
+        press(&ctx, &mut selected_comment, Modifiers::NONE);
+        assert!(selected_comment.marker_ui[0].job.is_none());
+        assert_eq!(selected_comment.views[0].picked, Some(4));
+
+        let mut focused_comments = app(&ctx);
+        dock::show(&mut focused_comments.dock, Pane::Comments);
+        let (surface, node, tab) = focused_comments.dock.find_tab(&Pane::Comments).unwrap();
+        focused_comments.dock.set_active_tab((surface, node, tab));
+        focused_comments.dock.set_focused_node_and_surface((surface, node));
+        press(&ctx, &mut focused_comments, Modifiers::NONE);
+        assert!(focused_comments.marker_ui[0].job.is_none());
+
+        let mut held = app(&ctx);
+        held.hold = Some(Hold { slot: 0, file_id: 10, start: 0, markers: vec![], wraps: 0 });
+        press(&ctx, &mut held, Modifiers::NONE);
+        assert!(held.marker_ui[0].job.is_none());
+        let mut modified = app(&ctx);
+        press(&ctx, &mut modified, Modifiers::SHIFT);
+        assert!(modified.marker_ui[0].job.is_none());
+
+        let popup_ctx = egui::Context::default();
+        let mut popup = app(&popup_ctx);
+        popup_ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("delete_guard_popup")));
+        press(&popup_ctx, &mut popup, Modifiers::NONE);
+        assert!(popup.marker_ui[0].job.is_none());
+
+        let typing_ctx = egui::Context::default();
+        let mut typing = app(&typing_ctx);
+        let mut text = String::from("keep text");
+        let _ = typing_ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { ui.text_edit_singleline(&mut text).request_focus(); });
+        });
+        assert!(typing_ctx.wants_keyboard_input());
+        press(&typing_ctx, &mut typing, Modifiers::NONE);
+        assert!(typing.marker_ui[0].job.is_none());
+
+        let mut editing = app(&ctx);
+        let comment = Comment { id: 4, markers: vec![], start: 0, end: 1, comment_type: String::new(), text: "draft".into() };
+        editing.comment_edit = Some(comment_list::Edit::new(0, 10, &comment, Field::Markers, editing.views[0].selection()));
+        press(&ctx, &mut editing, Modifiers::NONE);
+        assert!(editing.marker_ui[0].job.is_none());
+        assert!(editing.comment_edit.is_some());
+
+        let mut normal = app(&ctx);
+        press(&ctx, &mut normal, Modifiers::NONE);
+        assert!(matches!(normal.marker_ui[0].job, Some(MarkerJob::Prepare { command: MarkerCommand::Delete(_), .. })));
+    }
+
+
+    #[test]
+    fn shift_c_uses_active_view_last_selection_even_with_cubic_selected() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        for (slot, names) in [(0, ["A", "B", "C"]), (1, ["X", "Y", "Z"])] {
+            let (_tx, rx) = mpsc::channel();
+            app.views[slot].show(views::sample_data(if slot == 0 { "a.tak" } else { "b.tak" }, &names), rx, slot + 1, 1.0, 0.0);
+            app.views[slot].range = Some((2, 4));
+        }
+        app.views[0].select(0, false);
+        app.views[0].select(1, true);
+        app.views[1].select(2, false);
+        app.views[1].select(0, true);
+        app.views[1].select(1, true);
+        app.views[1].select(1, true); // removing the newest returns to index 0
+        app.active = 1;
+        app.refresh_marker_ui(1);
+        assert_eq!(app.marker_ui[1].tools.interpolation, FillMethod::Cubic);
+        let expected = app.views[1].edit_selection_state();
+        let event = egui::Event::Key { key: Key::C, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT };
+        let input = egui::RawInput { events: vec![event], ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.marker_keys(ctx));
+        match &app.marker_ui[1].job {
+            Some(MarkerJob::Prepare { command: MarkerCommand::Fill { method, scope, selection, .. }, .. }) => {
+                assert_eq!(*method, FillMethod::PatternBased);
+                assert_eq!(*scope, CoreFillScope::Selected);
+                assert_eq!(*selection, expected);
+                assert_eq!(selection.order.last().copied(), selection.primary);
+                assert_eq!(selection.primary, Some(app.views[1].data.as_ref().unwrap().markers[0].uid));
+            }
+            _ => panic!("Shift+C did not start the active view's Pattern fill: {:?}", app.takm_note),
+        }
+        assert!(app.marker_ui[0].job.is_none());
+        assert_eq!(app.views[0].primary, Some(1));
+    }
+
+    #[test]
+    fn gap_search_uses_all_selected_tracks_and_the_nearest_strict_boundary() {
+        let mut take = views::sample_take("gaps.tak", &["M", "N"]);
+        for (index, gap) in [(0, 6..=7), (1, 3..=4)] {
+            let t = &mut take.trajectories[index];
+            let keep: Vec<_> = (0..t.frames.len())
+                .filter(|&i| !gap.contains(&t.frames[i]))
+                .collect();
+            t.xyz = keep.iter().map(|&i| t.xyz[i]).collect();
+            t.frames = keep.iter().map(|&i| t.frames[i]).collect();
+        }
+        let (_tx, rx) = mpsc::channel();
+        let mut view = View::default();
+        view.show(tak_core::view_data::ViewData::build(take), rx, 1, 1.0, 0.0);
+        view.select_many(vec![0, 1], Some(0), false);
+        view.pb.frame = 2;
+        assert_eq!(view.next_selected_gap(true), Some(3));
+        view.pb.frame = 3;
+        assert_eq!(view.next_selected_gap(true), Some(6));
+        view.pb.frame = 6;
+        assert_eq!(view.next_selected_gap(false), Some(4));
+        view.pb.frame = 8;
+        assert_eq!(view.next_selected_gap(false), Some(7));
+        view.pb.frame = 7;
+        assert_eq!(view.next_selected_gap(false), Some(4));
+    }
+
+    #[test]
+    fn fit_selected_includes_every_visible_selected_point() {
+        let mut take = views::sample_take("fit.tak", &["M", "N"]);
+        for xyz in &mut take.trajectories[0].xyz {
+            *xyz = [0.0, 1.0, 0.0];
+        }
+        for xyz in &mut take.trajectories[1].xyz {
+            *xyz = [10.0, 1.0, 0.0];
+        }
+        let (_tx, rx) = mpsc::channel();
+        let mut view = View::default();
+        view.show(tak_core::view_data::ViewData::build(take), rx, 1, 1.0, 0.0);
+        view.select_many(vec![0, 1], Some(0), false);
+        view.scene_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        view.focus_selected();
+        assert!((view.cam.pivot.x - 5.0).abs() < 1e-4);
+        assert!(view.cam.distance > 5.0);
+    }
+
+}

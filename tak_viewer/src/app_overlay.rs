@@ -1,26 +1,3 @@
-//! A second file laid over a 3D view (plan step 7, "겹쳐 보기"): the user compares two versions of
-//! one recording (e.g. the raw copy and an agent's labels) in one 3D, on the same frame, so a
-//! marker that differs stands out.
-//!
-//! - On: Explorer right-click → "이 화면에 얹기" (the active view). Off: the same menu's
-//!   "얹은 파일 내리기", or ✕ on name tag 2. Another file over the same view replaces it (one per
-//!   view). The view's own file replaced or closed = the overlay goes too.
-//! - Look: the second file's markers are white rings (`scene::Layers`), its sticks thin white
-//!   lines under the first file's (plan step 8). Its names and trail are not drawn. (Step 8 also
-//!   drew a pink line between same-name markers more than 10 mm apart; taken out again, the user
-//!   found it not needed.)
-//! - Name tags `1 <file>` / `2 <file>` next to the view's file name tag: a click (or key 1 / 2 on
-//!   the active view) hides / shows that file's markers; a hidden one stays as a dim tag.
-//! - Refused (with the reason in the status bar, both numbers) when the frame count or frame rate
-//!   differs; refused when the file is open in a view or laid over one already, or when views and
-//!   overlays together would be more than `MAX_VIEWS` files.
-//! - Selection, Labels, the selected-marker pane, graphs and comments stay the first file's. The
-//!   second file is display only. Comments written while it is on say which of the two were
-//!   shown (`shown_a`, `shown_b`) and name it (`file_b`).
-//! - Undo: on / off / replace and each hide / show are layout actions (`app_undo.rs`
-//!   `LayoutSnap.overlays` · `shown`). The overlay is read on a background thread (markers only)
-//!   and counts as taken only once it is on screen; one put back by undo arrives quietly.
-//! - Not saved in the settings (like the range and the selected comment).
 
 use super::*;
 
@@ -76,6 +53,9 @@ impl TakViewerApp {
     /// Why `path` cannot be laid over view `slot` now (plain Korean), else Ok.
     fn overlay_allowed(&self, slot: usize, path: &Path) -> Result<(), String> {
         let v = &self.views[slot];
+        if v.remote.is_some() || v.remote_loading.is_some() || remote_ui::is_remote_key(path) {
+            return Err("원격 파일의 겹쳐 보기는 아직 지원하지 않아요.".into());
+        }
         let name = name_of(path);
         let Some(own) = v.target() else { return Err("얹을 수 없어요: 이 화면에 먼저 파일을 여세요.".into()) };
         if own == path {
@@ -121,6 +101,10 @@ impl TakViewerApp {
     }
 
     pub(super) fn start_overlay(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, quiet: bool) {
+        if self.save_destination_reserved(&path) {
+            self.overlay_say(ctx, "Save in progress for this file.".into());
+            return;
+        }
         #[cfg(test)]
         if self.hold_loads {
             self.views[slot].hold_overlay(path, quiet);

@@ -1,4 +1,6 @@
-//! `Nodes.dat` records for markers, skeletons, label groups, and force-plate corners.
+//! `Nodes.dat` records: Marker / Skeleton property records (`scripts/marker_store_remote.py`
+//! `_property_records`, `parse_marker_nodes` ~120-177), LabelGroups (`src/records.py`
+//! `label_groups`) and force-plate corners (`scripts/analyze_gait_forceplate.py` `extract_plates`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -171,7 +173,7 @@ pub struct MarkerNode {
     pub descriptor_sha256: String,
 }
 
-/// Structural marker role from parent UID and signed slot.
+/// Structural role from parent UID and signed slot (`src/skeleton.py` `marker_membership`).
 pub fn classify(parent: Uid, signed_slot: i32, assets: &HashSet<Uid>) -> MarkerKind {
     if assets.contains(&parent) {
         if signed_slot > 0 {
@@ -186,9 +188,15 @@ pub fn classify(parent: Uid, signed_slot: i32, assets: &HashSet<Uid>) -> MarkerK
     }
 }
 
-/// Lenient marker trailer parsing for display. Allow the candidate marker-size float at
-/// +36 and an additional integer at +40 while checking the remaining trailer bytes.
-/// Read parent UID and slot at their fixed offsets; discard UIDs with conflicting records.
+/// Read-only viewer extension, NOT in the Python reader (so the `--dump` output keeps the
+/// strict view). Marker trailers whose middle differs from `MARKER_MIDDLE` only in
+/// - the float32 at +36 (observed 0.012 = 12 mm, also 0.018; marker size candidate) and
+/// - the uint32 at +40 (strict value 1; observed 0..1284 in Motive-edited copy files),
+/// with the prefix, the `06` byte at +35 and the zero bytes +44..+48 unchanged.
+/// Parent UID / slot are read at the strict offsets. Returns UID -> (parent, slot_raw) for
+/// these records only; a UID seen twice with different values is dropped.
+/// Observed 2026-11-10 in `2_gait_10개/copy` (10 files): every such file then has exactly
+/// one marker per template slot, all slots in the SKL constraint list.
 pub fn lenient_memberships(nodes: &[u8]) -> Result<HashMap<Uid, (Uid, u32)>> {
     let records = property_records(nodes, &MARKER_SIGNATURES)?;
     let mut out: HashMap<Uid, (Uid, u32)> = HashMap::new();
@@ -266,7 +274,8 @@ pub fn parse_marker_nodes(nodes: &[u8], assets: &HashSet<Uid>) -> Result<Vec<Mar
     Ok(rows)
 }
 
-// LabelGroup records.
+// ---------------------------------------------------------------------------------------------
+// LabelGroup (`src/records.py` `label_groups`).
 
 const LABEL_GROUP_SIGNATURE: &[u8] = b"\x0a\x00LabelGroup";
 
@@ -351,7 +360,8 @@ pub fn label_groups(raw: &[u8]) -> Result<Vec<LabelGroup>> {
     Ok(groups)
 }
 
-// Force-plate records.
+// ---------------------------------------------------------------------------------------------
+// Force plates (`scripts/analyze_gait_forceplate.py` `extract_plates`).
 
 /// Returns plates plus non-fatal `node_json:` notes. Any recognized-but-invalid plate fails.
 pub fn extract_plates(nodes: &[u8]) -> Result<(Vec<ForcePlate>, Vec<String>)> {

@@ -1,4 +1,6 @@
-//! Compound-file container reader with shared little-endian and text helpers.
+//! Compound-file container reader. Port of `src/container.py` `TakContainer` (lines ~70-175).
+//! Accepts exactly what `TakContainer` accepts (not the editor's stricter geometry check).
+//! Also holds the small little-endian / text helpers shared by the other reader modules.
 
 use super::{err, Result, TakError};
 
@@ -110,7 +112,7 @@ pub(crate) fn uid_from(bytes: &[u8]) -> super::Uid {
     uid
 }
 
-/// Sequential reader for binary records.
+/// Sequential reader (`src/skeleton.py` `Reader`).
 pub(crate) struct Reader<'a> {
     pub raw: &'a [u8],
     pub pos: usize,

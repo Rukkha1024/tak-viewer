@@ -1,5 +1,6 @@
-//! `--dump <file.tak> <out.json>` writes the reader result as JSON.
-//! TAK and TAKM are read only; the latter reports its file kind.
+//! `--dump <file.tak> <out.json>`: the reader result as JSON, for the Python comparison test
+//! (`apps/checks/test_reader_matches_python.py`) and for checking files (skill `tak-viewer-check`).
+//! Reads the TAK (or `.takm`, same numbers + `"file_kind": "takm"`) only; writes only `<out.json>`.
 
 use std::path::Path;
 

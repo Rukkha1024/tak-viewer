@@ -1,6 +1,3 @@
-//! Stacked X, Y, and Z graph lanes with frame navigation, zoom, and gap marks.
-//! Multiple markers share lane colors. Hovering a curve highlights the marker across lanes
-//! and displays its name without changing saved state.
 
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
@@ -14,8 +11,6 @@ pub struct Lane {
     pub unit: &'static str,
 }
 
-/// A graphed marker's name appears in the floating graph tag or graph pane. Curves use
-/// lane colors; hovering identifies the marker.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Key<'a> {
     pub name: &'a str,
@@ -35,18 +30,19 @@ pub struct Curve {
 /// Width of a curve (points) and of a one-sample dot's radius.
 pub const LINE_W: f32 = 1.4;
 const DOT_R: f32 = 1.5;
-/// Hovered curves are twice as wide and lighter than the other curves.
 pub const HOVER_W: f32 = 2.0 * LINE_W;
 const HOVER_DOT_R: f32 = 2.0 * DOT_R;
 pub const HOVER_LIGHTEN: f32 = 0.3;
-/// A curve is hit when it passes within the vertical tolerance at the pointer position.
-/// The nearest curve wins; ties go to the earlier marker.
+/// The hit rule (orchestrator's choice, user not asked yet): a curve is under the mouse when it
+/// passes within this many points (vertically) of the pointer at the pointer's x, in the lane
+/// under the pointer; the nearest wins, ties go to the earlier marker.
 pub const HOVER_REACH: f32 = 5.0;
 /// Half the width (points) around the pointer's x in which a curve's points count (a thinned
 /// column is `COLUMN_W` wide, so a steep stroke is found over its whole height).
 const HOVER_HALF_W: f32 = COLUMN_W / 2.0;
-/// Display the hovered marker name near the pointer, moving it left or above when needed
-/// to keep it inside the lanes.
+/// The hovered marker's name next to the pointer (Figma mockup ①, box removed by the user):
+/// 11 pt, light (`theme::HUD_TEXT` = #e8e8e8), its top-left this far from the pointer tip; to the
+/// left / above the pointer where it would leave the lanes.
 pub const HOVER_FONT: f32 = 11.0;
 pub const HOVER_TEXT_AT: Vec2 = vec2(14.0, 16.0);
 const HOVER_TEXT_FLIP: Vec2 = vec2(6.0, 4.0);
@@ -78,12 +74,14 @@ pub struct Look {
     /// view's own name tag over a floating graph): the graph does not take it there.
     /// `Rect::NOTHING` = none.
     pub keep_out: Rect,
+    /// Inclusive edit range shared with the timeline; absent for other graph types.
+    pub selection: Option<(i64, i64)>,
 }
 
 impl Look {
     /// In a pane (GRAPH, devices): Motive Graph View colors.
     pub fn pane() -> Look {
-        Look { bg: theme::GRAPH_BG, nav_bg: theme::NAV_BG, watermark: theme::GRAPH_WATERMARK, values: true, tag_w: 0.0, keep_out: Rect::NOTHING }
+        Look { bg: theme::GRAPH_BG, nav_bg: theme::NAV_BG, watermark: theme::GRAPH_WATERMARK, values: true, tag_w: 0.0, keep_out: Rect::NOTHING, selection: None }
     }
 }
 
@@ -139,6 +137,17 @@ fn paint_spans(painter: &egui::Painter, plot: Rect, lo: f64, hi: f64, spans: &[S
                 }
             }
         }
+    }
+}
+
+fn paint_selection(painter: &egui::Painter, plot: Rect, lo: f64, hi: f64, range: Option<(i64, i64)>) {
+    let Some((start, end)) = range else { return };
+    let selection = Span { start, end, picked: false };
+    let Some((left, right)) = span_x(&selection, lo, hi, plot.left(), plot.width()) else { return };
+    let painter = painter.with_clip_rect(plot);
+    painter.rect_filled(Rect::from_min_max(pos2(left, plot.top()), pos2(right, plot.bottom())), 0.0, theme::RANGE.gamma_multiply(0.12));
+    for x in [left, right] {
+        painter.extend(Shape::dashed_line(&[pos2(x, plot.top()), pos2(x, plot.bottom())], Stroke::new(1.0, theme::RANGE), 4.0, 2.0));
     }
 }
 
@@ -793,7 +802,8 @@ fn curve_shapes<'a>(
     (shapes, drew)
 }
 
-/// Returns a frame to jump to when the user clicked / dragged in the graph.
+/// Returns a frame to jump to when the user clicked / dragged in the graph. Devices and 3D
+/// overlays retain scrubbing; the GRAPH panel opts into `show_select` instead.
 /// `cache`: see `Drawn` (None = worked out again every frame). `spans`: Comment bands behind
 /// the lanes (`Span`; empty = none, the graph as before step 6).
 #[allow(clippy::too_many_arguments)]
@@ -809,6 +819,103 @@ pub fn show(
     look: &Look,
     cache: Option<&mut Drawn>,
     spans: &[Span],
+) -> Option<i64> {
+    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, None)
+}
+
+/// GRAPH panel, including its detached window: a click moves the frame; a primary drag
+/// starting in the plot beyond 4 pt selects an inclusive edit range. The bottom navigation
+/// strip still scrubs. The caller owns the same range as the playback band.
+#[allow(clippy::too_many_arguments)]
+pub fn show_select(
+    ui: &mut Ui,
+    id: Id,
+    lanes: &[Lane],
+    first: i64,
+    last: i64,
+    frame: i64,
+    gaps: &[(i64, i64)],
+    lane_h: f32,
+    look: &Look,
+    cache: Option<&mut Drawn>,
+    spans: &[Span],
+    range: &mut Option<(i64, i64)>,
+) -> Option<i64> {
+    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, Some(range))
+}
+
+const RANGE_DRAG_THRESHOLD: f32 = 4.0;
+
+#[derive(Clone, Copy)]
+struct RangeDrag {
+    origin: Pos2,
+    first: i64,
+    selecting: bool,
+}
+
+/// Track the press ourselves: egui's click/drag threshold is independent of GRAPH's 4 pt
+/// rule. Once a drag crosses the threshold it remains a selection even if it returns to
+/// the press. Only events between its press and release count; the release owns the final
+/// endpoint. Egui does not own a complete press/move/release within one frame, so those
+/// unrecognized gestures stay ignored rather than bypassing popup / widget precedence.
+#[allow(clippy::too_many_arguments)]
+fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, frame_at: impl Fn(f32) -> i64, first: i64, last: i64, range: &mut Option<(i64, i64)>) -> (bool, bool) {
+    let id = id.with("range_drag");
+    let mut drag: Option<RangeDrag> = ui.data(|d| d.get_temp(id));
+    // The panel may have been hidden when the button was released. A later pointer move
+    // must not resume the abandoned gesture when the panel is shown again.
+    if !ui.input(|i| i.pointer.primary_down() || i.pointer.primary_released()) {
+        drag = None;
+    }
+    let owns_press = resp.is_pointer_button_down_on() || resp.clicked_by(egui::PointerButton::Primary) || resp.drag_stopped_by(egui::PointerButton::Primary);
+    let mut range_press = drag.is_some();
+    let mut selecting = drag.is_some_and(|d| d.selecting);
+    let down = ui.input(|i| {
+        for event in &i.events {
+            match event {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => {
+                    drag = (owns_press && plot.contains(*pos)).then(|| RangeDrag { origin: *pos, first: frame_at(pos.x), selecting: false });
+                    range_press |= drag.is_some();
+                }
+                egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
+                    if let Some(drag) = &mut drag {
+                        drag.selecting |= drag.origin.distance(*pos) > RANGE_DRAG_THRESHOLD;
+                        selecting |= drag.selecting;
+                        if drag.selecting {
+                            *range = Some(super::panels::ordered_range(drag.first, frame_at(pos.x), first, last));
+                        }
+                    }
+                    if matches!(event, egui::Event::PointerButton { .. }) { drag = None; }
+                }
+                _ => {}
+            }
+        }
+        i.pointer.primary_down()
+    });
+    ui.data_mut(|d| {
+        if down {
+            if let Some(drag) = drag { d.insert_temp(id, drag); }
+        } else {
+            d.remove::<RangeDrag>(id);
+        }
+    });
+    (range_press, selecting)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_inner(
+    ui: &mut Ui,
+    id: Id,
+    lanes: &[Lane],
+    first: i64,
+    last: i64,
+    frame: i64,
+    gaps: &[(i64, i64)],
+    lane_h: f32,
+    look: &Look,
+    cache: Option<&mut Drawn>,
+    spans: &[Span],
+    mut range: Option<&mut Option<(i64, i64)>>,
 ) -> Option<i64> {
     let full = ViewRange { lo: first as f64 - 0.5, hi: last as f64 + 0.5 };
     let mut vr: ViewRange = ui.data(|d| d.get_temp(id)).unwrap_or(full);
@@ -856,9 +963,12 @@ pub fn show(
         vr.hi = full.hi;
         vr.lo = (vr.hi - span).max(full.lo);
     }
-    if resp.double_clicked() {
+    let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
+        select_drag(ui, &resp, id, plot, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
+    });
+    if !selecting && resp.double_clicked() {
         vr = full;
-    } else if resp.clicked_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Primary) {
+    } else if !selecting && (resp.clicked_by(egui::PointerButton::Primary) || (!range_press && resp.dragged_by(egui::PointerButton::Primary))) {
         if let Some(p) = resp.interact_pointer_pos() {
             goto = Some(f_of(p.x, &vr).round().clamp(first as f64, last as f64) as i64);
         }
@@ -868,6 +978,7 @@ pub fn show(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, look.bg);
     paint_spans(&painter, plot, vr.lo, vr.hi, spans);
+    paint_selection(&painter, plot, vr.lo, vr.hi, range.as_deref().copied().unwrap_or(look.selection));
 
     // Frame grid ticks.
     let step = nice_step(vr.hi - vr.lo, (plot.width() / 80.0) as f64);
@@ -1108,7 +1219,8 @@ pub fn show(
     if with_legend && !lanes.is_empty() {
         legend(&painter, Rect::from_min_size(plot.min, vec2(plot.width(), lane_h)), [show_first, show_second]);
     }
-    // Draw the hovered marker name inside the lanes; `· 2` denotes an overlay curve.
+    // v0.29.0: the hovered marker's name next to the pointer, plain small text (no box: the
+    // user's edit of mockup ①), `· 2` for the laid-over file's curve; inside the lanes.
     if let (Some(c), Some(p)) = (hovered, pointer) {
         if let Some(name) = drawn.names.get(c.marker) {
             let text = if c.laid_over { format!("{name} · 2") } else { name.clone() };
@@ -1184,6 +1296,8 @@ fn forced_pointer(drawn: &Drawn, maps: &[Option<Map>], k: usize, frame: i64, plo
 mod tests {
     use super::{nice_step, thin, Lane, ViewRange};
     use eframe::egui::Color32;
+
+    include!("graph_selection_tests.rs");
 
     #[test]
     fn thinned_lines_keep_spikes_gaps_and_both_ends_whatever_the_file_length() {

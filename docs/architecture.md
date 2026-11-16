@@ -13,8 +13,11 @@
 
 ## 데이터와 쓰기
 
-`.tak`는 읽기만 해요. `.takm`은 카메라 기록을 제외한 사본에 Comment를 저장해요. 기존 `.takm`을 덮어쓰지 않으며, 보호된 `input/`에 만들거나 Comment를 추가하지 않아요. 그림과 JSON 출력에도 기존 경로 검사를 적용해요.
+`.takm`은 카메라 기록을 제외한 사본에 Comment를 저장해요. 현재 변환은 기존 `.takm`을 덮어쓰지 않으며, 보호된 `input/`에 만들거나 Comment를 추가하지 않아요. 그림과 JSON 출력에도 기존 경로 검사를 적용해요.
 
 ## 확인
 
 `cargo test --workspace --locked`로 자동 검사를 실행해요. 창과 그림 출력은 별도로 확인해야 해요. 파일을 읽는 성공만으로 Motive 호환성이나 동등한 동작이 검증되는 것은 아니에요.
+
+<!-- public-features-v0.32 -->
+마커 편집과 저장은 `tak_core/src/edit/`, SSH 원격 읽기는 `tak_core/src/remote/`가 담당해요.

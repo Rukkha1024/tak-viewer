@@ -1,7 +1,3 @@
-//! Open Editors lists files grouped by view, including overlays and files outside the
-//! workspace. Rows activate their view; overlay rows also toggle marker visibility. Close
-//! and add-folder controls act independently. Narrow rows elide the folder first, then the
-//! middle of the file name while preserving its extension. The list scrolls when needed.
 
 use super::explorer::{chevron, file_icon, ACTIVE_SEL_BG, BUTTON_BG, FG, FG_DIM, HOVER_BG, ICON_FG, SIDEBAR_BG, TAK_ICON};
 use super::{scene, theme};
@@ -30,6 +26,7 @@ pub const CHOSEN_VIEW: &str = "고른 화면";
 /// One file in the list.
 pub struct Entry {
     pub path: PathBuf,
+    pub host: Option<String>,
     /// The view has a file laid over it: 0 = its own file (filled dot), 1 = the laid-over file
     /// (white ring). None = no file laid over (file icon).
     pub mark: Option<usize>,
@@ -37,6 +34,7 @@ pub struct Entry {
     pub hidden: bool,
     /// Still being read.
     pub loading: bool,
+    pub dirty: bool,
     /// The file's folder, when it is inside no WORKSPACE folder (`폴더 추가` adds it).
     pub add_folder: Option<PathBuf>,
 }
@@ -87,13 +85,14 @@ fn name_of(p: &Path) -> String {
 /// A row's text in pieces: (file name, " …" / " · 숨김" suffix, folder name).
 fn row_parts(e: &Entry) -> (String, String, String) {
     let mut suffix = String::new();
+    if e.dirty { suffix.push('*'); }
     if e.loading {
         suffix.push_str(" …");
     }
     if e.hidden {
         suffix.push_str(" · 숨김");
     }
-    let folder = e.path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = e.host.clone().unwrap_or_else(|| e.path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     (name_of(&e.path), suffix, folder)
 }
 
@@ -128,9 +127,6 @@ pub fn middle_cut(name: &str, keep: usize) -> String {
     s
 }
 
-/// Fit the file name and optional folder into `avail` points. Drop the folder first,
-/// then elide the middle of the name while preserving its extension. Text is measured in
-/// the display font; return the fitted text and whether the folder fits.
 pub fn fit(name: &str, suffix: &str, folder_w: f32, avail: f32, width: impl Fn(&str) -> f32) -> (String, bool) {
     let whole = format!("{name}{suffix}");
     let w = width(&whole);
@@ -301,7 +297,7 @@ mod tests {
     fn entry(path: &str, mark: Option<usize>, outside: bool) -> Entry {
         let path = PathBuf::from(path);
         let add_folder = outside.then(|| path.parent().unwrap().to_path_buf());
-        Entry { path, mark, hidden: false, loading: false, add_folder }
+        Entry { path, host: None, mark, hidden: false, loading: false, dirty: false, add_folder }
     }
 
     /// Two views: view 0 (active) with b laid over it, view 2 with c from outside WORKSPACE.
@@ -479,10 +475,10 @@ mod tests {
 
     #[test]
     fn middle_cut_keeps_the_start_and_the_whole_ending() {
-        let n = "251209_S01_perturb_20_001.takm";
+        let n = "000000_S01_perturb_20_001.takm";
         assert_eq!(middle_cut(n, 99), n);
-        assert_eq!(middle_cut(n, 18), "251209_S01_p…20_001.takm");
-        assert_eq!(middle_cut(n, 2), "25….takm");
+        assert_eq!(middle_cut(n, 18), "000000_S01_p…20_001.takm");
+        assert_eq!(middle_cut(n, 2), "00….takm");
         assert_eq!(middle_cut(n, 0), "….takm");
         assert_eq!(middle_cut("a.b.tak", 0), "….tak", "only the last ending");
         assert_eq!(middle_cut("noending", 3), "no…g");
@@ -490,7 +486,7 @@ mod tests {
         let w = |s: &str| s.chars().count() as f32;
         assert_eq!(fit(n, "", 7.0, 40.0, w), (n.to_owned(), true));
         assert_eq!(fit(n, "", 7.0, 32.0, w), (n.to_owned(), false), "the folder goes first");
-        assert_eq!(fit(n, " · 숨김", 7.0, 20.0, w), ("251209…001.takm · 숨김".to_owned(), false));
+        assert_eq!(fit(n, " · 숨김", 7.0, 20.0, w), ("000000…001.takm · 숨김".to_owned(), false));
         assert_eq!(fit(n, "", 0.0, 1.0, w), ("….takm".to_owned(), false), "never less than the ending");
     }
 
@@ -525,8 +521,8 @@ mod tests {
     #[test]
     fn a_long_name_gives_up_the_folder_then_its_middle_and_keeps_its_ending_and_the_buttons() {
         let ctx = egui::Context::default();
-        let takm = "/x/review/251209_S01_perturb_20_001.takm";
-        let tak = "/x/raw/251209_S01_perturb_20_001.tak";
+        let takm = "/x/review/000000_S01_perturb_20_001.takm";
+        let tak = "/x/raw/000000_S01_perturb_20_001.tak";
         let rows = |hidden: bool| {
             let mut a = entry(takm, Some(0), true);
             a.hidden = hidden;
@@ -537,15 +533,15 @@ mod tests {
         let shown = |out: &egui::FullOutput| -> Vec<String> { names(out).into_iter().map(|n| n.1).collect() };
         // Wide: the whole name and the folder.
         let out = at_width(&ctx, rows(false), 600.0);
-        assert_eq!(shown(&out), vec!["251209_S01_perturb_20_001.takmreview", "251209_S01_perturb_20_001.takraw"]);
+        assert_eq!(shown(&out), vec!["000000_S01_perturb_20_001.takmreview", "000000_S01_perturb_20_001.takraw"]);
         // Medium: the whole name, no folder.
         let out = at_width(&ctx, rows(false), 350.0);
-        assert_eq!(shown(&out), vec!["251209_S01_perturb_20_001.takm", "251209_S01_perturb_20_001.tak"]);
+        assert_eq!(shown(&out), vec!["000000_S01_perturb_20_001.takm", "000000_S01_perturb_20_001.tak"]);
         // Narrow: cut in the middle, start and whole ending kept; " · 숨김" too.
         let out = at_width(&ctx, rows(true), 260.0);
         let s = shown(&out);
-        assert!(s[0].starts_with("2512") && s[0].contains('…') && s[0].ends_with(".takm · 숨김"), "{}", s[0]);
-        assert!(s[1].starts_with("2512") && s[1].contains('…') && s[1].ends_with("_001.tak"), "{}", s[1]);
+        assert!(s[0].starts_with("0000") && s[0].contains('…') && s[0].ends_with(".takm · 숨김"), "{}", s[0]);
+        assert!(s[1].starts_with("0000") && s[1].contains('…') && s[1].ends_with("_001.tak"), "{}", s[1]);
         let mut last = usize::MAX;
         for width in [600.0, 420.0, 320.0, 260.0, 220.0, 200.0, 180.0, 160.0, 150.0, 130.0] {
             let out = at_width(&ctx, rows(true), width);

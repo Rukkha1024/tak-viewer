@@ -1,6 +1,6 @@
 [package]
 name = "tak_viewer"
-description = "Read-only Motive-style viewer for OptiTrack .tak marker data"
+description = "Motive-style viewer and marker editor for OptiTrack TAK data"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -25,3 +25,4 @@ path = "src/main.rs"
 # Tests only: read/write settings the way eframe stores them (RON).
 [dev-dependencies]
 ron = "0.8"
+sha2 = "0.10"

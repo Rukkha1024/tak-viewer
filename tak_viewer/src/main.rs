@@ -25,6 +25,8 @@ mod capture;
 mod headless;
 mod instances;
 mod shot;
+mod ssh;
+mod ssh_probe;
 mod soft_render;
 mod ui;
 mod version;
@@ -51,6 +53,18 @@ fn main() -> eframe::Result<()> {
         let paths = args[2..].iter().map(|a| if a.starts_with("--") { a.clone() } else { workspace::resolve_path(a).to_string_lossy().into_owned() });
         let takm_args: Vec<String> = std::iter::once(args[1].clone()).chain(paths).collect();
         std::process::exit(tak_core::takm::run(&takm_args));
+    }
+    if args.iter().any(|a| matches!(a.as_str(), "--ssh-open" | "--ssh-list")) {
+        std::process::exit(ssh_probe::run(&args[1..]));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--ssh-demo") {
+        let state = args.get(i + 1).map(String::as_str).unwrap_or("");
+        if !matches!(state, "off" | "connecting" | "connected" | "markers_ready" | "lost" | "top_windows" | "top_linux") || !args.iter().any(|a| a == "--screenshot") {
+            eprintln!("--ssh-demo는 --screenshot과 함께 off|connecting|connected|markers_ready|lost|top_windows|top_linux를 써요.");
+            std::process::exit(2);
+        }
+        ssh::set_demo_state(state);
+        args.drain(i..i + 2);
     }
     let mut headless = args.iter().skip(1).any(|a| a == "--headless");
     if headless {

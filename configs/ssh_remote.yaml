@@ -1,0 +1,8 @@
+{
+  "connect_timeout_seconds": 8,
+  "maximum_payload_bytes": 536936448,
+  "directory_limit": 1000,
+  "probe_bytes": 256,
+  "linux_python": "",
+  "windows_python": ""
+}

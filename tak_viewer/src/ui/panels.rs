@@ -4,15 +4,14 @@
 use super::graph::{self, Lane, Look};
 use super::graph_float::{LaneSet, PLATE_LANES};
 use super::theme;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
+use eframe::egui::{self, pos2, vec2, Align2, FontId, Id, Rect, RichText, Sense, Stroke, Ui};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tak_core::comments::Comments;
 use tak_core::playback::Playback;
 use tak_core::tak::{uid_hex, MarkerKind};
 use tak_core::view_data::{DeviceView, GroupKind, ViewData, FZ_CHANNEL, VALID_SUBSAMPLES};
-
-pub const ROW_H: f32 = 20.0;
 
 /// User action produced by a pane.
 pub enum Action {
@@ -35,7 +34,7 @@ pub fn kind_label(kind: MarkerKind) -> &'static str {
     }
 }
 
-fn gaps_text(fill_pct: f32) -> String {
+pub(crate) fn gaps_text(fill_pct: f32) -> String {
     let g = 100.0 - fill_pct;
     if g <= 0.0 {
         String::new()
@@ -53,21 +52,57 @@ pub struct LabelsState {
     pub filter: String,
     pub collapsed: HashSet<usize>,
     pub scroll_to: Option<usize>,
-    initialized_for: Option<usize>,
 }
 
-/// Use one column below 260 pt of list width.
-const LABELS_TWO_COL_MIN: f32 = 260.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Row {
-    Header(usize),
-    Markers(usize, Option<usize>),
+pub(crate) fn declared_group_id(parent: &tak_core::tak::Uid) -> usize {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut hash);
+    hash.finish() as usize | (1usize << (usize::BITS - 1))
 }
+
+/// Primary groups retain identity while their first trajectory appears or disappears.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FoldKey {
+    Group { title: String, kind: u8, parent: Option<tak_core::tak::Uid> },
+    Declaration(usize),
+}
+
+impl FoldKey {
+    pub(crate) fn group(data: &ViewData, index: usize) -> Self {
+        let Some(group) = data.groups.get(index) else { return Self::Declaration(index) };
+        let parent = group.asset.and_then(|i| data.take.assets.get(i)).map(|a| a.uid)
+            .or_else(|| matches!(group.kind, GroupKind::OtherParent | GroupKind::LabelGroup)
+                .then(|| group.members.first().and_then(|&i| data.markers.get(i)).and_then(|m| m.parent)).flatten());
+        if matches!(group.kind, GroupKind::AssetTemplate | GroupKind::LabelGroup) {
+            if let Some(parent) = parent { return Self::Declaration(declared_group_id(&parent)); }
+        }
+        Self::Group { title: group.title.clone(), kind: group.kind as u8, parent }
+    }
+}
+
+pub(crate) fn fold_keys(data: &ViewData, collapsed: &HashSet<usize>) -> HashSet<FoldKey> {
+    collapsed.iter().map(|&i| FoldKey::group(data, i)).collect()
+}
+
+pub(crate) fn fold_indices(data: &ViewData, folds: &HashSet<FoldKey>) -> HashSet<usize> {
+    let mut collapsed = HashSet::new();
+    for key in folds {
+        let indices: Vec<_> = (0..data.groups.len()).filter(|&i| FoldKey::group(data, i) == *key).collect();
+        if indices.is_empty() {
+            if let FoldKey::Declaration(id) = key { collapsed.insert(*id); }
+        } else {
+            collapsed.extend(indices);
+        }
+    }
+    collapsed
+}
+
+/// Agent choice: below 260 pt of list width, one column (v0.30.0).
+pub(crate) const LABELS_TWO_COL_MIN: f32 = 260.0;
 
 impl LabelsState {
     /// New file: Unlabeled collapsed by default (Motive default layout shows labeled only).
-    pub fn reset(&mut self, data: &ViewData, file_id: usize) {
+    pub fn reset(&mut self, data: &ViewData, _file_id: usize) {
         self.collapsed.clear();
         self.filter.clear();
         self.scroll_to = None;
@@ -76,539 +111,22 @@ impl LabelsState {
                 self.collapsed.insert(gi);
             }
         }
-        self.initialized_for = Some(file_id);
     }
 }
 
-fn label_columns(width: f32) -> usize {
+pub(crate) fn label_columns(width: f32) -> usize {
     if width < LABELS_TWO_COL_MIN { 1 } else { 2 }
 }
 
-/// Per group: down the left column, then down the right; searching divides only the matches.
-fn rows(data: &ViewData, st: &LabelsState, columns: usize) -> Vec<Row> {
-    let needle = st.filter.trim().to_lowercase();
-    let mut out = Vec::new();
-    for (gi, g) in data.groups.iter().enumerate() {
-        let members: Vec<usize> = g
-            .members
-            .iter()
-            .copied()
-            .filter(|&m| needle.is_empty() || data.markers[m].name.to_lowercase().contains(&needle))
-            .collect();
-        if !needle.is_empty() && members.is_empty() {
-            continue;
-        }
-        out.push(Row::Header(gi));
-        if needle.is_empty() && st.collapsed.contains(&gi) {
-            continue;
-        }
-        let height = members.len().div_ceil(columns);
-        for r in 0..height {
-            out.push(Row::Markers(members[r], if columns == 2 { members.get(r + height).copied() } else { None }));
-        }
-    }
-    out
+/// Return index pairs in the same left-column-first order for the unified Labeling pane.
+pub(crate) fn label_row_pairs(member_count: usize, columns: usize) -> Vec<(usize, Option<usize>)> {
+    let height = member_count.div_ceil(columns);
+    (0..height).map(|row| (row, (columns == 2 && row + height < member_count).then_some(row + height))).collect()
 }
 
-struct Cols {
-    name: f32,
-    gaps_r: f32,
-}
-
-fn cols(rect: Rect) -> Cols {
-    Cols { name: rect.left() + 24.0, gaps_r: rect.right() - 8.0 }
-}
-
-fn label_cell(rect: Rect, column: usize, columns: usize) -> Rect {
+pub(crate) fn label_cell(rect: Rect, column: usize, columns: usize) -> Rect {
     let width = rect.width() / columns as f32;
     Rect::from_min_size(pos2(rect.left() + column as f32 * width, rect.top()), vec2(width, rect.height()))
-}
-
-fn label_scroll_offset(rows: &[Row], target: usize, pitch: f32) -> Option<f32> {
-    rows.iter().position(|r| matches!(*r, Row::Markers(left, right) if left == target || right == Some(target)))
-        .map(|r| ((r as f32 - 3.0) * pitch).max(0.0))
-}
-
-fn paint_label(ui: &Ui, rect: Rect, m: &tak_core::view_data::MarkerView, frame: i64, bg: Color32) {
-    let p = ui.painter();
-    let c = cols(rect);
-    p.rect_filled(rect, 0.0, bg);
-    p.circle_filled(pos2(rect.left() + 13.0, rect.center().y), 4.0, theme::color(m.color));
-    let name_color = if m.present(frame) { theme::LABEL_TRACKED } else { theme::LABEL_UNTRACKED };
-    let gaps = p.layout_no_wrap(gaps_text(m.fill_pct), FontId::proportional(12.5), theme::TEXT);
-    // Reserve the number first, including its real font width; elide the name, never Gaps.
-    let name_width = (c.gaps_r - 44.0_f32.max(gaps.size().x + 6.0) - c.name).max(0.0);
-    let mut job = egui::text::LayoutJob::simple_singleline(m.name.clone(), FontId::proportional(13.0), name_color);
-    job.wrap.max_width = name_width;
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let name = p.layout_job(job);
-    let clip = Rect::from_min_size(pos2(c.name, rect.top()), vec2(name_width, rect.height())).intersect(rect);
-    p.with_clip_rect(clip).galley(pos2(c.name, rect.center().y - name.size().y * 0.5), name, name_color);
-    p.galley(pos2(c.gaps_r - gaps.size().x, rect.center().y - gaps.size().y * 0.5), gaps, theme::TEXT);
-}
-
-/// LABELS shows gap percentages in two columns, reading down then across. Split each group
-/// at ceil(n / 2); use one column below 260 pt. Group headers remain full width, names are
-/// elided to fit, and only visible rows are painted.
-#[allow(clippy::too_many_arguments)]
-pub fn labels_pane(
-    ui: &mut Ui,
-    data: &ViewData,
-    frame: i64,
-    st: &mut LabelsState,
-    selected: &BTreeSet<usize>,
-    primary: Option<usize>,
-    file_id: usize,
-    max_height: f32,
-) -> Option<Action> {
-    if st.initialized_for != Some(file_id) {
-        st.reset(data, file_id);
-    }
-    let mut action = None;
-    let labeled_total = data.markers.iter().filter(|m| m.kind != MarkerKind::Unlabeled).count();
-    let labeled_now = data.markers.iter().filter(|m| m.kind != MarkerKind::Unlabeled && m.present(frame)).count();
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Labeled").strong().size(14.0));
-        ui.label(RichText::new(format!("{labeled_now} / {labeled_total}")).color(theme::TEXT_DIM).size(14.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let width = 130.0_f32.min(ui.available_width()).max(0.0);
-            ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("검색").desired_width(width));
-        });
-    });
-    let columns = label_columns(ui.available_width());
-    // Allocate the header now; paint it against the actual list width after the scroll area.
-    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-
-    // Measure the wrapped legend before filling the remaining height with the list.
-    let mut legend = egui::text::LayoutJob::default();
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    for (text, color) in [
-        ("흰 이름", theme::LABEL_TRACKED),
-        (" = 현재 프레임에 있음 · ", theme::TEXT_DIM),
-        ("자홍 이름", theme::LABEL_UNTRACKED),
-        (" = 없음 · Gaps = 비어 있는 프레임 비율(100% 채움이면 빈칸) · 빈구간 수 · 최대 길이는 마커를 고르면 '선택 마커' 패널에 나와요.", theme::TEXT_DIM),
-    ] {
-        legend.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
-    }
-    legend.wrap.max_width = ui.available_width();
-    let legend = ui.painter().layout_job(legend);
-    let list_height = (ui.available_height() - legend.size().y - ui.spacing().item_spacing.y).max(0.0).min(max_height);
-    let rows = rows(data, st, columns);
-    let mut scroll = ScrollArea::vertical().id_salt("labels_rows").max_height(list_height).auto_shrink([false, false]);
-    if let Some(target) = st.scroll_to.take() {
-        if let Some(offset) = label_scroll_offset(&rows, target, ROW_H + ui.spacing().item_spacing.y) {
-            scroll = scroll.vertical_scroll_offset(offset);
-        }
-    }
-    let mut toggle_group = None;
-    let list = scroll.show_rows(ui, ROW_H, rows.len(), |ui, range| {
-        let start = range.start;
-        for (k, row) in rows[range].iter().enumerate() {
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
-            let p = ui.painter();
-            let c = cols(rect);
-            match *row {
-                Row::Header(gi) => {
-                    let resp = ui.interact(rect, ui.make_persistent_id(("labels_group", file_id, gi)), Sense::click());
-                    let g = &data.groups[gi];
-                    p.rect_filled(rect, 0.0, theme::HEADER_BG);
-                    let collapsed = st.collapsed.contains(&gi) && st.filter.trim().is_empty();
-                    let present = g.members.iter().filter(|&&m| data.markers[m].present(frame)).count();
-                    let c0 = pos2(rect.left() + 12.0, rect.center().y);
-                    let tri = if collapsed {
-                        vec![c0 + vec2(-3.0, -4.5), c0 + vec2(4.0, 0.0), c0 + vec2(-3.0, 4.5)]
-                    } else {
-                        vec![c0 + vec2(-4.5, -3.0), c0 + vec2(4.5, -3.0), c0 + vec2(0.0, 4.0)]
-                    };
-                    p.add(egui::Shape::convex_polygon(tri, theme::TEXT_DIM, Stroke::NONE));
-                    let title = p.text(pos2(c.name, rect.center().y), Align2::LEFT_CENTER, &g.title, FontId::proportional(13.0), theme::TEXT);
-                    p.text(
-                        pos2(title.right() + 8.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        format!("{present} / {}", g.members.len()),
-                        FontId::proportional(12.0),
-                        theme::TEXT_DIM,
-                    );
-                    if resp.clicked() {
-                        toggle_group = Some(gi);
-                    }
-                }
-                Row::Markers(left, right) => {
-                    for (column, mi) in [Some(left), right].into_iter().enumerate() {
-                        let Some(mi) = mi else { continue };
-                        let cell = label_cell(rect, column, columns);
-                        let resp = ui.interact(cell, ui.make_persistent_id(("labels_marker", file_id, mi)), Sense::click());
-                        let bg = if Some(mi) == primary {
-                            theme::SELECT_PRIMARY.gamma_multiply(0.28)
-                        } else if selected.contains(&mi) {
-                            theme::SELECT_SECONDARY.gamma_multiply(0.22)
-                        } else if resp.hovered() {
-                            Color32::from_rgb(0x3a, 0x3a, 0x3a)
-                        } else if (start + k) % 2 == 1 {
-                            theme::ROW_ALT
-                        } else {
-                            theme::PANEL_BG
-                        };
-                        paint_label(ui, cell, &data.markers[mi], frame, bg);
-                        if resp.clicked() {
-                            let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                            action = Some(Action::Select { marker: mi, additive });
-                        }
-                    }
-                    if columns == 2 {
-                        p.line_segment([pos2(rect.center().x, rect.top()), pos2(rect.center().x, rect.bottom())], Stroke::new(1.0_f32, theme::GRAPH_SEP));
-                    }
-                }
-            }
-        }
-    });
-    let hrect = Rect::from_min_max(hrect.min, pos2(list.inner_rect.right(), hrect.bottom()));
-    let p = ui.painter();
-    for column in 0..columns {
-        let cell = label_cell(hrect, column, columns);
-        let c = cols(cell);
-        let f = FontId::proportional(12.5);
-        p.text(pos2(c.name, cell.center().y), Align2::LEFT_CENTER, "Labels", f.clone(), theme::ACCENT);
-        p.text(pos2(c.gaps_r, cell.center().y), Align2::RIGHT_CENTER, "Gaps", f, theme::TEXT_DIM);
-    }
-    p.line_segment([hrect.left_bottom(), hrect.right_bottom()], Stroke::new(1.0_f32, theme::GRAPH_SEP));
-    if columns == 2 {
-        p.line_segment([pos2(hrect.center().x, hrect.top()), pos2(hrect.center().x, hrect.bottom())], Stroke::new(1.0_f32, theme::GRAPH_SEP));
-    }
-    if let Some(gi) = toggle_group {
-        if !st.collapsed.remove(&gi) {
-            st.collapsed.insert(gi);
-        }
-    }
-    let (rect, _) = ui.allocate_exact_size(legend.size(), Sense::hover());
-    ui.painter().galley(rect.min, legend, theme::TEXT_DIM);
-    action
-}
-
-#[cfg(test)]
-mod labels_tests {
-    use super::*;
-    use tak_core::view_data::{ColorSource, Group};
-
-    fn data(groups: &[&[&str]]) -> ViewData {
-        let names: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
-        let mut take = crate::views::sample_take("labels.tak", &names);
-        for t in &mut take.trajectories {
-            t.kind = MarkerKind::Template;
-        }
-        let mut d = ViewData::build(take);
-        let mut first = 0;
-        d.groups = groups.iter().enumerate().map(|(gi, names)| {
-            let members: Vec<usize> = (first..first + names.len()).collect();
-            first += names.len();
-            for &mi in &members {
-                d.markers[mi].group = gi;
-            }
-            Group { title: format!("Group{gi}"), kind: GroupKind::AssetTemplate, color: ColorSource::Asset(gi), members, asset: None }
-        }).collect();
-        d
-    }
-
-    #[test]
-    fn layout_reads_down_first_per_group_in_existing_order_with_odd_single_and_empty_groups() {
-        let mut d = data(&[&["M0", "M1", "M2", "M3", "M4"], &["M5"], &["M6", "M7", "M8", "M9"], &[]]);
-        // Existing group order, rather than numeric marker order, is the reading order.
-        d.groups[0].members = vec![2, 0, 4, 1, 3];
-        let st = LabelsState::default();
-        assert_eq!(rows(&d, &st, 2), vec![
-            Row::Header(0), Row::Markers(2, Some(1)), Row::Markers(0, Some(3)), Row::Markers(4, None),
-            Row::Header(1), Row::Markers(5, None),
-            Row::Header(2), Row::Markers(6, Some(8)), Row::Markers(7, Some(9)), Row::Header(3),
-        ]);
-        let single = rows(&d, &st, 1);
-        let markers: Vec<usize> = single.iter().filter_map(|r| match *r {
-            Row::Markers(left, None) => Some(left),
-            Row::Markers(_, Some(_)) => panic!("one column has no right marker"),
-            Row::Header(_) => None,
-        }).collect();
-        assert_eq!(markers, [2, 0, 4, 1, 3, 5, 6, 7, 8, 9]);
-    }
-
-    #[test]
-    fn collapsed_groups_and_search_keep_the_existing_rules_and_split_only_matches() {
-        let mut d = data(&[&["keep A", "skip", "Keep B", "keep C"], &["other"], &["keep D"]]);
-        d.groups[2].kind = GroupKind::Unlabeled;
-        let mut st = LabelsState::default();
-        st.reset(&d, 7);
-        assert!(st.collapsed.contains(&2), "Unlabeled still starts collapsed");
-        st.collapsed.insert(0);
-        assert_eq!(rows(&d, &st, 2), [Row::Header(0), Row::Header(1), Row::Markers(4, None), Row::Header(2)]);
-        st.filter = "  KEEP  ".into();
-        assert_eq!(rows(&d, &st, 2), [
-            Row::Header(0), Row::Markers(0, Some(3)), Row::Markers(2, None),
-            Row::Header(2), Row::Markers(5, None),
-        ], "search opens matching collapsed groups and hides groups without matches");
-        st.filter = "no match".into();
-        assert!(rows(&d, &st, 2).is_empty());
-    }
-
-    #[test]
-    fn column_threshold_and_scroll_offsets_use_both_cells_and_the_real_pitch() {
-        assert_eq!(label_columns(259.9), 1);
-        assert_eq!(label_columns(260.0), 2);
-        assert_eq!(label_columns(380.0), 2);
-        let list = [Row::Header(0), Row::Markers(0, Some(4)), Row::Markers(1, Some(5)), Row::Markers(2, Some(6)), Row::Markers(3, None)];
-        assert_eq!(label_scroll_offset(&list, 4, 29.0), Some(0.0));
-        assert_eq!(label_scroll_offset(&list, 6, 29.0), Some(0.0));
-        assert_eq!(label_scroll_offset(&list, 3, 29.0), Some(29.0));
-        assert_eq!(label_scroll_offset(&list, 99, 29.0), None);
-        assert_eq!(label_scroll_offset(&[Row::Header(0)], 0, 29.0), None);
-    }
-
-    struct PaneTest {
-        ctx: egui::Context,
-        data: ViewData,
-        state: LabelsState,
-        selected: BTreeSet<usize>,
-        primary: Option<usize>,
-        frame: i64,
-        width: f32,
-        height: f32,
-        spacing: f32,
-    }
-
-    impl PaneTest {
-        fn new(groups: &[&[&str]]) -> Self {
-            let data = data(groups);
-            let mut state = LabelsState::default();
-            state.reset(&data, 7);
-            Self { ctx: egui::Context::default(), data, state, selected: BTreeSet::new(), primary: None, frame: 0, width: 380.0, height: 220.0, spacing: 3.0 }
-        }
-
-        fn draw(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) -> (egui::FullOutput, Option<Action>) {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(self.width + 16.0, 700.0))),
-                focused: true, modifiers, events, ..Default::default()
-            };
-            let mut action = None;
-            let ctx = self.ctx.clone();
-            let out = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(self.width);
-                    ui.spacing_mut().item_spacing.y = self.spacing;
-                    action = labels_pane(ui, &self.data, self.frame, &mut self.state, &self.selected, self.primary, 7, self.height);
-                });
-            });
-            (out, action)
-        }
-
-        fn idle(&mut self) -> egui::FullOutput {
-            self.draw(egui::Modifiers::NONE, vec![]).0
-        }
-
-        fn click(&mut self, at: egui::Pos2, modifiers: egui::Modifiers) -> Option<Action> {
-            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers };
-            self.draw(modifiers, vec![egui::Event::PointerMoved(at)]);
-            self.draw(modifiers, vec![button(true)]);
-            self.draw(modifiers, vec![button(false)]).1
-        }
-    }
-
-    struct Painted {
-        text: String,
-        glyphs: String,
-        rect: Rect,
-        clip: Rect,
-        color: Color32,
-        elided: bool,
-    }
-
-    fn texts(out: &egui::FullOutput) -> Vec<Painted> {
-        fn walk(shape: &egui::Shape, clip: Rect, found: &mut Vec<Painted>) {
-            match shape {
-                egui::Shape::Text(t) => found.push(Painted {
-                    text: t.galley.text().to_owned(),
-                    glyphs: t.galley.rows.iter().flat_map(|r| r.glyphs.iter().map(|g| g.chr)).collect(),
-                    rect: Rect::from_min_size(t.pos, t.galley.size()), clip,
-                    color: t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color),
-                    elided: t.galley.elided,
-                }),
-                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, found)),
-                _ => {}
-            }
-        }
-        let mut found = vec![];
-        for s in &out.shapes {
-            walk(&s.shape, s.clip_rect, &mut found);
-        }
-        found
-    }
-
-    fn at<'a>(texts: &'a [Painted], name: &str) -> &'a Painted {
-        texts.iter().find(|t| t.text == name).unwrap_or_else(|| panic!("{name} was not painted"))
-    }
-
-    #[test]
-    fn at_380pt_each_row_has_the_column_major_names_and_right_aligned_gaps_only() {
-        let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
-        for (i, m) in p.data.markers.iter_mut().enumerate() {
-            m.fill_pct = if i == 2 { 100.0 } else { 90.0 - i as f32 * 10.0 };
-            m.gaps = vec![(2, 3), (5, 6)];
-            m.max_gap = 123;
-        }
-        let painted = texts(&p.idle());
-        assert_eq!(painted.iter().filter(|t| t.text == "Labels").count(), 2);
-        let mut headers: Vec<_> = painted.iter().filter(|t| t.text == "Gaps").collect();
-        headers.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
-        assert_eq!(headers.len(), 2);
-        for (left, right) in [("M0", "M3"), ("M1", "M4")] {
-            assert!((at(&painted, left).rect.center().y - at(&painted, right).rect.center().y).abs() < 0.1);
-            assert!((at(&painted, right).rect.left() - at(&painted, left).rect.left() - 190.0).abs() < 0.5);
-        }
-        assert!(at(&painted, "M0").rect.top() < at(&painted, "M1").rect.top());
-        assert!(at(&painted, "M1").rect.top() < at(&painted, "M2").rect.top());
-        for (value, col) in [("10%", 0), ("20%", 0), ("40%", 1), ("50%", 1)] {
-            assert!((at(&painted, value).rect.right() - headers[col].rect.right()).abs() < 0.5, "{value} right-aligned to its header");
-        }
-        assert!(!painted.iter().any(|t| ["빈구간", "최대", "123", "2", "0%"].contains(&t.text.as_str())), "old header/cell numbers are gone");
-        assert!(painted.iter().any(|t| t.text.contains("빈구간 수 · 최대 길이는 마커를 고르면 '선택 마커' 패널에 나와요.")), "the legend tells where the other numbers are");
-    }
-
-    #[test]
-    fn right_column_click_ctrl_command_and_shift_use_the_existing_selection_actions() {
-        let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
-        let painted = texts(&p.idle());
-        let mut v = crate::views::View::default();
-        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
-        let command = egui::Modifiers { command: true, ..Default::default() };
-        let shift = egui::Modifiers { shift: true, ..Default::default() };
-        for (name, modifiers, want, additive, selection) in [
-            ("M3", egui::Modifiers::NONE, 3, false, vec![3]),
-            ("M0", ctrl, 0, true, vec![0, 3]),
-            ("M3", ctrl, 3, true, vec![0]),
-            ("M4", command, 4, true, vec![0, 4]),
-            ("M3", shift, 3, false, vec![3]),
-        ] {
-            let action = p.click(at(&painted, name).rect.center(), modifiers);
-            let Some(Action::Select { marker, additive: got }) = action else { panic!("{name} did not select a marker") };
-            assert_eq!((marker, got), (want, additive));
-            v.select(marker, got);
-            assert_eq!(v.selected.iter().copied().collect::<Vec<_>>(), selection);
-            p.selected = v.selected.clone();
-            p.primary = v.primary;
-        }
-    }
-
-    #[test]
-    fn odd_empty_cell_is_not_a_click_target_and_group_header_keeps_full_width() {
-        let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
-        let painted = texts(&p.idle());
-        let empty = at(&painted, "M2").rect.center() + vec2(190.0, 0.0);
-        assert!(p.click(empty, egui::Modifiers::NONE).is_none());
-        let header_right = pos2(at(&painted, "M3").rect.center().x, at(&painted, "Group0").rect.center().y);
-        assert!(p.click(header_right, egui::Modifiers::NONE).is_none());
-        assert!(p.state.collapsed.contains(&0));
-        let after = texts(&p.idle());
-        assert!(!after.iter().any(|t| t.text == "M0" || t.text == "M3"));
-        p.click(header_right, egui::Modifiers::NONE);
-        assert!(!p.state.collapsed.contains(&0));
-    }
-
-    #[test]
-    fn long_names_in_both_cells_are_font_elided_and_the_gaps_stay_visible() {
-        let left = "A_very_long_marker_name_abcdefghijklmnopqrstuvwxyz";
-        let right = "B_very_long_marker_name_abcdefghijklmnopqrstuvwxyz";
-        let mut p = PaneTest::new(&[&[left, right]]);
-        p.data.markers[0].fill_pct = 83.0;
-        p.data.markers[1].fill_pct = 57.0;
-        let painted = texts(&p.idle());
-        for (name, value) in [(left, "17%"), (right, "43%")] {
-            let (name, value) = (at(&painted, name), at(&painted, value));
-            assert!(name.elided);
-            assert!(name.glyphs.ends_with('…'), "inspect painted glyphs, not the original LayoutJob text");
-            assert!(name.rect.right() <= name.clip.right() + 0.5);
-            assert!(name.rect.right() < value.rect.left());
-            assert!(!value.elided);
-            assert_eq!(value.glyphs, value.text);
-            assert!(value.clip.contains_rect(value.rect));
-        }
-    }
-
-    #[test]
-    fn narrow_pane_paints_one_column_and_resizing_to_260pt_restores_two() {
-        let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
-        p.width = 259.0;
-        let painted = texts(&p.idle());
-        assert_eq!(painted.iter().filter(|t| t.text == "Gaps").count(), 1);
-        assert_eq!(painted.iter().filter(|t| t.text == "Labels").count(), 1);
-        for i in 1..5 {
-            let (a, b) = (at(&painted, &format!("M{}", i - 1)), at(&painted, &format!("M{i}")));
-            assert!((a.rect.left() - b.rect.left()).abs() < 0.1);
-            assert!(a.rect.top() < b.rect.top());
-        }
-        p.width = 260.0;
-        let painted = texts(&p.idle());
-        assert_eq!(painted.iter().filter(|t| t.text == "Gaps").count(), 2);
-        assert!((at(&painted, "M0").rect.top() - at(&painted, "M3").rect.top()).abs() < 0.1);
-    }
-
-    #[test]
-    fn right_column_scroll_target_is_visible_with_nondefault_spacing_and_only_nearby_rows_are_painted() {
-        let names: Vec<String> = (0..200).map(|i| format!("M{i:03}")).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut p = PaneTest::new(&[&refs]);
-        p.height = 130.0;
-        p.spacing = 9.0;
-        let before = texts(&p.idle());
-        assert!(!before.iter().any(|t| t.text == "M180"));
-        p.state.scroll_to = Some(180);
-        let out = p.idle();
-        let painted = texts(&out);
-        let target = at(&painted, "M180");
-        assert!(target.clip.contains_rect(target.rect));
-        assert!((target.rect.top() - at(&painted, "M080").rect.top()).abs() < 0.1);
-        // The name has its own cell clip. Use the row background's clip for the viewport.
-        let (row_top, viewport_top) = out.shapes.iter().find_map(|s| match &s.shape {
-            egui::Shape::Rect(r) if r.rect.contains(target.rect.center()) && (r.rect.height() - ROW_H).abs() < 0.1 => Some((r.rect.top(), s.clip_rect.top())),
-            _ => None,
-        }).expect("the target's background is painted");
-        assert!((row_top - viewport_top - 3.0 * (ROW_H + p.spacing)).abs() < 6.0, "three actual row pitches below the viewport top");
-        assert_eq!(p.state.scroll_to, None);
-        assert!(!painted.iter().any(|t| t.text == "M000" || t.text == "M199"));
-        assert!(painted.iter().filter(|t| t.text.starts_with('M')).count() < 20, "virtualized instead of painting all 200 markers");
-        assert!(texts(&p.idle()).iter().any(|t| t.text == "M180"));
-    }
-
-    #[test]
-    fn legend_keeps_space_below_a_list_that_fills_the_remaining_pane() {
-        let names: Vec<String> = (0..200).map(|i| format!("M{i:03}")).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut p = PaneTest::new(&[&refs]);
-        p.height = f32::INFINITY;
-        let painted = texts(&p.idle());
-        let legend = painted.iter().find(|t| t.text.contains("빈구간 수 · 최대 길이")).expect("the legend is painted");
-        assert!(legend.clip.contains_rect(legend.rect), "the docked pane must not clip its legend below the scroll area");
-        assert!(legend.rect.bottom() <= 692.5, "inside the 700 pt screen's panel margin");
-    }
-
-    #[test]
-    fn marker_colors_absence_and_primary_secondary_highlights_stay_per_cell() {
-        let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3"]]);
-        p.selected = [0, 2].into_iter().collect();
-        p.primary = Some(2);
-        let out = p.idle();
-        let painted = texts(&out);
-        assert_eq!(at(&painted, "M0").color, theme::LABEL_TRACKED);
-        assert_eq!(at(&painted, "M2").color, theme::LABEL_TRACKED);
-        for (name, fill) in [("M0", theme::SELECT_SECONDARY.gamma_multiply(0.22)), ("M2", theme::SELECT_PRIMARY.gamma_multiply(0.28))] {
-            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == fill && r.rect.contains(at(&painted, name).rect.center()) && (r.rect.width() - 190.0).abs() < 0.5)));
-        }
-        for m in &p.data.markers {
-            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Circle(c) if c.fill == theme::color(m.color) && (c.radius - 4.0).abs() < 0.1)));
-        }
-        p.frame = 10;
-        let absent = texts(&p.idle());
-        assert_eq!(at(&absent, "M0").color, theme::LABEL_UNTRACKED);
-        assert_eq!(at(&absent, "M2").color, theme::LABEL_UNTRACKED);
-    }
 }
 
 // ───────────────────────── Selected marker ─────────────────────────
@@ -742,12 +260,6 @@ impl LaneCache {
         (self.built, self.pairs_built)
     }
 
-    /// X / Y / Z of the graphed markers `markers` (`graphed`, not empty), and the frames where
-    /// one of them has no value; made again only for another file or other markers. Every lane
-    /// in its colour, X red, Y green, Z blue, whether one marker or several (v0.29.0, user
-    /// "graph 색깔은 지금 x,y,z 색깔대로"): every lane holds each marker's curve in that colour.
-    /// The first marker's lanes are built at once, the others' as far as the frame's work
-    /// allows (`graph::spend`), the rest at the next calls.
     pub fn get(&mut self, data: &ViewData, file_id: usize, markers: &[usize]) -> (&[Lane], &[(i64, i64)], &mut graph::Drawn) {
         let several = markers.len() > 1;
         let lanes_of = |k: usize| marker_lanes(data, markers[k]);
@@ -1022,7 +534,7 @@ fn marker_lanes(data: &ViewData, mi: usize) -> Vec<Lane> {
 pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeSet<usize>, primary: Option<usize>) -> Option<Action> {
     let Some(mi) = primary.filter(|m| *m < data.markers.len()) else {
         ui.add_space(4.0);
-        ui.label(RichText::new("3D 화면이나 Labels에서 마커를 클릭하세요.").color(theme::TEXT_DIM));
+        ui.label(RichText::new("3D 화면이나 Labeling에서 마커를 클릭하세요.").color(theme::TEXT_DIM));
         return None;
     };
     let m = &data.markers[mi];
@@ -1073,13 +585,13 @@ fn over_3d_button(ui: &mut Ui) -> bool {
 /// colours; the mouse over a curve shows its marker's name, `graph::show`), and
 /// "선택 N개 중 8개" when some are left out.
 #[allow(clippy::too_many_arguments)]
-pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], total: usize, file_id: usize, cache: &mut LaneCache, spans: &[graph::Span]) -> Option<Action> {
+pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], total: usize, file_id: usize, cache: &mut LaneCache, spans: &[graph::Span], selection: &mut Option<(i64, i64)>) -> Option<Action> {
     let Some(mi) = markers.first().copied().filter(|m| *m < data.markers.len()) else {
         ui.add_space(4.0);
         let mut over = false;
         ui.horizontal(|ui| {
             over = over_3d_button(ui);
-            ui.label(RichText::new("3D 화면이나 Labels에서 마커를 클릭하면 X·Y·Z 그래프가 나와요.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("3D 화면이나 Labeling에서 마커를 클릭하면 X·Y·Z 그래프가 나와요.").color(theme::TEXT_DIM));
         });
         return over.then_some(Action::GraphOver3d);
     };
@@ -1087,7 +599,8 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
     let (lanes, gaps, drawn) = cache.get(data, file_id, markers);
     const HINT_H: f32 = 22.0;
     let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lanes.len().max(1) as f32).clamp(34.0, 140.0);
-    let goto = graph::show(ui, Id::new(("sel_graph", file_id)), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &Look::pane(), Some(drawn), spans);
+    let look = Look::pane();
+    let goto = graph::show_select(ui, Id::new(("sel_graph", file_id)), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection);
     let mut over = false;
     let keys = graph_keys(data, markers, frame);
     ui.horizontal(|ui| {
@@ -1106,7 +619,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
         if total > markers.len() {
             ui.label(RichText::new(left_out_text(markers.len(), total)).small().color(theme::TEXT));
         }
-        ui.label(RichText::new("· 선 위에 마우스 = 마커 이름 · 클릭·드래그 = 프레임 이동 · 휠 = 확대 · 가운데 드래그 = 옆으로 · 더블클릭 = 전체 · 아래 빨간 칸 = 빈 구간").small().color(theme::TEXT_DIM));
+        ui.label(RichText::new("· 선 위에 마우스 = 마커 이름 · 클릭 = 프레임 이동 · 드래그 = 구간 선택 · 휠 = 확대 · 가운데 드래그 = 옆으로 · 더블클릭 = 전체 · 아래 빨간 칸 = 빈 구간").small().color(theme::TEXT_DIM));
     });
     if over {
         return Some(Action::GraphOver3d);
@@ -1121,8 +634,6 @@ pub struct DevicesState {
     pub channel: HashMap<usize, usize>,
 }
 
-/// Show force plates and analog devices. A chosen plate can float over the active 3D view;
-/// other analog devices remain in the devices pane.
 pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>) -> Option<Action> {
     if data.analog_pending {
         ui.add_space(4.0);
@@ -1196,7 +707,9 @@ pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesSt
 /// Height of the seek zone of a timeline (top part): ticks, played part, red marks, the
 /// selected marker's gaps, the current-frame line. A press or a drag here moves the frame.
 pub const SEEK_H: f32 = 28.0;
-/// Height of the band strip: dragging selects a frame range and clicking clears it.
+/// Height of the band strip right under the seek zone, in the same row: a drag here picks a
+/// frame range, a plain click clears it (later the Comment blocks go here). One constant so it
+/// is easy to tune after the user's try (v0.13.0, agent's choice).
 pub const BAND_H: f32 = 12.0;
 /// Height of the timeline of a playback bar: seek zone + band strip.
 pub const TIMELINE_H: f32 = SEEK_H + BAND_H;
@@ -1211,8 +724,6 @@ pub const BLOCK_MIN_W: f32 = 4.0;
 const BLOCK_FONT: f32 = 9.0;
 /// Height of a view's playback bar: margin, timeline, gap, button row, margin.
 pub const DECK_H: f32 = 4.0 + TIMELINE_H + 3.0 + 24.0 + 4.0;
-/// Above this width the playback bar shows all buttons. Narrower bars keep the essential
-/// controls visible and place the rest in a menu.
 pub const WIDE_DECK_MIN: f32 = 700.0;
 
 pub fn deck_is_wide(width: f32) -> bool {
@@ -1574,7 +1085,7 @@ fn timeline(
             pb.set_frame(frame_at(pos.x), now);
         }
     }
-    // Band strip: its own shade, the comment blocks, the range as an orange dashed box with a
+    // Band strip: its own shade, the comment blocks, the range as a yellow dashed box with a
     // faint fill above them.
     let bp = ui.painter_at(band);
     let corner = egui::Rounding { nw: 0.0, ne: 0.0, sw: 2.0, se: 2.0 };
@@ -1660,8 +1171,6 @@ fn timeline(
         if block_resp.clicked() {
             action = Some(DeckAction::GotoComment(b.id));
         }
-        // Right-clicking deletes a block immediately. Overlapping blocks give the click to the
-        // last drawn block on top.
         if block_resp.secondary_clicked() && comments.can_delete {
             action = Some(DeckAction::DeleteComment(b.id));
         }
@@ -1816,7 +1325,6 @@ fn speed_box(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
     }
 }
 
-/// Wide playback bar: all buttons fit in the row, and playback always loops.
 fn transport(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
     if btn(ui, "⏮", "처음 (Home)") {
         pb.step(i64::MIN / 2, now);
@@ -2040,6 +1548,8 @@ mod deck_tests {
             shown_b: String::new(),
             file_a: String::new(),
             file_b: String::new(),
+            operation: None,
+            expected: None,
         }
     }
 
@@ -2264,7 +1774,6 @@ mod deck_tests {
             cache.get(&d, 1, &[0]);
         }
         assert_eq!(cache.builds, 1);
-        // Multiple markers share axis colors: X red, Y green, and Z blue.
         let (lanes, _, _) = cache.get(&d, 1, &[2, 1, 0]);
         assert_eq!(lanes.len(), 3);
         assert_eq!(lanes.iter().map(|l| l.color).collect::<Vec<_>>(), vec![theme::AXIS_X, theme::AXIS_Y, theme::AXIS_Z]);

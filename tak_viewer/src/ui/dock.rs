@@ -1,15 +1,3 @@
-//! Pane layout, arranged like VS Code: Explorer on the left (primary side bar), the 3D views in
-//! the middle (editor), Labels and below it selected marker / devices (two tabs) on the right
-//! (secondary side bar). Nothing is below the views at first: the selected marker's graph
-//! floats over its 3D view (`graph_float.rs`); the GRAPH pane (panel below the views) is where
-//! the graph goes when the user sends it back. That is only the first arrangement: each pane has a title that
-//! can be dragged with the mouse to any side, stacked with other panes as tabs, or pulled out
-//! into a floating window (`egui_dock`). The layout is saved with the settings.
-//! Toggles (`Side`): everything docked left of / below / right of the 3D views is hidden as a
-//! whole and comes back where it was (`toggle_side`, `Hidden`).
-//! 3D views: up to `MAX_VIEWS` (`views.rs`), always in the main window. A new view splits the
-//! biggest view: 1 → 2 side by side → 3 → 2×2 (VS Code "open to the side").
-//! Drawing of each pane is in `app.rs` (`Tabs`); this file only knows the layout and tab look.
 
 use super::theme;
 use crate::views::MAX_VIEWS;
@@ -18,21 +6,27 @@ use egui_dock::{DockState, Node, NodeIndex, OverlayType, Style, SurfaceIndex, Ta
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Saved layouts older than this get the default arrangement once (their 3D views are kept).
+/// Saved-layout schema; valid older layouts migrate in place and keep their panels/views.
 /// 1 = v0.7.0: graph / devices below the views, graph is its own pane.
 /// 2 = v0.10.0: the graph floats over the 3D views, so no pane below them; devices is a tab
 /// next to the selected marker.
-pub const LAYOUT_VERSION: u32 = 2;
+/// 3 = v0.32.0: Labeling / Edit Tools tabs; v0.32.5 also merges any legacy Labels in place.
+pub const LAYOUT_VERSION: u32 = 3;
 /// Height of the tab row (file tabs of the 3D views, pane titles).
 pub const TAB_H: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "SavedPane")]
 pub enum Pane {
+    /// Editor area with no open 3D views; keeps the surrounding pane positions.
+    Empty,
     /// 3D view of one file; the number is its slot (0..MAX_VIEWS) in `TakViewerApp::views`.
     View(u8),
     Explorer,
+    /// Legacy saved marker-list pane; merged into `Labeling` before layout validation.
     Labels,
+    Labeling,
+    EditTools,
     /// Facts about the selected marker (its X/Y/Z graph is `Graph`).
     Selected,
     Graph,
@@ -44,10 +38,13 @@ pub enum Pane {
 /// Panes as read from the settings. Before v0.6.0 there was one 3D view, saved as `Scene`.
 #[derive(Deserialize)]
 enum SavedPane {
+    Empty,
     Scene,
     View(u8),
     Explorer,
     Labels,
+    Labeling,
+    EditTools,
     Selected,
     Graph,
     Devices,
@@ -57,10 +54,13 @@ enum SavedPane {
 impl From<SavedPane> for Pane {
     fn from(p: SavedPane) -> Pane {
         match p {
+            SavedPane::Empty => Pane::Empty,
             SavedPane::Scene => Pane::View(0),
             SavedPane::View(k) => Pane::View(k),
             SavedPane::Explorer => Pane::Explorer,
             SavedPane::Labels => Pane::Labels,
+            SavedPane::Labeling => Pane::Labeling,
+            SavedPane::EditTools => Pane::EditTools,
             SavedPane::Selected => Pane::Selected,
             SavedPane::Graph => Pane::Graph,
             SavedPane::Devices => Pane::Devices,
@@ -80,14 +80,16 @@ pub enum Side {
 
 impl Pane {
     /// Panes other than the 3D views (each at most once, can be closed from the "보기" menu).
-    pub const PANELS: [Pane; 6] = [Pane::Explorer, Pane::Labels, Pane::Selected, Pane::Graph, Pane::Devices, Pane::Comments];
+    pub const PANELS: [Pane; 7] = [Pane::Explorer, Pane::Labeling, Pane::EditTools, Pane::Selected, Pane::Graph, Pane::Devices, Pane::Comments];
 
     /// Title on the pane's tab (a 3D view's tab shows its file name instead, `app.rs`).
     pub fn title(self) -> &'static str {
         match self {
+            Pane::Empty => "",
             Pane::View(_) => "3D 화면",
             Pane::Explorer => "EXPLORER",
-            Pane::Labels => "LABELS",
+            Pane::Labels | Pane::Labeling => "Labeling",
+            Pane::EditTools => "Edit Tools",
             Pane::Selected => "선택 마커",
             Pane::Graph => "GRAPH",
             Pane::Devices => "장치",
@@ -98,9 +100,9 @@ impl Pane {
     /// Where the pane sits in the first arrangement (None for the 3D views).
     pub fn home(self) -> Option<Side> {
         match self {
-            Pane::View(_) => None,
+            Pane::View(_) | Pane::Empty => None,
             Pane::Explorer => Some(Side::Left),
-            Pane::Labels | Pane::Selected | Pane::Devices | Pane::Comments => Some(Side::Right),
+            Pane::Labels | Pane::Labeling | Pane::EditTools | Pane::Selected | Pane::Devices | Pane::Comments => Some(Side::Right),
             Pane::Graph => Some(Side::Bottom),
         }
     }
@@ -108,6 +110,8 @@ impl Pane {
     /// The pane this one shares a place with (as tabs) in the first arrangement.
     fn tab_mate(self) -> Option<Pane> {
         match self {
+            Pane::Labeling => Some(Pane::EditTools),
+            Pane::EditTools => Some(Pane::Labeling),
             Pane::Selected => Some(Pane::Devices),
             Pane::Devices => Some(Pane::Selected),
             // Not in the first arrangement (v0.17.0): opened, it joins the selected marker.
@@ -134,16 +138,16 @@ pub fn default_layout() -> DockState<Pane> {
 }
 
 /// The first arrangement with these 3D views (first one where the single view sits): Explorer
-/// left, views in the middle down to the bottom (the graph floats over them), Labels on the
-/// right with selected marker / devices (two tabs) below it. Split fractions are the share of
+/// left, views in the middle down to the bottom (the graph floats over them), Labeling / Edit
+/// Tools on the right with selected marker / devices below them. Split fractions are the share of
 /// the left / upper part.
 pub fn default_layout_for(slots: &[u8]) -> DockState<Pane> {
     let first = slots.first().copied().unwrap_or(0);
-    let mut d = DockState::new(vec![Pane::View(first)]);
+    let mut d = DockState::new(vec![if slots.is_empty() { Pane::Empty } else { Pane::View(first) }]);
     let s = d.main_surface_mut();
     let [scene, _explorer] = s.split_left(NodeIndex::root(), 0.19, vec![Pane::Explorer]);
-    let [scene, right] = s.split_right(scene, 0.70, vec![Pane::Labels]);
-    s.split_below(right, 0.6, vec![Pane::Selected, Pane::Devices]);
+    let [scene, right] = s.split_right(scene, 0.70, vec![Pane::Labeling, Pane::EditTools]);
+    s.split_below(right, 0.67, vec![Pane::Selected, Pane::Devices]);
     s.set_focused_node(scene);
     d.translations = translations();
     for &k in &slots[1.min(slots.len())..] {
@@ -160,18 +164,22 @@ pub fn scene_only(slot: u8) -> DockState<Pane> {
     d
 }
 
-/// A saved layout is used only when every 3D view is in the main window, there is at least
-/// one, and no pane appears twice; otherwise the default layout is used.
+/// A saved layout requires a main-window editor (a view or the empty placeholder), valid
+/// view slots and no duplicate panes; otherwise the default layout is used.
 pub fn sanitize(dock: DockState<Pane>) -> DockState<Pane> {
     let mut counts: HashMap<Pane, usize> = HashMap::new();
     let mut view_elsewhere = false;
     for ((surface, _), tab) in dock.iter_all_tabs() {
         *counts.entry(*tab).or_default() += 1;
-        if let Pane::View(k) = tab {
-            view_elsewhere |= surface != SurfaceIndex::main() || usize::from(*k) >= MAX_VIEWS;
+        match tab {
+            Pane::View(k) => view_elsewhere |= surface != SurfaceIndex::main() || usize::from(*k) >= MAX_VIEWS,
+            Pane::Empty => view_elsewhere |= surface != SurfaceIndex::main(),
+            _ => {}
         }
     }
-    if views(&dock).is_empty() || view_elsewhere || counts.values().any(|&c| c > 1) {
+    let slots = views(&dock);
+    let empty = counts.contains_key(&Pane::Empty);
+    if (slots.is_empty() != empty) || view_elsewhere || counts.values().any(|&c| c > 1) {
         return default_layout();
     }
     let mut d = dock;
@@ -222,7 +230,7 @@ pub fn free_slot(dock: &DockState<Pane>) -> Option<u8> {
 }
 
 fn has_view(node: &Node<Pane>) -> bool {
-    node.tabs().is_some_and(|t| t.iter().any(|p| matches!(p, Pane::View(_))))
+    node.tabs().is_some_and(|t| t.iter().any(|p| matches!(p, Pane::View(_) | Pane::Empty)))
 }
 
 /// Rectangles of the main-window leaves, from the split fractions inside `area`
@@ -286,6 +294,10 @@ pub fn add_view(dock: &mut DockState<Pane>, slot: u8, area: Rect) {
     if dock.find_tab(&Pane::View(slot)).is_some() {
         return;
     }
+    if views(dock).is_empty() {
+        *dock = default_layout_for(&[slot]);
+        return;
+    }
     let count = views(dock).len();
     let s = dock.main_surface_mut();
     let rects = leaf_rects(s, area);
@@ -304,11 +316,15 @@ pub fn add_view(dock: &mut DockState<Pane>, slot: u8, area: Rect) {
     s.set_focused_node(added);
 }
 
-/// Take a 3D view out of the layout (never the last one); the neighbour takes its place.
+/// Take a 3D view out of the layout. The last one becomes an empty editor in the same place.
 pub fn remove_view(dock: &mut DockState<Pane>, slot: u8) {
-    if views(dock).len() > 1 {
-        if let Some(loc) = dock.find_tab(&Pane::View(slot)) {
-            dock.remove_tab(loc);
+    if let Some((surface, node, tab)) = dock.find_tab(&Pane::View(slot)) {
+        if views(dock).len() == 1 {
+            if let Node::Leaf { tabs, .. } = &mut dock[surface][node] {
+                tabs[tab.0] = Pane::Empty;
+            }
+        } else {
+            dock.remove_tab((surface, node, tab));
         }
     }
 }
@@ -327,7 +343,7 @@ pub fn has(dock: &DockState<Pane>, pane: Pane) -> bool {
 
 /// Close a pane (3D views are closed with their tab ✕, `remove_view`).
 pub fn hide(dock: &mut DockState<Pane>, pane: Pane) {
-    if matches!(pane, Pane::View(_)) {
+    if matches!(pane, Pane::View(_) | Pane::Empty) {
         return;
     }
     if let Some(loc) = dock.find_tab(&pane) {
@@ -404,6 +420,63 @@ pub struct Hidden {
     pub right: Option<Stash>,
 }
 
+/// Merge the former marker-list pane before validating a saved layout. Prefer an existing
+/// `Labeling` pane, even when a side toggle has hidden it; otherwise rename the old pane in
+/// place. Remove other copies without moving the retained docked or floating pane. A closed
+/// marker-list pane stays closed. This runs before the app starts recording layout history.
+pub fn merge_label_panels(dock: &mut DockState<Pane>, hidden: &mut Hidden) {
+    let existing = has(dock, Pane::Labeling) || hidden.panes().any(|p| p == Pane::Labeling);
+    let mut retained = false;
+    let mut merge = |pane: &mut Pane| {
+        if *pane == Pane::Labeling || (!existing && *pane == Pane::Labels) {
+            *pane = if retained { Pane::Labels } else { Pane::Labeling };
+            retained = true;
+        }
+    };
+    for (_, pane) in dock.iter_all_tabs_mut() {
+        merge(pane);
+    }
+    for stash in [&mut hidden.left, &mut hidden.bottom, &mut hidden.right].into_iter().flatten() {
+        for pane in stash.leaves.iter_mut().flat_map(|leaf| &mut leaf.tabs) {
+            merge(pane);
+        }
+    }
+    // Removing through DockState also removes empty leaves/windows and repairs active tabs.
+    while let Some(loc) = dock.find_tab(&Pane::Labels) {
+        dock.remove_tab(loc);
+    }
+    hidden.forget(Pane::Labels);
+}
+
+/// Add Edit Tools to a pre-version-3 arrangement without reopening a closed marker list.
+pub fn migrate_labeling(dock: &mut DockState<Pane>, hidden: &mut Hidden) {
+    merge_label_panels(dock, hidden);
+    if has(dock, Pane::EditTools) || hidden.panes().any(|p| p == Pane::EditTools) {
+        return;
+    }
+    if let Some((surface, node, tab)) = dock.find_tab(&Pane::Labeling) {
+        if let Node::Leaf { tabs, active, .. } = &mut dock[surface][node] {
+            tabs.insert(tab.0 + 1, Pane::EditTools);
+            if active.0 > tab.0 {
+                active.0 += 1;
+            }
+            return;
+        }
+    }
+    for stash in [&mut hidden.left, &mut hidden.bottom, &mut hidden.right].into_iter().flatten() {
+        for leaf in &mut stash.leaves {
+            if let Some(at) = leaf.tabs.iter().position(|p| *p == Pane::Labeling) {
+                leaf.tabs.insert(at + 1, Pane::EditTools);
+                if leaf.active > at {
+                    leaf.active += 1;
+                }
+                return;
+            }
+        }
+    }
+    show(dock, Pane::EditTools);
+}
+
 impl Hidden {
     fn slot(&mut self, side: Side) -> &mut Option<Stash> {
         match side {
@@ -428,8 +501,17 @@ impl Hidden {
             let mut empty = false;
             if let Some(stash) = slot.as_mut() {
                 for leaf in &mut stash.leaves {
-                    leaf.tabs.retain(|p| keep(*p));
-                    leaf.active = leaf.active.min(leaf.tabs.len().saturating_sub(1));
+                    let mut at = 0;
+                    let mut active = 0;
+                    leaf.tabs.retain(|p| {
+                        let retained = keep(*p);
+                        if at < leaf.active && retained {
+                            active += 1;
+                        }
+                        at += 1;
+                        retained
+                    });
+                    leaf.active = active.min(leaf.tabs.len().saturating_sub(1));
                 }
                 stash.leaves.retain(|l| !l.tabs.is_empty());
                 empty = stash.leaves.is_empty();
@@ -565,8 +647,8 @@ fn home_stash(dock: &DockState<Pane>, hidden: &Hidden, side: Side) -> Option<Sta
         Side::Left => Stash { share: 0.19, leaves: vec![leaf(free, 1.0)] },
         Side::Bottom => Stash { share: 0.28, leaves: vec![leaf(free, 1.0)] },
         Side::Right => {
-            // Labels on top; selected marker / devices as tabs of one place below it.
-            let (labels, rest): (Vec<Pane>, Vec<Pane>) = free.into_iter().partition(|p| *p == Pane::Labels);
+            // Editing tabs on top; selected marker / devices share one place below them.
+            let (labels, rest): (Vec<Pane>, Vec<Pane>) = free.into_iter().partition(|p| matches!(p, Pane::Labeling | Pane::EditTools));
             Stash { share: 0.25, leaves: [(labels, 0.6), (rest, 0.4)].into_iter().filter(|(tabs, _)| !tabs.is_empty()).map(|(tabs, size)| leaf(tabs, size)).collect() }
         }
     })
@@ -629,8 +711,6 @@ pub fn panel_tab_style(base: &TabStyle) -> TabStyle {
 const TAB_CLOSE_W: f32 = 24.0;
 const TAB_CLOSE_X: f32 = 9.0;
 
-/// A lone 3D view draws over its tab row and paints the tab as a name tag. The underlying
-/// tab still handles drag, close, and click.
 #[derive(Clone, Debug)]
 pub struct ViewTag {
     pub rect: Rect,
@@ -799,8 +879,6 @@ pub fn add_view_at(dock: &mut DockState<Pane>, slot: u8, target: u8, zone: DropZ
     true
 }
 
-/// Dock colors use thin pane borders. A dragged tab shows its drop area in blue: an edge
-/// places it beside the target; the center adds it as a tab.
 pub fn style(egui_style: &egui::Style) -> Style {
     let mut s = Style::from_egui(egui_style);
     s.main_surface_border_stroke = Stroke::NONE;
@@ -859,7 +937,7 @@ mod tests {
     /// graph floats over the 3D views) and the COMMENTS pane (v0.17.0: opened from the menu or
     /// the status bar, so the first arrangement and `LAYOUT_VERSION` stay).
     fn all(views: &[u8]) -> Vec<Pane> {
-        views.iter().map(|&k| Pane::View(k)).chain(Pane::PANELS).filter(|p| !matches!(p, Pane::Graph | Pane::Comments)).collect()
+        views.iter().map(|&k| Pane::View(k)).chain(Pane::PANELS).filter(|p| !matches!(p, Pane::Graph | Pane::Comments | Pane::Labels)).collect()
     }
 
     #[test]
@@ -955,9 +1033,10 @@ mod tests {
     fn default_layout_is_the_vs_code_arrangement() {
         let d = default_layout();
         let view = rect_of(&d, Pane::View(0));
-        let (explorer, labels, selected) = (rect_of(&d, Pane::Explorer), rect_of(&d, Pane::Labels), rect_of(&d, Pane::Selected));
+        let (explorer, labels, selected) = (rect_of(&d, Pane::Explorer), rect_of(&d, Pane::Labeling), rect_of(&d, Pane::Selected));
         assert!(explorer.right() <= view.left() + 0.5 && explorer.height() == NOMINAL_AREA.height(), "Explorer: left, full height");
         assert!(labels.left() >= view.right() - 0.5 && selected.top() >= labels.bottom() - 0.5, "Labels right, selected marker below it");
+        assert_eq!(labels, rect_of(&d, Pane::EditTools), "the two editing tabs share a place");
         assert_eq!(selected, rect_of(&d, Pane::Devices), "selected marker and devices are tabs of one place");
         let s = d.main_surface();
         let (node, _) = s.find_tab(&Pane::Selected).unwrap();
@@ -997,18 +1076,18 @@ mod tests {
             assert!(!has(&d, p));
         }
         assert_eq!(tabs(&d), vec![Pane::View(0)]);
-        show(&mut d, Pane::Labels);
+        show(&mut d, Pane::Labeling);
         show(&mut d, Pane::Devices);
         show(&mut d, Pane::Explorer);
         show(&mut d, Pane::Explorer);
-        assert_eq!(tabs(&d), vec![Pane::View(0), Pane::Explorer, Pane::Labels, Pane::Devices]);
-        assert!(rect_of(&d, Pane::Devices).top() >= rect_of(&d, Pane::Labels).bottom() - 0.5, "devices comes back on the right, below Labels");
+        assert_eq!(tabs(&d), vec![Pane::View(0), Pane::Explorer, Pane::Labeling, Pane::Devices]);
+        assert!(rect_of(&d, Pane::Devices).top() >= rect_of(&d, Pane::Labeling).bottom() - 0.5, "devices comes back on the right, below Labeling");
         show(&mut d, Pane::Graph);
         let view = rect_of(&d, Pane::View(0));
         assert!(rect_of(&d, Pane::Graph).top() >= view.bottom() - 0.5, "the graph pane comes back below the views");
         show(&mut d, Pane::Selected);
         assert_eq!(rect_of(&d, Pane::Selected), rect_of(&d, Pane::Devices), "next to devices, as a tab");
-        assert!(rect_of(&d, Pane::Selected).top() >= rect_of(&d, Pane::Labels).bottom() - 0.5);
+        assert!(rect_of(&d, Pane::Selected).top() >= rect_of(&d, Pane::Labeling).bottom() - 0.5);
     }
 
     /// Centers of the view rectangles, as (column, row) on a 2×2 grid of the 3D area.
@@ -1056,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_view_lets_the_neighbour_fill_and_never_closes_the_last() {
+    fn closing_a_view_lets_the_neighbour_fill_and_the_last_leaves_an_empty_editor() {
         let mut d = default_layout();
         add_view(&mut d, 1, NOMINAL_AREA);
         let one = view_rects(&default_layout(), NOMINAL_AREA)[0].1;
@@ -1065,9 +1144,15 @@ mod tests {
         let left = view_rects(&d, NOMINAL_AREA)[0].1;
         assert!((left.area() - one.area()).abs() < 1.0, "view 1 now fills the place of both");
         remove_view(&mut d, 1);
-        assert_eq!(views(&d), vec![1], "last view stays");
+        assert!(views(&d).is_empty(), "last view closes");
         assert_eq!(free_slot(&d), Some(0));
-        assert_eq!(tabs(&d), all(&[1]));
+        assert!(has(&d, Pane::Empty));
+        assert_eq!(rect_of(&d, Pane::Empty), left, "the editor keeps its place");
+        let saved = sanitize(d.clone());
+        assert!(views(&saved).is_empty());
+        assert!(has(&saved, Pane::Empty));
+        add_view(&mut d, 2, NOMINAL_AREA);
+        assert_eq!(tabs(&d), all(&[2]), "a fresh open uses the default layout");
     }
 
     #[test]
@@ -1091,7 +1176,7 @@ mod tests {
         add_view(&mut d, 1, NOMINAL_AREA);
         let before: Vec<(Pane, Rect)> = tabs(&d).into_iter().map(|p| (p, rect_of(&d, p))).collect();
         let mut hidden = Hidden::default();
-        for (side, gone) in [(Side::Left, vec![Pane::Explorer]), (Side::Bottom, vec![Pane::Graph]), (Side::Right, vec![Pane::Labels, Pane::Selected, Pane::Devices])] {
+        for (side, gone) in [(Side::Left, vec![Pane::Explorer]), (Side::Bottom, vec![Pane::Graph]), (Side::Right, vec![Pane::Labeling, Pane::EditTools, Pane::Selected, Pane::Devices])] {
             toggle_side(&mut d, &mut hidden, NOMINAL_AREA, side);
             assert!(!side_open(&d, NOMINAL_AREA, side));
             assert!(gone.iter().all(|p| !has(&d, *p)), "{side:?} panes are off the screen");
@@ -1117,20 +1202,20 @@ mod tests {
 
     #[test]
     fn toggle_follows_dragged_panes_and_keeps_the_shown_tab() {
-        // Labels dragged to the left under the Explorer; devices is the shown tab of its place.
+        // Labeling dragged to the left under Explorer; devices is the shown tab of its place.
         let mut d = default_layout();
-        hide(&mut d, Pane::Labels);
+        hide(&mut d, Pane::Labeling);
         let (node, _) = d.main_surface().find_tab(&Pane::Explorer).unwrap();
-        d.main_surface_mut().split_below(node, 0.5, vec![Pane::Labels]);
+        d.main_surface_mut().split_below(node, 0.5, vec![Pane::Labeling]);
         let loc = d.find_tab(&Pane::Devices).unwrap();
         d.set_active_tab(loc);
         let mut hidden = Hidden::default();
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Left);
-        assert!(!has(&d, Pane::Explorer) && !has(&d, Pane::Labels), "the toggle takes what is on that side now");
+        assert!(!has(&d, Pane::Explorer) && !has(&d, Pane::Labeling), "the toggle takes what is on that side now");
         assert!(has(&d, Pane::Selected));
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Left);
-        assert!(rect_of(&d, Pane::Labels).top() >= rect_of(&d, Pane::Explorer).bottom() - 0.5);
-        assert!(rect_of(&d, Pane::Labels).right() <= rect_of(&d, Pane::View(0)).left() + 0.5);
+        assert!(rect_of(&d, Pane::Labeling).top() >= rect_of(&d, Pane::Explorer).bottom() - 0.5);
+        assert!(rect_of(&d, Pane::Labeling).right() <= rect_of(&d, Pane::View(0)).left() + 0.5);
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Right);
         assert!(!has(&d, Pane::Devices) && !has(&d, Pane::Selected));
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Right);
@@ -1153,12 +1238,14 @@ mod tests {
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Bottom);
         assert!(!has(&d, Pane::Graph) && has(&d, Pane::Devices), "a toggle never hides a floating window");
         toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Right);
-        assert!(has(&d, Pane::Labels) && has(&d, Pane::Selected));
-        assert!(rect_of(&d, Pane::Selected).top() >= rect_of(&d, Pane::Labels).bottom() - 0.5, "Labels on top, the selected marker below it");
+        assert!(has(&d, Pane::Labeling) && has(&d, Pane::Selected));
+        assert!(rect_of(&d, Pane::Selected).top() >= rect_of(&d, Pane::Labeling).bottom() - 0.5, "Labeling on top, the selected marker below it");
+        assert_eq!(rect_of(&d, Pane::Labeling), rect_of(&d, Pane::EditTools), "the toggle restores one pair of editing tabs");
+        assert!(!has(&d, Pane::Labels), "side toggles never recreate the legacy panel");
         // A pane shown from the menu is no longer hidden; a hidden pane is never doubled.
         hidden.forget(Pane::Graph);
         assert_eq!(hidden, Hidden::default());
-        let mut twice = Hidden { left: Some(Stash { share: 0.2, leaves: vec![StashLeaf { tabs: vec![Pane::Labels, Pane::Explorer, Pane::View(1)], active: 2, size: 1.0 }] }), ..Hidden::default() };
+        let mut twice = Hidden { left: Some(Stash { share: 0.2, leaves: vec![StashLeaf { tabs: vec![Pane::Labeling, Pane::Explorer, Pane::View(1)], active: 2, size: 1.0 }] }), ..Hidden::default() };
         twice.bottom = Some(Stash { share: 0.2, leaves: vec![StashLeaf { tabs: vec![Pane::Explorer], active: 0, size: 1.0 }] });
         twice.clean(&d);
         assert_eq!(twice.panes().collect::<Vec<_>>(), vec![Pane::Explorer], "on screen (Labels), 3D view and the second copy are dropped");
@@ -1205,6 +1292,108 @@ mod tests {
         assert_eq!(back, hidden);
         let empty: Hidden = ron::from_str("()").unwrap();
         assert_eq!(empty, Hidden::default());
+    }
+
+    fn assert_single_labeling(dock: &DockState<Pane>, hidden: &Hidden) {
+        let panes: Vec<Pane> = dock.iter_all_tabs().map(|(_, p)| *p).chain(hidden.panes()).collect();
+        assert_eq!(panes.iter().filter(|p| **p == Pane::Labeling).count(), 1, "{panes:?}");
+        assert!(!panes.contains(&Pane::Labels), "legacy panel is removed: {panes:?}");
+    }
+
+    #[test]
+    fn legacy_label_panel_is_renamed_in_its_docked_or_floating_place() {
+        for floating in [false, true] {
+            let mut d = DockState::new(vec![Pane::View(2)]);
+            if floating {
+                let window = d.add_window(vec![Pane::Labels, Pane::Devices]);
+                d.get_window_state_mut(window).unwrap().set_position(pos2(92.0, 84.0)).set_size(egui::vec2(330.0, 510.0));
+                d.set_active_tab((window, NodeIndex::root(), TabIndex(1)));
+            } else {
+                d.main_surface_mut().split_left(NodeIndex::root(), 0.28, vec![Pane::Labels, Pane::Devices]);
+            }
+            let saved = ron::to_string(&d).unwrap();
+            let expected = saved.replace("Labels", "Labeling");
+            d = ron::from_str(&saved).unwrap();
+            let mut hidden = Hidden::default();
+            merge_label_panels(&mut d, &mut hidden);
+            assert_single_labeling(&d, &hidden);
+            assert_eq!(ron::to_string(&d).unwrap(), expected, "only the pane name changes, floating={floating}");
+            merge_label_panels(&mut d, &mut hidden);
+            assert_eq!(ron::to_string(&d).unwrap(), expected, "migration is idempotent");
+        }
+    }
+
+    #[test]
+    fn existing_floating_labeling_wins_over_legacy_and_duplicate_panels() {
+        let mut d = DockState::new(vec![Pane::View(1), Pane::Labels, Pane::Graph]);
+        let retained = d.add_window(vec![Pane::Labeling, Pane::EditTools]);
+        d.get_window_state_mut(retained).unwrap().set_position(pos2(80.0, 90.0)).set_size(egui::vec2(320.0, 490.0));
+        let window = ron::to_string(&d[retained]).unwrap();
+        let place = ron::to_string(d.get_window_state(retained).unwrap()).unwrap();
+        d.add_window(vec![Pane::Labeling]);
+        let mut hidden = Hidden {
+            left: Some(Stash { share: 0.2, leaves: vec![StashLeaf { tabs: vec![Pane::Labels, Pane::Labeling, Pane::Comments], active: 2, size: 400.0 }] }),
+            ..Hidden::default()
+        };
+        merge_label_panels(&mut d, &mut hidden);
+        let d = sanitize(d);
+        assert_single_labeling(&d, &hidden);
+        assert_eq!(views(&d), vec![1], "duplicates do not reset the custom layout");
+        assert_eq!(d.find_tab(&Pane::Labeling).unwrap().0, retained);
+        assert_eq!(ron::to_string(&d[retained]).unwrap(), window, "the editing tabs stay together");
+        let mut d = d;
+        assert_eq!(ron::to_string(d.get_window_state(retained).unwrap()).unwrap(), place, "floating position and size stay");
+        assert!(has(&d, Pane::Graph));
+        assert_eq!(hidden.left.as_ref().unwrap().leaves[0].tabs, vec![Pane::Comments]);
+    }
+
+    #[test]
+    fn hidden_labeling_wins_over_a_visible_legacy_panel_and_keeps_active_tabs() {
+        let mut d = DockState::new(vec![Pane::View(3), Pane::Labels, Pane::Devices]);
+        let stash = Stash { share: 0.34, leaves: vec![StashLeaf { tabs: vec![Pane::Labels, Pane::Selected, Pane::Labeling, Pane::Comments], active: 1, size: 360.0 }] };
+        let mut hidden = Hidden { left: Some(stash), ..Hidden::default() };
+        merge_label_panels(&mut d, &mut hidden);
+        hidden.clean(&d);
+        assert_single_labeling(&d, &hidden);
+        assert!(!has(&d, Pane::Labeling), "the existing panel stays hidden on its own side");
+        let stash = hidden.left.as_ref().unwrap();
+        assert_eq!(stash.share, 0.34);
+        assert_eq!(stash.leaves[0], StashLeaf { tabs: vec![Pane::Selected, Pane::Labeling, Pane::Comments], active: 0, size: 360.0 });
+        toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Left);
+        assert_single_labeling(&d, &hidden);
+        let (surface, node, _) = d.find_tab(&Pane::Labeling).unwrap();
+        assert!(matches!(&d[surface][node], Node::Leaf { tabs, active, .. } if tabs[active.0] == Pane::Selected));
+        assert!(rect_of(&d, Pane::Labeling).right() <= rect_of(&d, Pane::View(3)).left() + 0.5);
+    }
+
+    #[test]
+    fn legacy_hidden_label_panel_keeps_its_side_and_version_two_adds_tools_once() {
+        let mut d = scene_only(2);
+        let stash = Stash { share: 0.29, leaves: vec![StashLeaf { tabs: vec![Pane::Labels, Pane::Devices], active: 1, size: 480.0 }] };
+        let mut hidden = Hidden { right: Some(stash), ..Hidden::default() };
+        hidden = ron::from_str(&ron::to_string(&hidden).unwrap()).unwrap();
+        migrate_labeling(&mut d, &mut hidden);
+        assert_single_labeling(&d, &hidden);
+        assert_eq!(hidden.right.as_ref().unwrap().leaves[0], StashLeaf { tabs: vec![Pane::Labeling, Pane::EditTools, Pane::Devices], active: 2, size: 480.0 });
+        let before = hidden.clone();
+        migrate_labeling(&mut d, &mut hidden);
+        assert_eq!(hidden, before, "a repeated migration does not add another Edit Tools tab");
+        toggle_side(&mut d, &mut hidden, NOMINAL_AREA, Side::Right);
+        assert_single_labeling(&d, &hidden);
+        let (surface, node, _) = d.find_tab(&Pane::Labeling).unwrap();
+        assert!(matches!(&d[surface][node], Node::Leaf { tabs, active, .. } if tabs[active.0] == Pane::Devices));
+    }
+
+    #[test]
+    fn marker_panel_merge_keeps_closed_panels_closed_and_panels_list_has_one_name() {
+        let mut d = scene_only(1);
+        let mut hidden = Hidden::default();
+        let before = ron::to_string(&d).unwrap();
+        merge_label_panels(&mut d, &mut hidden);
+        assert_eq!(ron::to_string(&d).unwrap(), before);
+        assert_eq!(hidden, Hidden::default());
+        assert!(!Pane::PANELS.contains(&Pane::Labels));
+        assert_eq!(Pane::PANELS.iter().filter(|p| p.title() == "Labeling").count(), 1);
     }
 
     #[test]

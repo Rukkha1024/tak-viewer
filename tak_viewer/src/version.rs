@@ -1,4 +1,6 @@
-//! The package version comes from the workspace manifest and is shared by both crates.
+//! Program version. The number lives in one place: `[workspace.package] version` in
+//! `apps/Cargo.toml` (tak_core and tak_viewer share it). Each released version has a
+//! `## vX.Y.Z` heading at the top of `apps/CHANGELOG.md` and a git tag `vX.Y.Z` in the apps repo.
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

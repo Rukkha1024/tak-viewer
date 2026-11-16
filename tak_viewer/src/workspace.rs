@@ -1,7 +1,3 @@
-//! Workspace stores up to ten folders and lists each lazily when expanded. A background
-//! watcher polls expanded folders and saved-root existence, sending only changed listings
-//! to the UI. Polling pauses while minimized and is disabled for command runs. Missing saved
-//! folders remain visible. Linux and WSL paths can be converted for Windows.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -108,8 +104,6 @@ pub enum AddRoot {
 
 // ───────────────────────────── Watcher ─────────────────────────────
 
-/// Pause between watcher rounds, measured from the end of the previous round so slow
-/// shares do not accumulate work.
 pub const WATCH_EVERY: Duration = Duration::from_millis(500);
 
 /// UI thread → watcher thread.
@@ -1117,15 +1111,19 @@ mod tests {
     #[test]
     #[ignore]
     fn watch_round_timing() {
-        let share = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let share = PathBuf::from(r"\\wsl.localhost\Ubuntu\home\user\workspace\example\ws-watch\tak_viewer\src");
         let local = temp("timing");
         for k in 0..40 {
             touch(&local.join(format!("f{k:02}.takm")));
             touch(&local.join(format!("f{k:02}.json")));
         }
         std::fs::create_dir_all(local.join("sub")).unwrap();
-        // Compare this checkout's source folder with a synthetic local folder.
-        let cases = vec![("source folder (tak_viewer/src)".to_owned(), share.clone()), ("local temp (40 .takm + 40 other + 1 folder)".to_owned(), local.clone())];
+        // A WSL folder with TAKs (their sizes are read too; names and sizes only), if there.
+        let mut cases = vec![("WSL share (tak_viewer/src)".to_owned(), share.clone()), ("local temp (40 .takm + 40 other + 1 folder)".to_owned(), local.clone())];
+        let raw = PathBuf::from(r"\\wsl.localhost\Ubuntu\home\user\workspace\tak-viewer\input\raw");
+        if raw.is_dir() {
+            cases.push(("WSL share (repo input/raw, 7 TAKs)".to_owned(), raw));
+        }
         for (what, dir) in cases {
             let mut w = watcher(&[dir.clone()], &[dir.clone()]);
             let mut times = Vec::new();

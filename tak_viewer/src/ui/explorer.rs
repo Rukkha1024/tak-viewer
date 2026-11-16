@@ -1,7 +1,3 @@
-//! Workspace tree with lazy folder listing, selection, and reveal of the open file.
-//! A background watcher polls expanded folders and saved-root existence. Changed listings
-//! replace the old ones without resetting folds or scroll. Removing or renaming a saved
-//! folder in the workspace changes its entry, not the directory on disk.
 
 use crate::views::MAX_VIEWS;
 use crate::workspace::{ancestors_between, folder_name, to_wsl_path, Listing, WsFile, Workspace, MAX_ROOTS};
@@ -508,7 +504,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
         rows
     };
 
-    let mut area = ScrollArea::vertical().id_salt("explorer_rows").auto_shrink([false, false]);
+    let mut area = ScrollArea::vertical().id_salt("explorer_rows").auto_shrink([false, true]);
     if let Some(target) = st.pending_scroll.clone() {
         if let Some(k) = rows.iter().position(|r| matches!(r, Row::File { file, .. } if file.path == target)) {
             area = area.vertical_scroll_offset((k as f32 * ROW_H - 4.0 * ROW_H).max(0.0));

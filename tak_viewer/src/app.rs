@@ -26,6 +26,10 @@ mod overlay;
 mod takm_save;
 #[path = "app_editors.rs"]
 mod editors;
+#[path = "app_ssh.rs"]
+mod remote_ui;
+#[path = "app_marker_edit.rs"]
+mod marker_edit;
 use crate::workspace::{self, AddRoot, Workspace, MAX_ROOTS};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use egui_dock::{DockArea, DockState};
@@ -57,6 +61,9 @@ const OPEN_FILTERS: [(&str, &[&str]); 4] =
 pub struct Settings {
     pub scene: SceneOptions,
     pub recent: Vec<String>,
+    /// SSH platform and Python command only; never remote paths, contents or connection state.
+    pub ssh_platforms: BTreeMap<String, String>,
+    pub ssh_python: BTreeMap<String, crate::ssh::PythonSetting>,
     /// Old single workspace folder (before 2026-11-10). Moved into `workspace_roots` once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
@@ -69,8 +76,7 @@ pub struct Settings {
     pub recent_workspaces: Vec<String>,
     /// Pane layout (dragged tabs). None = default layout.
     pub layout: Option<DockState<Pane>>,
-    /// `dock::LAYOUT_VERSION` the layout was saved with (0 = before v0.7.0: such a layout gets
-    /// the new first arrangement once, `take_layout`).
+    /// `dock::LAYOUT_VERSION` the layout was saved with (0 = before v0.7.0).
     pub layout_version: u32,
     /// Panes hidden by the side toggles (they come back where they were).
     pub hidden: dock::Hidden,
@@ -102,6 +108,8 @@ impl Default for Settings {
         Settings {
             scene: SceneOptions::default(),
             recent: vec![],
+            ssh_platforms: BTreeMap::new(),
+            ssh_python: BTreeMap::new(),
             workspace: None,
             workspace_roots: vec![],
             workspace_open: vec![],
@@ -124,28 +132,31 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The pane layout to start with and the panes hidden by the toggles. A layout saved
-    /// before v0.10.0 becomes the new first arrangement (nothing below the views, the graph
-    /// floats over them, devices next to the selected marker), with the same 3D views;
-    /// nothing is hidden then. While the GRAPH pane is open the graph does not float.
+    /// The pane layout and hidden sides to start with. Older valid layouts migrate in place:
+    /// rename the marker list, merge its duplicates, and add Edit Tools before version 3.
+    /// While the GRAPH pane is open the graph does not float.
     pub fn take_layout(&mut self) -> (DockState<Pane>, dock::Hidden) {
-        let old = self.layout_version < dock::LAYOUT_VERSION;
+        let old = self.layout_version < 2;
+        let needs_labeling = self.layout_version < 3;
         self.layout_version = dock::LAYOUT_VERSION;
-        let saved = self.layout.take().map(dock::sanitize);
         let mut hidden = std::mem::take(&mut self.hidden);
-        let dock = match saved {
-            Some(d) if old => {
-                hidden = dock::Hidden::default();
-                dock::default_layout_for(&dock::views(&d))
-            }
-            Some(d) => d,
+        let saved = self.layout.take().map(|mut d| {
+            dock::merge_label_panels(&mut d, &mut hidden);
+            dock::sanitize(d)
+        });
+        let mut dock = match saved {
+            Some(mut d) => {
+                if needs_labeling { dock::migrate_labeling(&mut d, &mut hidden); }
+                d
+            },
             None => dock::default_layout(),
         };
+        dock::merge_label_panels(&mut dock, &mut hidden);
         hidden.clean(&dock);
-        if old {
-            self.graph_float = true;
-        } else if dock::has(&dock, Pane::Graph) {
+        if dock::has(&dock, Pane::Graph) {
             self.graph_float = false;
+        } else if old {
+            self.graph_float = true;
         }
         (dock, hidden)
     }
@@ -185,8 +196,6 @@ struct Hold {
     wraps: u64,
 }
 
-/// The type strip appears after creating a comment. Selecting a button sets its type;
-/// actions elsewhere close the strip while retaining their normal behavior.
 #[derive(Clone, Debug, PartialEq)]
 struct TypeStrip {
     slot: usize,
@@ -250,6 +259,41 @@ fn ctrl_key(ctx: &egui::Context, key: Key) -> bool {
     })
 }
 
+/// Consume a pressed key only when all shortcut modifiers match exactly.
+fn exact_key(ctx: &egui::Context, key: Key, control: bool, shift: bool, alt: bool) -> bool {
+    ctx.input_mut(|input| {
+        let mut found = false;
+        input.events.retain(|event| match event {
+            egui::Event::Key { key: actual, pressed: true, modifiers, .. }
+                if *actual == key
+                    && (modifiers.command || modifiers.ctrl) == control
+                    && modifiers.shift == shift
+                    && modifiers.alt == alt => {
+                found = true;
+                false
+            }
+            _ => true,
+        });
+        found
+    })
+}
+
+/// Ctrl+W uses physical Ctrl alone; egui's platform `command` also accepts Cmd/Meta.
+fn close_view_key(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|input| {
+        let mut found = false;
+        input.events.retain(|event| match event {
+            egui::Event::Key { key: Key::W, pressed: true, modifiers, .. }
+                if modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd => {
+                found = true;
+                false
+            }
+            _ => true,
+        });
+        found
+    })
+}
+
 fn push_recent(list: &mut Vec<String>, s: String) {
     list.retain(|r| r != &s);
     list.insert(0, s);
@@ -261,6 +305,13 @@ use views::drop_later;
 pub struct TakViewerApp {
     /// The 3D views by slot; the ones on screen are the `Pane::View` tabs in `dock`.
     views: [View; MAX_VIEWS],
+    marker_ui: [marker_edit::MarkerUi; MAX_VIEWS],
+    marker_sessions: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::PreparedSession>,
+    marker_click: Option<(usize, tak_core::tak::Uid)>,
+    marker_delete: Option<usize>,
+    dirty_prompt: Option<marker_edit::DirtyPrompt>,
+    exit_approved: bool,
+    restoring_layout: bool,
     /// Slot of the active view (blue edge; side panes, keys, status bar, captures).
     active: usize,
     /// Counter for `View::file_id` (unique across views).
@@ -283,6 +334,12 @@ pub struct TakViewerApp {
     graph_to_panel: bool,
     auto: Option<AutoShot>,
     workspace: Workspace,
+    ssh: crate::ssh::SshManager,
+    ssh_sources: std::collections::HashMap<PathBuf, crate::ssh::RemoteLocation>,
+    ssh_cache: std::collections::VecDeque<remote_ui::Cached>,
+    ssh_reads: std::collections::HashMap<u64, (usize, crate::ssh::RemoteLocation)>,
+    ssh_note: Option<(String, f64)>,
+    ssh_demo_applied: bool,
     explorer: ExplorerState,
     /// Pane layout (saved into `settings.layout` on save).
     dock: DockState<Pane>,
@@ -304,6 +361,12 @@ pub struct TakViewerApp {
     no_persist: bool,
     /// Appends comment events on its own thread (started with the first comment).
     comment_writer: Option<comments::Writer>,
+    comment_registration: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    comment_registration_error: Option<String>,
+    comment_waiting: Vec<(usize, PathBuf, Event)>,
+    comment_failed: Vec<(usize, PathBuf, Event)>,
+    comment_outstanding: usize,
+    exit_waiting_comments: bool,
     /// A playback bar's comment request this frame: (view, what), applied after drawing.
     deck_action: Option<(usize, DeckAction)>,
     /// `M` is being held: a comment from its start frame to the frame where it goes up.
@@ -388,6 +451,7 @@ impl TakViewerApp {
     /// `workspace.rs`). Command runs never call this.
     pub fn start_folder_watch(&mut self) {
         self.workspace.start_watch();
+        self.ssh.discover_hosts();
     }
 
     #[cfg(test)]
@@ -437,8 +501,17 @@ impl TakViewerApp {
         };
         settings.migrate();
         let (dock, hidden) = settings.take_layout();
+        let settings_python = settings.ssh_python.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
+        let settings_ssh = settings.ssh_platforms.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
         let mut app = TakViewerApp {
             views: std::array::from_fn(|_| View::default()),
+            marker_ui: std::array::from_fn(|_| marker_edit::MarkerUi::default()),
+            marker_sessions: Default::default(),
+            marker_click: None,
+            marker_delete: None,
+            dirty_prompt: None,
+            exit_approved: false,
+            restoring_layout: false,
             active: 0,
             next_file_id: 0,
             focused_tab: None,
@@ -453,6 +526,12 @@ impl TakViewerApp {
             graph_to_panel: false,
             auto,
             workspace: Workspace::new(ctx.clone()),
+            ssh: { let mut ssh = crate::ssh::SshManager::new(ctx, settings_ssh); ssh.python_settings = settings_python; ssh },
+            ssh_sources: Default::default(),
+            ssh_cache: Default::default(),
+            ssh_reads: Default::default(),
+            ssh_note: None,
+            ssh_demo_applied: false,
             explorer: ExplorerState::default(),
             dock,
             hidden,
@@ -464,6 +543,12 @@ impl TakViewerApp {
             capture_done: None,
             no_persist,
             comment_writer: None,
+            comment_registration: None,
+            comment_registration_error: None,
+            comment_waiting: Vec::new(),
+            comment_failed: Vec::new(),
+            comment_outstanding: 0,
+            exit_waiting_comments: false,
             deck_action: None,
             hold: None,
             history: History::default(),
@@ -530,25 +615,26 @@ impl TakViewerApp {
     }
 
     /// Views of the last session: each saved file opens again in its view (at its remembered
-    /// spot). Views whose file is gone are taken out (one view always stays).
+    /// spot). Views whose file is gone are taken out; an explicitly empty editor stays empty.
     fn restore_views(&mut self, ctx: &egui::Context) {
+        let had_saved_files = !self.settings.views.is_empty();
         let saved: Vec<(u8, PathBuf)> = std::mem::take(&mut self.settings.views)
             .into_iter()
             .map(|(k, p)| (k, PathBuf::from(p)))
-            .filter(|(k, p)| dock::views(&self.dock).contains(k) && p.is_file())
+            .filter(|(k, p)| !remote_ui::is_remote_key(p) && dock::views(&self.dock).contains(k) && p.is_file())
             .collect();
         for k in dock::views(&self.dock) {
-            if !saved.iter().any(|(s, _)| *s == k) {
+            if !saved.iter().any(|(s, _)| *s == k) && (had_saved_files || dock::views(&self.dock).len() > 1) {
                 dock::remove_view(&mut self.dock, k);
             }
         }
         let open = dock::views(&self.dock);
         let want = self.settings.active_view;
-        self.active = usize::from(if open.contains(&want) { want } else { open[0] });
+        self.active = usize::from(if open.contains(&want) { want } else { open.first().copied().unwrap_or(0) });
         for (k, p) in saved {
             self.open_in(ctx, usize::from(k), p);
         }
-        self.activate(self.active);
+        if !open.is_empty() { self.activate(self.active); }
     }
 
     /// Slots of the views on screen.
@@ -574,17 +660,23 @@ impl TakViewerApp {
         self.focused_tab = Some(Pane::View(slot as u8));
     }
 
-    /// Name of a view's file for tabs and the menu bar. When another open view has a file of
-    /// the same name (raw / copy / agent result), the folder is added: "x_007.tak · copy".
     fn view_label(&self, slot: usize, open: &[usize]) -> Option<String> {
         let name = |p: &Path| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some((_, location, _)) = &self.views[slot].remote_loading {
+            return Some(format!("{} · {}", remote_ui::remote_name(location), location.host));
+        }
+        if let Some(location) = &self.views[slot].remote {
+            return Some(format!("{} · {}", remote_ui::remote_name(location), location.host));
+        }
         let path = self.views[slot].target()?;
         let same = open.iter().any(|&k| k != slot && self.views[k].target().is_some_and(|q| name(q) == name(path)));
         let folder = path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned());
-        Some(match folder {
+        let mut label = match folder {
             Some(f) if same => format!("{} · {f}", name(path)),
             _ => name(path),
-        })
+        };
+        if self.views[slot].marker_dirty() { label.push('*'); }
+        Some(label)
     }
 
     /// The view showing or reading this file, as its own file or laid over it (plan step 7: no
@@ -679,6 +771,10 @@ impl TakViewerApp {
     /// PageDown / PageUp: next / previous .tak or .takm in the same folder as the open file
     /// (the Explorer's name order: `a.tak`, `a.takm`, `b.tak`).
     fn step_file(&mut self, ctx: &egui::Context, delta: i64) {
+        if self.view().remote.is_some() {
+            self.ssh_note = Some(("원격 파일은 SSH 목록에서 골라 여세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         let Some(cur) = self.current_path() else { return };
         let Some(files) = self.workspace.siblings(cur) else { return };
         let Some(k) = files.iter().position(|f| f.path == cur) else { return };
@@ -704,8 +800,8 @@ impl TakViewerApp {
             self.activate(k);
             return;
         }
-        // The first file goes into the empty view the app starts with.
-        if self.open_views().len() == 1 && self.view().target().is_none() {
+        // The first file goes into a default view, including after every view was closed.
+        if self.open_views().is_empty() || (self.open_views().len() == 1 && self.view().target().is_none()) {
             self.open_in(ctx, self.active, path);
             return;
         }
@@ -733,6 +829,10 @@ impl TakViewerApp {
             self.activate(k);
             return;
         }
+        if self.open_views().is_empty() {
+            self.open_in(ctx, slot, path);
+            return;
+        }
         let empty_start = self.open_views().len() == 1 && self.views[slot].target().is_none();
         if zone == dock::DropZone::Center || empty_start {
             self.activate(slot);
@@ -752,6 +852,22 @@ impl TakViewerApp {
     /// Read a file into a view on a background thread (markers first, `views.rs`). The file
     /// the view showed is remembered where it was; the new one comes back to its own spot.
     fn open_in(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf) {
+        if self.save_destination_reserved(&path) {
+            self.takm_note = Some(("Save in progress for this file.".into(), ctx.input(|i| i.time)));
+            return;
+        }
+        if !self.restoring_layout && self.guard_dirty(slot, marker_edit::PendingTransition::Open { slot, path: path.clone() }) { return; }
+        self.cancel_pending_marker_job(slot);
+        self.cancel_remote_load(slot);
+        if let Some(location) = self.ssh_sources.get(&path).cloned() {
+            self.open_remote_in(ctx, slot, location, true);
+            return;
+        }
+        if remote_ui::is_remote_key(&path) {
+            self.ssh_note = Some(("이 원격 파일은 SSH 목록에서 다시 여세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
+        self.ensure_open_view(slot);
         self.remember(slot);
         // A file laid over this view goes with the file it was laid over (plan step 7).
         drop_later(self.views[slot].take_overlay());
@@ -766,9 +882,21 @@ impl TakViewerApp {
         self.error = None;
     }
 
+    /// A first file after closing every view starts with the default panel arrangement.
+    /// Undo restoring an old layout already supplied its own views and never resets it here.
+    fn ensure_open_view(&mut self, slot: usize) {
+        if self.open_views().is_empty() {
+            self.dock = dock::default_layout_for(&[slot as u8]);
+            self.hidden = dock::Hidden::default();
+            self.settings.graph_float = true;
+            self.activate(slot);
+        }
+    }
+
     /// Keep where a view is looking (files opened from the command line are not remembered).
     fn remember(&mut self, slot: usize) {
-        if !self.no_persist {
+        self.cache_remote(slot);
+        if !self.no_persist && self.views[slot].remote.is_none() {
             if let Some(spot) = self.views[slot].spot() {
                 views::remember(&mut self.settings.file_memory, spot);
             }
@@ -777,11 +905,22 @@ impl TakViewerApp {
 
     /// Close a view (tab ✕): remember its spot, stop its load, free its file.
     fn close_view(&mut self, slot: usize) {
+        if !self.open_views().contains(&slot) { return; }
+        if !self.restoring_layout && self.guard_dirty(slot, marker_edit::PendingTransition::CloseView { slot }) { return; }
+        self.cancel_pending_marker_job(slot);
+        self.remember_layout_spot(slot);
         self.remember(slot);
+        self.cancel_remote_load(slot);
         drop_later(self.views[slot].clear());
         dock::remove_view(&mut self.dock, slot as u8);
-        if self.active == slot || !self.open_views().contains(&self.active) {
-            let next = self.open_views()[0];
+        let open = self.open_views();
+        if open.is_empty() {
+            // Keep a valid empty slot for panel code; it is not an open 3D view.
+            self.active = 0;
+            self.focused_tab = self.dock.find_active_focused().map(|(_, pane)| *pane);
+            self.explorer.reveal = None;
+        } else if self.active == slot || !open.contains(&self.active) {
+            let next = open[0];
             self.active = usize::MAX;
             self.activate(next);
         }
@@ -796,9 +935,11 @@ impl TakViewerApp {
             self.views[slot].poll_comments();
             self.views[slot].poll_analog();
         }
+        self.poll_comment_ids(ctx);
         self.poll_overlays(ctx);
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
+        self.poll_ssh(ctx);
     }
 
     fn finish_load(&mut self, ctx: &egui::Context, slot: usize, loaded: Loaded) {
@@ -921,6 +1062,28 @@ impl TakViewerApp {
                 if auto.comments {
                     self.show_pane(Pane::Comments);
                 }
+                if auto.edit_tools { self.show_pane(Pane::EditTools); }
+                if auto.edit_pattern { self.select_pattern_for_capture(self.active); }
+                if auto.edit_layout != 0 {
+                    dock::hide(&mut self.dock, Pane::Selected);
+                    dock::hide(&mut self.dock, Pane::Devices);
+                    if let Some(loc) = self.dock.find_tab(&Pane::EditTools) {
+                        self.dock.remove_tab(loc);
+                    }
+                    if auto.edit_layout == 2 {
+                        self.set_graph_float(false);
+                        if let Some((node, _)) = self.dock.main_surface().find_tab(&Pane::Labeling) {
+                            self.dock.main_surface_mut().split_below(node, 0.55, vec![Pane::EditTools]);
+                        }
+                    } else if auto.edit_layout == 3 {
+                        self.settings.graph_float = false;
+                        dock::hide(&mut self.dock, Pane::Graph);
+                        if let Some((node, _)) = self.dock.main_surface().find_tab(&Pane::View(self.active as u8)) {
+                            let [_, graph] = self.dock.main_surface_mut().split_below(node, 0.58, vec![Pane::Graph]);
+                            self.dock.main_surface_mut().split_above(graph, 0.32, vec![Pane::EditTools]);
+                        }
+                    }
+                }
                 // `--edit-comment` (agent pictures): the edit of that cell shown in the active
                 // view. A command run writes nothing, so it is only looked at.
                 if let Some((id, field)) = auto.edit_comment {
@@ -967,6 +1130,10 @@ impl TakViewerApp {
 
     /// Menu "화면 캡처 저장": current frame from the current angle + top, side, front.
     fn start_menu_capture(&mut self) {
+        if self.view().remote.is_some() {
+            self.notice = Some("원격 파일의 캡처 저장은 아직 지원하지 않아요.".into());
+            return;
+        }
         let Some(d) = &self.view().data else { return };
         if self.capture.is_some() {
             return;
@@ -1209,6 +1376,9 @@ impl TakViewerApp {
     /// or Err(why not, plain Korean).
     fn comment_ready(&self, slot: usize) -> Result<String, String> {
         let path = self.comment_writable(slot)?;
+        if self.views[slot].comments.id_pool.as_ref().is_none_or(|ids| ids.is_empty()) {
+            return Err(self.views[slot].comments.id_error.clone().unwrap_or_else(|| "Preparing Comment IDs. Try again shortly.".into()));
+        }
         if let Some(e) = &self.comment_edit {
             if e.field == Field::Type {
                 return Err(format!("Comment {}의 유형 목록이 열려 있어요. 고르거나 Esc로 닫은 뒤에 새로 만들 수 있어요.", e.id));
@@ -1216,7 +1386,6 @@ impl TakViewerApp {
             return Err(format!("Comment {}을 고치는 중이에요. Enter = 저장, Esc = 취소 뒤에 새로 만들 수 있어요.", e.id));
         }
         let v = &self.views[slot];
-        // A comment without selected markers contains a frame range only.
         let frames = match v.range {
             Some((a, b)) if a != b => format!("구간 {a} – {b}"),
             Some((a, _)) => format!("프레임 {a}"),
@@ -1228,7 +1397,7 @@ impl TakViewerApp {
         };
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         Ok(format!(
-            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labels에서 클릭, Ctrl+클릭 = 여러 개).\n{name} 안에 바로 저장해요. Ctrl+Z = 되돌리기."
+            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labeling에서 클릭, Ctrl+클릭 = 여러 개).\n{name} 안에 바로 저장해요. Ctrl+Z = 되돌리기."
         ))
     }
 
@@ -1237,9 +1406,11 @@ impl TakViewerApp {
     /// show it).
     fn comment_writable(&self, slot: usize) -> Result<&Path, String> {
         let v = &self.views[slot];
+        if self.marker_saving(slot) || self.exit_waiting_comments { return Err("저장이 끝날 때까지 기다려 주세요.".into()); }
         if v.data.is_none() {
             return Err("파일을 열면 Comment를 남길 수 있어요.".into());
         }
+        if v.remote.is_some() { return Err(remote_ui::REMOTE_NO_COMMENTS.into()); }
         // A TAK takes no Comments (`.takm` step ③), also in a command run.
         if self.shows_tak(slot) {
             return Err(views::TAK_NO_COMMENTS.into());
@@ -1263,7 +1434,7 @@ impl TakViewerApp {
     /// None when nothing may be written (command run, no file, its comment file still being read
     /// or refused).
     fn comment_target(&self, slot: usize) -> Option<(PathBuf, String)> {
-        if self.no_persist {
+        if self.no_persist || self.views[slot].remote.is_some() || self.marker_saving(slot) || self.exit_waiting_comments {
             return None;
         }
         let v = &self.views[slot];
@@ -1275,11 +1446,15 @@ impl TakViewerApp {
 
     /// View `slot` shows a file that is not a `.takm` (a TAK: no Comments).
     fn shows_tak(&self, slot: usize) -> bool {
-        self.views[slot].path().is_some_and(|p| !tak_core::takm::is_takm_path(p))
+        self.views[slot].remote.is_none() && self.views[slot].path().is_some_and(|p| !tak_core::takm::is_takm_path(p))
     }
 
     /// `M`, the `Comment` button or `T` on a TAK: why nothing happens, in the status bar.
     fn say_no_comments(&mut self, ctx: &egui::Context, slot: usize) {
+        if self.views[slot].remote.is_some() {
+            self.ssh_note = Some((remote_ui::REMOTE_NO_COMMENTS.into(), ctx.input(|i| i.time)));
+            return;
+        }
         if self.shows_tak(slot) {
             self.takm_note = Some((views::TAK_NO_COMMENTS.to_owned(), ctx.input(|i| i.time)));
         }
@@ -1289,8 +1464,15 @@ impl TakViewerApp {
     /// `slot`: the list changes at once, the writer thread writes. False when nothing may be
     /// written there (then nothing changes).
     fn write_change(&mut self, ctx: &egui::Context, slot: usize, kind: EventKind, c: &Comment) -> bool {
+        if kind != EventKind::Add && self.views[slot].comments.list.id_is_ambiguous(c.id) {
+            self.notice = Some("This older file has duplicate Comment IDs; this comment cannot be edited safely.".into());
+            return false;
+        }
         let Some((path, file_a)) = self.comment_target(slot) else { return false };
         let mut event = Event::of(kind, c, capture::local_iso_time(), file_a);
+        if kind != EventKind::Add {
+            event.expected = self.views[slot].comments.list.get(c.id).cloned();
+        }
         // With a file laid over this view (plan step 7): which of the two were shown, and the
         // second file (same `name|size` form). Without one the line is as before.
         let v = &self.views[slot];
@@ -1309,6 +1491,7 @@ impl TakViewerApp {
     /// `comment_ready` says no.
     fn make_comment(&mut self, ctx: &egui::Context, slot: usize) {
         if self.comment_ready(slot).is_err() {
+            self.retry_comment_ids(ctx, slot);
             self.say_no_comments(ctx, slot);
             return;
         }
@@ -1322,7 +1505,10 @@ impl TakViewerApp {
     /// Ctrl+Z (the redo part goes). The range is cleared, the selection stays; the cleared range
     /// is part of the same undo action (v0.15.1).
     fn add_comment(&mut self, ctx: &egui::Context, slot: usize, markers: Vec<String>, start: i64, end: i64) {
-        let id = self.views[slot].comments.list.next_id();
+        let Some(id) = self.views[slot].comments.id_pool.as_mut().and_then(Iterator::next) else {
+            self.notice = Some("Preparing Comment IDs. Try again shortly.".into());
+            return;
+        };
         let c = Comment { id, markers, start, end, comment_type: String::new(), text: String::new() };
         // What changed before it (e.g. frames moved while `M` was held) comes first.
         self.observe(true);
@@ -1505,6 +1691,12 @@ impl TakViewerApp {
         self.comment_edit = None;
         let v = &self.views[e.slot];
         let Some(c) = v.comments.list.get(e.id).cloned().filter(|_| v.file_id == e.file_id) else { return };
+        if c != e.base {
+            let message = format!("Comment {} changed in another window · reloaded", e.id);
+            self.history.note = Some((message.clone(), ctx.input(|i| i.time)));
+            self.notice = Some(message);
+            return;
+        }
         // A type picked in the list (type-combo): the same path as the strip and `T` (one
         // `edit` line, one action that merges with type changes of this comment in a row, the
         // short note `Comment 2 · Jitter`; the same type = nothing).
@@ -1661,6 +1853,7 @@ impl TakViewerApp {
     fn start_hold(&mut self, ctx: &egui::Context) {
         let slot = self.active;
         if self.comment_ready(slot).is_err() {
+            self.retry_comment_ids(ctx, slot);
             self.say_no_comments(ctx, slot);
             return;
         }
@@ -1694,33 +1887,128 @@ impl TakViewerApp {
 
     /// Hand an event to the writer thread (started on the first comment).
     fn send_comment(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, event: Event) {
-        let writer = self.comment_writer.get_or_insert_with(|| {
-            let ctx = ctx.clone();
-            comments::Writer::spawn(Box::new(move || ctx.request_repaint()))
-        });
-        let v = &mut self.views[slot];
-        if writer.send(v.file_id, path, event) {
-            v.comments.pending += 1;
+        self.ensure_comment_writer(ctx);
+        let tag = self.views[slot].file_id;
+        if let Some(reason) = self.comment_registration_error.clone() {
+            self.views[slot].comments.failed = Some(reason);
+            self.comment_failed.push((tag, path, event));
+        } else if self.comment_registration.is_some() {
+            self.comment_waiting.push((tag, path, event));
+            self.views[slot].comments.pending_since.get_or_insert_with(Instant::now);
+            self.views[slot].comments.pending += 1;
+            self.comment_outstanding += 1;
+            ctx.request_repaint_after(Duration::from_millis(30));
+        } else if self.comment_writer.as_ref().is_some_and(|writer| writer.send(tag, path.clone(), event.clone())) {
+            self.views[slot].comments.pending_since.get_or_insert_with(Instant::now);
+            self.views[slot].comments.pending += 1;
+            self.comment_outstanding += 1;
         } else {
-            v.comments.failed = Some("저장하는 스레드가 멈췄어요".into());
+            self.views[slot].comments.failed = Some("저장하는 스레드가 멈췄어요".into());
+            self.comment_failed.push((tag, path, event));
+        }
+    }
+
+    fn ensure_comment_writer(&mut self, ctx: &egui::Context) {
+        if self.comment_writer.is_some() || self.comment_registration_error.is_some() { return; }
+        let wake = ctx.clone();
+        let writer = comments::Writer::spawn(Box::new(move || wake.request_repaint()));
+        match writer.barrier() {
+            Ok(rx) => self.comment_registration = Some(rx),
+            Err(error) => self.comment_registration_error = Some(error.to_string()),
+        }
+        self.comment_writer = Some(writer);
+    }
+
+    /// Reserve ids off the drawing thread; the on-disk reservation also covers other windows.
+    fn poll_comment_ids(&mut self, ctx: &egui::Context) {
+        if self.no_persist { return; }
+        for slot in self.open_views() {
+            let state = &mut self.views[slot].comments;
+            if let Some(rx) = &state.id_rx {
+                match rx.try_recv() {
+                    Ok(Ok(ids)) => { state.id_pool = Some(ids); state.id_error = None; state.id_rx = None; }
+                    Ok(Err(reason)) => { state.id_error = Some(reason); state.id_rx = None; }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        state.id_error = Some("Comment ID preparation stopped.".into()); state.id_rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(30)),
+                }
+            }
+            if state.id_rx.is_some() || state.id_error.is_some() || state.id_pool.as_ref().is_some_and(|ids| !ids.is_empty()) { continue; }
+            let Some(Ok(path)) = state.target.clone() else { continue };
+            if !tak_core::takm::is_takm_path(&path) { continue; }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(comments::reserve_takm_ids(&path, 1024).map_err(|e| e.to_string()));
+                wake.request_repaint();
+            });
+            state.id_rx = Some(rx);
+        }
+    }
+
+    fn retry_comment_ids(&mut self, ctx: &egui::Context, slot: usize) {
+        if self.views.get(slot).is_some_and(|v| v.comments.id_error.is_some()) {
+            self.views[slot].comments.id_error = None;
+            self.poll_comment_ids(ctx);
         }
     }
 
     /// Writes the writer thread finished: "saved" or the failure, in the view still showing
     /// that file (its `file_id` is the tag).
     fn poll_comment_writes(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.comment_registration {
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(30)),
+                result => {
+                    self.comment_registration = None;
+                    let status = result.unwrap_or_else(|_| Err("Comment 저장 준비가 중단됐어요.".into()));
+                    if let Err(reason) = status { self.comment_registration_error = Some(reason); }
+                    for (tag, path, event) in std::mem::take(&mut self.comment_waiting) {
+                        let submitted = self.comment_registration_error.is_none() && self.comment_writer.as_ref().is_some_and(|w| w.send(tag, path.clone(), event.clone()));
+                        if !submitted {
+                            self.comment_failed.push((tag, path, event));
+                            self.comment_outstanding = self.comment_outstanding.saturating_sub(1);
+                            for view in self.views.iter_mut().filter(|v| v.file_id == tag) {
+                                view.comments.pending = view.comments.pending.saturating_sub(1);
+                                if view.comments.pending == 0 { view.comments.pending_since = None; }
+                                view.comments.failed = Some(self.comment_registration_error.clone().unwrap_or_else(|| "Comment 저장이 중단됐어요.".into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let Some(w) = &self.comment_writer else { return };
         let done = w.poll();
         let now = ctx.input(|i| i.time);
         for d in done {
+            self.comment_outstanding = self.comment_outstanding.saturating_sub(1);
+            if d.result.is_err() && d.conflict.is_none() && !d.cancelled {
+                self.comment_failed.push((d.tag, d.path.clone(), d.event.clone()));
+            }
+            if let Some(conflict) = &d.conflict {
+                self.history.forget_comment(&d.path, conflict.id);
+            }
             for v in self.views.iter_mut().filter(|v| v.file_id == d.tag && v.data.is_some()) {
                 v.comments.pending = v.comments.pending.saturating_sub(1);
+                if v.comments.pending == 0 { v.comments.pending_since = None; }
+                if d.cancelled { continue; }
+                if let Some(conflict) = &d.conflict {
+                    v.comments.list.reload_one(conflict.id, conflict.latest.clone());
+                    if conflict.latest.is_none() && v.picked == Some(conflict.id) { v.picked = None; }
+                    let message = format!("Comment {} changed in another window · reloaded", conflict.id);
+                    self.history.note = Some((message.clone(), now));
+                    self.notice = Some(message);
+                    continue;
+                }
                 match d.result {
                     Ok(()) => v.comments.saved_at = Some(now),
                     Err(ref e) => v.comments.failed = Some(e.clone()),
                 }
             }
         }
+        self.poll_comment_retry_transition(ctx);
     }
 
     /// Status bar item of view `slot`'s comments: text, hover text, and whether it is a warning.
@@ -1757,9 +2045,22 @@ impl TakViewerApp {
     fn comments_tab(&mut self, ui: &mut egui::Ui) {
         let slot = self.comment_edit.as_ref().map_or(self.active, |e| e.slot);
         let write = self.comment_writable(slot).map(|_| ());
+        if self.views[slot].remote.is_some() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(remote_ui::REMOTE_NO_COMMENTS).size(12.0).color(theme::WARN));
+            ui.add(egui::Label::new(RichText::new(format!("있던 Comment {}개는 아래에서 볼 수 있어요. 달려면 서버에서 .takm을 만들어 주세요.", self.views[slot].comments.list.list().len())).size(11.0).color(theme::TEXT_DIM)).wrap());
+            if self.views[slot].comments.list.list().is_empty() { return; }
+        }
         if self.shows_tak(slot) {
             self.tak_comments_tab(ui, slot);
             return;
+        }
+        if let Some(reason) = self.views[slot].comments.id_error.clone() {
+            ui.label(RichText::new(format!("Comment ID reservation failed: {reason}")).color(theme::WARN));
+            if ui.button("Retry Comment IDs").clicked() {
+                let ctx = ui.ctx().clone();
+                self.retry_comment_ids(&ctx, slot);
+            }
         }
         let v = &self.views[slot];
         let waiting = match (&v.data, &v.comments.target) {
@@ -1780,7 +2081,8 @@ impl TakViewerApp {
         let live_markers = (self.marker_edit() == Some((slot, v.file_id))).then(|| v.selected_names().join(", "));
         let (first, last) = (v.pb.first, v.pb.last);
         let input = comment_list::ListIn { list: &v.comments.list, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, live_markers, first, last };
-        let mut out = comment_list::show(ui, input, &mut self.comment_order, &mut self.comment_edit);
+        let show = if v.remote.is_some() { comment_list::show_remote } else { comment_list::show };
+        let mut out = show(ui, input, &mut self.comment_order, &mut self.comment_edit);
         #[cfg(test)]
         {
             self.comment_rows = out.rows.clone();
@@ -1823,9 +2125,6 @@ impl TakViewerApp {
         }
     }
 
-    /// Cancel an edit when its list is hidden or another row is clicked. A row click selects
-    /// the comment and markers without moving playback; double-clicking `#` seeks. Delete,
-    /// sort, and cell edit actions are handled separately.
     fn after_comments_tab(&mut self, now: f64, ctx: &egui::Context) {
         let out = std::mem::take(&mut self.comment_out);
         if !out.drawn {
@@ -1906,14 +2205,35 @@ impl TakViewerApp {
 
     /// Keys act on the active view.
     fn handle_keys(&mut self, ctx: &egui::Context, now: f64) {
-        if self.typing(ctx) {
+        if self.typing(ctx) || self.dirty_prompt.is_some() || ctx.memory(|m| m.any_popup_open()) {
             return;
         }
         // Ctrl+Z / Ctrl+Y work on the whole app (v0.16.0), also with no file in the active view.
         self.undo_keys(ctx);
+        // A focused 3D tab takes precedence, including the final view;
+        // a panel keeps the last chosen 3D view as the shortcut's target.
+        if self.hold.is_none() && self.comment_edit.is_none() && !ctx.input(|i| i.key_down(Key::M))
+            && close_view_key(ctx)
+        {
+            let open = self.open_views();
+            if !open.is_empty() {
+                let slot = match self.dock.find_active_focused().map(|(_, tab)| *tab) {
+                    Some(Pane::View(slot)) => usize::from(slot),
+                    _ => self.active,
+                };
+                if open.contains(&slot) {
+                    self.close_view(slot);
+                }
+            }
+            return;
+        }
         if self.view().data.is_none() {
             return;
         }
+        if exact_key(ctx, Key::S, true, false, false) && self.hold.is_none() && self.comment_edit.is_none() && !ctx.memory(|m| m.any_popup_open()) {
+            self.save_markers(ctx, self.active, false, false);
+        }
+        self.marker_keys(ctx);
         let renaming = self.explorer.is_renaming(ctx.cumulative_pass_nr());
         // `T` (step 5): the selected comment's next type. A real press only (an auto-repeat
         // of a held T is used up and does nothing more).
@@ -1931,9 +2251,25 @@ impl TakViewerApp {
         if t {
             self.cycle_type(ctx);
         }
+        let edit_keys_allowed = self.hold.is_none() && self.comment_edit.is_none();
+        if edit_keys_allowed && exact_key(ctx, Key::L, false, false, false) {
+            self.settings.scene.names = !self.settings.scene.names;
+        }
+        let pointer = ctx.input(|input| input.pointer.hover_pos());
+        let fit_all = edit_keys_allowed && exact_key(ctx, Key::F, false, true, false);
+        let fit_selected = edit_keys_allowed && exact_key(ctx, Key::F, false, false, false);
+        if fit_all || fit_selected {
+            let slot = pointer.and_then(|p| self.open_views().into_iter().find(|&slot| {
+                let view = &self.views[slot];
+                view.scene_rect.contains(p) && !view.graph_rect.is_some_and(|r| r.contains(p)) && !view.plate_rect.is_some_and(|r| r.contains(p))
+            }));
+            if let Some(slot) = slot {
+                if fit_all { self.views[slot].fit_pending = true; } else { self.views[slot].focus_selected(); }
+            }
+        }
         let v = &mut self.views[self.active];
         // Consume keys before widgets so a focused button/slider never steals Space or arrows.
-        let pressed = |key: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
+        let pressed = |key: Key| exact_key(ctx, key, false, false, false);
         if pressed(Key::Space) {
             v.pb.toggle(now);
         }
@@ -1955,20 +2291,15 @@ impl TakViewerApp {
         if pressed(Key::End) {
             v.pb.step(i64::MAX / 2, now);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F)) {
-            v.fit_pending = true;
-        }
-        if pressed(Key::F) {
-            v.focus_selected();
-        }
-        // Motive Z / Shift+Z: next / previous gap of the selected trajectory.
-        let shift_z = ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Z));
-        let z = pressed(Key::Z);
+        // Motive Z / Shift+Z: nearest boundary across all selected trajectories.
+        let shift_z = edit_keys_allowed && exact_key(ctx, Key::Z, false, true, false);
+        let z = edit_keys_allowed && pressed(Key::Z);
+        let mut no_gap = false;
         if z || shift_z {
-            if let (Some(d), Some(m)) = (&v.data, v.primary) {
-                if let Some(f) = d.next_gap(m, v.pb.frame, z) {
-                    v.pb.step(f - v.pb.frame, now);
-                }
+            if let Some(f) = v.next_selected_gap(z) {
+                v.pb.step(f - v.pb.frame, now);
+            } else {
+                no_gap = true;
             }
         }
         // Frame range of the playback bar's band strip: `[` = start here, `]` = end here.
@@ -1977,6 +2308,12 @@ impl TakViewerApp {
         }
         if pressed(Key::CloseBracket) {
             v.range_end_here();
+        }
+        if edit_keys_allowed && pressed(Key::V) { v.range_start_here(); }
+        if edit_keys_allowed && pressed(Key::B) { v.range_end_here(); }
+        if edit_keys_allowed && exact_key(ctx, Key::B, false, true, false) { v.range = None; }
+        if edit_keys_allowed && exact_key(ctx, Key::V, false, true, false) {
+            if let Some(data) = &v.data { v.range = Some((data.start_frame, data.end_frame)); }
         }
         // Plan step 7: `1` / `2` hide or show the markers of this view's own file / the file laid
         // over it (as a click on name tag 1 / 2). Nothing without an overlay.
@@ -2000,15 +2337,15 @@ impl TakViewerApp {
                 v.picked = None;
             }
         }
+        if no_gap {
+            self.takm_note = Some(("빈 구간을 찾지 못했어요.".into(), now));
+        }
     }
 
-    /// M is handled on press and release. Ctrl+Z and Ctrl+Y undo and redo across the app,
-    /// but are ignored while M is held. Ctrl+Shift+Z is consumed without redoing; plain Z and
-    /// Shift+Z remain available for gap navigation.
     fn undo_keys(&mut self, ctx: &egui::Context) {
-        ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+        exact_key(ctx, Key::Z, true, true, false);
         let redo = ctrl_key(ctx, Key::Y);
-        let undo = ctrl_key(ctx, Key::Z);
+        let undo = ctrl_key(ctx, Key::Z) || exact_key(ctx, Key::Z, true, false, true);
         // Not while a cell of the COMMENTS pane is edited (Enter / Esc first; its line at the
         // top says so).
         if self.hold.is_none() && self.comment_edit.is_none() {
@@ -2066,6 +2403,14 @@ impl TakViewerApp {
                         ui.close_menu();
                         self.open_path_dialog();
                     }
+                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("저장  (Ctrl+S)")).clicked() {
+                        ui.close_menu();
+                        self.save_markers(ctx, self.active, false, false);
+                    }
+                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("다른 이름으로 저장…")).clicked() {
+                        ui.close_menu();
+                        self.save_markers(ctx, self.active, true, false);
+                    }
                     // `.takm` step ③: the active view's TAK as `.takm` (dim, with the reason).
                     let takm = self.takm_allowed(self.current_path());
                     if ui.add_enabled(takm.is_ok(), egui::Button::new(".takm으로 저장")).clicked() {
@@ -2102,7 +2447,7 @@ impl TakViewerApp {
                     });
                     if ui
                         .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new("화면 캡처 저장 (지금 + 위·옆·앞)  (Ctrl+Shift+S)"))
-                        .on_hover_text("기본 캡처 폴더에 PNG, sheet.png, captures.json 저장 (완료 후 경로 표시)")
+                        .on_hover_text("repo 안 experiments/tak_captures/ 에 PNG, sheet.png, captures.json 저장")
                         .clicked()
                     {
                         ui.close_menu();
@@ -2131,7 +2476,8 @@ impl TakViewerApp {
                     ui.label(RichText::new("패널 하나씩  (제목을 마우스로 끌어 옮겨요)").color(theme::TEXT_DIM));
                     for (pane, label) in [
                         (Pane::Explorer, "Explorer (폴더 트리)"),
-                        (Pane::Labels, "Labels"),
+                        (Pane::Labeling, "Labeling"),
+                        (Pane::EditTools, "Edit Tools"),
                         (Pane::Selected, "선택 마커"),
                         (Pane::Devices, "장치 (forceplate · EMG)"),
                         (Pane::Comments, "Comments 목록"),
@@ -2217,6 +2563,7 @@ impl TakViewerApp {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 let text = |s: String| RichText::new(s).size(12.0).color(theme::STATUS_TEXT);
+                if !self.ssh_status(ui) {
                 match &self.views[self.active].data {
                     Some(d) => {
                         let open = self.open_views();
@@ -2259,6 +2606,13 @@ impl TakViewerApp {
                         ui.label(text("파일을 열면 여기에 파일 정보가 나와요.".to_owned()));
                     }
                 }
+                }
+                if let Some((note, t)) = &self.ssh_note {
+                    if now - t < 8.0 && self.view().remote_warning.as_ref() != Some(note) {
+                        ui.label(text(note.clone()).strong());
+                        ctx.request_repaint_after(Duration::from_secs_f64(8.0 - (now - t) + 0.05));
+                    }
+                }
                 // "`.takm`으로 저장" running, then its result; or why a TAK takes no Comment.
                 if let Some(w) = self.takm_working() {
                     ui.label(text(w).strong());
@@ -2280,6 +2634,7 @@ impl TakViewerApp {
                 });
             });
         });
+        open_comments |= ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("ssh_open_comments"))).unwrap_or(false);
         if open_comments {
             self.show_pane(Pane::Comments);
         }
@@ -2368,6 +2723,7 @@ impl TakViewerApp {
         // The type strip of a comment just made in this view (not in pictures of a capture).
         let file_now = self.views[slot].file_id;
         let strip = self.type_strip.as_ref().filter(|s| s.slot == slot && s.file_id == file_now && !capturing).map(|s| (s.id, panels::type_strip_rects(ui.ctx(), deck_rect)));
+        let quick_available = self.quick_label_available(ui.ctx(), slot);
         let v = &mut self.views[slot];
         if v.fit_pending {
             if let Some((lo, hi)) = v.data.as_ref().and_then(|d| d.bounds) {
@@ -2407,10 +2763,21 @@ impl TakViewerApp {
         };
         let out = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(input), |ui| {
-                scene::show(ui, rect, row, tag_size, &covers, v.data.as_ref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, v.plate, &hud, layers)
+                scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, v.plate, &hud, layers)
             })
             .inner;
-        match (out.clicked, out.plate) {
+        let quick = quick_available && self.marker_ui[slot].labeling.mode == crate::ui::labeling::LabelingMode::QuickLabel && v.armed_label.is_some();
+        if let Some(index) = out.context_clicked {
+            if !v.selected.contains(&index) { v.select(index, false); }
+        }
+        if out.remove_marker { self.marker_delete = Some(slot); }
+        let is_unlabeled = |index: usize| v.data.as_ref().and_then(|d| d.markers.get(index)).is_some_and(|m| m.kind == tak_core::tak::MarkerKind::Unlabeled);
+        let quick_click = out.clicked.flatten().filter(|&index| quick && is_unlabeled(index));
+        let quick_double = out.double_clicked.is_some_and(|index| quick && is_unlabeled(index));
+        if let Some(index) = quick_click.filter(|_| out.double_clicked.is_none()) {
+            if let Some(marker) = v.data.as_ref().and_then(|data| data.markers.get(index)) { self.marker_click = Some((slot, marker.uid)); }
+        }
+        match (out.clicked.filter(|_| quick_click.is_none()), out.plate) {
             (Some(Some(m)), _) => v.select(m, out.ctrl),
             // On a plate: choose / un-choose it; the marker selection stays (both graphs can be up).
             (Some(None), Some(p)) => v.toggle_plate(p),
@@ -2420,9 +2787,16 @@ impl TakViewerApp {
         if let Some((markers, primary)) = out.box_selected {
             v.select_many(markers, primary, out.ctrl);
         }
-        if let Some(m) = out.double_clicked {
+        if let Some(m) = out.double_clicked.filter(|_| !quick_double) {
             v.select(m, false);
             v.focus_selected();
+        }
+        if quick {
+            if let (Some(key), Some(pointer)) = (v.armed_label, ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p))) {
+                if let Some(name) = self.marker_ui[slot].labeling.groups.iter().flat_map(|g| &g.labels).find(|row| row.key == Some(key)).map(|row| &row.name) {
+                    ui.painter().text(pointer + egui::vec2(14.0, 16.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(12.0), theme::ACCENT);
+                }
+            }
         }
         if let Some((path, _)) = &v.loading {
             // Reading a file into this view: a small note in its middle.
@@ -2441,7 +2815,7 @@ impl TakViewerApp {
         }
         let bar = CommentBar { list: &v.comments.list, blocks: &mut v.comments.blocks, make, can_delete, held, picked: v.picked, draft };
         // (Undo: a band drag, like any drag, is one action when the mouse is let go, `app_undo.rs`.)
-        let deck = panels::deck(ui, deck_rect, slot, v.data.as_ref(), &mut v.pb, &mut v.range, v.primary, &mut v.heat, v.file_id, now, bar);
+        let deck = panels::deck(ui, deck_rect, slot, v.data.as_deref(), &mut v.pb, &mut v.range, v.primary, &mut v.heat, v.file_id, now, bar);
         match deck.action {
             // During an edit of the COMMENTS pane a block click only moves the frame (the
             // selection is the edit's).
@@ -2485,6 +2859,7 @@ impl TakViewerApp {
                 first: d.start_frame,
                 last: d.end_frame,
                 frame,
+                selection: v.range,
                 spans,
                 keys: &keys,
                 left_out: total - graphed.len(),
@@ -2508,6 +2883,7 @@ impl TakViewerApp {
                 first: d.start_frame,
                 last: d.end_frame,
                 frame,
+                selection: None,
                 spans: &[],
                 keys: &[],
                 left_out: 0,
@@ -2557,7 +2933,7 @@ impl TakViewerApp {
             }
         }
         if let Some(t) = &tag {
-            dock::paint_view_tag(ui, &over, t, chosen, several);
+            dock::paint_view_tag(ui, &over, t, chosen, true);
         }
         if let Some(t) = &overlay_tags {
             self.overlay_tags_ui(ui, &over, slot, rect, t);
@@ -2613,7 +2989,27 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         let app = &mut *self.app;
+        if self.open.is_empty() && !matches!(tab, Pane::Empty | Pane::Explorer) {
+            crate::ui::empty::panel(ui, *tab);
+            return;
+        }
         match tab {
+            Pane::Empty => {
+                let rect = ui.available_rect_before_wrap();
+                crate::ui::empty::editor(ui);
+                if let Some(file) = egui::DragAndDrop::payload::<explorer::FileDrag>(ui.ctx()) {
+                    let hovered = ui.ctx().pointer_hover_pos().is_some_and(|p| rect.contains(p)
+                        && ui.ctx().layer_id_at(p).map_or(true, |layer| layer == ui.layer_id()));
+                    if hovered {
+                        ui.painter().rect_filled(rect, 0.0, theme::DROP_FILL);
+                        ui.painter().rect_stroke(rect.shrink(1.0), 0.0, egui::Stroke::new(1.5, theme::ACTIVE_VIEW));
+                        if ui.input(|i| i.pointer.any_released()) {
+                            app.file_drop = Some((app.active, dock::DropZone::Center, file.0.clone()));
+                        }
+                    }
+                }
+                return;
+            }
             Pane::View(k) => {
                 let k = usize::from(*k);
                 let tag = self.tags[k].take();
@@ -2640,9 +3036,18 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 // The menu offers "얹은 파일 내리기" while the active view has one.
                 let overlaid = app.view().overlay_target().is_some();
                 let revealing = app.explorer.reveal.is_some().then(|| app.explorer.folds().0.clone());
-                if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, overlaid, &mut app.explorer) {
-                    self.ws_action = Some(a);
-                }
+                // WORKSPACE keeps its existing height when short; a long tree reserves room
+                // for the SSH section, so all three section headers remain reachable.
+                let available = ui.available_height();
+                let reserve = crate::ui::ssh_explorer::desired_height(&app.ssh).min((available * 0.7).max(22.0));
+                let workspace_h = (available - reserve).max(26.0);
+                let max = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), workspace_h));
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(max), |ui| {
+                    if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, overlaid, &mut app.explorer) {
+                        self.ws_action = Some(a);
+                    }
+                });
+                app.ssh_section(ui);
                 // Folders the Explorer expanded to show the open file are no action of their own
                 // (a folder added in the same frame still is).
                 if let Some(before) = revealing.filter(|_| app.explorer.reveal.is_none()) {
@@ -2653,6 +3058,14 @@ impl egui_dock::TabViewer for Tabs<'_> {
             }
             Pane::Comments => {
                 app.comments_tab(ui);
+                return;
+            }
+            Pane::Labels | Pane::Labeling => {
+                app.labeling_tab(ui);
+                return;
+            }
+            Pane::EditTools => {
+                app.edit_tools_tab(ui);
                 return;
             }
             _ => {}
@@ -2668,7 +3081,6 @@ impl egui_dock::TabViewer for Tabs<'_> {
         };
         let frame = v.pb.frame;
         let action = match tab {
-            Pane::Labels => panels::labels_pane(ui, d, frame, &mut v.labels, &v.selected, v.primary, v.file_id, f32::INFINITY),
             Pane::Selected => {
                 ui.add_space(4.0);
                 panels::selected_pane(ui, d, frame, &v.selected, v.primary)
@@ -2681,22 +3093,22 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 // The Comment bands of the graphed markers (step 6).
                 let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
                 let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
-                panels::graph_pane(ui, d, frame, &graphed, total, v.file_id, &mut v.lanes, spans)
+                panels::graph_pane(ui, d, frame, &graphed, total, v.file_id, &mut v.lanes, spans, &mut v.range)
             }
             Pane::Devices => {
                 ui.add_space(4.0);
                 panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate)
             }
-            Pane::View(_) | Pane::Explorer | Pane::Comments => None,
+            Pane::Empty | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
         };
         if action.is_some() {
             self.action = action;
         }
     }
 
-    /// A 3D view closes with its tab ✕ while another one is open.
+    /// Every 3D view can close; the empty editor is a permanent layout placeholder.
     fn closeable(&mut self, tab: &mut Pane) -> bool {
-        !matches!(tab, Pane::View(_)) || self.open.len() > 1
+        !matches!(tab, Pane::Empty)
     }
 
     fn on_close(&mut self, tab: &mut Pane) -> bool {
@@ -2710,12 +3122,12 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     /// 3D views stay in the main window.
     fn allowed_in_windows(&self, tab: &mut Pane) -> bool {
-        !matches!(tab, Pane::View(_))
+        !matches!(tab, Pane::View(_) | Pane::Empty)
     }
 
     /// 3D view and Explorer paint their own background.
     fn clear_background(&self, tab: &Pane) -> bool {
-        !matches!(tab, Pane::View(_) | Pane::Explorer)
+        !matches!(tab, Pane::View(_) | Pane::Empty | Pane::Explorer)
     }
 
     /// 3D views have file tabs (the active view's is bright), the other panes a plain title.
@@ -2725,7 +3137,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
             Pane::View(k) => dock::view_tab_style(global, usize::from(*k) == self.app.active),
             _ => dock::panel_tab_style(global),
         };
-        if matches!(tab, Pane::View(_) | Pane::Explorer) {
+        if matches!(tab, Pane::View(_) | Pane::Empty | Pane::Explorer) {
             s.tab_body.inner_margin = egui::Margin::ZERO;
         }
         Some(s)
@@ -2767,6 +3179,10 @@ impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
+        if !self.no_persist && !self.exit_approved && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_exit(ctx);
+        }
         // v0.27.0 speed fix: the graphs' building and thinning share a budget per frame
         // (`graph::spend`; the passes of one frame have the same input time); none outside this
         // frame (`GraphFrame`). A picture run (`--screenshot`, `--capture`, menu capture) has no
@@ -2781,13 +3197,14 @@ impl TakViewerApp {
         // Drag & drop: folder -> workspace; files -> the view under the mouse (else the active
         // one), more files next to it.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if !dropped.is_empty() {
+        if !dropped.is_empty() && self.dirty_prompt.is_none() {
             let at = ctx.input(|i| i.pointer.latest_pos());
             if let Some(k) = at.and_then(|p| self.open_views().into_iter().find(|&k| self.views[k].scene_rect.contains(p))) {
                 self.activate(k);
             }
             let mut first = true;
             for p in dropped {
+                if self.dirty_prompt.is_some() { break; }
                 if p.is_dir() {
                     self.open_workspace(p);
                 } else if std::mem::take(&mut first) {
@@ -2797,26 +3214,27 @@ impl TakViewerApp {
                 }
             }
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::O)) {
+        let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none() && !ctx.memory(|m| m.any_popup_open());
+        if global_keys && exact_key(ctx, Key::O, true, true, false) {
             self.pick_folder();
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+        if global_keys && exact_key(ctx, Key::O, true, false, false) {
             self.pick_file(ctx, false);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
+        if global_keys && exact_key(ctx, Key::L, true, false, false) {
             self.open_path_dialog();
         }
         // Side toggles (VS Code keys). Ctrl+Alt+B first: Ctrl+B also matches it.
-        for (mods, key, side) in [(Modifiers::COMMAND | Modifiers::ALT, Key::B, Side::Right), (Modifiers::COMMAND, Key::B, Side::Left), (Modifiers::COMMAND, Key::J, Side::Bottom)] {
-            if ctx.input_mut(|i| i.consume_key(mods, key)) && self.capture.is_none() {
+        for (key, alt, side) in [(Key::B, true, Side::Right), (Key::B, false, Side::Left), (Key::J, false, Side::Bottom)] {
+            if global_keys && exact_key(ctx, key, true, false, alt) && self.capture.is_none() {
                 self.toggle_side(side);
             }
         }
-        if !self.typing(ctx) {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown)) {
+        if global_keys {
+            if exact_key(ctx, Key::PageDown, false, false, false) {
                 self.step_file(ctx, 1);
             }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp)) {
+            if exact_key(ctx, Key::PageUp, false, false, false) {
                 self.step_file(ctx, -1);
             }
         }
@@ -2830,13 +3248,20 @@ impl TakViewerApp {
             self.workspace.set_minimized(minimized);
             explorer::keep_watch(&mut self.explorer, &mut self.workspace);
         }
-        if self.workspace.is_loading() {
+        if self.workspace.is_loading() || self.ssh.is_busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        if self.ssh.is_busy() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.ssh.cancel_all();
+        }
         // Background loads: markers ready? Then force plates / EMG.
         self.poll_loads(ctx);
+        self.poll_marker_jobs(ctx);
+        self.poll_marker_saves(ctx);
+        self.poll_exit_wait(ctx);
 
+        self.apply_ssh_demo(ctx);
         self.drive_auto_shot(ctx, now);
         self.drive_capture(ctx, now);
         // A cell edit of the COMMENTS pane first (its Enter / Esc), then `M` held (comment while
@@ -2850,7 +3275,7 @@ impl TakViewerApp {
         if self.capture.is_none() {
             self.handle_keys(ctx, now);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+        if global_keys && exact_key(ctx, Key::S, true, true, false) {
             self.start_menu_capture();
         }
         // Every view plays on its own (no frame matching between views).
@@ -2862,6 +3287,7 @@ impl TakViewerApp {
         }
         self.close_hold_on_wrap(ctx);
         self.settings.speed = self.view().pb.speed;
+        self.dirty_dialog(ctx);
         self.graph_in_one_place();
 
         self.menu_bar(ctx);
@@ -2937,6 +3363,8 @@ impl TakViewerApp {
             Some((_, DeckAction::GotoComment(_))) | None => {}
         }
         self.apply(action, now);
+        if let Some((slot, uid)) = self.marker_click.take() { self.label_sample(ctx, slot, uid); }
+        if let Some(slot) = self.marker_delete.take() { self.delete_selected(ctx, slot); }
         if let Some(a) = ws_action {
             self.explorer_action(ctx, a);
         }
@@ -3139,7 +3567,7 @@ impl TakViewerApp {
                         ("M 짧게", "Comment: 구간(없으면 지금 프레임) + 고른 마커(없어도 돼요)를 바로 저장 (재생 막대의 Comment 버튼과 같아요)"),
                         ("유형 버튼 3개 / T", "Comment를 만든 바로 뒤 재생 막대 위에 Jitter · Marker swap · Needs visual check 버튼이 떠요: 누르면 그 유형이 붙어요 (다른 키 · 다른 곳 누르기 = 그냥 닫힘). T = 고른 Comment의 유형을 차례로 바꾸기: 없음 → Jitter → Marker swap → Needs visual check → 없음"),
                         ("재생 막대 띠의 주황 칸 누르기 / 오른쪽 클릭", "그 Comment의 첫 프레임으로 + 그 마커 선택 (마커 없는 Comment는 프레임만) / 바로 지우기"),
-                        ("COMMENTS 탭", "보기 메뉴 · 상태 줄 Comments N으로 열기. 줄 누르기 = 그 Comment와 마커 고르기(프레임 · 재생은 그대로) · # 두 번 누르기 = 그 Comment 첫 프레임으로 · 칸 두 번 누르기 = 고치기(Markers: 3D · Labels에서 마커를 고르고 Enter, Frames · Comment: 쓰고 Enter; 프레임은 그대로), Esc = 취소 · Type ▼ 상자 한 번 누르기 = 유형 목록(누르면 바로 저장, ↑ ↓ Enter, Esc · 다른 곳 = 닫기) · ✕ = 지우기 · 칸 이름 = 정렬 (한 번 더 = 거꾸로)"),
+                        ("COMMENTS 탭", "보기 메뉴 · 상태 줄 Comments N으로 열기. 줄 누르기 = 그 Comment와 마커 고르기(프레임 · 재생은 그대로) · # 두 번 누르기 = 그 Comment 첫 프레임으로 · 칸 두 번 누르기 = 고치기(Markers: 3D · Labeling에서 마커를 고르고 Enter, Frames · Comment: 쓰고 Enter; 프레임은 그대로), Esc = 취소 · Type ▼ 상자 한 번 누르기 = 유형 목록(누르면 바로 저장, ↑ ↓ Enter, Esc · 다른 곳 = 닫기) · ✕ = 지우기 · 칸 이름 = 정렬 (한 번 더 = 거꾸로)"),
                         ("Ctrl+Z / Ctrl+Y", "한 번 = 동작 하나 되돌리기 / 다시 하기: 프레임 · 시점 · 선택 · 구간 · Comment · 설정 · 패널 · 파일 열기 · 폴더를 한 일의 차례대로 (앱 전체, 이어진 움직임은 하나, 최근 동작 500개까지, 글 칸에 커서가 있으면 그 글의 되돌리기)"),
                         ("Ctrl+O", "파일 열기 (창에 끌어다 놓아도 됨)"),
                         ("Explorer 클릭 / Ctrl+클릭", "지금 화면에 열기 / 옆 화면에 열기 (3D 화면 최대 4개, 2×2까지)"),
@@ -3322,8 +3750,11 @@ impl TakViewerApp {
         let open = self.open_views();
         self.settings.views = open
             .iter()
+            .filter(|&&k| self.views[k].remote.is_none())
             .filter_map(|&k| self.views[k].path().map(|p| (k as u8, p.to_string_lossy().into_owned())))
             .collect();
+        self.settings.ssh_python = self.ssh.python_settings.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
+        self.settings.ssh_platforms = self.ssh.platform_overrides.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
         self.settings.active_view = self.active as u8;
         let active = self.active;
         for k in open.into_iter().filter(|&k| k != active).chain([active]) {
@@ -3337,6 +3768,10 @@ impl TakViewerApp {
 mod tests {
     use super::*;
     use eframe::{App, Storage};
+
+    include!("app_graph_selection_tests.rs");
+    include!("app_empty_ui_tests.rs");
+    include!("app_close_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.
@@ -3384,7 +3819,7 @@ mod tests {
 
     #[test]
     fn command_line_runs_leave_the_settings_file_alone() {
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&egui::Context::default(), None, vec![], Some(shot), None);
         let mut st = FileLike::default();
         app.save(&mut st);
@@ -3444,7 +3879,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_from_before_the_toggles_get_the_new_arrangement_once_and_keep_their_views() {
+    fn settings_from_before_the_toggles_keep_their_arrangement_and_views() {
         // v0.6.0 text: no layout_version / hidden, no Graph pane, three 3D views.
         let mut layout = dock::default_layout();
         dock::hide(&mut layout, Pane::Graph);
@@ -3467,13 +3902,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_from_before_the_floating_graph_float_it_once_and_keep_their_views() {
+    fn settings_from_before_the_floating_graph_keep_hidden_panes_and_views() {
         // v0.9.0 text: the graph pane below two 3D views, hidden by the bottom toggle, and
         // none of the floating-graph settings.
         let mut layout = dock::default_layout_for(&[0, 2]);
         dock::show(&mut layout, Pane::Graph);
         let mut hidden = dock::Hidden::default();
         dock::toggle_side(&mut layout, &mut hidden, dock::NOMINAL_AREA, Side::Bottom);
+        let saved_hidden = hidden.clone();
         let s = Settings { workspace_roots: vec![r"C:\data".into()], layout: Some(layout), layout_version: 1, hidden, ..Settings::default() };
         let text = ron::to_string(&s).unwrap();
         let new_fields = ["graph_float:true,", "graph_opacity:60,"];
@@ -3490,7 +3926,7 @@ mod tests {
         let (dock, hidden) = back.take_layout();
         assert_eq!(dock::views(&dock), vec![0, 2], "the 3D views stay");
         assert!(!dock::has(&dock, Pane::Graph) && dock::has(&dock, Pane::Devices) && back.graph_float);
-        assert_eq!(hidden, dock::Hidden::default(), "the hidden bottom panel is not kept: nothing is below the views now");
+        assert_eq!(hidden, saved_hidden, "the hidden bottom panel keeps its saved placement");
         // From then on the layout is used as saved: a graph pane brought back stays a pane.
         let mut dock = dock;
         dock::show(&mut dock, Pane::Graph);
@@ -3638,7 +4074,6 @@ mod tests {
 
     #[test]
     fn the_graph_goes_up_into_the_tab_row_of_a_view_alone_and_works_there() {
-        // A lone view extends to the top, and its graph can occupy that area beside the name tag.
         let ctx = egui::Context::default();
         let (mut app, tab) = one_view_with_graph(&ctx);
         let whole = app.views[0].scene_rect;
@@ -3793,11 +4228,11 @@ mod tests {
     fn a_view_tabbed_with_a_pane_keeps_its_graph_below_the_tab_row() {
         let ctx = egui::Context::default();
         let (mut app, _) = one_view_with_graph(&ctx);
-        let loc = app.dock.find_tab(&Pane::Labels).unwrap();
+        let loc = app.dock.find_tab(&Pane::Labeling).unwrap();
         app.dock.remove_tab(loc);
         let (node, _) = app.dock.main_surface().find_tab(&Pane::View(0)).unwrap();
         if let egui_dock::Node::Leaf { tabs, .. } = &mut app.dock.main_surface_mut()[node] {
-            tabs.push(Pane::Labels);
+            tabs.push(Pane::Labeling);
         }
         app.settings.graph_boxes[0].size = Some([400.0, 120.0]);
         frame_with(&ctx, &mut app, vec![]);
@@ -3886,7 +4321,6 @@ mod tests {
 
     #[test]
     fn a_click_on_a_plate_chooses_it_keeps_the_markers_and_floats_its_fz_over_that_view_only() {
-        // A selected force plate can be graphed.
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 2);
         assert!(app.views[0].graph_rect.is_some() && app.views[0].plate_rect.is_none(), "no plate chosen: no plate graph");
@@ -4027,7 +4461,6 @@ mod tests {
 
     #[test]
     fn the_plate_graph_shows_fx_fy_fz_and_its_lane_list_adds_and_removes_lanes_at_once() {
-        // Force and moment channels are selected with six checkboxes.
         let ctx = egui::Context::default();
         // Low graph: the lower half of the list lies over the 3D, the upper half over the graph.
         let (mut app, tab) = plate_graph_at_frame_5(&ctx, Some([600.0, 100.0]));
@@ -4241,11 +4674,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 1);
         app.views[0].plate = Some(0);
-        app.views[0].data.as_mut().unwrap().analog_pending = true;
+        std::sync::Arc::get_mut(app.views[0].data.as_mut().unwrap()).unwrap().analog_pending = true;
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].plate_rect.is_none() && app.views[0].graph_rect.is_some());
         assert_eq!(app.views[0].plate_lanes.builds, 0, "no lane made from forces not read yet");
-        app.views[0].data.as_mut().unwrap().analog_pending = false;
+        std::sync::Arc::get_mut(app.views[0].data.as_mut().unwrap()).unwrap().analog_pending = false;
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].plate_rect.is_some());
     }
@@ -4253,7 +4686,7 @@ mod tests {
     #[test]
     fn screenshot_plate_argument_chooses_that_plate_in_every_view() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, menu_capture: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         for (k, name) in [(0, "a.tak"), (1, "b.tak")] {
@@ -4291,23 +4724,145 @@ mod tests {
         let mut app = window_app();
         dock::hide(&mut app.dock, Pane::Devices);
         app.toggle_side(Side::Right);
-        assert!(!dock::has(&app.dock, Pane::Labels));
+        assert!(!dock::has(&app.dock, Pane::Labeling));
         app.sync_settings();
         let text = ron::to_string(&app.settings).unwrap();
         let mut back: Settings = ron::from_str(&text).unwrap();
         let (dock, mut hidden) = back.take_layout();
-        assert!(!dock::has(&dock, Pane::Labels) && !dock::has(&dock, Pane::Devices), "a layout of this version is used as saved");
+        assert!(!dock::has(&dock, Pane::Labeling) && !dock::has(&dock, Pane::Devices), "a layout of this version is used as saved");
         assert_eq!(hidden, app.hidden);
         let mut dock = dock;
         dock::toggle_side(&mut dock, &mut hidden, dock::NOMINAL_AREA, Side::Right);
-        assert!(dock::has(&dock, Pane::Labels) && dock::has(&dock, Pane::Selected), "the toggle brings them back after a restart");
+        assert!(dock::has(&dock, Pane::Labeling) && dock::has(&dock, Pane::Selected), "the toggle brings them back after a restart");
         // The menu shows a hidden pane right away; it is then no longer the toggle's.
-        app.show_pane(Pane::Labels);
-        assert!(dock::has(&app.dock, Pane::Labels));
+        app.show_pane(Pane::Labeling);
+        assert!(dock::has(&app.dock, Pane::Labeling));
         app.toggle_side(Side::Right);
         app.toggle_side(Side::Right);
-        assert!(dock::has(&app.dock, Pane::Labels) && dock::has(&app.dock, Pane::Selected), "no pane is lost or doubled");
+        assert!(dock::has(&app.dock, Pane::Labeling) && dock::has(&app.dock, Pane::Selected), "no pane is lost or doubled");
         assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn version_two_layout_migrates_label_tabs_without_resetting_custom_panes() {
+        let mut layout = dock::default_layout();
+        let (surface, node, _) = layout.find_tab(&Pane::Labeling).unwrap();
+        if let egui_dock::Node::Leaf { tabs, active, .. } = &mut layout[surface][node] {
+            *tabs = vec![Pane::Labels];
+            *active = egui_dock::TabIndex(0);
+        }
+        dock::show(&mut layout, Pane::Graph);
+        let mut settings = Settings { layout: Some(layout), layout_version: 2, ..Settings::default() };
+        let (layout, _) = settings.take_layout();
+        assert!(dock::has(&layout, Pane::Graph));
+        assert!(dock::has(&layout, Pane::Labeling) && dock::has(&layout, Pane::EditTools));
+        assert!(!dock::has(&layout, Pane::Labels));
+        let a = layout.find_tab(&Pane::Labeling).unwrap();
+        let b = layout.find_tab(&Pane::EditTools).unwrap();
+        assert_eq!((a.0, a.1), (b.0, b.1));
+    }
+
+    #[test]
+    fn saved_label_panels_merge_before_validation_and_keep_files_and_floating_placement() {
+        let mut layout = DockState::new(vec![Pane::View(1), Pane::View(3), Pane::Labels, Pane::Graph]);
+        let window = layout.add_window(vec![Pane::Labeling, Pane::EditTools, Pane::Labeling]);
+        layout.get_window_state_mut(window).unwrap().set_position(egui::pos2(120.0, 140.0)).set_size(egui::vec2(390.0, 620.0));
+        let window_state = ron::to_string(layout.get_window_state(window).unwrap()).unwrap();
+        let files = vec![(1, "first.takm".to_owned()), (3, "second.tak".to_owned())];
+        let settings = Settings { layout: Some(layout), layout_version: 3, views: files.clone(), active_view: 3, ..Settings::default() };
+        let saved = ron::to_string(&settings).unwrap();
+        let mut back: Settings = ron::from_str(&saved).unwrap();
+        let (mut layout, hidden) = back.take_layout();
+        assert_eq!(dock::views(&layout), vec![1, 3], "merge happens before duplicate validation can reset the layout");
+        assert_eq!(back.views, files);
+        assert_eq!(back.active_view, 3);
+        assert!(dock::has(&layout, Pane::Graph));
+        assert!(!back.graph_float);
+        assert!(!dock::has(&layout, Pane::Labels));
+        assert_eq!(layout.iter_all_tabs().filter(|(_, pane)| **pane == Pane::Labeling).count(), 1);
+        assert_eq!(layout.find_tab(&Pane::Labeling).unwrap().0, window);
+        assert_eq!(ron::to_string(layout.get_window_state(window).unwrap()).unwrap(), window_state);
+        assert_eq!(hidden, dock::Hidden::default());
+    }
+
+    #[test]
+    fn saved_layout_without_either_marker_panel_stays_closed() {
+        for version in 0..=3 {
+            let layout = dock::scene_only(2);
+            let settings = Settings { layout: Some(layout), layout_version: version, ..Settings::default() };
+            let mut back: Settings = ron::from_str(&ron::to_string(&settings).unwrap()).unwrap();
+            let (layout, hidden) = back.take_layout();
+            assert_eq!(dock::views(&layout), vec![2]);
+            assert!(!dock::has(&layout, Pane::Labels) && !dock::has(&layout, Pane::Labeling), "the marker list stays closed in version {version}");
+            assert_eq!(dock::has(&layout, Pane::EditTools), version < 3, "older layouts gain only Edit Tools");
+            assert_eq!(hidden, dock::Hidden::default());
+        }
+    }
+
+    #[test]
+    fn serialized_version_one_labels_layout_migrates_without_resetting_its_arrangement() {
+        let mut layout = DockState::new(vec![Pane::View(1), Pane::View(3)]);
+        let [_, labels] = layout.main_surface_mut().split_left(egui_dock::NodeIndex::root(), 0.27, vec![Pane::Labels, Pane::Devices]);
+        layout.set_active_tab((egui_dock::SurfaceIndex::main(), labels, egui_dock::TabIndex(1)));
+        dock::show(&mut layout, Pane::Graph);
+        let mut expected = layout.clone();
+        if let egui_dock::Node::Leaf { tabs, active, .. } = &mut expected.main_surface_mut()[labels] {
+            *tabs = vec![Pane::Labeling, Pane::EditTools, Pane::Devices];
+            *active = egui_dock::TabIndex(2);
+        }
+        let settings = Settings { layout: Some(layout), layout_version: 1, ..Settings::default() };
+        let saved = ron::to_string(&settings).unwrap();
+        assert!(saved.contains("Labels") && !saved.contains("Labeling") && !saved.contains("EditTools"));
+        let mut back: Settings = ron::from_str(&saved).unwrap();
+        let (layout, hidden) = back.take_layout();
+        assert_eq!(dock::views(&layout), vec![1, 3]);
+        assert_eq!(dock::shape(&layout), dock::shape(&expected), "split shares, tab positions and unrelated panes stay");
+        assert_eq!(layout.find_tab(&Pane::Labeling).unwrap().1, labels);
+        assert!(!dock::has(&layout, Pane::Labels));
+        assert!(!back.graph_float, "the saved Graph pane stays open");
+        assert_eq!(hidden, dock::Hidden::default());
+    }
+
+    #[test]
+    fn marker_panel_migration_is_not_undoable_and_layout_undo_keeps_one_panel() {
+        let ctx = egui::Context::default();
+        let mut layout = dock::default_layout();
+        layout.add_window(vec![Pane::Labels]);
+        let settings = Settings { layout: Some(layout), layout_version: 3, ..Settings::default() };
+        let mut storage = FileLike::default();
+        eframe::set_value(&mut storage, eframe::APP_KEY, &settings);
+        let mut app = TakViewerApp::build(&ctx, Some(&storage), vec![], None, None);
+        frame_with(&ctx, &mut app, vec![]);
+        assert!(app.history.kinds().is_empty(), "startup migration adds no history action");
+        let check = |app: &TakViewerApp| {
+            let visible = app.dock.iter_all_tabs().map(|(_, pane)| *pane);
+            let hidden = [&app.hidden.left, &app.hidden.bottom, &app.hidden.right].into_iter().flatten()
+                .flat_map(|stash| &stash.leaves).flat_map(|leaf| leaf.tabs.iter().copied());
+            let panes: Vec<Pane> = visible.chain(hidden).collect();
+            assert!(!panes.contains(&Pane::Labels));
+            assert_eq!(panes.iter().filter(|p| **p == Pane::Labeling).count(), 1);
+        };
+        check(&app);
+        app.toggle_side(Side::Right);
+        app.observe(true);
+        assert_eq!(app.history.kinds(), vec!["Layout"]);
+        assert!(!dock::has(&app.dock, Pane::Labeling));
+        check(&app);
+        app.undo_redo(&ctx, false);
+        assert!(dock::has(&app.dock, Pane::Labeling));
+        check(&app);
+        app.undo_redo(&ctx, true);
+        assert!(!dock::has(&app.dock, Pane::Labeling));
+        check(&app);
+        app.show_pane(Pane::Labeling);
+        app.observe(true);
+        check(&app);
+        app.undo_redo(&ctx, false);
+        assert!(!dock::has(&app.dock, Pane::Labeling));
+        check(&app);
+        app.undo_redo(&ctx, true);
+        assert!(dock::has(&app.dock, Pane::Labeling));
+        check(&app);
     }
 
     /// One UI frame on a 1600×960 screen with these keys tapped: each pressed and let go in the
@@ -4344,7 +4899,7 @@ mod tests {
         assert!(all.left() > 250.0 && all.right() < 1300.0 && all.bottom() < 700.0, "panes on three sides: {all:?}");
         let no_left = view_after(&mut app, &[(ctrl, Key::B)]);
         assert!(no_left.left() < 1.0 && (no_left.bottom() - all.bottom()).abs() < 1.0, "Ctrl+B hides the left side only: {no_left:?}");
-        assert!(!dock::has(&app.dock, Pane::Explorer) && dock::has(&app.dock, Pane::Labels));
+        assert!(!dock::has(&app.dock, Pane::Explorer) && dock::has(&app.dock, Pane::Labeling));
         let no_right = view_after(&mut app, &[(ctrl_alt, Key::B)]);
         assert!(no_right.left() < 1.0 && no_right.right() > 1599.0, "Ctrl+Alt+B hides the right side, not the left again: {no_right:?}");
         let alone = view_after(&mut app, &[(ctrl, Key::J)]);
@@ -4401,11 +4956,11 @@ mod tests {
             assert!((place.bottom() - r.bottom() - panels::DECK_H).abs() < 0.5, "view {k}: its playback bar under it: {r:?} in {place:?}");
         }
         // A pane tabbed together with view 0: that place keeps its tab row.
-        let loc = app.dock.find_tab(&Pane::Labels).unwrap();
+        let loc = app.dock.find_tab(&Pane::Labeling).unwrap();
         app.dock.remove_tab(loc);
         let (node, _) = app.dock.main_surface().find_tab(&Pane::View(0)).unwrap();
         if let egui_dock::Node::Leaf { tabs, .. } = &mut app.dock.main_surface_mut()[node] {
-            tabs.push(Pane::Labels);
+            tabs.push(Pane::Labeling);
         }
         run_frame(&ctx, &mut app, &[]);
         run_frame(&ctx, &mut app, &[]);
@@ -4490,6 +5045,152 @@ mod tests {
         frame_with(ctx, &mut app, vec![]);
         frame_with(ctx, &mut app, vec![]);
         app
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_focused_view_and_panel_focus_uses_the_last_chosen_view() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        app.activate(0);
+        // Dock focus can change before the next drawing pass synchronizes `active`.
+        dock::focus_view(&mut app.dock, 1);
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0]);
+        assert_eq!(app.views[0].path(), Some(Path::new("a.tak")));
+        assert!(app.views[1].target().is_none());
+        assert_eq!(app.active, 0);
+
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        let tab = view_tab(&ctx, &app, 1);
+        click_at(&ctx, &mut app, tab.left_center() + egui::vec2(20.0, 0.0));
+        assert_eq!(app.active, 1, "clicking a 3D tab chooses it");
+        let (surface, node, tab) = app.dock.find_tab(&Pane::Explorer).unwrap();
+        app.dock.set_active_tab((surface, node, tab));
+        app.dock.set_focused_node_and_surface((surface, node));
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0], "panel focus keeps the last chosen 3D view");
+        // The final view closes through the same shortcut.
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert!(app.views[0].path().is_none());
+        assert!(app.open_views().is_empty());
+    }
+
+    #[test]
+    fn ctrl_w_close_and_undo_restore_the_view_spot_range_and_overlay_as_one_action() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("ctrl_w_undo");
+        let (mut app, files) = editors_app(&ctx, &dir);
+        app.activate(0);
+        app.views[0].pb.set_frame(6, 0.0);
+        app.views[0].select(1, false);
+        app.views[0].range = Some((2, 7));
+        app.views[0].shown = [false, true];
+        app.views[0].cam.yaw += 0.4;
+        let yaw = app.views[0].cam.yaw;
+        frame_with(&ctx, &mut app, vec![]);
+        let before = steps(&app, 0).0;
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![1]);
+        assert_eq!(app.file_count(), 1);
+        assert!(app.views[0].target().is_none() && app.views[0].overlay_target().is_none());
+        assert_eq!(steps(&app, 0), (before + 1, 0));
+        assert_eq!(app.history.kinds().last().map(String::as_str), Some("Layout"));
+        undo_key(&ctx, &mut app);
+        assert_eq!(app.open_views(), vec![0, 1]);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.views[0].target(), Some(files[0].as_path()));
+        assert_eq!(app.views[0].overlay_target(), Some(files[1].as_path()));
+        arrive(&ctx, &mut app, 0);
+        overlay_arrive(&ctx, &mut app, 0);
+        assert_eq!(app.views[0].pb.frame, 6);
+        assert_eq!(app.views[0].range, Some((2, 7)));
+        assert_eq!(app.views[0].primary, Some(1));
+        assert_eq!(app.views[0].shown, [false, true]);
+        assert_eq!(app.views[0].cam.yaw, yaw);
+        assert_eq!(steps(&app, 0), (before, 1));
+        redo_key(&ctx, &mut app);
+        assert_eq!(app.open_views(), vec![1]);
+        assert_eq!(app.file_count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ctrl_w_respects_exact_modifiers_text_popup_comment_edit_and_held_m() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        app.activate(1);
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT, Modifiers::ALT,
+            Modifiers { shift: true, ..ctrl() }, Modifiers { alt: true, ..ctrl() },
+            Modifiers { shift: true, alt: true, ..ctrl() },
+            Modifiers { command: true, mac_cmd: true, ..Modifiers::NONE },
+            Modifiers { mac_cmd: true, ..ctrl() }]
+        {
+            run_frame(&ctx, &mut app, &[(modifiers, Key::W)]);
+            assert_eq!(app.open_views(), vec![0, 1], "{modifiers:?}");
+        }
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("ctrl_w_popup")));
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0, 1]);
+        ctx.memory_mut(|m| m.close_popup());
+        key_down(&ctx, &mut app, Key::M);
+        assert!(app.hold.is_none(), "TAK cannot start a Comment hold");
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0, 1], "physical M still has priority");
+        key_up(&ctx, &mut app, Key::M);
+        app.hold = Some(Hold { slot: 1, file_id: app.views[1].file_id, start: 0, markers: vec![], wraps: 0 });
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0, 1]);
+        assert!(app.hold.is_some());
+        app.hold = None;
+        let comment = Comment { id: 1, markers: vec![], start: 0, end: 1, comment_type: String::new(), text: String::new() };
+        app.views[1].comments.list.apply(&Event::of(EventKind::Add, &comment, "t".into(), "b.tak|0".into()));
+        app.comment_edit = Some(comment_list::Edit::new(1, app.views[1].file_id, &comment, comment_list::Field::Markers, app.views[1].selection()));
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0, 1]);
+        app.comment_edit = None;
+        app.open_path_dialog();
+        frame_with(&ctx, &mut app, vec![]);
+        assert!(ctx.wants_keyboard_input());
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0, 1]);
+        assert!(app.path_input.is_some());
+    }
+
+    #[test]
+    fn ctrl_w_with_no_3d_view_does_nothing_and_can_close_a_loading_view() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.dock = DockState::new(vec![Pane::Explorer]);
+        let _ = ctx.run(egui::RawInput { events: vec![key_event(Key::W, true, ctrl())], ..Default::default() }, |ctx| app.handle_keys(ctx, 0.0));
+        assert!(app.open_views().is_empty());
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        app.hold_loads = true;
+        app.activate(1);
+        app.open_in(&ctx, 1, "loading.tak".into());
+        // No marker data is needed to close a tab whose file is still loading.
+        drop_later(app.views[1].data.take());
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+        assert_eq!(app.open_views(), vec![0]);
+        assert!(app.views[1].loading.is_none());
+    }
+
+    #[test]
+    fn ctrl_w_pending_or_failed_comments_use_the_existing_close_dialog() {
+        for pending in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = two_views(&ctx);
+            app.activate(1);
+            if pending { app.views[1].comments.pending = 1; }
+            else { app.views[1].comments.failed = Some("write failed".into()); }
+            let before = steps(&app, 0);
+            run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
+            assert!(app.dirty_prompt.is_some(), "pending={pending}");
+            assert_eq!(app.open_views(), vec![0, 1]);
+            assert_eq!(app.views[1].path(), Some(Path::new("b.tak")));
+            assert_eq!(steps(&app, 0), before, "a blocked close is not an action");
+        }
     }
 
     /// Press at `from`, move in steps to `to`, rest there, let go (the release frame is the
@@ -4730,7 +5431,20 @@ mod tests {
         app.views[0].comments.take_load(load_c(&tak));
         frame_with(ctx, &mut app, vec![]);
         frame_with(ctx, &mut app, vec![]);
+        if !command_run && matches!(app.views[0].comments.target, Some(Ok(_))) {
+            wait_comment_ids(ctx, &mut app, 0);
+        }
         app
+    }
+
+    fn wait_comment_ids(ctx: &egui::Context, app: &mut TakViewerApp, slot: usize) {
+        for _ in 0..2000 {
+            if app.views[slot].comments.id_pool.as_ref().is_some_and(|ids| !ids.is_empty()) { return; }
+            assert!(app.views[slot].comments.id_error.is_none(), "{:?}", app.views[slot].comments.id_error);
+            frame_with(ctx, app, vec![]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("Comment IDs not ready");
     }
 
     /// Frames until the writer thread has confirmed every write.
@@ -4743,6 +5457,215 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("comment writes not confirmed");
+    }
+
+    #[test]
+    fn failed_comments_block_every_close_path_and_retry_in_order() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("failed_retry_close");
+        let mut app = comment_app(&ctx, &dir, false);
+        let path = dir.join("a.takm");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        app.add_comment(&ctx, 0, vec!["M".into()], 1, 1);
+        app.add_comment(&ctx, 0, vec!["N".into()], 2, 2);
+        until_saved(&ctx, &mut app);
+        assert_eq!(app.comment_failed.len(), 2);
+        assert!(app.views[0].comments.failed.is_some());
+        app.close_editor(0);
+        assert!(app.dirty_prompt.is_some());
+        app.dirty_prompt = None;
+        app.open_in(&ctx, 0, dir.join("other.tak"));
+        assert!(app.dirty_prompt.is_some());
+        assert!(app.views[0].loading.is_none());
+        app.dirty_prompt = None;
+        app.request_exit(&ctx);
+        assert!(app.dirty_prompt.is_some());
+        assert!(!app.exit_approved);
+        app.dirty_prompt = None;
+        app.views[0].comments.pending = 1;
+        app.close_editor(0);
+        assert!(app.dirty_prompt.is_some());
+        app.dirty_prompt = None;
+        app.views[0].comments.pending = 0;
+        std::fs::write(&path, original).unwrap();
+        app.close_editor(0);
+        app.retry_comments_and_transition(&ctx, 0);
+        for _ in 0..2000 {
+            frame_with(&ctx, &mut app, vec![]);
+            if app.views[0].data.is_none() { break; }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.views[0].data.is_none(), "successful retry closes the view");
+        assert!(app.comment_failed.is_empty());
+        let parsed = tak_core::takm::read_comments(&path).unwrap();
+        assert_eq!(parsed.events.iter().map(|e| e.markers.clone()).collect::<Vec<_>>(), vec![vec!["M"], vec!["N"]]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_comments_block_tab_close_replacement_and_exit() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("pending_comment_close");
+        let mut app = comment_app(&ctx, &dir, false);
+        app.views[0].comments.pending = 1;
+        app.close_view(0);
+        assert!(app.dirty_prompt.is_some());
+        app.dirty_prompt = None;
+        app.open_in(&ctx, 0, dir.join("other.tak"));
+        assert!(app.dirty_prompt.is_some());
+        assert!(app.views[0].loading.is_none());
+        app.dirty_prompt = None;
+        app.request_exit(&ctx);
+        assert!(app.dirty_prompt.is_some());
+        assert!(!app.exit_approved);
+        app.dirty_prompt = None;
+        app.views[0].comments.pending = 0;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_comment_can_be_discarded_after_write_finishes() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("failed_comment_discard");
+        let mut app = comment_app(&ctx, &dir, false);
+        let path = dir.join("a.takm");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        app.add_comment(&ctx, 0, vec!["M".into()], 1, 1);
+        until_saved(&ctx, &mut app);
+        assert_eq!(app.comment_failed.len(), 1);
+        std::fs::write(&path, original).unwrap();
+        app.close_editor(0);
+        assert!(app.dirty_prompt.is_some());
+        app.discard_pending_transition(&ctx);
+        assert!(app.views[0].data.is_none());
+        assert!(app.comment_failed.is_empty());
+        assert!(tak_core::takm::read_comments(&path).unwrap().events.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_id_reservation_can_retry_on_create_and_visible_retry() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("id_reservation_retry");
+        let mut app = comment_app(&ctx, &dir, false);
+        for use_create in [true, false] {
+            app.views[0].comments.id_pool = None;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(Err("injected reservation failure".into())).unwrap();
+            app.views[0].comments.id_rx = Some(rx);
+            app.poll_comment_ids(&ctx);
+            assert!(app.views[0].comments.id_error.is_some());
+            if use_create { app.make_comment(&ctx, 0); }
+            else {
+                app.show_pane(Pane::Comments);
+                let out = frame_with(&ctx, &mut app, vec![]);
+                let retry = text_rects(&out, "Retry Comment IDs")[0].center();
+                click_at(&ctx, &mut app, retry);
+            }
+            wait_comment_ids(&ctx, &mut app, 0);
+            assert!(app.views[0].comments.id_error.is_none());
+        }
+        app.make_comment(&ctx, 0);
+        until_saved(&ctx, &mut app);
+        assert_eq!(tak_core::takm::read_comments(&dir.join("a.takm")).unwrap().comments().len(), 1);
+    }
+
+    #[test]
+    fn stale_other_window_edit_and_delete_reload_the_latest_comment() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("stale_window_reload");
+        let mut a = comment_app(&ctx, &dir, false);
+        a.add_comment(&ctx, 0, vec!["M".into()], 1, 1);
+        until_saved(&ctx, &mut a);
+        let id = a.views[0].comments.list.list()[0].id;
+        let mut b = comment_app(&ctx, &dir, false);
+        let mut c = comment_app(&ctx, &dir, false);
+        let mut updated = a.views[0].comments.list.get(id).unwrap().clone();
+        updated.text = "A text".into();
+        assert!(a.edit_comment(&ctx, 0, updated.clone()));
+        until_saved(&ctx, &mut a);
+        let mut stale = b.views[0].comments.list.get(id).unwrap().clone();
+        stale.markers = vec!["N".into()];
+        assert!(b.edit_comment(&ctx, 0, stale));
+        until_saved(&ctx, &mut b);
+        assert_eq!(b.views[0].comments.list.get(id), Some(&updated));
+        assert_eq!(b.notice.as_deref(), Some(format!("Comment {id} changed in another window · reloaded").as_str()));
+        assert!(b.comment_failed.is_empty());
+        c.delete_comment(&ctx, 0, id);
+        until_saved(&ctx, &mut c);
+        assert_eq!(c.views[0].comments.list.get(id), Some(&updated));
+        assert_eq!(tak_core::takm::read_comments(&dir.join("a.takm")).unwrap().comments().get(id), Some(&updated));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_lock_shows_stall_and_allows_cancel_then_exit_discard() {
+        use sha2::{Digest, Sha256};
+        use std::fs::OpenOptions;
+        let ctx = egui::Context::default();
+        let dir = comment_dir("held_lock_discard");
+        let mut app = comment_app(&ctx, &dir, false);
+        app.ensure_comment_writer(&ctx);
+        for _ in 0..2000 {
+            app.poll_comment_writes(&ctx);
+            if app.comment_registration.is_none() { break; }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.comment_registration.is_none());
+        let path = dir.join("a.takm");
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let key = format!("{:x}", Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
+        let lock = OpenOptions::new().read(true).write(true).open(format!("/tmp/.tak_viewer_{key}.lock")).unwrap();
+        lock.lock().unwrap();
+        app.add_comment(&ctx, 0, vec![], 1, 1);
+        assert_eq!(app.views[0].comments.pending, 1);
+        app.close_editor(0);
+        assert!(app.dirty_prompt.is_some());
+        app.retry_comments_and_transition(&ctx, 0);
+        if std::env::var_os("TAK_FIX2_REAL_WAIT").is_some() {
+            std::thread::sleep(Duration::from_millis(10_100));
+        } else {
+            app.dirty_prompt.as_mut().unwrap().started = Instant::now() - Duration::from_secs(11);
+        }
+        frame_with(&ctx, &mut app, vec![]);
+        let out = frame_with(&ctx, &mut app, vec![]);
+        assert!(!text_rects(&out, "Saving has waited more than 10 seconds.").is_empty());
+        assert!(!text_rects(&out, "Discard loses unsaved Comments and marker edits. A write already in progress may still finish.").is_empty());
+        let cancel = text_rects(&out, "Cancel")[0].center();
+        click_at(&ctx, &mut app, cancel);
+        assert!(app.dirty_prompt.is_none());
+        app.request_exit(&ctx);
+        frame_with(&ctx, &mut app, vec![]);
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let discard = text_rects(&out, "Discard")[0].center();
+        click_at(&ctx, &mut app, discard);
+        assert!(app.exit_approved, "exit must not wait for the held lock; prompt={} pending={}", app.dirty_prompt.is_some(), app.views[0].comments.pending);
+        drop(lock);
+        for _ in 0..2000 {
+            app.poll_comment_writes(&ctx);
+            if app.comment_outstanding == 0 { break; }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.comment_outstanding, 0);
+        assert!(tak_core::takm::read_comments(&path).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn legacy_duplicate_ids_are_read_but_not_edited_ambiguously() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("legacy_duplicate");
+        let path = dir.join("a.takm");
+        let a = Comment { id: 1, markers: vec!["M".into()], start: 0, end: 0, comment_type: String::new(), text: String::new() };
+        let b = Comment { markers: vec!["N".into()], ..a.clone() };
+        tail_append(&path, &[Event::of(EventKind::Add, &a, "t".into(), String::new()), Event::of(EventKind::Add, &b, "t".into(), String::new())]).unwrap();
+        let mut app = comment_app(&ctx, &dir, false);
+        assert_eq!(app.views[0].comments.list.len(), 2);
+        assert!(!app.set_comment_type(&ctx, 0, 1, "Jitter"));
+        assert_eq!(app.views[0].comments.list.len(), 2);
+        assert!(app.notice.as_deref().is_some_and(|text| text.contains("duplicate Comment IDs")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn file_events(dir: &Path) -> Vec<comments::Event> {
@@ -4819,7 +5742,6 @@ mod tests {
 
     #[test]
     fn comments_without_a_marker_are_made_shown_by_number_keep_the_selection_on_click_and_undo() {
-        // A comment can be created without selecting a marker.
         let ctx = egui::Context::default();
         let dir = comment_dir("no_marker");
         let mut app = comment_app(&ctx, &dir, false);
@@ -4888,6 +5810,7 @@ mod tests {
         app.views[1].comments.take_load(load_c(&tak));
         app.views[1].select(0, false);
         frame_with(&ctx, &mut app, vec![]);
+        wait_comment_ids(&ctx, &mut app, 1);
         let r = app.views[1].scene_rect;
         let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + 4.0 + panels::TIMELINE_H + 3.0 + 12.0);
         let out = click_at(&ctx, &mut app, dots);
@@ -4938,6 +5861,8 @@ mod tests {
             shown_b: String::new(),
             file_a: "a.tak|0".into(),
             file_b: String::new(),
+            operation: None,
+            expected: None,
         };
         tail_append(&dir.join("a.takm"), &[ev(1, &["N", "GONE", "M"], 3, 6), ev(2, &["M"], 8, 8)]).unwrap();
     }
@@ -5408,7 +6333,6 @@ mod tests {
         assert_eq!(app.views[0].comments.list.list(), &[first.clone()]);
         assert_eq!(note(&app), "Redo · Comment 1 added");
         file_matches_memory(&ctx, &mut app, &dir);
-        // Ctrl+Shift+Z does not redo; Ctrl+Y does.
         undo(&mut app);
         ctrl_shift_z(&mut app);
         assert!(app.views[0].comments.list.is_empty(), "Ctrl+Shift+Z does not redo");
@@ -5475,7 +6399,6 @@ mod tests {
 
     #[test]
     fn one_history_for_the_app_kept_with_a_new_file_and_off_while_m_is_held_or_typing() {
-        // Undo history is shared across the app.
         let ctx = egui::Context::default();
         let (dir_a, dir_b) = (comment_dir("undo_a"), comment_dir("undo_b"));
         let mut app = comment_app(&ctx, &dir_a, false);
@@ -5486,6 +6409,7 @@ mod tests {
         app.views[1].comments.take_load(load_c(&tak_b));
         app.quiet();
         frame_with(&ctx, &mut app, vec![]);
+        wait_comment_ids(&ctx, &mut app, 1);
         app.quiet();
         for k in [0, 1] {
             app.activate(k);
@@ -5870,9 +6794,11 @@ mod tests {
         t.xyz = keep.iter().map(|&i| t.xyz[i]).collect();
         t.frames = keep.iter().map(|&i| t.frames[i]).collect();
         let mut app = comment_app(&ctx, &dir, false);
+        let reserved_ids = app.views[0].comments.id_pool.take();
         let (_tx, rx) = std::sync::mpsc::channel();
         app.views[0].show(tak_core::view_data::ViewData::build(take), rx, 12, 1.0, 0.0);
         app.views[0].comments.take_load(load_c(&dir.join("a.takm")));
+        app.views[0].comments.id_pool = reserved_ids;
         frame_with(&ctx, &mut app, vec![]);
         label_click(&mut app, 0, false);
         // Shift+Z goes to the gap (so a Ctrl+Shift+Z falling through would show); since v0.16.0
@@ -5880,7 +6806,7 @@ mod tests {
         app.views[0].pb.set_frame(8, 0.0);
         app.quiet();
         run_frame(&ctx, &mut app, &[(Modifiers::SHIFT, Key::Z)]);
-        assert_eq!(app.views[0].pb.frame, 4);
+        assert_eq!(app.views[0].pb.frame, 6);
         app.views[0].pb.set_frame(8, 0.0);
         app.quiet();
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
@@ -5919,7 +6845,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Ctrl+Z / Ctrl+Y for app actions.
 
     /// Do `change`, end the frame, then Ctrl+Z (state back, `undo_note`) and Ctrl+Y (state as
     /// after the change). The change must be exactly one new action.
@@ -5973,13 +6898,13 @@ mod tests {
         let p = plate_middle(&app, 0, 0);
         round_trip(&ctx, &mut app, "plate", |c, a| { click_at(c, a, p); }, |a| v0(a).plate, "Undo · Plate none");
         round_trip(&ctx, &mut app, "speed", |_, a| a.views[0].pb.speed = 2.0, |a| v0(a).pb.speed, "Undo · Speed 1x");
-        round_trip(&ctx, &mut app, "Labels folds", |_, a| {
+        round_trip(&ctx, &mut app, "Labeling folds", |_, a| {
             // (A group's fold arrow: open ↔ folded.)
             let c = &mut a.views[0].labels.collapsed;
             if !c.remove(&0) {
                 c.insert(0);
             }
-        }, |a| v0(a).labels.collapsed.clone().into_iter().collect::<Vec<_>>(), "Undo · Labels");
+        }, |a| v0(a).labels.collapsed.clone().into_iter().collect::<Vec<_>>(), "Undo · Labeling");
         round_trip(&ctx, &mut app, "device channel", |_, a| { a.views[0].devices.channel.insert(0, 2); }, |a| v0(a).devices.channel.get(&0).copied(), "Undo · Device channel");
         round_trip(&ctx, &mut app, "display option", |_, a| a.settings.scene.grid = !a.settings.scene.grid, |a| a.settings.scene.grid, "Undo · Display");
         let opacity = app.settings.graph_opacity;
@@ -6089,6 +7014,9 @@ mod tests {
         app.views[k].comments_rx = Some(comments_rx);
         frame_with(ctx, app, vec![]);
         frame_with(ctx, app, vec![]);
+        if !app.no_persist && matches!(app.views[k].comments.target, Some(Ok(_))) {
+            wait_comment_ids(ctx, app, k);
+        }
     }
 
     /// Every view reading a file gets it (`arrive`).
@@ -6157,9 +7085,8 @@ mod tests {
         assert_eq!(steps(&app, 0), (4, 1), "showing it again is no action");
         undo_key(&ctx, &mut app);
         assert_eq!((ids(&app), note(&app).as_str()), (vec![1, 2], "Undo · Comment 3 removed"));
-        // Reopening must read the confirmed deletion, rather than race the writer thread.
         until_saved(&ctx, &mut app);
-        assert!(app.views[0].comments.failed.is_none(), "{:?}", app.views[0].comments.failed);
+        assert!(app.comment_failed.is_empty(), "the undo event must be saved before closing the file");
         undo_key(&ctx, &mut app);
         assert_eq!(sel(&app), (vec![], None));
         undo_key(&ctx, &mut app);
@@ -6172,14 +7099,12 @@ mod tests {
         redo_key(&ctx, &mut app);
         assert_eq!(note(&app), "Wait · loading a.takm");
         arrive(&ctx, &mut app, 0);
-        assert_eq!(ids(&app), vec![1, 2], "the confirmed deletion is read back");
         for _ in 0..3 {
             redo_key(&ctx, &mut app);
         }
         assert_eq!((app.views[0].pb.frame, sel(&app), ids(&app)), (3, (vec![0], Some(0)), vec![1, 2, 3]));
-        assert_eq!(steps(&app, 0), (4, 1), "the comment redo must not skip to opening b");
         until_saved(&ctx, &mut app);
-        assert!(app.views[0].comments.failed.is_none(), "{:?}", app.views[0].comments.failed);
+        assert!(app.comment_failed.is_empty(), "the redo event must be saved before switching files");
         redo_key(&ctx, &mut app);
         arrive(&ctx, &mut app, 0);
         assert_eq!((app.views[0].path(), steps(&app, 0)), (Some(b.as_path()), (5, 0)));
@@ -6326,6 +7251,34 @@ mod tests {
     /// `comment_app` with the COMMENTS pane opened (in front) and drawn; setup is no action.
     fn comments_tab_app(ctx: &egui::Context, dir: &Path, command_run: bool) -> TakViewerApp {
         tab_app_named(ctx, dir, command_run, &["M", "N"])
+    }
+
+    #[test]
+    fn quick_label_defers_real_scene_clicks_to_comment_marker_edit_and_held_m() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("quick_comment_click");
+        let mut app = comments_tab_app(&ctx, &dir, false);
+        app.add_comment(&ctx, 0, vec!["M".into()], 0, 0);
+        until_saved(&ctx, &mut app);
+        app.start_comment_edit(1, Field::Markers);
+        app.views[0].armed_label = Some(tak_core::edit::LabelKey { parent: [7; 16], slot: 1 });
+        assert!(!app.quick_label_available(&ctx, 0));
+        let point = marker_on_screen(&app, 1);
+        click_at(&ctx, &mut app, point);
+        assert_eq!(app.views[0].primary, Some(1));
+        assert!(app.comment_edit.is_some());
+        assert!(!app.marker_job_running(0));
+        app.cancel_comment_edit();
+        key_down(&ctx, &mut app, Key::M);
+        assert!(app.hold.is_some());
+        assert!(!app.quick_label_available(&ctx, 0));
+        let point = marker_on_screen(&app, 0);
+        click_at(&ctx, &mut app, point);
+        assert_eq!(app.views[0].primary, Some(0));
+        assert!(!app.marker_job_running(0));
+        key_up(&ctx, &mut app, Key::M);
+        until_saved(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `comments_tab_app` with these marker names.
@@ -6505,7 +7458,6 @@ mod tests {
 
     #[test]
     fn a_row_click_selects_without_moving_or_pausing_and_only_a_double_click_on_the_number_goes_there() {
-        // Double-clicking `#` moves to the comment; a row click does not.
         let ctx = egui::Context::default();
         let dir = comment_dir("tab_row_dbl");
         let mut app = long_tab_app(&ctx, &dir);
@@ -6581,7 +7533,7 @@ mod tests {
     fn identical_comments_are_selected_one_by_one_and_the_selected_row_stands_out() {
         let ctx = egui::Context::default();
         let dir = comment_dir("tab_twins");
-        // Two comments may have the same markers and frames.
+        // Two comments with the same markers and frames (the user's case).
         comments_on_disk(&dir, &[(1, &["M"], 2, 5), (2, &["M"], 2, 5)]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         app.views[0].pb.set_frame(3, 0.0);
@@ -6636,7 +7588,7 @@ mod tests {
         let mut app = tab_app_named(&ctx, &dir, false, &["M", "N", "O"]);
         let place = place_of(&app, Pane::Comments);
         let shown = |out: &egui::FullOutput, s: &str| text_rects(out, s).iter().any(|t| place.contains(t.center()));
-        // Double-click Markers, select markers, and press Enter.
+        // The user's way: double click Markers → pick markers → Enter.
         let [markers, ..] = cells_of(&ctx, &mut app, 1);
         double_click(&ctx, &mut app, markers);
         assert_eq!(app.comment_edit.as_ref().map(|e| (e.id, e.field)), Some((1, Field::Markers)));
@@ -7283,6 +8235,8 @@ mod tests {
             list.apply(&Event::of(EventKind::Add, &c, "t".into(), "a.tak|0".into()));
         }
         app.views[0].comments.list = list;
+        // The fixture above is deliberately in-memory only, so supply its corresponding range.
+        app.views[0].comments.id_pool = Some(2001..=3000);
         let out = frame_with(&ctx, &mut app, vec![]);
         let place = place_of(&app, Pane::Comments);
         let drawn = (1..=2000).filter(|k| text_rects(&out, &format!("note {k}")).iter().any(|t| place.contains(t.center()))).count();
@@ -7348,7 +8302,6 @@ mod tests {
 
     #[test]
     fn a_type_strip_follows_each_new_comment_a_click_sets_the_type_and_the_next_action_closes_it() {
-        // After M creates a comment, the type buttons briefly appear by the bar.
         let ctx = egui::Context::default();
         let dir = comment_dir("strip");
         let mut app = comment_app(&ctx, &dir, false);
@@ -7558,7 +8511,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The type selector and its list.
 
     /// Open the type list of comment `id` with one click on its Type box, then one more frame
     /// (a list shown for the first time is measured, unseen, in its first frame).
@@ -7893,7 +8845,7 @@ mod tests {
         let mut app = TakViewerApp::build(&ctx, Some(&st), vec![], None, None);
         app.hold_loads = true;
         assert_eq!(app.workspace.roots(), &[PathBuf::from(r"C:\data")], "saved folders kept");
-        for pane in [Pane::Explorer, Pane::Labels, Pane::Selected, Pane::Devices] {
+        for pane in [Pane::Explorer, Pane::Labeling, Pane::EditTools, Pane::Selected, Pane::Devices] {
             assert!(dock::has(&app.dock, pane), "layout kept: {pane:?}");
         }
         assert!(!dock::has(&app.dock, Pane::Comments));
@@ -7929,7 +8881,7 @@ mod tests {
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         // A screenshot run is a command run too.
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8259,7 +9211,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = window_app();
         let v = &mut app.views[0];
-        v.data = Some(views::sample_data("a.tak", &["LKNE", "RKNE"]));
+        v.data = Some(std::sync::Arc::new(views::sample_data("a.tak", &["LKNE", "RKNE"])));
         v.pb = tak_core::playback::Playback::new(0, 9, 100.0);
         v.pb.set_frame(3, 0.0);
         v.select(1, false);
@@ -8279,7 +9231,7 @@ mod tests {
     #[test]
     fn command_line_runs_do_not_use_or_fill_the_memory() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         app.settings.file_memory = vec![views::Spot {
             path: "a.tak".into(),
@@ -8293,7 +9245,7 @@ mod tests {
             primary: None,
             plate: None,
         }];
-        app.views[0].data = Some(views::sample_data("b.tak", &["X"]));
+        app.views[0].data = Some(std::sync::Arc::new(views::sample_data("b.tak", &["X"])));
         app.open(&ctx, PathBuf::from("a.tak"));
         assert!(app.view().restore.is_none());
         assert_eq!(app.settings.file_memory.len(), 1, "b.tak not remembered");
@@ -8483,12 +9435,12 @@ mod tests {
         assert_eq!((dock::views(&app.dock), app.views[1].target()), (vec![0, 1], Some(f[2].as_path())), "{}", note(&app));
         arrive(&ctx, &mut app, 1);
         assert_eq!(editor_lines(&ctx, &mut app)[0], "OPEN EDITORS (3)");
-        // The only view: × closes its file (and the one laid over it); the view stays, empty.
+        // The only view: × closes it and its overlay, leaving the empty editor.
         let x = editor_x(&ctx, &mut app, &row("c.tak"));
         click_at(&ctx, &mut app, x);
         let x = editor_x(&ctx, &mut app, &row("a.tak"));
         click_at(&ctx, &mut app, x);
-        assert_eq!((dock::views(&app.dock), app.views[0].target(), app.file_count()), (vec![0], None, 0));
+        assert_eq!((dock::views(&app.dock), app.views[0].target(), app.file_count()), (vec![], None, 0));
         assert_eq!(editor_lines(&ctx, &mut app), vec!["OPEN EDITORS (0)", EMPTY]);
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].target(), app.views[0].overlay_target()), (Some(f[0].as_path()), Some(f[1].as_path())), "{}", note(&app));
@@ -9054,7 +10006,7 @@ mod tests {
     fn same_names_get_their_folder_and_a_narrow_view_shortens_the_names_but_keeps_both_tags() {
         let ctx = egui::Context::default();
         let dir = comment_dir("overlay_names");
-        let name = "251209_S01_perturb_20_001.tak";
+        let name = "000000_S01_perturb_20_001.tak";
         for sub in ["copy", "raw"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -9068,8 +10020,8 @@ mod tests {
         let narrow = egui::Rect::from_min_size(wide.min, egui::vec2(420.0, wide.height()));
         let t = app.overlay_tags(&ctx, 0, narrow, None).unwrap();
         assert!(t.tags[1].right() <= narrow.right() && t.close.right() <= narrow.right(), "{:?} {narrow:?}", t.tags);
-        assert!(t.labels[0].starts_with("1 25") && t.labels[0].contains('…') && t.labels[0].ends_with(".tak · copy"), "{}", t.labels[0]);
-        assert!(t.labels[1].starts_with("2 25") && t.labels[1].ends_with(".tak · raw"), "{}", t.labels[1]);
+        assert!(t.labels[0].starts_with("1 00") && t.labels[0].contains('…') && t.labels[0].ends_with(".tak · copy"), "{}", t.labels[0]);
+        assert!(t.labels[1].starts_with("2 00") && t.labels[1].ends_with(".tak · raw"), "{}", t.labels[1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9309,7 +10261,7 @@ mod tests {
         let ctx = egui::Context::default();
         let dir = comment_dir("overlay_shot");
         let f = take_files(&dir, &["a.tak", "b.tak"]);
-        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);
@@ -9648,6 +10600,8 @@ mod tests {
         assert_eq!(file_events(&dir).len(), 3);
         // Ctrl+Z: the comment, then the switch (the TAK again at its place; the .takm stays).
         undo_key(&ctx, &mut app);
+        until_saved(&ctx, &mut app);
+        assert!(app.comment_failed.is_empty(), "the undo event must be saved before switching files");
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].target(), note(&app).as_str()), (Some(tak.as_path()), "Undo · Open a.tak"));
         arrive(&ctx, &mut app, 0);
@@ -9766,11 +10720,11 @@ mod tests {
 
     #[test]
     fn every_selected_marker_is_in_the_graph_lanes_in_the_lane_colors_with_overlay_bands_and_both_places() {
-        // All marker curves use the axis lane colors, including dashed overlay curves.
         let lane_colors = |n: usize| vec![vec![theme::AXIS_X; n], vec![theme::AXIS_Y; n], vec![theme::AXIS_Z; n]];
         let ctx = egui::Context::default();
         let dir = comment_dir("multi_graph");
         let (mut app, f) = pair_app_named(&ctx, &dir, "a.takm");
+        wait_comment_ids(&ctx, &mut app, 0);
         let (m, n, q) = (marker_index(&app, "M"), marker_index(&app, "N"), marker_index(&app, "Q"));
         let two_frames = |app: &mut TakViewerApp| {
             frame_with(&ctx, app, vec![]);
@@ -9897,5 +10851,21 @@ mod tests {
         let (graphed, total) = panels::graphed(v.data.as_ref().unwrap(), &v.selected, 11);
         assert_eq!((graphed, total), ((0..8).collect::<Vec<_>>(), 12));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ssh_settings_tests {
+    use super::*;
+    #[test]
+    fn python_settings_round_trip_and_old_settings_default() {
+        let mut settings = Settings::default();
+        settings.ssh_platforms.insert("lab".into(), "windows".into());
+        settings.ssh_python.insert("lab".into(), crate::ssh::PythonSetting { explicit:Some(r"codex sandbox -c sandbox_mode=read-only -- C:\Python313\python.exe".into()), remembered:Some("py -3".into()) });
+        let decoded: Settings = ron::from_str(&ron::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(settings.ssh_python, decoded.ssh_python);
+        assert_eq!(settings.ssh_platforms, decoded.ssh_platforms);
+        let old: Settings = ron::from_str("(ssh_platforms:{\"lab\":\"windows\"})").unwrap();
+        assert!(old.ssh_python.is_empty());
     }
 }

@@ -12,8 +12,8 @@
 //! [F+32, end)          Comment tail: the lines of a `<stem>.comments.csv` (no BOM), only appended
 //! ```
 //!
-//! [0, F+32) is written once (`convert`) and never rewritten (`verify_fixed` checks it); the
-//! tail only grows (`append_lines` / `append_events`, read with `read_tail` / `read_comments`).
+//! Conversion writes the fixed part once; a marker save replaces it after validation and
+//! recomputes its seal. Comment appends and marker saves share a per-path OS lock.
 //! Reading gives the same `Take` as the TAK (`read_take` here; markers first in
 //! `tak::fast_read`, through the same stream walk).
 
@@ -297,6 +297,9 @@ pub fn write(w: &mut impl Write, tak: &[u8], source_name: &str, made_at: &str) -
 /// Why `out` may not be written for `tak` (plain Korean), None = it may: not inside a
 /// repository's `input/` (same rule as captures and comment files), not over an existing file.
 pub fn check_out(out: &Path, tak: &Path) -> std::result::Result<(), String> {
+    if in_input(out) {
+        return Err(format!("input/ 폴더 안에는 .takm을 만들지 않아요: {}. --out-dir로 다른 폴더를 정해 주세요.", out.display()));
+    }
     let dir = out.parent().unwrap_or(out);
     let roots = [repo_root(tak), dir.ancestors().find(|a| a.exists()).and_then(repo_root)];
     for root in roots.into_iter().flatten() {
@@ -319,7 +322,65 @@ pub fn check_out(out: &Path, tak: &Path) -> std::result::Result<(), String> {
 /// `path` is inside a repository's `input/` (the repository found above it on disk). Looks at
 /// the disk: call it off the drawing thread.
 pub fn in_input(path: &Path) -> bool {
-    path.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root).is_some_and(|root| in_repo_input(path, &root))
+    fn under_input(p: &Path) -> bool {
+        p.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root)
+            .is_some_and(|root| in_repo_input(p, &root))
+    }
+    // Resolve directory and file symlinks before checking; also retain the lexical check.
+    under_input(path) || match canonical_target(path) { Ok(p) => under_input(&p), Err(_) => true }
+}
+
+/// Resolve symlinks through the nearest existing ancestor, including missing descendants.
+pub fn canonical_target(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let mut current = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(mut base) => {
+                for part in suffix.iter().rev() {
+                    if part == ".." { base.pop(); }
+                    else if part != "." { base.push(part); }
+                }
+                return Ok(base);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let name = current.file_name().ok_or(e)?;
+                suffix.push(name.to_os_string());
+                current = current.parent().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing ancestor"))?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The stable lock file is intentionally retained: removing it can split waiting processes
+/// across different inodes. Its key is the canonical destination, shared by app instances.
+pub(crate) fn coordination_root() -> PathBuf {
+    #[cfg(unix)]
+    { PathBuf::from("/tmp") }
+    #[cfg(windows)]
+    { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir) }
+    #[cfg(not(any(unix, windows)))]
+    { std::env::temp_dir() }
+}
+
+pub(crate) fn path_lock_key(path: &Path) -> io::Result<String> {
+    let target = canonical_target(path)?;
+    #[cfg(windows)]
+    let key = target.to_string_lossy().to_lowercase().into_bytes();
+    #[cfg(not(windows))]
+    let key = target.as_os_str().as_encoded_bytes().to_vec();
+    Ok(format!("{:x}", Sha256::digest(key)))
+}
+
+pub(crate) fn lock_path(path: &Path) -> io::Result<File> {
+    let target = canonical_target(path)?;
+    if in_input(&target) { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "input/ 보호")); }
+    let lock = coordination_root().join(format!(".tak_viewer_{}.lock", path_lock_key(&target)?));
+    let f = OpenOptions::new().read(true).write(true).create(true).open(lock)?;
+    f.lock()?;
+    Ok(f)
 }
 
 /// Why the viewer may not append Comments to the tail of `takm` (plain Korean), Ok when it may.
@@ -354,18 +415,30 @@ fn stat(p: &Path) -> io::Result<(u64, Option<SystemTime>)> {
     Ok((m.len(), m.modified().ok()))
 }
 
+#[cfg(not(windows))]
+pub(crate) fn place_new(tmp: &Path, dest: &Path) -> std::io::Result<()> { std::fs::hard_link(tmp, dest) }
+#[cfg(windows)]
+pub(crate) fn place_new(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    // MoveFileW is a same-volume move that fails if the destination exists. This supports
+    // Windows filesystems without hard links while preserving create-if-absent semantics.
+    #[link(name = "kernel32")]
+    unsafe extern "system" { fn MoveFileW(from: *const u16, to: *const u16) -> i32; }
+    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) } != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
 /// Put the finished temporary file at `out` without ever replacing a file that is there.
 fn place(tmp: &Path, out: &Path) -> std::result::Result<(), String> {
     let exists = || format!("이미 있어요: {}. 덮어쓰지 않아요.", out.display());
-    match std::fs::hard_link(tmp, out) {
+    match place_new(tmp, out) {
         Ok(()) => {
             let _ = std::fs::remove_file(tmp);
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(exists()),
-        // No hard links here (e.g. the WSL share): check, then rename.
-        Err(_) if out.exists() => Err(exists()),
-        Err(_) => std::fs::rename(tmp, out).map_err(|e| format!("이름을 바꾸지 못했어요: {e}")),
+        // A check followed by rename can overwrite a file created between the two calls.
+        Err(e) => Err(format!("덮어쓰지 않는 저장을 할 수 없어요: {e}")),
     }
 }
 
@@ -383,11 +456,18 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
     // Comments made before (v0.14.0 – v0.23.x) in `<stem>.comments.csv` go into the tail, so
     // none is lost; the CSV is only read.
     let csv = comments::path_for(tak);
-    let old = comments::read(&csv).map_err(|e| format!("옆의 Comment 파일을 읽지 못했어요: {} ({e})", csv.display()))?;
-    let bytes = std::fs::read(tak).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
     if let Some(dir) = out_dir {
         std::fs::create_dir_all(dir).map_err(|e| format!("폴더를 만들지 못했어요: {} ({e})", dir.display()))?;
     }
+    comments::drain_shared_writers(&[&out, &csv]).map_err(|e| format!("Comment 저장을 기다리지 못했어요: {e}"))?;
+    let mut paths = vec![canonical_target(&out).map_err(|e| e.to_string())?];
+    if !in_input(&csv) { paths.push(canonical_target(&csv).map_err(|e| e.to_string())?); }
+    paths.sort(); paths.dedup();
+    let _locks: Vec<_> = paths.iter().map(|p| lock_path(p)).collect::<io::Result<_>>()
+        .map_err(|e| format!("저장 잠금을 얻지 못했어요: {e}"))?;
+    check_out(&out, tak)?;
+    let old = comments::read(&csv).map_err(|e| format!("옆의 Comment 파일을 읽지 못했어요: {} ({e})", csv.display()))?;
+    let bytes = std::fs::read(tak).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
     let name = tak.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = out.with_file_name(format!(".{}.{}.part", out.file_name().map(|s| s.to_string_lossy()).unwrap_or_default(), std::process::id()));
     let made_at = {
@@ -563,13 +643,17 @@ pub fn append_lines(path: &Path, lines: &[String]) -> Result<()> {
             return err("input/ 폴더 안 파일에는 쓰지 않아요");
         }
     }
-    let mut f = OpenOptions::new().read(true).append(true).open(path)?;
+    let target = canonical_target(path)?;
+    if in_input(&target) || !is_takm_path(&target) { return err("안전하지 않은 Comment 대상이에요"); }
+    let _lock = lock_path(&target)?;
+    let mut f = OpenOptions::new().read(true).append(true).open(&target)?;
     let (_, tail) = tail_bytes(&f)?;
     let mut out = String::new();
     if tail.last().is_some_and(|&b| b != b'\n') {
         if comments::ends_in_quote(&String::from_utf8_lossy(&tail)) {
             out.push('"');
         }
+        out += comments::INCOMPLETE_SUFFIX;
         out += EOL;
     }
     for l in lines {
@@ -582,9 +666,72 @@ pub fn append_lines(path: &Path, lines: &[String]) -> Result<()> {
 }
 
 /// Append comment events (`comments::encode` lines) to the tail.
+#[derive(Clone, Debug)]
+pub struct CommentConflict {
+    pub id: u64,
+    pub latest: Option<comments::Comment>,
+}
+
 pub fn append_events(path: &Path, events: &[comments::Event]) -> Result<()> {
-    let lines: Vec<String> = events.iter().map(|e| comments::encode(e).trim_end_matches(['\r', '\n']).to_owned()).collect();
-    append_lines(path, &lines)
+    if append_events_guarded(path, events, None)?.is_some() {
+        return err("Comment changed in another window");
+    }
+    Ok(())
+}
+
+/// Compare the view's base under the same lock as the append. Cancellation is checked after
+/// lock acquisition, so a discarded write waiting on a lock cannot later alter the file.
+pub fn append_events_guarded(path: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Option<CommentConflict>> {
+    if let Some(root) = path.parent().and_then(|d| d.ancestors().find(|a| a.exists())).and_then(repo_root) {
+        if in_repo_input(path, &root) { return err("input/ 폴더 안 파일에는 쓰지 않아요"); }
+    }
+    let target = canonical_target(path)?;
+    if in_input(&target) || !is_takm_path(&target) { return err("안전하지 않은 Comment 대상이에요"); }
+    let _lock = lock_path(&target)?;
+    if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
+    let mut file = OpenOptions::new().read(true).append(true).open(&target)?;
+    let (_, mut tail) = tail_bytes(&file)?;
+    for event in events {
+        if event.operation.as_ref().is_some_and(|id| comments::parse(&String::from_utf8_lossy(&tail))
+            .events.iter().any(|old| old.operation.as_ref() == Some(id))) {
+            continue;
+        }
+        if let Some(expected) = &event.expected {
+            let live = comments::parse(&String::from_utf8_lossy(&tail)).comments();
+            let latest = live.get(event.id).cloned();
+            if live.id_is_ambiguous(event.id) || latest.as_ref() != Some(expected) {
+                return Ok(Some(CommentConflict { id: event.id, latest }));
+            }
+        }
+        let encoded = comments::encode(event);
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::new();
+        if tail.last().is_some_and(|&b| b != b'\n') || comments::ends_in_quote(&String::from_utf8_lossy(&tail)) {
+            // A retry after a partial write completes that same line, including a cut quote.
+            let matching = event.operation.as_ref().and_then(|_| {
+                (1..bytes.len().min(tail.len() + 1)).rev().find(|&n| {
+                    tail.ends_with(&bytes[..n]) && (tail.len() == n || tail[tail.len() - n - 1] == b'\n')
+                })
+            });
+            if let Some(n) = matching {
+                out.extend_from_slice(&bytes[n..]);
+            } else {
+                if comments::ends_in_quote(&String::from_utf8_lossy(&tail)) { out.push(b'"'); }
+                // The marker must land after all twelve legacy fields, even if the cut was
+                // in the first field. Otherwise an old fragment could look complete.
+                out.extend_from_slice(comments::INCOMPLETE_SUFFIX.as_bytes());
+                out.extend_from_slice(EOL.as_bytes());
+                out.extend_from_slice(bytes);
+            }
+        } else {
+            out.extend_from_slice(bytes);
+        }
+        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
+        file.write_all(&out)?;
+        tail.extend_from_slice(&out);
+    }
+    file.flush()?;
+    Ok(None)
 }
 
 /// Check the fixed part against its SHA-256 (reads the whole fixed part).
@@ -780,7 +927,111 @@ mod tests {
             shown_b: String::new(),
             file_a: "walk_001.takm|1".into(),
             file_b: String::new(),
+            operation: None,
+            expected: None,
         }
+    }
+
+    #[test]
+    fn retry_finishes_partial_event_and_does_not_duplicate_a_completed_event() {
+        let (_dir, _source, path) = converted("retry_event");
+        let mut item = event(17, "a, quoted note");
+        item.operation = Some("process-unique-operation".into());
+        let line = comments::encode(&item);
+        let cut = line.find("operation=").unwrap() + 4;
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(&line.as_bytes()[..cut]).unwrap();
+        assert!(read_comments(&path).unwrap().events.is_empty());
+        append_events(&path, &[item.clone()]).unwrap();
+        append_events(&path, &[item.clone()]).unwrap();
+        assert_eq!(read_comments(&path).unwrap().events, vec![item]);
+    }
+
+    #[test]
+    fn every_interrupted_byte_with_an_interleaved_writer_retries_once() {
+        let (dir, _source, original) = converted("every_cut_interleaved");
+        let mut a = event(41, "한글, \"quoted\" text");
+        a.operation = Some("writer-a".into());
+        let mut b = event(42, "other writer");
+        b.operation = Some("writer-b".into());
+        let encoded = comments::encode(&a);
+        for cut in 0..encoded.len() {
+            let path = dir.0.join(format!("cut-{cut}.takm"));
+            std::fs::copy(&original, &path).unwrap();
+            OpenOptions::new().append(true).open(&path).unwrap().write_all(&encoded.as_bytes()[..cut]).unwrap();
+            assert!(read_comments(&path).unwrap().events.is_empty(), "before interleave at {cut}");
+            append_events(&path, &[b.clone()]).unwrap();
+            let after_b = read_comments(&path).unwrap();
+            assert!(after_b.events.iter().all(|e| e.id != a.id), "foreign write completed fragment at {cut}");
+            append_events(&path, &[a.clone()]).unwrap();
+            append_events(&path, &[a.clone()]).unwrap();
+            let events = read_comments(&path).unwrap().events;
+            assert_eq!(events.iter().filter(|e| e.id == a.id).count(), 1, "cut {cut}");
+            assert_eq!(events.iter().filter(|e| e.id == b.id).count(), 1, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn every_legacy_fragment_is_discarded_before_a_foreign_event() {
+        let (dir, _source, original) = converted("every_legacy_cut");
+        let legacy = event(51, "legacy, \"quoted\" text");
+        let mut other = event(52, "new writer");
+        other.operation = Some("new-writer".into());
+        let encoded = comments::encode(&legacy);
+        for cut in 1..encoded.len() {
+            let path = dir.0.join(format!("legacy-{cut}.takm"));
+            std::fs::copy(&original, &path).unwrap();
+            OpenOptions::new().append(true).open(&path).unwrap().write_all(&encoded.as_bytes()[..cut]).unwrap();
+            append_events(&path, &[other.clone()]).unwrap();
+            let events = read_comments(&path).unwrap().events;
+            assert!(events.iter().all(|e| e.id != legacy.id), "legacy fragment at {cut}");
+            assert_eq!(events.iter().filter(|e| e.id == other.id).count(), 1, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn guarded_edit_and_delete_reject_stale_bases_under_lock() {
+        let (_dir, _source, path) = converted("stale_guard");
+        let mut add = event(9, "original");
+        add.operation = Some("base".into());
+        append_events(&path, &[add]).unwrap();
+        let base = read_comments(&path).unwrap().comments().get(9).unwrap().clone();
+        let mut a = base.clone();
+        a.text = "A text".into();
+        let mut change_a = comments::Event::of(comments::Kind::Edit, &a, "t".into(), "a".into());
+        change_a.expected = Some(base.clone());
+        assert!(append_events_guarded(&path, &[change_a], None).unwrap().is_none());
+        let mut stale = base.clone();
+        stale.markers = vec!["B marker".into()];
+        for kind in [comments::Kind::Edit, comments::Kind::Delete] {
+            let mut change_b = comments::Event::of(kind, &stale, "t".into(), "b".into());
+            change_b.expected = Some(base.clone());
+            let conflict = append_events_guarded(&path, &[change_b], None).unwrap().unwrap();
+            assert_eq!(conflict.latest, Some(a.clone()));
+            assert_eq!(read_comments(&path).unwrap().comments().get(9), Some(&a));
+        }
+    }
+
+    #[test]
+    fn cancelled_writer_does_not_write_after_held_lock_is_released() {
+        let (_dir, _source, path) = converted("discard_held_lock");
+        let writer = comments::Writer::spawn(Box::new(|| {}));
+        writer.drain().unwrap();
+        let lock = lock_path(&path).unwrap();
+        let mut item = event(13, "discarded");
+        item.operation = Some("discarded-operation".into());
+        assert!(writer.send(7, path.clone(), item));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(writer.poll().is_empty());
+        writer.cancel_tag(7);
+        drop(lock);
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = writer.poll();
+            if !done.is_empty() { assert!(done[0].cancelled); break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(read_comments(&path).unwrap().events.is_empty());
     }
 
     #[test]

@@ -1,5 +1,8 @@
-//! Colors and fonts use a VS Code Dark+ frame and Motive-inspired pane interiors.
-//! Values are visually sampled where documented defaults are unavailable.
+//! Colors and fonts (`apps/docs/design.md`): VS Code Dark+ for the frame around the panes,
+//! Motive 3 for what is inside them.
+//! Sources: OptiTrack docs (Settings: Views defaults, Labels pane, Graph View pane, Viewport)
+//! and their screenshots, retrieved 2026-11-09. Hex values are sampled by eye from those
+//! screenshots (implementation choice); documented defaults are noted where they exist.
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, Rounding, Stroke};
 use tak_core::view_data::ColorSource;
@@ -25,8 +28,9 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
 pub const ACCENT: Color32 = Color32::from_rgb(0x2f, 0xc0, 0xd8);
 pub const WARN: Color32 = Color32::from_rgb(0xe8, 0xa3, 0x3d);
 
-// Labels pane: "White label = tracked in the current frame; magenta = not tracked."
+// Labels use red for a point absent at the current frame.
 pub const LABEL_TRACKED: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xe6);
+pub const LABEL_ABSENT: Color32 = Color32::from_rgb(0xf0, 0x5a, 0x5a);
 pub const LABEL_UNTRACKED: Color32 = Color32::from_rgb(0xe0, 0x3c, 0xe0);
 
 // 3D viewport. Settings default background "black"; screenshot ≈ #1c1c1c. Grid default white.
@@ -91,16 +95,14 @@ pub const NAV_GAP: Color32 = Color32::from_rgb(0x8c, 0x22, 0x22);
 pub const NAV_GAP_BRIGHT: Color32 = Color32::from_rgb(0xe0, 0x2a, 0x2a);
 /// Edit-mode control deck timeline is green (Motive Basics).
 pub const TIMELINE_GREEN: Color32 = Color32::from_rgb(0x46, 0xc8, 0x5a);
-/// Frame-range band uses a dashed orange outline and faint fill.
-pub const RANGE: Color32 = Color32::from_rgb(0xff, 0x98, 0x00);
+/// Inclusive edit range in GRAPH and the playback band: yellow outline and faint fill.
+pub const RANGE: Color32 = Color32::from_rgb(0xff, 0xcc, 0x33);
 /// Band strip under the seek zone (a little lighter than `NAV_BG`, so the two zones read apart).
 pub const BAND_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
-/// Comment blocks use a solid orange fill, a dark edge, and dark text.
-pub const COMMENT: Color32 = RANGE;
+/// A comment's block in the band strip: solid orange, with a thin dark edge and dark text.
+pub const COMMENT: Color32 = Color32::from_rgb(0xff, 0x98, 0x00);
 pub const COMMENT_EDGE: Color32 = Color32::from_rgb(0x5a, 0x36, 0x00);
 pub const COMMENT_TEXT: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
-/// The selected comment has a white band edge and a blue row highlight; the current-frame
-/// indicator remains a thin orange bar.
 pub const COMMENT_PICKED: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 pub const PICKED_ROW: Color32 = Color32::from_rgb(0x09, 0x47, 0x71);
 pub const PICKED_EDGE: Color32 = ACTIVE_VIEW;

@@ -1,5 +1,9 @@
-//! Read-only TAK reader. Public types form the contract with `view_data` and the viewer;
-//! implementation details reside in the submodules.
+//! Read-only `.tak` reader. Port of the lenient Python path
+//! (`scripts/marker_store_remote.py`, `src/container.py`, `src/skeleton.py`,
+//! `src/records.py`, `scripts/analyze_gait_forceplate.py`, `scripts/export_forceplate_inputs.py`).
+//! Never writes. Byte layout notes: `docs/FORMAT_NOTES.md` (observed, not a vendor spec).
+//!
+//! CONTRACT shared with `view_data` and the viewer: the public types below. Internals live in the submodules.
 
 pub mod channels;
 pub mod container;
@@ -41,7 +45,7 @@ pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(TakError(msg.into()))
 }
 
-/// Structural marker role, determined from parent and slot rather than names.
+/// Structural marker role (`src/skeleton.py` `marker_membership`). Never from names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkerKind {
     /// Skeleton asset parent, signed slot > 0: Motive marker-set marker.
@@ -176,7 +180,8 @@ pub struct AnalogChannel {
     pub values: Vec<f32>,
 }
 
-/// An analog device comprises consecutive channels starting at `AnalogChannel0`.
+/// A device = consecutive analog channels starting at `AnalogChannel0`
+/// (`scripts/export_forceplate_inputs.py` `analog_devices`).
 #[derive(Clone, Debug)]
 pub struct AnalogDevice {
     pub channels: Vec<AnalogChannel>,
@@ -216,8 +221,6 @@ pub fn is_take_path(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tak"))
 }
 
-/// Repository root above `p`: the legacy AGENTS files or the exact standalone marker.
-/// Looks at the disk: not for the drawing thread.
 pub fn repo_root(p: &Path) -> Option<PathBuf> {
     p.ancestors().find(|d| {
         (d.join("AGENTS.md").is_file() && d.join("apps").join("AGENTS.md").is_file())
@@ -252,7 +255,8 @@ pub fn read_take(path: &Path) -> Result<Take> {
     Ok(take)
 }
 
-/// Read the take and optional display data; errors in optional data become warnings.
+/// `scripts/marker_store_remote.py` `read_take` / `decode_marker_streams` plus the optional
+/// display parts (skeleton, LabelGroups, plates, analog), which only add warnings on failure.
 fn decode(path: &Path, data: &[u8]) -> Result<Take> {
     let container = container::Container::parse(data)?;
     let streams = container.read_named(&["Nodes.dat", "Channels.dat", "MetaData.dat"])?;

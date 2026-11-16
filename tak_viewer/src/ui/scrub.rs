@@ -1,5 +1,3 @@
-//! Drag a frame number to adjust it while the view follows. Used by the playback bar and
-//! comment frame editors.
 
 use eframe::egui::{CursorIcon, PointerButton, Pos2, Response, Ui};
 

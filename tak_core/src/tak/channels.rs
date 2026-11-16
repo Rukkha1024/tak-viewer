@@ -1,4 +1,7 @@
-//! `Channels.dat` parsing for marker translation channels and analog devices.
+//! `Channels.dat`: marker Translation channels (`scripts/marker_store_remote.py`
+//! `_read_marker_suffix` ~207-285, `iter_channel_inventory` ~296-342, `_read_marker_uid_join`
+//! ~345-396, `read_marker_channels` ~399-410) and analog devices
+//! (`scripts/export_forceplate_inputs.py` `analog_devices` + `src/trim.py` `channel_records`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -357,8 +360,8 @@ pub fn decode_samples(raw16: &[u8]) -> (Vec<u32>, Vec<[f32; 3]>) {
     (frames, xyz)
 }
 
-/// An analog device starts at `AnalogChannel0`; each sample is a frame number and
-/// floating-point values. Non-increasing frame numbers are rejected.
+/// `analog_devices`: `AnalogChannelN`, N == 0 starts a device; sample = u32 frame + dim f32.
+/// Like `src/trim.py` `channel_records`, any channel with non-increasing frames fails.
 pub fn analog_devices(channels: &[u8], inventory: &[ChannelRecord]) -> Result<Vec<AnalogDevice>> {
     let mut devices: Vec<AnalogDevice> = Vec::new();
     for record in inventory {

@@ -1,7 +1,3 @@
-//! Multiple viewers coordinate settings through per-process lock files. A live window
-//! holds its lock; stale locks left after a crash are removed. While multiple windows are
-//! open, periodic settings writes are suppressed; the last window saves on close. Command
-//! runs do not register. Windows session 0 cannot display an interactive window.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};

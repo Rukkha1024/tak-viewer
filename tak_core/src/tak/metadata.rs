@@ -1,5 +1,6 @@
-//! Read `MetaData.dat` properties from UTF-16LE or UTF-8 XML. Names and values may be
-//! child elements or attributes; frame numbers use Python-compatible parsing rules.
+//! `MetaData.dat` properties. Port of `scripts/marker_store_remote.py` `decode_marker_streams`
+//! (~413-432): find `<properties>`...`</properties>` in UTF-16LE, then UTF-8; name/value are
+//! child elements or attributes. Python `int()` / `float()` parsing rules for the frame fields.
 
 use super::container::{find, utf16le_strict};
 use super::{err, Result, TakError};

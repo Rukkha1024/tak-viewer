@@ -12,14 +12,18 @@
 //! - `explorer`: VS Code style folder tree (Workspace, up to 10 saved folders).
 //! - `dock`: pane layout (VS Code arrangement, side toggles, drag titles to move panes; saved
 //!   with the settings) and the tab look.
-//! - `theme`: colors and fonts for the application frame and panes.
+//! - `theme`: all colors and fonts (VS Code frame, Motive inside; `apps/docs/design.md`).
 pub mod comment_list;
 pub mod dock;
 pub mod explorer;
+pub mod edit_tools;
+pub mod empty;
 pub mod graph;
 pub mod graph_float;
+pub mod labeling;
 pub mod open_editors;
 pub mod panels;
 pub mod scene;
 pub mod scrub;
+pub mod ssh_explorer;
 pub mod theme;

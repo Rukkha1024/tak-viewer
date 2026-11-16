@@ -1,8 +1,3 @@
-//! Comments pane for the active file. Columns can be sorted; a row click selects the
-//! comment and markers without moving playback. Double-clicking `#` seeks to its first
-//! frame. Double-clicking an editable cell starts editing; Enter saves and Escape cancels.
-//! The type selector saves immediately. The app performs writes and records undo actions.
-//! Sorting is cached and only visible rows are drawn.
 
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
@@ -188,6 +183,7 @@ pub struct Edit {
     pub file_id: usize,
     pub id: u64,
     pub field: Field,
+    pub base: Comment,
     /// What is typed in the boxes (Frames: start, end; Text: text).
     pub start: String,
     pub end: String,
@@ -211,7 +207,7 @@ pub struct Edit {
 
 impl Edit {
     pub fn new(slot: usize, file_id: usize, c: &Comment, field: Field, before: crate::views::Selection) -> Edit {
-        Edit { slot, file_id, id: c.id, field, start: c.start.to_string(), end: c.end.to_string(), text: c.text.clone(), choice: c.comment_type.clone(), list: Rect::NOTHING, anchor: Rect::NOTHING, before, fresh: true, frame_before: None }
+        Edit { slot, file_id, id: c.id, field, base: c.clone(), start: c.start.to_string(), end: c.end.to_string(), text: c.text.clone(), choice: c.comment_type.clone(), list: Rect::NOTHING, anchor: Rect::NOTHING, before, fresh: true, frame_before: None }
     }
 }
 
@@ -241,8 +237,6 @@ pub enum ListAction {
     /// Select this comment (a single click on its row, v0.27.3): it becomes the selected comment
     /// and its markers are selected; the frame and playback stay.
     Select(u64),
-    /// Double-clicking `#` selects the comment and its markers, seeks to its first frame,
-    /// and stops playback.
     Goto(u64),
     Delete(u64),
     Sort(SortKey),
@@ -542,6 +536,15 @@ pub fn top_line(edit: Option<(u64, Field)>, picked: Option<u64>, write: &Result<
 /// Draw the list. `edit` is the cell being edited (if it is one of this file's comments, its
 /// boxes are drawn here and take the typing).
 pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edit>) -> ListOut {
+    show_inner(ui, input, order, edit, false)
+}
+
+/// The remote pane already shows its two-line read-only explanation above the table.
+pub fn show_remote(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edit>) -> ListOut {
+    show_inner(ui, input, order, edit, true)
+}
+
+fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edit>, remote: bool) -> ListOut {
     let mut out = ListOut { drawn: true, ..ListOut::default() };
     // The pane: the type list stays inside it.
     let room = ui.max_rect().intersect(ui.clip_rect());
@@ -557,12 +560,14 @@ pub fn show(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<Edi
     let writable = input.write.is_ok();
     let mut edit = edit.as_mut().filter(|e| e.file_id == input.file_id);
     // The line at the top (a long reason wraps; never a hover text).
+    if !remote {
     let (line, color) = top_line(edit.as_ref().map(|e| (e.id, e.field)), input.picked, &input.write);
     ui.horizontal(|ui| {
         ui.set_min_height(ROW_H);
         ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(line).size(LINE_FONT).color(color)).wrap());
     });
+    }
     // Column names: a click sorts by that column.
     let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     ui.painter().rect_filled(head, 0.0, theme::HEADER_BG);
@@ -899,11 +904,9 @@ mod tests {
         let cell = |k: usize| move |row: Rect| cell_points(row)[k];
         let select = Some(ListAction::Select(7));
         for write in [&ok, &off] {
-            // A single row click selects; the first click of a double click does the same.
             for k in 0..3 {
                 assert_eq!(clicks(&list, write, cell(k)).0, select, "cell {k}, {write:?}");
             }
-            // Double-clicking `#` seeks, including when comments are read-only.
             assert_eq!(clicks(&list, write, id_point), (select, [select, Some(ListAction::Goto(7))]), "{write:?}");
         }
         // Markers / Frames / Comment double clicked: that cell's edit, no go-to; where comments

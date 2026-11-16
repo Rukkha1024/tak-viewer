@@ -3,6 +3,7 @@
 //! Colors are recorded as a [`ColorSource`] only; the viewer theme turns them into screen colors.
 
 use crate::geom::{v3, Vec3};
+use crate::edit::{DocumentSnapshot, EditError, Revision};
 use crate::marker_sets;
 use crate::tak::{uid_hex, AnalogDevice, ForcePlate, MarkerKind, Take, Trajectory, Uid};
 use std::collections::HashMap;
@@ -24,7 +25,8 @@ pub enum ColorSource {
     Unlabeled,
 }
 
-/// Forceplate vertical force channel and valid subsamples per frame.
+/// Forceplate vertical force channel and valid subsamples per frame
+/// (`scripts/export_forceplate_inputs.py` FZ_CHANNEL / FZ_SUBSAMPLES).
 pub const FZ_CHANNEL: usize = 2;
 pub const VALID_SUBSAMPLES: usize = 10;
 
@@ -44,10 +46,10 @@ pub struct MarkerView {
     dense: Vec<[f32; 3]>,
     pub n_samples: usize,
     pub fill_pct: f32,
-    /// Missing ranges inside [start_frame, end_frame].
+    /// Missing ranges inside [start_frame, end_frame] (`src/trajectory.py` `gaps`).
     pub gaps: Vec<(i64, i64)>,
     pub max_gap: i64,
-    /// Present runs of frames.
+    /// Present runs (`src/trajectory.py` `segments`).
     pub segments: Vec<(i64, i64)>,
 }
 
@@ -122,6 +124,8 @@ pub struct ViewData {
     /// Force plate forces / EMG are still being read (markers-first open, `tak::fast_read`).
     /// Set by the caller; `attach_analog` clears it.
     pub analog_pending: bool,
+    /// Marker revision used to build this view; None for the initial read-only display.
+    pub edit_revision: Option<Revision>,
 }
 
 /// Frame range and plates of a `ViewData` (`ViewData::analog_target`).
@@ -570,7 +574,48 @@ impl ViewData {
             occlusion,
             take,
             analog_pending: false,
+            edit_revision: None,
         }
+    }
+
+    /// Rebuild marker-derived display data from an immutable document snapshot. Run on a worker
+    /// with an owned Take whose analog stage is complete. Publication must check the revision.
+    /// The initial fast open does not call this and does not copy an editable document.
+    pub fn rebuild_edited(mut take: Take, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
+        let input = snapshot.input().ok_or(EditError::NotLoaded)?;
+        let mut existing = HashMap::new();
+        for track in std::mem::take(&mut take.trajectories) {
+            if existing.insert(track.uid, track).is_some() { return Err(EditError::DuplicateUid); }
+        }
+        let order = snapshot.track_order();
+        let original: std::collections::HashSet<Uid> = input.tracks.iter().map(|t| t.uid).collect();
+        let mut tracks = Vec::with_capacity(order.len());
+        for &uid in order {
+            let Some(raw) = snapshot.track(&uid) else { continue };
+            let mut trajectory = match existing.remove(&uid) {
+                Some(t) => t,
+                None if original.contains(&uid) => return Err(EditError::UnsupportedLayout),
+                None => {
+                    let (parent_uid, slot, kind, asset_uid) = match raw.label {
+                        None => (Some([0; 16]), Some(0), MarkerKind::Unlabeled, None),
+                        Some(label) => {
+                            let asset = take.assets.iter().any(|a| a.uid == label.parent);
+                            let kind = if asset && label.slot > 0 { MarkerKind::Template } else if asset { MarkerKind::SkeletonExtra } else { MarkerKind::OtherParent };
+                            (Some(label.parent), Some(label.slot), kind, asset.then_some(label.parent))
+                        }
+                    };
+                    Trajectory { uid, name: raw.name.clone(), parent_uid, slot_raw: slot.map(|s| s as u32), slot, kind, asset_uid, frames: Vec::new(), xyz: Vec::new(), raw16_sha256: String::new(), lenient_membership: false }
+                }
+            };
+            trajectory.frames = raw.samples.iter().map(|s| s.frame()).collect();
+            trajectory.xyz = raw.samples.iter().map(|s| s.xyz()).collect();
+            trajectory.raw16_sha256.clear();
+            tracks.push(trajectory);
+        }
+        take.trajectories = tracks;
+        let mut view = ViewData::build(take);
+        view.edit_revision = Some(snapshot.revision());
+        Ok(view)
     }
 
     /// What `AnalogPart::prepare` needs from this view data (small: plate corners and the
@@ -587,13 +632,22 @@ impl ViewData {
     }
 
     /// Like `attach_analog`, with the per-frame work already done (`AnalogPart::prepare` on the
-    /// loading thread). Only moves data: cheap on the drawing thread.
+    /// loading thread). Drops the previous buffers here; use `swap_prepared` to retire them elsewhere.
     pub fn attach_prepared(&mut self, part: AnalogPart) {
-        self.take.analog = part.analog;
+        drop(self.swap_prepared(part));
+    }
+
+    /// Move prepared stage-2 data into this view and return the previous buffers without
+    /// dropping them. The caller can retire that part off the drawing thread.
+    pub fn swap_prepared(&mut self, part: AnalogPart) -> AnalogPart {
         self.take.warnings.extend(part.warning);
-        self.devices = part.devices;
-        self.plates = part.plates;
         self.analog_pending = false;
+        AnalogPart {
+            analog: std::mem::replace(&mut self.take.analog, part.analog),
+            warning: None,
+            devices: std::mem::replace(&mut self.devices, part.devices),
+            plates: std::mem::replace(&mut self.plates, part.plates),
+        }
     }
 
     /// Centroid and top (max Y) of an asset's template markers present at `frame`.
@@ -677,6 +731,22 @@ mod tests {
         assert_eq!(later.take.analog.len(), 2);
         assert_eq!(later.take.warnings, vec!["w".to_owned()]);
         assert_eq!(full.plates[0].fz.len(), 5);
+
+        // Swapping has the same result and returns ownership of all previous allocations.
+        let old_analog = later.take.analog.as_ptr();
+        let old_devices = later.devices.as_ptr();
+        let old_plates = later.plates.as_ptr();
+        let part = AnalogPart::prepare(take.analog.clone(), None, &later.analog_target());
+        later.analog_pending = true;
+        let retired = later.swap_prepared(part);
+        assert!(!later.analog_pending);
+        assert_eq!(retired.analog.as_ptr(), old_analog);
+        assert_eq!(retired.devices.as_ptr(), old_devices);
+        assert_eq!(retired.plates.as_ptr(), old_plates);
+        assert!(retired.warning.is_none());
+        assert_eq!(format!("{:?}", later.devices), format!("{:?}", full.devices));
+        assert_eq!(format!("{:?}", later.plates), format!("{:?}", full.plates));
+        assert_eq!(later.take.warnings, vec!["w".to_owned()]);
     }
 
     #[test]

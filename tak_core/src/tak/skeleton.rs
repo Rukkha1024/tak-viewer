@@ -1,5 +1,8 @@
-//! Read embedded skeleton assets, marker sticks, and per-marker display data.
-//! Offsets and local coordinates remain as stored. Invalid optional data becomes a warning.
+//! Embedded Skeleton assets. Port of `src/skeleton.py` `_skeleton_headers` (75),
+//! `_embedded_skeletons` (198-376) without the coordinate-parity inference (offsets/locals as
+//! stored), `SUPPORTED_PROFILES`, and `marker_sticks` (384+). Plus the per-marker display table
+//! after the sticks (`docs/FORMAT_NOTES.md` "Marker Sticks"), validated structurally.
+//! Nothing here can fail `read_take`: problems become `None` / empty + a warning.
 
 use std::collections::HashSet;
 

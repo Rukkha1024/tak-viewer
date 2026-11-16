@@ -1,24 +1,3 @@
-//! Verification helper: `tak_viewer --screenshot out.png [--frame N] [--select NAME]
-//! [--plate N|NAME] [--range A-B] file.tak` renders one frame, saves the window as PNG and exits. Minimal PNG
-//! writer (stored deflate). `--plate` chooses a force plate (by name, else by number from 0), so
-//! its graph floats over the 3D (the lanes of the first choice, Fx · Fy · Fz). `--frame` /
-//! `--select` / `--plate` apply to every view. `--range <a>-<b>` picks that frame range in every
-//! view's playback bar (band strip), so a range can be checked without a window.
-//! `--menu-capture` first runs the menu "화면 캡처 저장" and shoots the window when it is done.
-//! `--comments` brings the COMMENTS pane to the front (opens it next to the selected marker when
-//! it is closed) before the shot (v0.17.0). Agent-only, for pictures (v0.17.1):
-//! `--pick-comment <id>` selects that comment in every view (as a click on its band block, or
-//! since v0.27.3 a double click on the `#` of its row: its first frame and markers; `--frame`
-//! still wins), `--edit-comment <id>[:markers|frames|comment|type]`
-//! also shows the edit of that cell (markers when not said). A command run writes nothing, so
-//! that edit can only be looked at. `--type-strip <id>` (v0.18.0) shows the type strip of that
-//! comment next to the `Comment` button, as right after it was made (looked at only, too).
-//! `--select A,B,C` (v0.27.0, agent-only): several markers selected, as Ctrl+click one after
-//! another (the last one found is the primary), for pictures of the graph of several markers.
-//! `--hover <NAME>` (v0.29.0, agent-only): every view's marker graph drawn as if the mouse were on
-//! that marker's curve (its own file's) in the Y lane, a little right of the current-frame line:
-//! the curve thick and the name next to the pointer, for pictures of the hover without a mouse.
-//! (`--capture` pictures have no graph, so it has no `--hover`.)
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -49,6 +28,9 @@ pub struct AutoShot {
     /// `--range <a>-<b>`: frame range for every view (ordered and clamped when applied).
     pub range: Option<(i64, i64)>,
     pub menu_capture: bool,
+    pub edit_tools: bool,
+    pub edit_pattern: bool,
+    pub edit_layout: u8,
     /// `--comments`: the COMMENTS pane in front.
     pub comments: bool,
     /// `--pick-comment <id>`: that comment selected in every view.
@@ -111,6 +93,9 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let mut plate = None;
     let mut range = None;
     let mut menu_capture = false;
+    let mut edit_tools = false;
+    let mut edit_pattern = false;
+    let mut edit_layout = 0;
     let mut comments = false;
     let mut pick_comment = None;
     let mut edit_comment = None;
@@ -128,6 +113,9 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                     plate: None,
                     range: None,
                     menu_capture: false,
+                    edit_tools: false,
+                    edit_pattern: false,
+                    edit_layout: 0,
                     comments: false,
                     pick_comment: None,
                     edit_comment: None,
@@ -178,6 +166,23 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                 comments = true;
                 i += 1;
             }
+            "--edit-tools" => {
+                edit_tools = true;
+                i += 1;
+            }
+            "--edit-pattern" => {
+                edit_tools = true;
+                edit_pattern = true;
+                i += 1;
+            }
+            "--edit-split" => {
+                edit_layout = 2;
+                i += 1;
+            }
+            "--edit-bottom" => {
+                edit_layout = 3;
+                i += 1;
+            }
             "--pick-comment" if i + 1 < args.len() => {
                 pick_comment = args[i + 1].trim().parse().ok();
                 if pick_comment.is_none() {
@@ -211,6 +216,9 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         s.plate = plate;
         s.range = range;
         s.menu_capture = menu_capture;
+        s.edit_tools = edit_tools;
+        s.edit_pattern = edit_pattern;
+        s.edit_layout = edit_layout;
         s.comments = comments;
         s.pick_comment = edit_comment.map(|e| e.0).or(pick_comment);
         s.edit_comment = edit_comment;
@@ -318,6 +326,17 @@ mod tests {
         let (s, rest) = parse(&a);
         assert!(s.unwrap().comments, "--comments: the COMMENTS pane in front");
         assert_eq!(rest, vec!["x.tak".to_string()]);
+        let a: Vec<String> = ["--screenshot", "o.png", "--edit-pattern", "x.tak"].iter().map(|s| s.to_string()).collect();
+        let (s, rest) = parse(&a);
+        let s = s.unwrap();
+        assert!(s.edit_tools && s.edit_pattern);
+        assert_eq!(rest, vec!["x.tak".to_string()]);
+        for (flag, expected) in [("--edit-split", 2), ("--edit-bottom", 3)] {
+            let a: Vec<String> = ["--screenshot", "o.png", flag, "x.tak"].iter().map(|s| s.to_string()).collect();
+            let (s, rest) = parse(&a);
+            assert_eq!(s.unwrap().edit_layout, expected);
+            assert_eq!(rest, vec!["x.tak".to_string()]);
+        }
         // v0.17.1: a selected comment, an edit shown; bad values are never taken for a file.
         let a: Vec<String> = ["--screenshot", "o.png", "--pick-comment", "2", "--edit-comment", "3:frames", "x.tak"].iter().map(|s| s.to_string()).collect();
         let (s, rest) = parse(&a);

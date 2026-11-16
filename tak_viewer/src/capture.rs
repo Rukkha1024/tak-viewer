@@ -1,7 +1,6 @@
 //! Visual check captures (`--capture`, and the menu "화면 캡처 저장").
 //! Renders chosen frames from chosen angles to PNG inside the repository
-//! (`experiments/tak_captures/<time>_<file>/`), or under the system temporary folder when no
-//! repository is found, plus `sheet.png` (all shots in one image) and
+//! (`experiments/tak_captures/<time>_<file>/`), plus `sheet.png` (all shots in one image) and
 //! `captures.json` (frame, view, camera, marker counts, missing marker-set markers, selected
 //! marker positions). Read-only: never writes a `.tak`, never writes under `input/`.
 
@@ -25,7 +24,6 @@ tak_viewer --capture <file.tak> [options]      (WSL paths are fine)
   --ui                 keep the side panels (default: 3D view only)
   --size 1600x1000     window size in points
   --out DIR            output folder (default <repo>/experiments/tak_captures/<time>_<file>)
-                       outside a repo: <temp>/tak_viewer/captures/<time>_<file>
   --no-sheet           do not write sheet.png
   --headless           no window: works without a desktop (agent shells). Pictures are painted on
                        the CPU: same content as the window capture, pixels can differ slightly
@@ -332,7 +330,7 @@ pub fn check_out_dir(out: &Path, tak: &Path) -> Result<(), String> {
 }
 
 /// Default output folder: `<repo>/experiments/tak_captures/<time>_<file stem>`, with the repo
-/// found above the TAK, else above the current folder. Outside both, use the system temp folder.
+/// found above the TAK, else above the current folder.
 pub fn default_out_dir(tak: &Path, stamp: &str) -> Result<PathBuf, String> {
     let root = repo_root(tak)
         .or_else(|| std::env::current_dir().ok().as_deref().and_then(repo_root));

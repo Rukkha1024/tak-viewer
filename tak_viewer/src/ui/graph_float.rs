@@ -1,7 +1,3 @@
-//! Floating graphs cover part of a 3D view without resizing it. Marker graphs show X, Y,
-//! and Z lanes; force-plate graphs offer force and moment channels. Their name tags can be
-//! dragged, and graph edges resize them. Opacity, position, size, and folding are retained
-//! per view. The 3D view name tag stays accessible above a floating graph.
 
 use super::dock;
 use super::graph::{self, Drawn, Lane, Look};
@@ -9,7 +5,7 @@ use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2};
 use serde::{Deserialize, Serialize};
 
-/// Default background darkness as a percentage.
+/// Background darkness in percent the user asked for as the first value.
 pub const DEFAULT_OPACITY: u8 = 60;
 /// Gap between the graph and the edge of the 3D view.
 const MARGIN: f32 = 6.0;
@@ -30,8 +26,10 @@ const LANE_MIN_H: f32 = 16.0;
 /// Room kept right of a tag of several markers (v0.27.0) for the first lane's max value text.
 const VALUE_ROOM: f32 = 90.0;
 
-/// Force-plate graph lanes use analog channels 0 through 5: forces followed by moments.
-/// Axis colors match the marker graph: X red, Y green, Z blue.
+/// A force plate graph's lanes, top to bottom: the plate device's analog channels 0..6. The
+/// file names them only `AnalogChannel0` … `AnalogChannel5`; this order (forces, then moments)
+/// was checked on real files (work log 2026-11-11, v0.12.0). Colors as the marker lanes: x red,
+/// y green, z blue.
 pub const PLATE_LANES: [(&str, Color32); 6] =
     [("Fx", theme::AXIS_X), ("Fy", theme::AXIS_Y), ("Fz", theme::AXIS_Z), ("Mx", theme::AXIS_X), ("My", theme::AXIS_Y), ("Mz", theme::AXIS_Z)];
 
@@ -190,6 +188,7 @@ pub struct Graph<'a> {
     pub first: i64,
     pub last: i64,
     pub frame: i64,
+    pub selection: Option<(i64, i64)>,
     /// Comment bands behind the lanes (marker graph, step 6; empty for a plate graph).
     pub spans: &'a [graph::Span],
     /// v0.27.0, a marker graph of several markers: their names, shown in the name tag instead of
@@ -514,6 +513,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
             values: lane_h >= 40.0 && rect.width() >= 260.0,
             tag_w: TAG_PAD + if hot { full_w } else { plain_w },
             keep_out: view_tag,
+            selection: g.selection,
         };
         let Graph { lanes, drawn, gaps, plot_id, first, last, frame, spans, .. } = g;
         out.goto = ui

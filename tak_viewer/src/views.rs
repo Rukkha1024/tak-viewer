@@ -1,6 +1,12 @@
-//! Each view owns its file data, camera, frame, selection, and loading state. Views are
-//! independent; an optional overlay follows its view's frame and camera. Recent view state
-//! is retained in settings, while the arrangement is managed by `ui/dock.rs`.
+//! The 3D views: up to `MAX_VIEWS` files side by side (like VS Code editor groups). A `View`
+//! holds everything about one open file: its data, camera, frame, selection and its load.
+//! Views are not linked: each has its own frame and camera (user: no frame matching).
+//! A view may carry a second file laid over its 3D (`Overlay`, plan step 7): not a view of its
+//! own, it follows that view's frame and camera and is drawn as white rings only.
+//! `Spot` = where a file was being viewed (frame, camera, selected marker names, chosen force
+//! plate). The app keeps the latest `MAX_SPOTS` in the settings and puts a file back there when
+//! it is opened again.
+//! Layout of the views (which slots are on screen, where) is in `ui/dock.rs`.
 
 use crate::camera::Camera;
 use crate::ui::panels::{self, BlockCache, DevicesState, HeatCache, LabelsState, LaneCache, PlateCache};
@@ -10,14 +16,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tak_core::comments::{self, Comments};
-use tak_core::geom::Vec3;
+use tak_core::geom::{v3, Vec3};
 use tak_core::playback::Playback;
 use tak_core::view_data::{AnalogPart, ViewData};
+use tak_core::edit::{DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
 
-/// Maximum number of simultaneous 3D views.
+/// Shared only between the view and layout history, never with the `Arc<ViewData>` used by analog.
+pub type EditSession = Arc<Mutex<EditDocument>>;
+/// Captured by the initial marker reader before it opens the file.
+pub type SourceStamp = Arc<Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>>;
+
 pub const MAX_VIEWS: usize = 4;
 /// Remembered files (`Spot`), most recent first.
 pub const MAX_SPOTS: usize = 50;
@@ -32,7 +43,6 @@ pub enum LoadMsg {
     Analog(Result<AnalogPart, String>, f64),
 }
 
-/// TAK files are read-only; comments can be saved after conversion to TAKM.
 pub const TAK_NO_COMMENTS: &str = "TAK에는 Comment를 달 수 없어요. .takm으로 저장하면 달 수 있어요.";
 
 /// The Comments of a file being opened, read on the loading thread right after its markers
@@ -82,8 +92,10 @@ pub enum Change {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Selection {
     pub selected: BTreeSet<usize>,
+    pub order: Vec<usize>,
     pub primary: Option<usize>,
     pub comment: Option<u64>,
+    pub armed_label: Option<LabelKey>,
 }
 
 /// A frame range of a view's band strip (`View::range`).
@@ -112,8 +124,12 @@ pub struct CommentState {
     pub label: Option<String>,
     /// Writes sent and not confirmed yet.
     pub pending: usize,
+    pub pending_since: Option<Instant>,
     /// A write failed (message); stays while this file is open.
     pub failed: Option<String>,
+    pub id_pool: Option<std::ops::RangeInclusive<u64>>,
+    pub id_rx: Option<Receiver<Result<std::ops::RangeInclusive<u64>, String>>>,
+    pub id_error: Option<String>,
     /// When the last write was confirmed (`egui` input time): "saved" for a moment.
     pub saved_at: Option<f64>,
     /// Where the comment blocks sit in this view's band strip.
@@ -130,6 +146,9 @@ impl CommentState {
         self.skipped = parsed.skipped + usize::from(parsed.cut);
         self.label = load.label;
         self.target = Some(load.target);
+        self.id_pool = None;
+        self.id_rx = None;
+        self.id_error = None;
     }
 }
 
@@ -151,7 +170,8 @@ pub struct Spot {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y: f32,
-    /// Selected marker names; `primary` = the one picked last.
+    /// Selected marker names in selection order; `primary` = the one picked last.
+    /// Older settings store Labels order; restoring them puts their primary last.
     pub selected: Vec<String>,
     pub primary: Option<String>,
     /// Name of the chosen force plate (its graph floats over the 3D). Not in settings saved
@@ -173,7 +193,7 @@ pub fn recall<'a>(list: &'a [Spot], path: &Path) -> Option<&'a Spot> {
 }
 
 /// Free a file's view data on another thread (big files take a moment).
-pub fn drop_later(old: Option<ViewData>) {
+pub fn drop_later<T: Send + 'static>(old: Option<T>) {
     if let Some(old) = old {
         std::thread::spawn(move || drop(old));
     }
@@ -246,12 +266,29 @@ pub struct Loaded {
 }
 
 pub struct View {
-    pub data: Option<ViewData>,
+    pub data: Option<Arc<ViewData>>,
+    /// Lazy, per-file marker document; preparing raw records never delays markers-first open.
+    pub edit_document: Option<EditSession>,
+    pub restore_edit_document: Option<EditSession>,
+    pub restore_edit_selection: Option<EditSelection>,
+    /// Selected Comment restored with a reversible close/open, after its markers arrive.
+    pub restore_picked: Option<Option<u64>>,
+    /// Latest desired marker revision; older worker results must not be published.
+    pub edit_refresh: Option<Revision>,
+    pub edit_selection: Option<EditSelection>,
+    pub armed_label: Option<LabelKey>,
+    pub source_stamp: Option<SourceStamp>,
+    /// Typed remote address. The path inside ViewData is an opaque memory identity only.
+    pub remote: Option<crate::ssh::RemoteLocation>,
+    pub remote_warning: Option<String>,
+    pub remote_loading: Option<(u64, crate::ssh::RemoteLocation, PathBuf)>,
     /// Unique for each file shown in this app (egui ids, Labels reset, graph cache).
     pub file_id: usize,
     pub cam: Camera,
     pub pb: Playback,
     pub selected: BTreeSet<usize>,
+    /// Selection order, oldest first. Kept separate from the set used for drawing.
+    pub selection_order: Vec<usize>,
     pub primary: Option<usize>,
     /// The selected comment (v0.17.1, one per view or none; not saved): a click on its row in
     /// the COMMENTS pane or on its band block, or the comment just made. While it is selected, a
@@ -327,10 +364,22 @@ impl Default for View {
     fn default() -> Self {
         View {
             data: None,
+            edit_document: None,
+            restore_edit_document: None,
+            restore_edit_selection: None,
+            restore_picked: None,
+            edit_refresh: None,
+            edit_selection: None,
+            armed_label: None,
+            source_stamp: None,
+            remote: None,
+            remote_warning: None,
+            remote_loading: None,
             file_id: 0,
             cam: Camera::default(),
             pb: Playback::new(0, 0, 100.0),
             selected: BTreeSet::new(),
+            selection_order: Vec::new(),
             primary: None,
             picked: None,
             plate: None,
@@ -367,6 +416,10 @@ impl Default for View {
 }
 
 impl View {
+    pub fn marker_dirty(&self) -> bool {
+        self.edit_document.as_ref().is_some_and(|session| session.lock().map_or(true, |doc| doc.is_dirty()))
+    }
+
     /// The file on screen.
     pub fn path(&self) -> Option<&Path> {
         self.data.as_ref().map(|d| d.take.path.as_path())
@@ -374,12 +427,12 @@ impl View {
 
     /// The file being read, else the file on screen.
     pub fn target(&self) -> Option<&Path> {
-        self.loading.as_ref().map(|(p, _)| p.as_path()).or_else(|| self.path())
+        self.remote_loading.as_ref().map(|(_, _, p)| p.as_path()).or_else(|| self.loading.as_ref().map(|(p, _)| p.as_path())).or_else(|| self.path())
     }
 
     /// Markers, the comment file, force plates or the overlay's markers still coming.
     pub fn busy(&self) -> bool {
-        self.loading.is_some() || self.analog_rx.is_some() || self.comments_rx.is_some() || self.overlay_load.is_some()
+        self.remote_loading.is_some() || self.loading.is_some() || self.analog_rx.is_some() || self.comments_rx.is_some() || self.overlay_load.is_some()
     }
 
     /// The laid-over file on screen.
@@ -455,10 +508,15 @@ impl View {
     /// force plates / EMG once no file's markers are loading any more. A load this view started
     /// before is cancelled.
     pub fn start_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>) {
+        drop_later(self.restore_edit_document.take());
+        self.restore_edit_selection = None;
+        self.restore_picked = None;
         let (tx, rx) = channel();
         let (comments_tx, comments_rx) = channel();
         let ctx2 = ctx.clone();
         let p = path.clone();
+        let stamp: SourceStamp = Arc::new(Mutex::new(None));
+        self.source_stamp = Some(stamp.clone());
         self.load_cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
         self.load_cancel = cancel.clone();
@@ -466,6 +524,11 @@ impl View {
         std::thread::spawn(move || {
             let panic_msg = || "읽는 중 내부 오류(panic)가 났어요.".to_owned();
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if let Ok(mut initial) = stamp.lock() {
+                        *initial = Some((p.clone(), meta.len(), meta.modified().ok()));
+                    }
+                }
                 let fast = tak_core::tak::fast_read::read_take_fast(&p, false).map_err(|e| e.to_string())?;
                 let t = Instant::now();
                 let mut data = ViewData::build(fast.take);
@@ -533,6 +596,10 @@ impl View {
     /// Stop reading (the view closes or shows another file).
     pub fn cancel_load(&mut self) {
         self.load_cancel.store(true, Ordering::SeqCst);
+        drop_later(self.restore_edit_document.take());
+        self.restore_edit_selection = None;
+        self.restore_picked = None;
+        self.remote_loading = None;
         self.loading = None;
         self.analog_rx = None;
         self.comments_rx = None;
@@ -554,25 +621,47 @@ impl View {
 
     /// Show a freshly read file: new playback, no selection, the remembered spot if any (else
     /// framed). Returns the previous data, to be freed off the drawing thread.
-    pub fn show(&mut self, data: ViewData, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<ViewData> {
+    pub fn show(&mut self, data: ViewData, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
+        self.show_shared(Arc::new(data), rx, file_id, speed, now)
+    }
+
+    pub fn show_shared(&mut self, data: Arc<ViewData>, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
+        self.remote = None;
+        self.remote_warning = None;
+        self.remote_loading = None;
         let mut pb = Playback::new(data.start_frame, data.end_frame, data.take.frame_rate);
         pb.speed = speed;
         self.pb = pb;
         self.selected.clear();
+        self.selection_order.clear();
         self.primary = None;
-        self.picked = None;
+        self.picked = self.restore_picked.take().flatten();
         self.plate = None;
         self.range = None;
         // Its own comments come from the loading thread (`poll_comments`).
         self.comments = CommentState::default();
         self.fresh = true;
         self.file_id = file_id;
+        let path = &data.take.path;
+        let restored = self.restore_edit_document.take().filter(|session| session.lock().ok().is_some_and(|doc| doc.source_path() == path || doc.save_path() == Some(path.as_path())));
+        let restored_selection = if restored.is_some() { self.restore_edit_selection.take() } else { self.restore_edit_selection = None; None };
+        let session = restored.unwrap_or_else(|| Arc::new(Mutex::new(EditDocument::unloaded(path.clone()))));
+        self.edit_refresh = session.lock().ok().and_then(|doc| {
+            (doc.snapshot().is_loaded() && (doc.is_dirty() || doc.save_path().is_some_and(|saved| saved != path))).then(|| doc.revision())
+        });
+        drop_later(self.edit_document.replace(session));
+        self.edit_selection = restored_selection;
+        self.armed_label = None;
         self.analog_rx = data.analog_pending.then_some((file_id, rx));
         self.labels.reset(&data, file_id);
         let old = self.data.replace(data);
         match self.restore.take() {
             Some(spot) => self.apply_spot(&spot, now),
             None => self.fit_pending = true,
+        }
+        if let Some(selection) = self.edit_selection.clone() {
+            self.apply_uid_selection(&selection);
+            if self.edit_refresh.is_none() { self.edit_selection = None; }
         }
         if let Some(range) = self.restore_range.take() {
             self.range = range.map(|(a, b)| panels::ordered_range(a, b, self.pb.first, self.pb.last));
@@ -611,7 +700,7 @@ impl View {
         };
         self.load_steps.push(("analog", took));
         self.analog_ms = self.open_started.map(ms_since);
-        if let Some(d) = self.data.as_mut().filter(|_| id == self.file_id) {
+        if let Some(d) = self.data.as_mut().filter(|_| id == self.file_id).and_then(Arc::get_mut) {
             match result {
                 Ok(part) => d.attach_prepared(part),
                 Err(e) => d.attach_analog(Vec::new(), Some(format!("analog channels not loaded: {e}"))),
@@ -631,7 +720,7 @@ impl View {
             pitch: self.cam.pitch,
             distance: self.cam.distance,
             fov_y: self.cam.fov_y,
-            selected: self.selected.iter().filter_map(|&m| name(m)).collect(),
+            selected: self.ordered_selection().into_iter().filter_map(name).collect(),
             primary: self.primary.and_then(name),
             plate: self.plate.and_then(|p| d.plates.get(p)).map(|p| p.name.clone()),
         })
@@ -658,10 +747,12 @@ impl View {
         let Some(d) = &self.data else { return };
         let find = |name: &str| d.markers.iter().position(|m| m.name == name);
         self.selected = spot.selected.iter().filter_map(|n| find(n)).collect();
+        self.selection_order = spot.selected.iter().filter_map(|n| find(n)).collect();
         self.primary = spot.primary.as_deref().and_then(find).filter(|m| self.selected.contains(m));
-        self.labels.scroll_to = self.primary;
         // Plates are known with the markers (their forces come later).
         self.plate = spot.plate.as_deref().and_then(|n| d.plates.iter().position(|p| p.name == n));
+        self.normalize_selection();
+        self.labels.scroll_to = self.primary;
     }
 
     /// Set the frame range from two ends in any order (kept inside the file's frames).
@@ -705,8 +796,11 @@ impl View {
         let (start, markerless) = (c.start, c.markers.is_empty());
         self.picked = Some(id);
         if !markerless {
+            self.edit_selection = None;
             self.selected = found.iter().copied().collect();
+            self.selection_order = found.clone();
             self.primary = found.first().copied();
+            self.normalize_selection();
             self.labels.scroll_to = self.primary;
         }
         Some(start)
@@ -718,58 +812,172 @@ impl View {
     }
 
     /// Back to an empty view. Returns the data, to be freed off the drawing thread.
-    pub fn clear(&mut self) -> Option<ViewData> {
+    pub fn clear(&mut self) -> Option<Arc<ViewData>> {
         self.cancel_load();
         // The laid-over file goes with the view (plan step 7).
         drop_later(self.take_overlay());
-        std::mem::take(self).data
+        let mut old = std::mem::take(self);
+        drop_later(old.edit_document.take());
+        drop_later(old.restore_edit_document.take());
+        old.data
+    }
+
+    /// Commit or undo a prepared patch; the expensive view rebuild is requested separately.
+    pub fn apply_marker_patch(&mut self, patch: &EditPatch, redo: bool) -> Result<(), EditError> {
+        let session = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?;
+        let mut document = session.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
+        document.apply(patch, redo)?;
+        let revision = document.revision();
+        drop(document);
+        let selection = if redo { patch.selection_after.clone() } else { patch.selection_before.clone() };
+        self.apply_uid_selection(&selection);
+        self.edit_refresh = Some(revision);
+        self.edit_selection = Some(selection);
+        Ok(())
+    }
+
+    fn uid_selection(&self) -> EditSelection {
+        let data = self.data.as_ref();
+        EditSelection {
+            selected: self.selected.iter().filter_map(|&i| data?.markers.get(i).map(|m| m.uid)).collect(),
+            order: self.ordered_selection().into_iter().filter_map(|i| data?.markers.get(i).map(|m| m.uid)).collect(),
+            primary: self.primary.and_then(|i| data?.markers.get(i).map(|m| m.uid)),
+            armed_label: self.armed_label,
+        }
+    }
+
+    pub fn edit_selection_state(&self) -> EditSelection {
+        self.edit_selection.clone().unwrap_or_else(|| self.uid_selection())
+    }
+
+    fn apply_uid_selection(&mut self, selection: &EditSelection) {
+        self.armed_label = selection.armed_label;
+        let Some(data) = &self.data else { return };
+        self.selected = data.markers.iter().enumerate().filter_map(|(i, m)| selection.selected.contains(&m.uid).then_some(i)).collect();
+        self.selection_order = selection.order.iter().filter_map(|id| data.markers.iter().position(|m| m.uid == *id)).collect();
+        self.primary = selection.primary.and_then(|id| data.markers.iter().position(|m| m.uid == id)).filter(|i| self.selected.contains(i));
+        self.normalize_selection();
+        self.labels.scroll_to = self.primary;
+    }
+
+    /// Snapshot for an off-thread rebuild. Wait for analog before sharing or replacing its view.
+    pub fn edit_refresh_snapshot(&self) -> Option<DocumentSnapshot> {
+        if self.analog_rx.is_some() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return None; }
+        let desired = self.edit_refresh?;
+        let document = self.edit_document.as_ref()?.lock().ok()?;
+        (document.revision() == desired).then(|| document.snapshot())
+    }
+
+    /// Publish a worker-built view only for the latest document revision. Reset all marker
+    /// caches together and retire the old buffers off-thread; the view keeps its file identity.
+    pub fn publish_edited_view(&mut self, data: ViewData) -> Result<(), EditError> {
+        if self.analog_rx.is_some() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return Err(EditError::Other("아날로그를 읽는 중이에요".into())); }
+        let expected = self.edit_refresh.ok_or(EditError::StaleRevision)?;
+        let document = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
+        if document.revision() != expected || data.edit_revision != Some(expected) { return Err(EditError::StaleRevision); }
+        if data.take.path != document.source_path() && document.save_path() != Some(data.take.path.as_path()) { return Err(EditError::WrongDocument); }
+        drop(document);
+        let filter = self.labels.filter.clone();
+        let folds = self.data.as_ref().map(|old| panels::fold_keys(old, &self.labels.collapsed)).unwrap_or_default();
+        let old_groups: std::collections::HashSet<_> = self.data.as_ref().map(|old| (0..old.groups.len())
+            .map(|i| panels::FoldKey::group(old, i)).collect()).unwrap_or_default();
+        self.labels.reset(&data, self.file_id);
+        self.labels.filter = filter;
+        let new_defaults: Vec<_> = self.labels.collapsed.iter().copied()
+            .filter(|&i| !old_groups.contains(&panels::FoldKey::group(&data, i))).collect();
+        self.labels.collapsed = panels::fold_indices(&data, &folds);
+        self.labels.collapsed.extend(new_defaults);
+        // Preserve a later user selection if it replaced the patch's pending selection.
+        let selection = self.edit_selection.take().unwrap_or_else(|| self.uid_selection());
+        drop_later(Some(std::mem::take(&mut self.lanes)));
+        drop_later(Some(std::mem::take(&mut self.heat)));
+        drop_later(self.data.replace(Arc::new(data)));
+        self.apply_uid_selection(&selection);
+        self.edit_refresh = None;
+        Ok(())
+    }
+
+    /// Current selection in click order. Public set/primary assignments and older snapshots
+    /// are completed deterministically, with a valid primary last.
+    pub fn ordered_selection(&self) -> Vec<usize> {
+        let mut remaining = self.selected.clone();
+        let mut order: Vec<_> = self.selection_order.iter().chain(self.selected.iter()).copied().filter(|m| remaining.remove(m)).collect();
+        if let Some(primary) = self.primary.filter(|m| self.selected.contains(m)) {
+            order.retain(|m| *m != primary);
+            order.push(primary);
+        }
+        order
+    }
+
+    fn normalize_selection(&mut self) {
+        self.selection_order = self.ordered_selection();
+        self.primary = self.selection_order.last().copied();
     }
 
     pub fn select(&mut self, marker: usize, additive: bool) {
+        self.edit_selection = None;
+        self.normalize_selection();
         if additive {
             if !self.selected.remove(&marker) {
                 self.selected.insert(marker);
-                self.primary = Some(marker);
-            } else if self.primary == Some(marker) {
-                self.primary = self.selected.iter().next_back().copied();
+                self.selection_order.push(marker);
+            } else {
+                self.selection_order.retain(|m| *m != marker);
             }
         } else {
             self.selected.clear();
             self.selected.insert(marker);
-            self.primary = Some(marker);
+            self.selection_order = vec![marker];
         }
+        self.primary = self.selection_order.last().copied();
         self.labels.scroll_to = self.primary;
     }
 
     /// Box selection: replace the selection, or add to it with Ctrl. An empty box without
     /// Ctrl clears the selection (like a click on empty space).
-    pub fn select_many(&mut self, markers: Vec<usize>, primary: Option<usize>, additive: bool) {
+    pub fn select_many(&mut self, mut markers: Vec<usize>, primary: Option<usize>, additive: bool) {
+        self.edit_selection = None;
         if !additive {
             self.clear_selection();
+        } else {
+            self.normalize_selection();
         }
-        self.selected.extend(markers);
-        if primary.is_some() {
+        markers.sort_unstable();
+        markers.dedup();
+        for marker in markers {
+            if self.selected.insert(marker) { self.selection_order.push(marker); }
+        }
+        if primary.is_some_and(|m| self.selected.contains(&m)) {
             self.primary = primary;
+        } else {
+            self.primary = self.selection_order.last().copied();
         }
+        self.normalize_selection();
         self.labels.scroll_to = self.primary;
     }
 
     pub fn clear_selection(&mut self) {
+        self.edit_selection = None;
         self.selected.clear();
+        self.selection_order.clear();
         self.primary = None;
     }
 
     /// The selection now (markers and the selected comment).
     pub fn selection(&self) -> Selection {
-        Selection { selected: self.selected.clone(), primary: self.primary, comment: self.picked }
+        Selection { selected: self.selected.clone(), order: self.ordered_selection(), primary: self.primary, comment: self.picked, armed_label: self.armed_label }
     }
 
     /// Put a selection back (undo / redo) the way a click leaves it: Labels scrolls to the
     /// primary marker; the 3D, panes and graphs read `selected` / `primary` every frame.
     pub fn set_selection(&mut self, s: Selection) {
+        self.edit_selection = None;
         self.selected = s.selected;
+        self.selection_order = s.order;
         self.primary = s.primary;
         self.picked = s.comment;
+        self.armed_label = s.armed_label;
+        self.normalize_selection();
         self.labels.scroll_to = self.primary;
     }
 
@@ -812,14 +1020,38 @@ impl View {
         }
     }
 
-    /// Motive F: zoom to selected (pivot on it, come closer if far).
-    pub fn focus_selected(&mut self) {
-        if let (Some(d), Some(m)) = (&self.data, self.primary) {
-            if let Some(p) = d.markers[m].position(self.pb.frame) {
-                self.cam.pivot = p;
-                self.cam.distance = self.cam.distance.min(2.5);
+    /// Find the closest gap boundary across the entire selected marker set.
+    pub fn next_selected_gap(&self, forward: bool) -> Option<i64> {
+        let data = self.data.as_ref()?;
+        let frame = self.pb.frame;
+        self.selected.iter().filter_map(|&index| {
+            let gaps = &data.markers.get(index)?.gaps;
+            if forward {
+                gaps.get(gaps.partition_point(|&(start, _)| start <= frame)).map(|gap| gap.0)
+            } else {
+                gaps.partition_point(|&(_, end)| end < frame).checked_sub(1)
+                    .and_then(|at| gaps.get(at)).map(|gap| gap.1)
             }
+        }).reduce(|a, b| if forward { a.min(b) } else { a.max(b) })
+    }
+
+    /// Fit all selected points visible at the current frame.
+    pub fn focus_selected(&mut self) {
+        if self.overlay.is_some() && !self.shown[0] { return; }
+        let Some(data) = &self.data else { return };
+        let mut positions = self.selected.iter().filter_map(|&index| {
+            data.markers.get(index)?.position(self.pb.frame)
+        });
+        let Some(first) = positions.next() else { return };
+        let (mut lo, mut hi) = (first, first);
+        for point in positions {
+            lo = v3(lo.x.min(point.x), lo.y.min(point.y), lo.z.min(point.z));
+            hi = v3(hi.x.max(point.x), hi.y.max(point.y), hi.z.max(point.z));
         }
+        let aspect = if self.scene_rect.is_positive() {
+            self.scene_rect.width() / self.scene_rect.height().max(1.0)
+        } else { 1.0 };
+        self.cam.fit_box(lo, hi, aspect);
     }
 }
 
@@ -900,6 +1132,169 @@ pub(crate) fn sample_take(path: &str, names: &[&str]) -> tak_core::tak::Take {
 mod tests {
     use super::*;
 
+    fn selection_view() -> View {
+        let mut view = View::default();
+        let (_tx, rx) = channel();
+        view.show(sample_data("selection.tak", &["A", "B", "C", "D"]), rx, 1, 1.0, 0.0);
+        view
+    }
+
+    #[test]
+    fn selection_order_survives_ctrl_deselection_reselection_and_undo_snapshots() {
+        let mut view = selection_view();
+        view.select(2, false);
+        view.select(0, true);
+        view.select(1, true);
+        let before = view.selection();
+        assert_eq!(before.order, vec![2, 0, 1]);
+        view.select(1, true);
+        assert_eq!((view.ordered_selection(), view.primary), (vec![2, 0], Some(0)));
+        view.select(1, true);
+        view.select(0, true);
+        assert_eq!((view.ordered_selection(), view.primary), (vec![2, 1], Some(1)));
+        view.set_selection(before.clone());
+        assert_eq!(view.selection(), before);
+        view.select(1, true);
+        assert_eq!(view.primary, Some(0), "undo restores the preceding click, not the greatest index");
+        view.clear_selection();
+        assert!(view.ordered_selection().is_empty());
+        assert!(view.selection_order.is_empty());
+    }
+
+    #[test]
+    fn box_selection_orders_new_markers_deterministically_and_its_primary_last() {
+        let mut view = selection_view();
+        view.select(2, false);
+        view.select(0, true);
+        view.select_many(vec![3, 1, 3], Some(3), true);
+        assert_eq!(view.ordered_selection(), vec![2, 0, 1, 3]);
+        view.select_many(vec![1, 0], Some(0), true);
+        assert_eq!(view.ordered_selection(), vec![2, 1, 3, 0]);
+        view.select(0, true);
+        assert_eq!(view.primary, Some(3));
+        view.select_many(vec![2, 0, 1], Some(0), false);
+        assert_eq!(view.ordered_selection(), vec![1, 2, 0]);
+        view.select_many(vec![], None, false);
+        assert!(view.ordered_selection().is_empty());
+        assert_eq!(view.primary, None);
+    }
+
+    #[test]
+    fn spots_keep_selection_chronology_and_old_settings_restore_primary_last() {
+        let mut view = selection_view();
+        view.select(2, false);
+        view.select(0, true);
+        view.select(1, true);
+        let saved = view.spot().unwrap();
+        assert_eq!(saved.selected, vec!["C", "A", "B"]);
+        let decoded: Spot = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+        let mut restored = selection_view();
+        restored.apply_spot(&decoded, 0.0);
+        assert_eq!(restored.ordered_selection(), vec![2, 0, 1]);
+        restored.select(1, true);
+        assert_eq!(restored.primary, Some(0));
+
+        let old = Spot { selected: vec!["A".into(), "B".into(), "C".into()], primary: Some("B".into()), ..saved };
+        restored.apply_spot(&old, 0.0);
+        assert_eq!(restored.ordered_selection(), vec![0, 2, 1]);
+        restored.select(1, true);
+        assert_eq!(restored.primary, Some(2));
+    }
+
+    #[test]
+    fn uid_selection_keeps_chronology_when_an_edited_view_reorders_markers() {
+        let mut view = selection_view();
+        view.select(2, false);
+        view.select(0, true);
+        view.select(1, true);
+        let selection = view.edit_selection_state();
+        assert_eq!(selection.order, vec![[3; 16], [1; 16], [2; 16]]);
+        let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
+        view.edit_refresh = Some(revision);
+        view.edit_selection = Some(selection.clone());
+        let mut take = sample_take("selection.tak", &["A", "B", "C", "D"]);
+        take.trajectories.rotate_left(1);
+        let mut rebuilt = ViewData::build(take);
+        rebuilt.edit_revision = Some(revision);
+        view.publish_edited_view(rebuilt).unwrap();
+        assert_eq!(view.edit_selection_state(), selection);
+        let primary = view.primary.unwrap();
+        view.select(primary, true);
+        assert_eq!(view.edit_selection_state().primary, Some([1; 16]));
+    }
+
+    #[test]
+    fn later_user_selection_keeps_its_order_after_a_pending_view_rebuild() {
+        let mut view = selection_view();
+        view.select(2, false);
+        let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
+        view.edit_refresh = Some(revision);
+        view.edit_selection = Some(view.edit_selection_state());
+        view.select(1, false);
+        view.select(0, true);
+        let expected = view.edit_selection_state();
+        let mut rebuilt = sample_data("selection.tak", &["A", "B", "C", "D"]);
+        rebuilt.edit_revision = Some(revision);
+        view.publish_edited_view(rebuilt).unwrap();
+        assert_eq!(view.edit_selection_state(), expected);
+        assert_eq!(view.ordered_selection(), vec![1, 0]);
+    }
+
+    #[test]
+    fn comment_selection_restores_an_order_and_markerless_comments_keep_click_order() {
+        let mut view = selection_view();
+        let comment = comments::Comment { id: 1, markers: vec!["C".into(), "A".into(), "B".into()], start: 2, end: 3, comment_type: String::new(), text: String::new() };
+        let markerless = comments::Comment { id: 2, markers: vec![], ..comment.clone() };
+        view.comments.list = Comments::from_events(&[
+            comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new()),
+            comments::Event::of(comments::Kind::Add, &markerless, String::new(), String::new()),
+        ]);
+        view.select_comment(1);
+        assert_eq!(view.primary, Some(2), "comment selection retains its established primary");
+        assert_eq!(view.ordered_selection(), vec![0, 1, 2]);
+        view.select(2, true);
+        assert_eq!(view.primary, Some(1));
+        view.select(0, false);
+        view.select(2, true);
+        view.select(1, true);
+        view.select_comment(2);
+        assert_eq!(view.ordered_selection(), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn editable_document_does_not_prevent_late_analog_attachment() {
+        use tak_core::tak::{AnalogChannel, AnalogDevice};
+        let mut data = sample_data("a.tak", &["M"]);
+        let target = data.analog_target();
+        data.analog_pending = true;
+        let (tx, rx) = channel();
+        let mut view = View::default();
+        view.show(data, rx, 7, 1.0, 0.0);
+        assert_eq!(Arc::strong_count(view.data.as_ref().unwrap()), 1);
+        assert!(view.edit_document.is_some());
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        tx.send(LoadMsg::Analog(Ok(AnalogPart::prepare(analog, None, &target)), 1.0)).unwrap();
+        view.poll_analog();
+        assert!(!view.data.as_ref().unwrap().analog_pending);
+        assert_eq!(view.data.as_ref().unwrap().take.analog[0].channels[0].values, vec![42.0]);
+    }
+
+    #[test]
+    fn cancelling_a_reopen_does_not_apply_its_edit_selection_to_another_file() {
+        let mut view = View::default();
+        let (_tx, rx) = channel();
+        view.show(sample_data("a.tak", &["M"]), rx, 1, 1.0, 0.0);
+        view.select(0, false);
+        view.restore_edit_document = view.edit_document.clone();
+        view.restore_edit_selection = Some(view.edit_selection_state());
+        view.hold_load("b.tak".into(), None);
+        assert!(view.restore_edit_document.is_none());
+        assert!(view.restore_edit_selection.is_none());
+        let (_tx, rx) = channel();
+        view.show(sample_data("b.tak", &["M"]), rx, 2, 1.0, 0.0);
+        assert!(view.selected.is_empty());
+    }
+
     #[test]
     fn the_range_is_ordered_kept_inside_the_file_and_cleared_by_a_new_file() {
         let mut v = View::default();
@@ -942,6 +1337,8 @@ mod tests {
             shown_b: String::new(),
             file_a: String::new(),
             file_b: String::new(),
+            operation: None,
+            expected: None,
         };
         let mut v = View::default();
         let (tx, rx) = channel();

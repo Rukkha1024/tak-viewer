@@ -1,7 +1,6 @@
 //! The app side of OPEN EDITORS (`ui/open_editors.rs`): what it lists and what its clicks do.
 //! Every click reuses an action that already exists, so undo works as for them: × on a view's
-//! file = the view tab's ✕ (`close_view`; the only view keeps its place and shows nothing, as
-//! when undo puts back a layout without that file), × on a laid-over file = `overlay_off`,
+//! file = the view tab's ✕ (`close_view`, including the last view), × on a laid-over file = `overlay_off`,
 //! `폴더 추가` = `open_workspace` (the add-folder action), a row = `activate`. A row of a view
 //! with a file laid over it = a click on that file's name tag 1 / 2: `activate` (what the press
 //! on the tag does) and `name_tag_click` (hide / show, the same layout undo action and notes);
@@ -22,11 +21,13 @@ impl TakViewerApp {
                 let over = v.overlay_target();
                 let entry = |path: &Path, i: usize| Entry {
                     path: path.to_path_buf(),
+                    host: if i == 0 { v.remote_loading.as_ref().map(|(_, l, _)| l.host.clone()).or_else(|| v.remote.as_ref().map(|l| l.host.clone())) } else { None },
                     mark: over.map(|_| i),
                     // Keys 1 / 2 hide a file only while one is laid over the view.
                     hidden: v.overlay.is_some() && !v.shown[i],
                     loading: if i == 0 { v.loading.is_some() } else { v.overlay_load.is_some() },
-                    add_folder: self.folder_outside_workspace(path),
+                    dirty: i == 0 && v.marker_dirty(),
+                    add_folder: if i == 0 && (v.remote.is_some() || v.remote_loading.is_some()) { None } else { self.folder_outside_workspace(path) },
                 };
                 let mut entries = vec![entry(own, 0)];
                 entries.extend(over.map(|p| entry(p, 1)));
@@ -64,13 +65,8 @@ impl TakViewerApp {
         }
     }
 
-    /// × on a view's file: the view closes like with its tab ✕; the only view stays, empty.
-    fn close_editor(&mut self, slot: usize) {
-        if self.open_views().len() > 1 {
-            self.close_view(slot);
-        } else {
-            self.remember(slot);
-            drop_later(self.views[slot].clear());
-        }
+    /// × on a view's file: the same close and dirty prompt as its tab ✕ and Ctrl+W.
+    pub(super) fn close_editor(&mut self, slot: usize) {
+        self.close_view(slot);
     }
 }

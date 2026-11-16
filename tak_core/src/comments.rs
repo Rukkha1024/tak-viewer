@@ -1,8 +1,15 @@
-//! Comments on a take contain markers, a frame range, a type, and optional text. Events
-//! are appended as CSV records and folded into the current comments when read. The TAKM
-//! tail stores new comments; a legacy sibling CSV can be imported during conversion.
-//! Incomplete final records and malformed rows are ignored. Writes run on a background
-//! thread and protected targets are refused.
+//! Comments (주석) on a take: the selected markers + a frame range, saved next to the TAK in
+//! `<TAK stem>.comments.csv` (`path_for`). No GUI code here: the viewer draws and asks.
+//!
+//! The file is a log: one CSV line per event (`add` / `edit` / `delete`), only ever appended
+//! (`append`), never rewritten. So a save is instant and a crash can only cut the line being
+//! written; earlier lines stay as they were. Reading (`read`, `parse`) folds the events into the
+//! live comments (`Comments`): `add` adds, `edit` replaces that id's fields, `delete` removes it.
+//! A last line cut off in the middle is ignored, other bad lines are skipped, extra columns after
+//! the known ones are ignored.
+//!
+//! Refusals (`check_target`): never a `.tak` path, never inside the repository's `input/`.
+//! Writing happens on one background thread (`Writer`), never on the drawing thread.
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -20,6 +27,8 @@ pub const SUFFIX: &str = ".comments.csv";
 const EOL: &str = "\r\n";
 /// Byte order mark at the start of a new file, so Excel reads it as UTF-8 (Korean text).
 const BOM: char = '\u{feff}';
+/// A cut record is followed by enough empty fields to put this marker beyond legacy columns.
+pub(crate) const INCOMPLETE_SUFFIX: &str = ",,,,,,,,,,,,__takm_truncated_v1__";
 
 /// What a line of the file records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +77,10 @@ pub struct Event {
     /// `file_label`: TAK file name and size, so a CSV is not mixed up with another file.
     pub file_a: String,
     pub file_b: String,
+    /// Optional operation key for idempotent retries; absent in older tails.
+    pub operation: Option<String>,
+    /// In-memory state on which an edit/delete was based; never serialized.
+    pub expected: Option<Comment>,
 }
 
 impl Event {
@@ -87,8 +100,18 @@ impl Event {
             shown_b: String::new(),
             file_a,
             file_b: String::new(),
+            operation: Some(new_operation_token()),
+            expected: None,
         }
     }
+}
+
+/// Give each new event a stable token, retained when the same event is retried.
+pub fn new_operation_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("{}-{nanos}-{sequence}", std::process::id())
 }
 
 /// A live comment (after folding the events).
@@ -110,8 +133,12 @@ impl Comment {
 
 // ───────────────────────────── Types (Comment plan step 5) ─────────────────────────────
 
-/// Comment types use a consistent order: Jitter, Marker swap, Needs visual check.
-/// They are stored in `comment_type`; empty means no type, and unknown values are preserved.
+/// The comment types (user: `Marker swap` · `Jitter` · `Needs visual check`), in their one
+/// order everywhere (the type list of the COMMENTS pane, the strip of three buttons, `T`, the
+/// sort): Jitter → Marker swap → Needs visual check, the order of the user's sketch and of the
+/// chosen mockup (type-combo; v0.18.0 had Marker swap first). Written as these names in the
+/// `comment_type` column; empty = no type. Any other value (written by hand or by a later
+/// version) is kept as it is.
 pub const TYPES: [&str; 3] = ["Jitter", "Marker swap", "Needs visual check"];
 
 /// Short form of a type for a narrow column: `Swap` · `Jitter` · `Check`; no type = empty; a
@@ -193,11 +220,26 @@ impl Comments {
         self.list.iter().find(|c| c.id == id)
     }
 
+    /// Replace only this id after a concurrent edit, preserving other rows and cache revision.
+    pub fn reload_one(&mut self, id: u64, latest: Option<Comment>) {
+        self.list.retain(|comment| comment.id != id);
+        if let Some(comment) = latest {
+            let at = self.list.iter().position(|c| c.id > id).unwrap_or(self.list.len());
+            self.list.insert(at, comment);
+        }
+        self.revision += 1;
+    }
+
+    /// Old files can contain duplicate live ids, which cannot identify one selected row.
+    pub fn id_is_ambiguous(&self, id: u64) -> bool {
+        self.list.iter().filter(|c| c.id == id).take(2).count() > 1
+    }
+
     /// Fold one event in. `edit` / `delete` of an id that is not live change nothing (a deleted
     /// comment stays deleted). An `add` of a deleted id brings that comment back (undo of a
     /// delete, v0.15.0); it goes in at its id's place, after any comment with the same or a
-    /// smaller id. Two `add`s with the same id (two windows wrote the same file) both stay; an
-    /// `edit` / `delete` then acts on both.
+    /// smaller id. Legacy events retain their original folding behavior when ids collided.
+    /// New events with an operation key affect at most one live entry.
     pub fn apply(&mut self, e: &Event) {
         self.max_id = self.max_id.max(e.id);
         self.revision += 1;
@@ -209,11 +251,47 @@ impl Comments {
             Kind::Edit => {
                 for c in self.list.iter_mut().filter(|c| c.id == e.id) {
                     *c = Comment::from_event(e);
+                    if e.operation.is_some() { break; }
                 }
             }
-            Kind::Delete => self.list.retain(|c| c.id != e.id),
+            Kind::Delete => {
+                if e.operation.is_none() { self.list.retain(|c| c.id != e.id); }
+                else if let Some(index) = self.list.iter().position(|c| c.id == e.id) { self.list.remove(index); }
+            }
         }
     }
+}
+
+/// Reserve a durable, disjoint range of ids for one TAKM. Run on a worker: the per-path lock
+/// also covers appends and marker saves in other instances of the same operating system.
+pub fn reserve_takm_ids(path: &Path, count: u64) -> io::Result<std::ops::RangeInclusive<u64>> {
+    if count == 0 { return Err(io::Error::other("empty Comment id reservation")); }
+    let target = crate::takm::canonical_target(path)?;
+    if !crate::takm::is_takm_path(&target) || crate::takm::in_input(&target) {
+        return Err(io::Error::other("unsafe Comment target"));
+    }
+    let _lock = crate::takm::lock_path(&target)?;
+    let parsed = crate::takm::read_comments(&target).map_err(io::Error::other)?;
+    let tail_max = parsed.events.iter().map(|event| event.id).max().unwrap_or(0);
+    let key = crate::takm::path_lock_key(&target)?;
+    let ledger = crate::takm::coordination_root().join(format!(".tak_viewer_comment_ids_{key}"));
+    let mut f = OpenOptions::new().read(true).append(true).create(true).open(ledger)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    let complete_end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+    let complete = std::str::from_utf8(&bytes[..complete_end]).map_err(io::Error::other)?;
+    let mut reserved_max = 0u64;
+    for line in complete.lines().filter(|line| !line.is_empty()) {
+        let value = line.parse::<u64>().map_err(io::Error::other)?;
+        reserved_max = reserved_max.max(value);
+    }
+    let start = tail_max.max(reserved_max).checked_add(1).ok_or_else(|| io::Error::other("Comment ids exhausted"))?;
+    let end = start.checked_add(count - 1).ok_or_else(|| io::Error::other("Comment ids exhausted"))?;
+    // A cut record never produced a returned reservation. Complete it as an empty separator.
+    if complete_end < bytes.len() { f.write_all(b"\n")?; }
+    writeln!(f, "{end}")?;
+    f.sync_all()?;
+    Ok(start..=end)
 }
 
 // ───────────────────────────── Paths and refusals ─────────────────────────────
@@ -228,6 +306,9 @@ pub fn path_for(tak: &Path) -> PathBuf {
 /// Why the app may not write `csv`, in plain Korean (None = it may). Looks at the disk (finds the
 /// repository above it): call it off the drawing thread.
 pub fn check_target(csv: &Path) -> Result<(), String> {
+    if crate::takm::in_input(csv) {
+        return Err("input/ 폴더 안 원본 파일이라 Comment를 쓰지 않아요.".into());
+    }
     if crate::tak::is_take_path(csv) {
         return Err(format!("Comment 파일 이름이 .tak으로 끝나서 쓰지 않아요: {}", csv.display()));
     }
@@ -332,10 +413,14 @@ pub fn header_line() -> String {
     COLUMNS.join(",") + EOL
 }
 
+fn token_marker(token: &str) -> String {
+    token.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// One event as a CSV line, with its line ending.
 pub fn encode(e: &Event) -> String {
     let fields = [
-        e.time.clone(),
+        e.operation.as_ref().map_or_else(|| e.time.clone(), |token| format!("@event:{}:{}", token_marker(token), e.time)),
         e.kind.as_str().to_owned(),
         e.id.to_string(),
         join_markers(&e.markers),
@@ -348,7 +433,12 @@ pub fn encode(e: &Event) -> String {
         e.file_a.clone(),
         e.file_b.clone(),
     ];
-    fields.iter().map(|f| field(f)).collect::<Vec<_>>().join(",") + EOL
+    let mut line = fields.iter().map(|f| field(f)).collect::<Vec<_>>().join(",");
+    if let Some(operation) = &e.operation {
+        line.push(',');
+        line.push_str(&field(&format!("operation={operation}")));
+    }
+    line + EOL
 }
 
 /// An event from the fields of one record (at least the known columns; more are ignored).
@@ -357,6 +447,18 @@ fn decode(f: &[String]) -> Option<Event> {
     if f.len() < COLUMNS.len() {
         return None;
     }
+    if f.len() > COLUMNS.len()
+        && f.last().is_some_and(|s| s == "__takm_truncated_v1__")
+        && f[f.len() - 12..f.len() - 1].iter().all(String::is_empty)
+    { return None; }
+    let operation = f.get(12).and_then(|s| s.strip_prefix("operation=")).map(str::to_owned);
+    let time = if let Some(tagged) = f[0].strip_prefix("@event:") {
+        let (token, time) = tagged.split_once(':')?;
+        if token.is_empty() || operation.as_deref().is_none_or(|op| token_marker(op) != token) { return None; }
+        time.to_owned()
+    } else {
+        f[0].clone()
+    };
     let kind = Kind::parse(&f[1])?;
     let id: u64 = f[2].trim().parse().ok()?;
     let frame = |s: &str| s.trim().parse::<i64>().ok();
@@ -367,7 +469,7 @@ fn decode(f: &[String]) -> Option<Event> {
         _ => return None,
     };
     Some(Event {
-        time: f[0].clone(),
+        time,
         kind,
         id,
         markers: split_markers(&f[3]),
@@ -379,6 +481,8 @@ fn decode(f: &[String]) -> Option<Event> {
         shown_b: f[9].clone(),
         file_a: f[10].clone(),
         file_b: f[11].clone(),
+        operation,
+        expected: None,
     })
 }
 
@@ -409,10 +513,9 @@ fn records(text: &str) -> Vec<(Vec<String>, bool)> {
         match c {
             '"' if cur.is_empty() => quoted = true,
             ',' => fields.push(std::mem::take(&mut cur)),
+            '\r' if chars.peek() != Some(&'\n') => cur.push(c),
             '\r' | '\n' => {
-                if c == '\r' && chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
+                if c == '\r' { chars.next(); }
                 fields.push(std::mem::take(&mut cur));
                 out.push((std::mem::take(&mut fields), true));
                 started = false;
@@ -511,7 +614,12 @@ pub(crate) fn ends_in_quote(text: &str) -> bool {
 /// Refuses `.tak` paths and the repository's `input/` (`check_target`).
 pub fn append(path: &Path, events: &[Event]) -> io::Result<()> {
     check_target(path).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-    let mut f = OpenOptions::new().read(true).append(true).create(true).open(path)?;
+    let target = crate::takm::canonical_target(path)?;
+    if crate::tak::is_take_path(&target) || crate::takm::is_takm_path(&target) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Comment 대상이 원본 파일을 가리켜요"));
+    }
+    let _lock = crate::takm::lock_path(&target)?;
+    let mut f = OpenOptions::new().read(true).append(true).create(true).open(target)?;
     let len = f.metadata()?.len();
     let mut out = String::new();
     if len == 0 {
@@ -528,6 +636,9 @@ pub fn append(path: &Path, events: &[Event]) -> io::Result<()> {
             if ends_in_quote(&String::from_utf8_lossy(&text)) {
                 out.push('"');
             }
+            // Even a fragment in the first field must put the discard marker beyond all
+            // twelve legacy columns.
+            out += INCOMPLETE_SUFFIX;
             out += EOL;
         }
     }
@@ -545,13 +656,16 @@ pub fn append(path: &Path, events: &[Event]) -> io::Result<()> {
 pub struct Done {
     pub tag: usize,
     pub path: PathBuf,
+    pub event: Event,
     pub result: Result<(), String>,
+    pub conflict: Option<crate::takm::CommentConflict>,
+    pub cancelled: bool,
 }
 
-struct Job {
-    tag: usize,
-    path: PathBuf,
-    event: Event,
+enum Job {
+    Event { tag: usize, path: PathBuf, event: Event, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool> },
+    Retry(PathBuf),
+    Barrier(Sender<Result<(), String>>),
 }
 
 /// One thread that appends events in the order they were sent (`append`, or
@@ -561,6 +675,7 @@ pub struct Writer {
     tx: Option<Sender<Job>>,
     done: Receiver<Done>,
     thread: Option<JoinHandle<()>>,
+    cancellations: std::sync::Mutex<std::collections::HashMap<usize, Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>>,
 }
 
 impl Writer {
@@ -568,25 +683,135 @@ impl Writer {
         let (tx, rx) = channel::<Job>();
         let (done_tx, done) = channel();
         let thread = std::thread::spawn(move || {
-            for job in rx {
-                // A `.takm`: its Comment tail (the viewer writes only these since `.takm` step ③);
-                // anything else: a comment file.
-                let one = std::slice::from_ref(&job.event);
-                let result = if crate::takm::is_takm_path(&job.path) {
-                    crate::takm::append_events(&job.path, one).map_err(|e| e.to_string())
-                } else {
-                    append(&job.path, one).map_err(|e| e.to_string())
+            let registration = shared_writers::Registration::new();
+            let registration_error = registration.as_ref().err().map(|e| e.to_string());
+            let mut registration = registration.ok();
+            let mut failed = std::collections::HashMap::<String, String>::new();
+            #[cfg(test)]
+            let mut timeout_pause_done = false;
+            loop {
+                let job = match rx.recv_timeout(Duration::from_millis(30)) {
+                    Ok(job) => job,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        #[cfg(test)]
+                        if !timeout_pause_done {
+                            if let (Some(paused), Some(release)) = (std::env::var_os("TAK_2C_TIMEOUT_PAUSED"), std::env::var_os("TAK_2C_TIMEOUT_RELEASE")) {
+                                let _ = std::fs::write(paused, b"paused");
+                                let until = Instant::now() + Duration::from_secs(10);
+                                while !Path::new(&release).exists() && Instant::now() < until { std::thread::sleep(Duration::from_millis(2)); }
+                            }
+                            timeout_pause_done = true;
+                        }
+                        let Some(r) = &registration else { continue };
+                        let Ok(requests) = r.requests() else { continue };
+                        if requests.is_empty() { continue; }
+                        // The request existed before this queue check. Any event submitted
+                        // before that save must already be queued; handle it before replying.
+                        match rx.try_recv() {
+                            Ok(job) => job,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                let _ = r.answer_requests(&requests, &failed);
+                                continue;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                if let Some(r) = registration.take() { r.retire(&failed); }
+                                break;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if let Some(r) = registration.take() { r.retire(&failed); }
+                        break;
+                    }
                 };
-                let _ = done_tx.send(Done { tag: job.tag, path: job.path, result });
+                let (tag, path, event, cancelled) = match job {
+                    Job::Event { tag, path, event, cancelled } => (tag, path, event, cancelled),
+                    Job::Barrier(done) => {
+                        let result = if let Some(e) = &registration_error { Err(e.clone()) }
+                                     else { failed.values().next().cloned().map_or(Ok(()), Err) };
+                        let _ = done.send(result);
+                        continue;
+                    }
+                    Job::Retry(path) => {
+                        let key = crate::takm::path_lock_key(&path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                        failed.remove(&key);
+                        continue;
+                    }
+                };
+                // The writer must register successfully before any Comment can be appended.
+                let one = std::slice::from_ref(&event);
+                let key = crate::takm::path_lock_key(&path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                let mut conflict = None;
+                let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    Err("Comment write cancelled".into())
+                } else if let Some(e) = &registration_error {
+                    Err(e.clone())
+                } else if let Some(reason) = failed.get(&key) {
+                    Err(reason.clone())
+                } else if crate::takm::is_takm_path(&path) {
+                    match crate::takm::append_events_guarded(&path, one, Some(&cancelled)) {
+                        Ok(Some(found)) => { conflict = Some(found); Err("Comment changed in another window".into()) }
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    append(&path, one).map_err(|e| e.to_string())
+                };
+                let was_cancelled = cancelled.load(std::sync::atomic::Ordering::Acquire);
+                if conflict.is_none() && !was_cancelled {
+                    if let Err(reason) = &result {
+                        failed.entry(key).or_insert_with(|| format!("{}: {reason}", path.display()));
+                    }
+                }
+                let _ = done_tx.send(Done { tag, path, event, result, conflict, cancelled: was_cancelled });
                 wake();
             }
         });
-        Writer { tx: Some(tx), done, thread: Some(thread) }
+        Writer { tx: Some(tx), done, thread: Some(thread), cancellations: std::sync::Mutex::new(std::collections::HashMap::new()) }
     }
 
     /// Queue one event for `path`. False when the thread is gone.
-    pub fn send(&self, tag: usize, path: PathBuf, event: Event) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send(Job { tag, path, event }).is_ok())
+    pub fn send(&self, tag: usize, path: PathBuf, mut event: Event) -> bool {
+        if event.operation.is_none() { event.operation = Some(new_operation_token()); }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut all) = self.cancellations.lock() {
+            let entries = all.entry(tag).or_default();
+            entries.retain(|old| old.strong_count() > 0);
+            entries.push(std::sync::Arc::downgrade(&cancelled));
+        }
+        self.tx.as_ref().is_some_and(|tx| tx.send(Job::Event { tag, path, event, cancelled }).is_ok())
+    }
+
+    /// Do not wait for a locked disk; queued work checks cancellation before writing.
+    pub fn cancel_tag(&self, tag: usize) {
+        if let Ok(mut all) = self.cancellations.lock() {
+            if let Some(entries) = all.remove(&tag) {
+                for entry in entries {
+                    if let Some(flag) = entry.upgrade() { flag.store(true, std::sync::atomic::Ordering::Release); }
+                }
+            }
+        }
+    }
+
+    /// Allow a failed path to accept a retry, before re-enqueuing its events in order.
+    pub fn retry(&self, path: PathBuf) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(Job::Retry(path)).is_ok())
+    }
+
+    /// Queue a barrier without blocking the UI. Move its receiver to a worker and wait there.
+    /// The first successful barrier also proves this instance is registered; enable Comment
+    /// submission only after that acknowledgement. Earlier failures also remain in `poll()`.
+    pub fn barrier(&self) -> io::Result<Receiver<Result<(), String>>> {
+        let (done, wait) = channel();
+        self.tx.as_ref().ok_or_else(|| io::Error::other("Comment writer stopped"))?
+            .send(Job::Barrier(done)).map_err(|_| io::Error::other("Comment writer stopped"))?;
+        Ok(wait)
+    }
+
+    /// Blocking convenience for non-UI callers.
+    pub fn drain(&self) -> io::Result<()> {
+        self.barrier()?.recv().map_err(|_| io::Error::other("Comment writer stopped"))?
+            .map_err(io::Error::other)
     }
 
     /// Writes finished since the last call.
@@ -611,6 +836,170 @@ impl Drop for Writer {
     }
 }
 
+// A writer registers on its own background thread. Save requests ask every registered writer
+// to drain its queue before acquiring the target locks. The registration lock makes process
+// death detectable; request/answer files are published only after complete writes.
+mod shared_writers {
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    fn nonce() -> String {
+        format!("{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), SEQUENCE.fetch_add(1, Ordering::Relaxed))
+    }
+    pub(super) fn root() -> PathBuf { crate::takm::coordination_root().join("tak_viewer_comment_registry_v1") }
+    fn root_lock(root: &Path) -> io::Result<File> {
+        std::fs::create_dir_all(root)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).open(root.join("registry.lock"))?;
+        file.lock()?;
+        Ok(file)
+    }
+    fn publish(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let tmp = path.with_file_name(format!(".publish.{}", nonce()));
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let result = file.write_all(bytes).and_then(|()| file.flush());
+        drop(file);
+        if let Err(e) = result { let _ = std::fs::remove_file(&tmp); return Err(e); }
+        let result = crate::takm::place_new(&tmp, path);
+        let _ = std::fs::remove_file(&tmp);
+        result
+    }
+    pub(super) struct Registration { id: String, root: PathBuf, path: PathBuf, file: Option<File> }
+    impl Registration {
+        pub(super) fn new() -> io::Result<Self> {
+            let root = root();
+            let _guard = root_lock(&root)?;
+            let id = nonce();
+            let path = root.join(format!("writer.{id}.lock"));
+            let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+            if let Err(e) = file.lock() { drop(file); let _ = std::fs::remove_file(&path); return Err(e); }
+            Ok(Self { id, root, path, file: Some(file) })
+        }
+        pub(super) fn requests(&self) -> io::Result<Vec<PathBuf>> {
+            let prefix = format!("request.{}.", self.id);
+            Ok(std::fs::read_dir(&self.root)?.filter_map(|item| item.ok())
+                .filter(|item| item.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|item| item.path()).collect())
+        }
+        pub(super) fn answer_requests(&self, requests: &[PathBuf], failed: &HashMap<String, String>) -> io::Result<()> {
+            for request in requests {
+                let name = request.file_name().ok_or_else(|| io::Error::other("missing request name"))?.to_string_lossy();
+                let keys = match std::fs::read(&request).and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).map_err(io::Error::other)) {
+                    Ok(keys) => keys,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                let failure = keys.iter().find_map(|key| failed.get(key)).cloned();
+                let body = serde_json::to_vec(&failure).map_err(io::Error::other)?;
+                let answer = self.root.join(name.replacen("request.", "answer.", 1));
+                match publish(&answer, &body) {
+                    Ok(()) => { let _ = std::fs::remove_file(request); }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => { let _ = std::fs::remove_file(request); }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        pub(super) fn retire(mut self, failed: &HashMap<String, String>) {
+            if let Ok(_guard) = root_lock(&self.root) {
+                if let Ok(requests) = self.requests() { let _ = self.answer_requests(&requests, failed); }
+                self.file.take();
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+    impl Drop for Registration {
+        fn drop(&mut self) { self.file.take(); }
+    }
+    fn writer_active(path: &Path) -> io::Result<bool> {
+        let probe = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match probe.try_lock() {
+            Ok(()) => Ok(false),
+            Err(e) => {
+                let error: io::Error = e.into();
+                if error.kind() == io::ErrorKind::WouldBlock { Ok(true) } else { Err(error) }
+            }
+        }
+    }
+    struct Pending { request: PathBuf, answer: PathBuf, writer: PathBuf }
+    impl Drop for Pending {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.request); let _ = std::fs::remove_file(&self.answer); }
+    }
+    pub(super) fn drain(paths: &[&Path]) -> io::Result<()> {
+        let mut keys = paths.iter().map(|p| crate::takm::path_lock_key(p)).collect::<io::Result<Vec<_>>>()?;
+        keys.sort(); keys.dedup();
+        let root = root();
+        let guard = root_lock(&root)?;
+        let mut pending = Vec::new();
+        for item in std::fs::read_dir(&root)? {
+            let item = item?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_prefix("writer.").and_then(|n| n.strip_suffix(".lock")) else { continue };
+            let writer = item.path();
+            let probe = match OpenOptions::new().read(true).write(true).open(&writer) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            match probe.try_lock() {
+                Ok(()) => { drop(probe); let _ = std::fs::remove_file(writer); continue; }
+                Err(e) => {
+                    let error: io::Error = e.into();
+                    if error.kind() != io::ErrorKind::WouldBlock { return Err(error); }
+                }
+            }
+            let request = root.join(format!("request.{id}.{}", nonce()));
+            let answer = root.join(request.file_name().unwrap().to_string_lossy().replacen("request.", "answer.", 1));
+            publish(&request, &serde_json::to_vec(&keys).map_err(io::Error::other)?)?;
+            pending.push(Pending { request, answer, writer });
+        }
+        drop(guard);
+        let until = Instant::now() + Duration::from_secs(20);
+        while !pending.is_empty() {
+            let mut i = 0;
+            while i < pending.len() {
+                match std::fs::read(&pending[i].answer) {
+                    Ok(bytes) => {
+                        let failure: Option<String> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                        if let Some(failure) = failure { return Err(io::Error::other(failure)); }
+                        pending.swap_remove(i);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        if !writer_active(&pending[i].writer)? && !pending[i].answer.exists() {
+                            return Err(io::Error::other("Comment writer stopped during save barrier"));
+                        }
+                        i += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if !pending.is_empty() {
+                if Instant::now() >= until { return Err(io::Error::new(io::ErrorKind::TimedOut, "Comment writer did not drain")); }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Wait on a worker until every registered instance has drained earlier Comment events.
+pub(crate) fn drain_shared_writers(paths: &[&Path]) -> io::Result<()> { shared_writers::drain(paths) }
+
+#[cfg(test)]
+pub(crate) fn test_shared_request_for_process(pid: u32) -> bool {
+    let prefix = format!("request.{pid}-");
+    std::fs::read_dir(shared_writers::root()).ok().is_some_and(|entries| entries.flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +1018,8 @@ mod tests {
             shown_b: String::new(),
             file_a: "a.tak|1234".into(),
             file_b: String::new(),
+            operation: None,
+            expected: None,
         }
     }
 
@@ -658,6 +1049,21 @@ mod tests {
         // Plain fields are not quoted; the header is the column list.
         assert_eq!(encode(&ev(Kind::Delete, 3, &["M"], 5, 5)), "2026-11-13T14:05:09+09:00,delete,3,M,5,5,,,1,,a.tak|1234,\r\n");
         assert_eq!(header_line(), "time,kind,comment_id,markers,frame_start,frame_end,comment_type,comment_text,shown_a,shown_b,file_a,file_b\r\n");
+    }
+
+    #[test]
+    fn old_keyed_and_unkeyed_lines_still_replay_and_new_tokens_are_unique() {
+        let old = "t,add,1,M,1,2,,,1,,a.takm|1,,operation=old-token\r\nt,add,2,N,3,4,,,1,,a.takm|1,\r\n";
+        let parsed = parse(&(header_line() + old));
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(parsed.events[0].operation.as_deref(), Some("old-token"));
+        assert!(parsed.events[1].operation.is_none());
+        assert_eq!(parsed.comments().len(), 2);
+        let base = parsed.comments().get(1).unwrap().clone();
+        let a = Event::of(Kind::Edit, &base, "t".into(), "a".into());
+        let b = Event::of(Kind::Edit, &base, "t".into(), "a".into());
+        assert_ne!(a.operation, b.operation);
+        assert_eq!(parse(&encode(&a)).events, vec![a]);
     }
 
     #[test]
@@ -693,9 +1099,9 @@ mod tests {
 
     #[test]
     fn a_comment_without_markers_round_trips_as_no_markers_and_old_lines_read_the_same() {
-        // A comment can be created without selected markers.
         let c = Comment { id: 4, markers: vec![], start: 2, end: 9, comment_type: String::new(), text: String::new() };
-        let add = Event::of(Kind::Add, &c, "2026-11-13T14:05:09+09:00".into(), "a.tak|1234".into());
+        let mut add = Event::of(Kind::Add, &c, "2026-11-13T14:05:09+09:00".into(), "a.tak|1234".into());
+        add.operation = None; // This assertion checks the legacy 12-column format.
         let line = encode(&add);
         assert_eq!(line, "2026-11-13T14:05:09+09:00,add,4,,2,9,,,1,,a.tak|1234,\r\n", "an empty markers cell");
         let del = Event::of(Kind::Delete, &c, "t".into(), "a.tak|1234".into());
@@ -732,12 +1138,18 @@ mod tests {
         // A deleted comment stays deleted (a later edit of it changes nothing).
         c.apply(&ev(Kind::Edit, 1, &["A"], 4, 4));
         assert!(c.is_empty());
-        // Two adds with one id (two windows): both stay, a delete removes both.
+        // A new operation targets only one entry, even in a legacy collision.
         let mut c = Comments::from_events(&[ev(Kind::Add, 4, &["A"], 0, 0), ev(Kind::Add, 4, &["B"], 1, 1)]);
         assert_eq!(c.len(), 2);
         let r = c.revision();
-        c.apply(&ev(Kind::Delete, 4, &[], 0, 0));
-        assert!(c.is_empty() && c.revision() > r, "every change moves the revision");
+        let mut delete = ev(Kind::Delete, 4, &[], 0, 0);
+        delete.operation = Some("new-operation".into());
+        c.apply(&delete);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.list()[0].markers, vec!["B"]);
+        assert!(c.revision() > r, "every change moves the revision");
+        let legacy = Comments::from_events(&[ev(Kind::Add, 4, &["A"], 0, 0), ev(Kind::Add, 4, &["B"], 1, 1), ev(Kind::Delete, 4, &[], 0, 0)]);
+        assert!(legacy.is_empty(), "old histories retain their original replay behavior");
         // Frames written in the wrong order are put in order.
         let p = parse(&encode(&ev(Kind::Add, 1, &["A"], 9, 3)));
         assert_eq!((p.events[0].start, p.events[0].end), (3, 9));
@@ -765,7 +1177,8 @@ mod tests {
         assert_eq!((ids(&c), c.next_id()), (vec![1, 2, 3], 4));
         // `Event::of` writes a comment's fields as they are.
         let e = Event::of(Kind::Delete, c.get(2).unwrap(), "t".into(), "a.tak|7".into());
-        assert_eq!(encode(&e), "t,delete,2,B,4,9,,,1,,a.tak|7,\r\n");
+        assert!(e.operation.is_some());
+        assert_eq!(parse(&encode(&e)).events, vec![e]);
         // A file whose ids are out of order (hand edit) folds into id order.
         let c = Comments::from_events(&[ev(Kind::Add, 5, &["A"], 0, 0), ev(Kind::Add, 3, &["B"], 0, 0), ev(Kind::Add, 3, &["C"], 1, 1)]);
         assert_eq!(c.list().iter().map(|c| (c.id, c.markers[0].as_str())).collect::<Vec<_>>(), vec![(3, "B"), (3, "C"), (5, "A")]);
@@ -813,7 +1226,7 @@ mod tests {
         let p = |s: &str| path_for(Path::new(s));
         assert_eq!(p("a.tak"), PathBuf::from("a.comments.csv"));
         assert_eq!(p(r"C:\data\x\A.TAK"), PathBuf::from(r"C:\data\x\A.comments.csv"), "upper-case .TAK");
-        assert_eq!(p("/d/251209_S01 perturb 20_001.tak"), PathBuf::from("/d/251209_S01 perturb 20_001.comments.csv"));
+        assert_eq!(p("/d/000000_S01 perturb 20_001.tak"), PathBuf::from("/d/000000_S01 perturb 20_001.comments.csv"));
         assert_eq!(p("/d/a.b.tak"), PathBuf::from("/d/a.b.comments.csv"), "only the last extension goes");
         assert_eq!(p("/d/a.tak.tak"), PathBuf::from("/d/a.tak.comments.csv"));
         assert_eq!(p("/d/noext"), PathBuf::from("/d/noext.comments.csv"));
@@ -834,7 +1247,6 @@ mod tests {
 
     #[test]
     fn nothing_is_written_inside_the_repository_input_folder() {
-        // A fake repository: AGENTS.md and apps/AGENTS.md at its root.
         let root = temp_dir("repo");
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("input").join("raw")).unwrap();
@@ -915,6 +1327,79 @@ mod tests {
     }
 
     #[test]
+    fn two_writers_reserve_distinct_ids_and_edit_delete_one_comment() {
+        let dir = temp_dir("unique_writers");
+        let source = dir.join("input.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|n| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let id = *reserve_takm_ids(&path, 8).unwrap().start();
+                let writer = Writer::spawn(Box::new(|| {}));
+                let mut add = ev(Kind::Add, id, &[if n == 0 { "A" } else { "B" }], 0, 2);
+                assert!(writer.send(n, path.clone(), add.clone()));
+                writer.drain().unwrap();
+                if n == 0 {
+                    add.kind = Kind::Edit;
+                    add.text = "edited".into();
+                    assert!(writer.send(n, path, add));
+                    writer.drain().unwrap();
+                }
+                id
+            })
+        }).collect();
+        let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_ne!(ids[0], ids[1]);
+        let before = crate::takm::read_comments(&path).unwrap().comments();
+        assert_eq!(before.len(), 2);
+        assert_eq!(before.get(ids[0]).unwrap().text, "edited");
+        crate::takm::append_events(&path, &[ev(Kind::Delete, ids[0], &[], 0, 0)]).unwrap();
+        let after = crate::takm::read_comments(&path).unwrap().comments();
+        assert!(after.get(ids[0]).is_none());
+        assert_eq!(after.get(ids[1]).unwrap().markers, vec!["B"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn comment_id_reservations_are_shared_between_processes() {
+        if let Some(path) = std::env::var_os("TAK_4B_CHILD_COMMENT_PATH") {
+            let path = PathBuf::from(path);
+            let result = PathBuf::from(std::env::var_os("TAK_4B_CHILD_COMMENT_RESULT").unwrap());
+            let id = *reserve_takm_ids(&path, 1).unwrap().start();
+            let writer = Writer::spawn(Box::new(|| {}));
+            assert!(writer.send(1, path, ev(Kind::Add, id, &["child"], 0, 0)));
+            writer.drain().unwrap();
+            std::fs::write(result, id.to_string()).unwrap();
+            return;
+        }
+        let dir = temp_dir("unique_processes");
+        let source = dir.join("input.tak");
+        std::fs::write(&source, crate::sample_tak::sample_tak()).unwrap();
+        let path = crate::takm::convert(&source, None).unwrap().out;
+        let result = dir.join("child_id");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("comments::tests::comment_id_reservations_are_shared_between_processes")
+            .env("TAK_4B_CHILD_COMMENT_PATH", &path).env("TAK_4B_CHILD_COMMENT_RESULT", &result)
+            .stdout(std::process::Stdio::null()).spawn().unwrap();
+        let id = *reserve_takm_ids(&path, 1).unwrap().start();
+        let writer = Writer::spawn(Box::new(|| {}));
+        assert!(writer.send(0, path.clone(), ev(Kind::Add, id, &["parent"], 0, 0)));
+        writer.drain().unwrap();
+        assert!(child.wait().unwrap().success());
+        let other: u64 = std::fs::read_to_string(result).unwrap().parse().unwrap();
+        assert_ne!(id, other);
+        let live = crate::takm::read_comments(&path).unwrap().comments();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live.get(id).unwrap().markers, vec!["parent"]);
+        assert_eq!(live.get(other).unwrap().markers, vec!["child"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn local_time_is_written_as_iso_8601_with_its_offset() {
         assert_eq!(iso_time([2026, 11, 13, 14, 5, 9], 540), "2026-11-13T14:05:09+09:00");
         assert_eq!(iso_time([2026, 1, 2, 3, 4, 5], -330), "2026-01-02T03:04:05-05:30");
@@ -950,7 +1435,9 @@ mod tests {
         }
         // The known names as written (one plain cell each; the unknown one above is quoted).
         let c = Comment { comment_type: "Needs visual check".into(), ..base.clone() };
-        assert_eq!(encode(&Event::of(Kind::Edit, &c, "t".into(), "a.tak|1".into())), "t,edit,3,LKNE,10,20,Needs visual check,n,1,,a.tak|1,\r\n");
+        let mut legacy_edit = Event::of(Kind::Edit, &c, "t".into(), "a.tak|1".into());
+        legacy_edit.operation = None;
+        assert_eq!(encode(&legacy_edit), "t,edit,3,LKNE,10,20,Needs visual check,n,1,,a.tak|1,\r\n");
         // Files from before step 5 (always an empty type) read as no type.
         let old = "2026-11-13T16:01:10+09:00,add,1,LKNE,300,1400,,,1,,a.tak|32663605,\r\n";
         let p = parse(&(header_line() + old));

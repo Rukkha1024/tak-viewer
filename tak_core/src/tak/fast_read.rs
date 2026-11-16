@@ -1,9 +1,3 @@
-//! Markers-first TAK reader. Stage 1 reads the container, metadata, nodes, and marker
-//! channels using positional reads, skipping camera and analog data. Stage 2 reads analog
-//! channels on a background thread. Both stages reuse the standard container and channel
-//! parsers; unexpected layouts fall back to `read_take`. TAK reads fail if file size or
-//! modification time changes. TAKM reads allow a growing comment tail, but require that
-//! the fixed portion remain present.
 
 use super::channels::{channel_dim, CHANNELS_HEADER};
 use super::container::{u16_at, u32_at, utf16le_strict, Container, END, MAGIC};

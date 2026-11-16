@@ -1,6 +1,6 @@
 [package]
 name = "tak_core"
-description = "Read-only OptiTrack .tak reader and view data (no GUI)"
+description = "OptiTrack TAK reader, marker editing, and view data (no GUI)"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

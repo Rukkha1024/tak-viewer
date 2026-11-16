@@ -235,3 +235,131 @@ pub fn sample_tak() -> Vec<u8> {
         ("Calibration.dat", noise(1000, 9)),
     ])
 }
+
+/// Deterministic synthetic recording with a force plate and an embedded skeleton.
+/// This is fabricated test data, not a captured Motive compatibility reference.
+pub fn sample_tak_with_devices() -> Vec<u8> {
+    let text = |out: &mut Vec<u8>, value: &str| {
+        out.extend((value.encode_utf16().count() as u16).to_le_bytes());
+        out.extend(utf16(value));
+    };
+    let asset = [4u8; 16];
+    let mut nodes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    for (name, uid) in [("LKNE", 1u8), ("RKNE", 2), ("Unl", 3)] {
+        let mut marker = marker_node(name, uid);
+        if uid < 3 {
+            let n = marker.len();
+            marker[n - 20..n - 4].copy_from_slice(&asset);
+            marker[n - 4..].copy_from_slice(&(uid as u32).to_le_bytes());
+        }
+        nodes.extend(marker);
+    }
+    nodes.extend(b"\x08\x00Skeleton");
+    text(
+        &mut nodes,
+        r#"{"properties":[{"name":"NodeName","value":"Synthetic skeleton"},{"name":"SkeletonMarkersetName","value":"Synthetic (2)"}]}"#,
+    );
+    nodes.extend([0; 19]);
+    nodes.extend(asset);
+    nodes.extend(b"SKL");
+    nodes.extend(123u32.to_le_bytes());
+    nodes.extend(2039u32.to_le_bytes());
+    text(&mut nodes, "Synthetic skeleton");
+    nodes.extend(0u16.to_le_bytes());
+    nodes.extend(1.7f32.to_le_bytes());
+    nodes.extend(asset);
+    nodes.extend(2u32.to_le_bytes());
+    for (slot, name) in [(1u32, "LKNE"), (2, "RKNE")] {
+        nodes.extend(1u32.to_le_bytes());
+        nodes.extend(slot.to_le_bytes());
+        for v in [0.0f32, 0.5, 0.0, 0.0, 0.0, 0.0] {
+            nodes.extend(v.to_le_bytes());
+        }
+        nodes.extend((slot - 1).to_le_bytes());
+        nodes.extend(1u32.to_le_bytes());
+        nodes.extend([0; 8]); // finite joint span
+        nodes.extend(asset);
+        nodes.extend(slot.to_le_bytes());
+        text(&mut nodes, name);
+        nodes.extend([0; 16]);
+        for v in [0.1f32, 0.0, 0.0] {
+            nodes.extend(v.to_le_bytes());
+        }
+        nodes.push(1);
+        nodes.extend([0; 16]); // finite constraint extras
+        nodes.extend(0u32.to_le_bytes()); // no secondary constraints
+    }
+    nodes.extend(2u32.to_le_bytes());
+    for slot in [1u32, 2] {
+        nodes.extend(asset);
+        nodes.extend(slot.to_le_bytes());
+    }
+    nodes.extend([0; crate::tak::skeleton::STICK_TAIL_GAP]);
+    nodes.extend(crate::tak::skeleton::STICK_MARKER);
+    nodes.extend(1u32.to_le_bytes());
+    for slot in [1u32, 2] {
+        nodes.extend(asset);
+        nodes.extend(slot.to_le_bytes());
+    }
+    for v in [0.2f32, 0.8, 0.4] {
+        nodes.extend(v.to_le_bytes());
+    }
+    nodes.extend(2u32.to_le_bytes());
+    for slot in [1u32, 2] {
+        nodes.extend(asset);
+        nodes.extend(slot.to_le_bytes());
+        for v in [0.2f32, 0.8, 0.4] {
+            nodes.extend(v.to_le_bytes());
+        }
+    }
+    nodes.extend(b"ENDS");
+    // Plate discovery uses the four-space JSON prefix from the recorded format.
+    nodes.extend(utf16("{\n    \"properties\": [\n"));
+    nodes.extend(utf16(
+        r#"{"name":"NodeName","value":"Synthetic plate"},
+{"name":"DeviceNode_DeviceType","value":2},
+{"name":"DeviceNode_Corner 0","value":"0,0,1"},
+{"name":"DeviceNode_Corner 1","value":"1,0,1"},
+{"name":"DeviceNode_Corner 2","value":"1,0,3"},
+{"name":"DeviceNode_Corner 3","value":"0,0,3"}]}"#,
+    ));
+    let mut recs: Vec<Vec<u8>> = (0..6).map(|n| analog(n, 300)).collect();
+    recs.extend([analog(0, 300), analog(1, 300)]);
+    recs.extend([
+        translation(1, 0..300),
+        translation(2, (0..300).filter(|f| !(100..140).contains(f))),
+        translation(3, 50..60),
+    ]);
+    let mut channels = CHANNELS_HEADER.to_vec();
+    channels.extend((recs.len() as u32).to_le_bytes());
+    for r in recs {
+        channels.extend(r);
+    }
+    let original = sample_tak();
+    let container =
+        crate::tak::container::Container::parse(&original).expect("synthetic container");
+    let streams = container
+        .read_named(&[
+            "Nodes.dat",
+            "DeviceData/Track 0.trk",
+            "DeviceData/Track 1.trk",
+            "Channels.dat",
+            "MetaData.dat",
+            "Calibration.dat",
+        ])
+        .expect("synthetic streams");
+    let streams: Vec<(&str, Vec<u8>)> = streams
+        .iter()
+        .map(|(name, bytes)| {
+            (
+                name.as_str(),
+                match name.as_str() {
+                    "Nodes.dat" => nodes.clone(),
+                    "Channels.dat" => channels.clone(),
+                    _ => bytes.clone(),
+                },
+            )
+        })
+        .collect();
+    cfb(&streams)
+}

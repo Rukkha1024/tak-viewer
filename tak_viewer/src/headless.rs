@@ -57,7 +57,6 @@ pub static BENCH_SELECT: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// curve (or none) every second frame, the worst case for the hover's thick curves.
 pub static BENCH_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `--bench [frames] <file.tak>…` measures loading and frame rendering performance.
 pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [f32; 2]) -> i32 {
     let ctx = egui::Context::default();
     let start = Instant::now();
@@ -170,19 +169,51 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
 
 /// Returns the process exit code: 0 = done, 1 = failed or timed out.
 pub fn run(initial: Vec<PathBuf>, auto: Option<AutoShot>, capture: Option<CapturePlan>, size: [f32; 2]) -> i32 {
+    run_with_probe(initial, auto, capture, size, None)
+}
+
+pub fn run_ssh(probe: crate::ssh_probe::Probe, auto: Option<AutoShot>) -> i32 {
+    run_with_probe(vec![], auto, None, [1600.0, 960.0], Some(probe))
+}
+fn run_with_probe(initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Option<CapturePlan>, size: [f32; 2], mut probe: Option<crate::ssh_probe::Probe>) -> i32 {
     let ctx = egui::Context::default();
-    let mut app = TakViewerApp::build(&ctx, None, initial, auto, capture);
+    let initial_auto = if probe.is_some() { None } else { auto.take() };
+    let mut app = TakViewerApp::build(&ctx, None, initial, initial_auto, capture);
+    if let Some(p) = &mut probe { if let Err(e) = p.start(&mut app, &ctx) { eprintln!("{e}"); return 1; } }
     let mut textures = Textures::default();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(size[0], size[1]));
     let start = Instant::now();
     let mut events: Vec<Event> = Vec::new();
     loop {
-        if start.elapsed() > TIMEOUT {
+        if probe.is_none() && start.elapsed() > TIMEOUT {
             eprintln!("headless: stopped after {} s without finishing", TIMEOUT.as_secs());
             return 1;
         }
         let raw = frame_input(screen, start, std::mem::take(&mut events));
         let out = ctx.run(raw, |ctx| app.frame(ctx));
+        if let Some(p) = &mut probe {
+            match p.tick(&mut app, &ctx) {
+                crate::ssh_probe::Step::Escape => events.push(Event::Key { key:egui::Key::Escape, physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }),
+                crate::ssh_probe::Step::Capture => { if let Some(auto) = auto.take() { app.ssh_probe_capture(auto); } },
+                crate::ssh_probe::Step::Done(mut code) => {
+                    // Errors and cancellation still produce reviewable evidence of the live view.
+                    if let Some(auto) = auto.take() {
+                        textures.set(&out.textures_delta);
+                        let ppp = out.pixels_per_point;
+                        let px = [(size[0] * ppp).round() as usize, (size[1] * ppp).round() as usize];
+                        let prims = ctx.tessellate(out.shapes.clone(), ppp);
+                        let img = soft_render::paint(&prims, &textures, px, ppp, CLEAR);
+                        let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+                        if let Err(e) = crate::shot::save_png(&auto.out, px[0], px[1], &rgba) { eprintln!("screenshot: {e}"); code = 1; }
+                    }
+                    app.ssh_probe_disconnect(&p.alias);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while app.ssh_probe_workers_running() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+                    return if app.ssh_probe_workers_running() { 1 } else { code };
+                }
+                crate::ssh_probe::Step::Wait => (),
+            }
+        }
         textures.set(&out.textures_delta);
         let commands = out.viewport_output.get(&ViewportId::ROOT).map(|v| v.commands.as_slice()).unwrap_or(&[]);
         let close = commands.iter().any(|c| matches!(c, ViewportCommand::Close));
@@ -196,6 +227,12 @@ pub fn run(initial: Vec<PathBuf>, auto: Option<AutoShot>, capture: Option<Captur
         }
         textures.free(&out.textures_delta);
         if close {
+            if let Some(p) = &probe {
+                app.ssh_probe_disconnect(&p.alias);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while app.ssh_probe_workers_running() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+                if app.ssh_probe_workers_running() { return 1; }
+            }
             return i32::from(app.failed);
         }
         if !shot {

@@ -2,7 +2,7 @@
 
 `.takm`은 TAK에서 카메라 기록 `DeviceData/Track 0.trk`만 제외한 사본과 주석을 담는 파일이에요. 마커, 이름, 힘판, EMG 등 다른 스트림은 바이트 그대로 보존하도록 설계했어요. Motive 호환성은 검증하지 않았어요.
 
-파일은 변환할 때 한 번 쓰는 고정 부분과 그 뒤에 덧붙이는 UTF-8 Comment 꼬리로 나뉘어요. 기존 `.takm`은 덮어쓰지 않아요. 예전 형식 `TAKM\r\n\x1a\n`은 현재 형식과 달라서 읽지 않아요. 압축은 사용하지 않아요.
+파일은 고정 부분과 그 뒤의 UTF-8 Comment 꼬리로 나뉘어요. 현재 변환은 기존 `.takm`을 덮어쓰지 않아요. 예전 형식 `TAKM\r\n\x1a\n`은 현재 형식과 달라서 읽지 않아요. 압축은 사용하지 않아요.
 
 변환할 때 TAK 옆 `<이름>.comments.csv`가 있으면 완전한 Comment 줄을 꼬리에 가져와요. 첫 줄은 칸 이름이고 잘린 마지막 줄은 제외해요. CSV는 읽기만 해요. `.takm`에서 새 주석을 저장할 때 `file_a`는 `<.takm 이름>|<고정 길이 F>`를 사용해요. 가져온 줄은 원래 값을 유지해요. TAK에는 주석을 저장하지 않아요.
 
@@ -21,9 +21,7 @@
 | 64 | … | 남긴 stream의 byte를 TAK 안 차례대로 빈틈없이 이어 붙임(각 자리 · 길이는 표에) |
 | `T` | 표 길이 | stream 표, UTF-8 JSON(아래) |
 | `F` | 32 | SHA-256(byte `0` ~ `F`−1) |
-| `F`+32 | 끝까지 | Comment 꼬리: 주석 CSV와 같은 줄(UTF-8, 줄 끝 CRLF, 첫 줄은 칸 이름, BOM 없음). 끝에 덧붙이기만 해요 |
-
-byte `0` ~ `F`+32−1은 바꿀 때 한 번 쓰고 다시는 안 고쳐요. 꼬리에 줄을 덧붙여도 그 SHA-256은 그대로 맞아요.
+| `F`+32 | 끝까지 | Comment 꼬리: 주석 CSV와 같은 줄(UTF-8, 줄 끝 CRLF, 첫 줄은 칸 이름, BOM 없음) |
 
 stream 표는 UTF-8 JSON이에요. 아래는 구조를 설명하기 위한 가상 예시예요. 실제 표는 한 줄이며 칸 순서는 달라도 돼요.
 
@@ -46,7 +44,7 @@ stream 표는 UTF-8 JSON이에요. 아래는 구조를 설명하기 위한 가�
 
 ## 읽기와 쓰기
 
-`tak_viewer.exe --to-takm sample.tak [--out-dir <폴더>]`로 변환해요. 임시 파일을 완성한 뒤 이름을 바꾸며, 입력 TAK는 읽기만 해요. 이미 존재하는 `.takm`, 보호된 `input/`, TAK가 아닌 입력은 거부해요. 파일마다 결과를 표시하며 실패가 있으면 종료 코드 1, 잘못된 옵션은 2예요.
+`tak_viewer.exe --to-takm sample.tak [--out-dir <폴더>]`로 변환해요. 임시 파일을 완성한 뒤 이름을 바꿔요. 이미 존재하는 `.takm`, 보호된 `input/`, TAK가 아닌 입력은 거부해요. 파일마다 결과를 표시하며 실패가 있으면 종료 코드 1, 잘못된 옵션은 2예요.
 
 `tak::read_take`와 `tak::fast_read::read_take_fast`가 `.takm`을 읽어요. `--dump` 결과에는 `"file_kind": "takm"`이 추가돼요. `takm::read_tail` · `read_tail_text` · `read_comments`는 꼬리를 읽고, `append_lines` · `append_events`는 꼬리에 줄을 더해요. `verify_fixed`는 고정 부분의 SHA-256을 확인하고 `check_tail`은 쓰기 가능 여부를 검사해요.
 
@@ -73,3 +71,8 @@ tail = data[fixed_len + 32:].decode('utf-8')
 for line in tail.split('\n')[:-1]:   # 마지막 조각 = 줄바꿈이 없는(잘린) 줄이라 뺌
     print('  |', line.rstrip('\r'))
 ```
+
+<!-- public-features-v0.32 -->
+## 마커 편집 저장
+
+마커 편집을 저장할 때 변경한 마커 스트림을 새로 쓰고 나머지 스트림과 주석을 보존하도록 설계했어요. 처음 TAK에서 저장하면 별도 `.takm`을 만들어요. 이미 열린 `.takm`은 편집을 저장할 때 갱신될 수 있어요. 같은 파일을 서로 다른 경로나 계정에서 동시에 고치는 경우는 보장하지 않아요.

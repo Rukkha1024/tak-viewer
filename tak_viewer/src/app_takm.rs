@@ -1,7 +1,3 @@
-//! Convert a TAK to TAKM in the background from the comments pane, file menu, or Explorer.
-//! The original is read only; a sibling comments CSV, when present, is imported. Existing
-//! TAKM files are opened without overwrite, and protected input paths are refused. Views
-//! switch to the converted file while preserving their state; undo restores the TAK view.
 
 use super::*;
 use std::sync::mpsc::{channel, Receiver};
@@ -55,6 +51,7 @@ impl TakViewerApp {
     /// looked at here (the thread does).
     pub(super) fn takm_allowed(&self, tak: Option<&Path>) -> Result<PathBuf, String> {
         let Some(tak) = tak else { return Err("지금 화면에 TAK를 열면 쓸 수 있어요.".into()) };
+        if remote_ui::is_remote_key(tak) { return Err("원격 파일은 서버에서 .takm으로 만들어 주세요.".into()); }
         if !tak_core::tak::is_take_path(tak) {
             return Err("지금 화면의 파일이 TAK가 아니에요(이미 .takm).".into());
         }
@@ -136,8 +133,16 @@ impl TakViewerApp {
     /// selection, plate), range and file laid over it. A file open (Ctrl+Z puts the TAK back).
     /// When `takm` is already open in a view, that view is chosen instead. False when no view
     /// showed `tak`.
-    fn switch_to_takm(&mut self, ctx: &egui::Context, tak: &Path, takm: &Path) -> bool {
+    pub(super) fn switch_to_takm(&mut self, ctx: &egui::Context, tak: &Path, takm: &Path) -> bool {
+        if self.save_destination_reserved(takm) {
+            self.takm_note = Some(("Save in progress for this file.".into(), ctx.input(|i| i.time)));
+            return true;
+        }
         let slots: Vec<usize> = self.open_views().into_iter().filter(|&k| self.views[k].path() == Some(tak)).collect();
+        if let Some(&slot) = slots.first() {
+            if self.guard_dirty(slot, marker_edit::PendingTransition::SwitchTakm { tak: tak.to_path_buf(), takm: takm.to_path_buf() }) { return true; }
+            self.cancel_pending_marker_job(slot);
+        }
         if let Some(k) = self.view_of(takm) {
             if !slots.is_empty() {
                 self.activate(k);

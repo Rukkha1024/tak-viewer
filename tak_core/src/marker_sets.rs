@@ -1,6 +1,3 @@
-//! Observed marker-set data, not a vendor specification.
-//! When a supported asset has no stored sticks, the viewer uses this fallback table for
-//! drawing only. Files are never changed.
 
 use crate::tak::MarkerStick;
 
