@@ -29,8 +29,13 @@ struct Focus {
 
 fn id() -> egui::Id { egui::Id::new("clicked_shortcut_focus") }
 
+/// egui's wants_keyboard_input also includes buttons and menu items.
+pub(crate) fn text_input_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
 fn input_priority(ctx: &egui::Context) -> bool {
-    ctx.wants_keyboard_input() || ctx.memory(|m| m.any_popup_open()) || ctx.input(|i| {
+    text_input_focused(ctx) || ctx.memory(|m| m.any_popup_open()) || ctx.input(|i| {
         !i.focused || i.key_down(Key::M) || i.events.iter().any(|event| matches!(event,
             egui::Event::Key { key: Key::M, pressed: true, modifiers, .. } if modifiers.is_none()))
     })

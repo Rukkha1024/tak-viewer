@@ -2026,9 +2026,9 @@ impl TakViewerApp {
         }
     }
 
-    /// Keys belong to a text field now (egui's keyboard focus): the app's keys do nothing.
+    /// Only actual text editors own typing shortcuts; focused buttons/menus do not.
     fn typing(&self, ctx: &egui::Context) -> bool {
-        self.layout_strip.is_renaming() || ctx.wants_keyboard_input()
+        self.layout_strip.is_renaming() || key_focus::text_input_focused(ctx)
     }
 
     /// Right click on a block: a delete line (with the comment's fields, for people reading the
@@ -4077,6 +4077,31 @@ impl TakViewerApp {
 }
 
 impl eframe::App for TakViewerApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // egui processes Tab focus traversal before update(), even with Ctrl held.
+        // Normalize to our existing PageUp/Down path before that happens. The frame's
+        // popup, capture, held-M and dirty-dialog guards still decide whether to switch.
+        let typing = self.typing(ctx);
+        let mut releases = Vec::new();
+        raw.events.retain_mut(|event| {
+            if let egui::Event::Key { key, physical_key, pressed, modifiers, .. } = event {
+                if *key == Key::Tab && (modifiers.ctrl || modifiers.command) && !modifiers.alt {
+                    if typing || !*pressed { return false; }
+                    *key = if modifiers.shift { Key::PageUp } else { Key::PageDown };
+                    *physical_key = None;
+                    modifiers.shift = false;
+                    // A synthetic tap must not leave PageUp/Down held if Ctrl or Shift
+                    // is released before the physical Tab key-up arrives.
+                    releases.push(egui::Event::Key {
+                        key: *key, physical_key: None, pressed: false, repeat: false, modifiers: *modifiers,
+                    });
+                }
+            }
+            true
+        });
+        raw.events.extend(releases);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame(ctx);
     }
@@ -4152,6 +4177,7 @@ mod tests {
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
     include!("app_layout_tabs_tests.rs");
+    include!("app_tab_input_tests.rs");
     include!("app_freshness_tests.rs");
     include!("app_hidden_work_tests.rs");
 
@@ -5390,7 +5416,8 @@ mod tests {
             .flat_map(|&(modifiers, key)| [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }))
             .collect();
         let modifiers = keys.first().map_or(Modifiers::NONE, |k| k.0);
-        let raw = egui::RawInput { screen_rect: Some(screen), focused: true, modifiers, events, ..Default::default() };
+        let mut raw = egui::RawInput { screen_rect: Some(screen), focused: true, modifiers, events, ..Default::default() };
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
         let _ = ctx.run(raw, |ctx| app.frame(ctx));
     }
 
@@ -5487,7 +5514,9 @@ mod tests {
     /// One frame with these input events; returns what was painted.
     fn frame_with(ctx: &egui::Context, app: &mut TakViewerApp, events: Vec<egui::Event>) -> egui::FullOutput {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 960.0));
-        ctx.run(egui::RawInput { screen_rect: Some(screen), focused: true, events, ..Default::default() }, |ctx| app.frame(ctx))
+        let mut raw = egui::RawInput { screen_rect: Some(screen), focused: true, events, ..Default::default() };
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        ctx.run(raw, |ctx| app.frame(ctx))
     }
 
     /// Mouse over `at`, press, release, then one more frame (its output is returned).

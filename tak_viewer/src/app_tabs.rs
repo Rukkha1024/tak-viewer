@@ -575,9 +575,9 @@ impl TabStrip {
                                     .x
                             });
                             let width = (text_width + 52.0).clamp(112.0, 260.0);
-                            let (rect, _) = ui.allocate_exact_size(
+                            let (rect, chip) = ui.allocate_exact_size(
                                 egui::vec2(width, TAB_STRIP_HEIGHT),
-                                Sense::hover(),
+                                Sense::click(),
                             );
                             drawn.push((tab.id, rect));
                             ui.painter().rect_filled(
@@ -597,6 +597,9 @@ impl TabStrip {
                                     Stroke::new(2.0, BLUE),
                                 );
                             }
+                            // Middle-click owns the complete chip, including the name,
+                            // rename field, padding and ×. Do not emit Activate first.
+                            let mut middle_close = chip.clicked_by(PointerButton::Middle);
                             let close_rect = Rect::from_center_size(
                                 egui::pos2(rect.right() - 16.0, rect.center().y),
                                 egui::vec2(24.0, 24.0),
@@ -634,6 +637,7 @@ impl TabStrip {
                                     }
                                     output.response
                                 };
+                                middle_close |= output.clicked_by(PointerButton::Middle);
                                 rename.select_all = false;
                                 if output.changed() {
                                     rename.error = model.validate_name(tab.id, &rename.text).err();
@@ -684,6 +688,7 @@ impl TabStrip {
                                     galley,
                                     Color32::WHITE,
                                 );
+                                middle_close |= response.clicked_by(PointerButton::Middle);
                                 if response.clicked() {
                                     actions.push(TabAction::Activate(tab.id));
                                 }
@@ -728,7 +733,7 @@ impl TabStrip {
                                 [x + egui::vec2(-3.0, 3.0), x + egui::vec2(3.0, -3.0)],
                                 stroke,
                             );
-                            if close.clicked() {
+                            if close.clicked() || close.clicked_by(PointerButton::Middle) || middle_close {
                                 actions.push(TabAction::Close(tab.id));
                             }
                         }
@@ -1292,6 +1297,25 @@ mod tests {
         );
         assert_eq!(model.tabs().len(), 3);
         assert_eq!(model.tabs()[0].id, first);
+    }
+
+    #[test]
+    fn middle_click_any_chip_region_emits_only_close_for_active_or_inactive_tab() {
+        for active in [true, false] {
+            for pos in [egui::pos2(30.0, 22.0), egui::pos2(104.0, 22.0), egui::pos2(118.0, 9.0)] {
+                let ctx = egui::Context::default();
+                let mut strip = TabStrip::default();
+                let mut model: TabModel<()> = TabModel::new(());
+                let first = model.active_id().unwrap();
+                model.add(());
+                if active { model.activate(first); }
+                for _ in 0..3 { draw(&ctx, &mut strip, &model, vec![]); }
+                draw(&ctx, &mut strip, &model, pointer(pos, PointerButton::Middle, true));
+                let actions = draw(&ctx, &mut strip, &model, pointer(pos, PointerButton::Middle, false)).0;
+                assert_eq!(actions, [TabAction::Close(first)], "active={active}, pos={pos:?}");
+                assert_eq!(model.tabs().len(), 2, "the caller owns the existing close path");
+            }
+        }
     }
 
     #[test]
