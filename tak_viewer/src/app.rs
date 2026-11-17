@@ -45,6 +45,8 @@ mod layout_tabs;
 mod layout_controller;
 #[path = "app_hidden_work.rs"]
 mod hidden_work;
+#[path = "app_desktop_drop.rs"]
+mod desktop_drop;
 use crate::workspace::{self, AddRoot, Workspace, MAX_ROOTS};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use egui_dock::{DockArea, DockState};
@@ -420,6 +422,7 @@ pub struct TakViewerApp {
     focused_tab: Option<Pane>,
     /// An Explorer file let go over a 3D view this frame: (view, where in it, file).
     file_drop: Option<(usize, dock::DropZone, PathBuf)>,
+    desktop_hover: crate::desktop_drop::Hover,
     /// Window title last sent.
     title_shown: String,
     /// Pane area of the last frame (where new views are placed).
@@ -538,7 +541,9 @@ pub struct TakViewerApp {
 
 impl TakViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>, auto: Option<AutoShot>, capture_plan: Option<CapturePlan>) -> Self {
-        Self::build(&cc.egui_ctx, cc.storage, initial, auto, capture_plan)
+        let mut app = Self::build(&cc.egui_ctx, cc.storage, initial, auto, capture_plan);
+        #[cfg(windows)] app.desktop_hover.set_window(cc);
+        app
     }
 
     /// A window the user works in (not a command line run): remember its open-window entry.
@@ -631,6 +636,7 @@ impl TakViewerApp {
             next_file_id: 0,
             focused_tab: None,
             file_drop: None,
+            desktop_hover: Default::default(),
             title_shown: String::new(),
             dock_area: dock::NOMINAL_AREA,
             settings,
@@ -3504,25 +3510,9 @@ impl TakViewerApp {
         let _graph_frame = GraphFrame;
         self.watch_other_windows(ctx);
 
-        // Drag & drop: folder -> workspace; files -> the view under the mouse (else the active
-        // one), more files next to it.
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if !dropped.is_empty() && self.dirty_prompt.is_none() {
-            let at = ctx.input(|i| i.pointer.latest_pos());
-            if let Some(k) = at.and_then(|p| self.open_views().into_iter().find(|&k| self.views[k].scene_rect.contains(p))) {
-                self.activate(k);
-            }
-            let mut first = true;
-            for p in dropped {
-                if self.dirty_prompt.is_some() { break; }
-                if p.is_dir() {
-                    self.open_workspace(p);
-                } else if std::mem::take(&mut first) {
-                    self.open(ctx, p);
-                } else {
-                    self.open_side(ctx, p);
-                }
-            }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty())
+            || !self.desktop_hover.paths.is_empty() || self.desktop_hover.position.is_some() {
+            self.read_desktop_drop(ctx);
         }
         let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none()
             && self.capture.is_none()
@@ -3945,6 +3935,7 @@ impl TakViewerApp {
             });
             self.show_help = open;
         }
+        if !self.desktop_hover.paths.is_empty() { self.paint_desktop_drop(ctx); }
         // Current click geometry and higher-priority widgets settle before destructive keys.
         key_focus::finish_frame(ctx);
         self.comment_list_keys(ctx);
@@ -4098,6 +4089,7 @@ impl TakViewerApp {
 
 impl eframe::App for TakViewerApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.desktop_hover.native_input(ctx, raw);
         // egui processes Tab focus traversal before update(), even with Ctrl held.
         // Normalize to our existing PageUp/Down path before that happens. The frame's
         // popup, capture, held-M and dirty-dialog guards still decide whether to switch.
@@ -4196,6 +4188,7 @@ mod tests {
     include!("app_graph_selection_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
+    include!("app_desktop_drop_tests.rs");
     include!("app_layout_tabs_tests.rs");
     include!("app_tab_input_tests.rs");
     include!("app_freshness_tests.rs");

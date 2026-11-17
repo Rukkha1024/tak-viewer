@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "tak_core"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "memchr",
  "roxmltree",
@@ -2858,17 +2858,19 @@ dependencies = [
 
 [[package]]
 name = "tak_viewer"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "eframe",
  "egui_dock",
  "png",
+ "raw-window-handle",
  "rfd",
  "ron",
  "serde",
  "serde_json",
  "sha2",
  "tak_core",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

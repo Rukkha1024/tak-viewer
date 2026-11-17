@@ -14,6 +14,10 @@ serde_json = "1"
 png = "0.18"
 egui_dock = { version = "0.14", features = ["serde"] }
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+
 # WSL/Linux builds (tests) need a windowing backend feature.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.29", default-features = false, features = ["x11"] }

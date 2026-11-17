@@ -441,6 +441,11 @@ pub fn layout_strip_rect(dock: &DockState<Pane>) -> Option<Rect> {
     (rect.is_positive() && rect.is_finite()).then_some(rect)
 }
 
+pub fn empty_rect(dock: &DockState<Pane>) -> Option<Rect> {
+    let (surface, node, _) = dock.find_tab(&Pane::Empty)?;
+    dock[surface][node].rect().filter(|r| r.is_positive() && r.is_finite())
+}
+
 /// Put a new 3D view next to the others: the biggest view is cut in half. The second view
 /// goes to the right of the first (VS Code "open to the side"); later ones go below unless the
 /// view is clearly wider than tall (1 → 2 side by side → 3 → 2×2). The new view gets the focus.
@@ -1037,6 +1042,29 @@ pub fn add_view_at(dock: &mut DockState<Pane>, slot: u8, target: u8, zone: DropZ
         DropZone::Center => return false,
     };
     s.set_focused_node(added);
+    true
+}
+
+/// One edge drop: incoming views share that half evenly, perpendicular to the edge.
+pub fn add_views_at(dock: &mut DockState<Pane>, slots: &[u8], target: u8, zone: DropZone) -> bool {
+    let Some(&first) = slots.first() else { return false };
+    if zone == DropZone::Center || slots.len() + views(dock).len() > MAX_VIEWS
+        || slots.iter().enumerate().any(|(i, k)| usize::from(*k) >= MAX_VIEWS
+            || slots[..i].contains(k) || dock.find_tab(&Pane::View(*k)).is_some()) { return false; }
+    if !add_view_at(dock, first, target, zone) { return false; }
+    let mut last = first;
+    for (i, &slot) in slots.iter().enumerate().skip(1) {
+        let (node, _) = dock.main_surface().find_tab(&Pane::View(last)).expect("just added view");
+        let fraction = 1.0 / (slots.len() - i + 1) as f32;
+        let tree = dock.main_surface_mut();
+        let [_, added] = if matches!(zone, DropZone::Left | DropZone::Right) {
+            tree.split_below(node, fraction, vec![Pane::View(slot)])
+        } else {
+            tree.split_right(node, fraction, vec![Pane::View(slot)])
+        };
+        tree.set_focused_node(added);
+        last = slot;
+    }
     true
 }
 

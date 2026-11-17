@@ -336,7 +336,8 @@ fn run_with_probe(initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Op
             eprintln!("headless: stopped after {} s without finishing", TIMEOUT.as_secs());
             return 1;
         }
-        let raw = frame_input(screen, start, std::mem::take(&mut events));
+        let mut raw = frame_input(screen, start, std::mem::take(&mut events));
+        crate::desktop_drop::inject_preview(&mut raw);
         let out = ctx.run(raw, |ctx| app.frame(ctx));
         if let Some(p) = &mut probe {
             match p.tick(&mut app, &ctx) {
