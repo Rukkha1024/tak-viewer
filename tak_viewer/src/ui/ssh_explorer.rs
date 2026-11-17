@@ -115,6 +115,7 @@ pub fn desired_height(manager: &SshManager) -> f32 {
                 ROW_H
                     + if children {
                         ROW_H
+                            + ROW_H
                             + (h.rows.len() as f32 * ROW_H).min(220.0)
                             + if h.note.is_some() { 32.0 } else { 0.0 }
                     } else {
@@ -244,6 +245,11 @@ pub fn show(
                 if !matches!(host.state, HostState::Connected | HostState::Lost) { return; }
                 let connected = host.state == HostState::Connected;
                 let (path_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!host.path.is_empty(), egui::Button::new(RichText::new("Add to WORKSPACE").size(11.0))).clicked() {
+                        actions.push(SshAction::AddWorkspace { location: RemoteLocation { host: host.alias.clone(), path: host.path.clone() }, platform: if platform == "Windows" { "windows" } else { "linux" }.into() });
+                    }
+                });
                 let refresh_rect = Rect::from_min_max(pos2(path_rect.right() - 23.0, path_rect.top()), path_rect.right_bottom());
                 let up_rect = refresh_rect.translate(vec2(-24.0, 0.0));
                 let input_rect = Rect::from_min_max(pos2(path_rect.left() + 26.0, path_rect.top() + 1.0), pos2((up_rect.left() - 4.0).max(path_rect.left() + 26.0), path_rect.bottom() - 1.0));
@@ -267,6 +273,12 @@ pub fn show(
                                 chevron(ui.painter(), pos2(x + 7.0, rect.center().y), *expanded, ICON_FG);
                                 label(ui, name, Rect::from_min_max(pos2(x + 20.0, rect.top()), rect.right_bottom()), FontId::proportional(12.0), FG);
                                 if response.clicked() && connected { inputs.push(folder_input(&host.alias, &host.path, path)); }
+                                response.context_menu(|ui| {
+                                    if ui.button("Add to WORKSPACE").clicked() {
+                                        actions.push(SshAction::AddWorkspace { location: RemoteLocation { host: host.alias.clone(), path: path.clone() }, platform: if platform == "Windows" { "windows" } else { "linux" }.into() });
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                             TreeRow::File { path, name, .. } => {
                                 file_icon(ui.painter(), pos2(x + 8.0, rect.center().y), TAK_ICON);

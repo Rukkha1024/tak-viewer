@@ -189,7 +189,7 @@ fn change_count(bytes: &mut [u8], at: usize, delta: i64) -> Result<(), EditError
 }
 
 /// Rewrite only existing marker Translation records; insert or remove only validated new nodes.
-fn serialize_markers(snapshot: &DocumentSnapshot, nodes: &[u8], channels: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EditError> {
+pub(crate) fn serialize_markers(snapshot: &DocumentSnapshot, nodes: &[u8], channels: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EditError> {
     let input = snapshot.input().ok_or(EditError::NotLoaded)?;
     let assets = tak::nodes::skeleton_asset_set(nodes).map_err(error)?;
     let parsed = tak::nodes::parse_marker_nodes(nodes, &assets).map_err(error)?;

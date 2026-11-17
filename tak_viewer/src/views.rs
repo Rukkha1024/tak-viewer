@@ -55,6 +55,7 @@ struct SharedFileState {
     data: Arc<ViewData>,
     document: EditSession,
     source_stamp: Option<SourceStamp>,
+    remote: Option<crate::ssh::RemoteLocation>,
     comments: SharedComments,
     emg_demand: bool,
     emg_wake: Option<(DocumentId, Sender<DocumentId>)>,
@@ -696,6 +697,7 @@ impl View {
                 data: self.data.clone()?,
                 document: self.edit_document.clone()?,
                 source_stamp: self.source_stamp.clone(),
+                remote: self.remote.clone(),
                 comments: SharedComments::capture(&self.comments),
                 emg_demand: false,
                 emg_wake: None,
@@ -731,9 +733,9 @@ impl View {
     /// Open an already loaded file without disk work. Playback, camera, selection, ID pools
     /// and controls stay independent. Pending reads remain owned by the original view.
     pub fn show_shared_file(&mut self, shared: SharedFile, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
-        let (data, document, stamp, comments, generation) = {
+        let (data, document, stamp, comments, remote, generation) = {
             let state = shared.0.lock().ok()?;
-            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.remote.clone(), state.generation)
         };
         let restore = self.restore.take();
         let restore_range = self.restore_range.take();
@@ -750,6 +752,7 @@ impl View {
         self.analog_rx = None;
         self.comments_rx = None;
         comments.install(&mut self.comments);
+        if remote.is_some() {self.remote=remote;}
         self.shared_file = Some(shared);
         self.shared_generation = generation;
         // The canonical data already represents this document's current revision.
@@ -789,9 +792,9 @@ impl View {
     }
 
     pub fn adopt_shared_preserving_state(&mut self, shared: SharedFile, now: f64) -> bool {
-        let (data, document, stamp, comments, generation) = {
+        let (data, document, stamp, comments, remote, generation) = {
             let Ok(state) = shared.0.lock() else { return false };
-            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+            (state.data.clone(), state.document.clone(), state.source_stamp.clone(), state.comments.clone(), state.remote.clone(), state.generation)
         };
         if !self.can_adopt_document(&document, &data.take.path) { return false; }
         if self.edit_document.as_ref().is_some_and(|own| Arc::ptr_eq(own, &document)) {
@@ -811,6 +814,7 @@ impl View {
         self.source_stamp = stamp;
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
         comments.install(&mut self.comments);
+        if remote.is_some() {self.remote=remote;}
         if let Some(data) = self.data.as_ref() {
             self.pb.first = data.start_frame;
             self.pb.last = data.end_frame.max(data.start_frame);
@@ -843,11 +847,12 @@ impl View {
         }
         let data_changed = !Arc::ptr_eq(data, &state.data);
         let comments_changed = !state.comments.matches(&self.comments);
-        if data_changed || comments_changed {
+        if data_changed || comments_changed || state.remote!=self.remote {
             if data_changed { drop_later(Some(std::mem::replace(&mut state.data, data.clone()))); }
             if !data.emg_pending { state.emg_demand = false; }
             if comments_changed { state.comments = SharedComments::capture(&self.comments); }
             state.source_stamp = self.source_stamp.clone();
+            state.remote=self.remote.clone();
             state.generation = state.generation.wrapping_add(1);
         }
         if let Some((document, wake)) = &state.editor_wake { let _ = wake.send(*document); }
@@ -859,18 +864,19 @@ impl View {
     /// selection by UID. The handle always reads live state, so an old handle cannot roll back
     /// a save, rename, Comment write, or marker edit.
     pub fn sync_shared_file(&mut self, shared: &SharedFile) -> bool {
-        let (data, stamp, comments, generation) = {
+        let (data, stamp, comments, remote, generation) = {
             let Ok(state) = shared.0.lock() else { return false };
             if !self.edit_document.as_ref().is_some_and(|doc| Arc::ptr_eq(doc, &state.document)) { return false; }
             if !Arc::ptr_eq(&self.filters,&state.filters) {drop_later(Some(std::mem::replace(&mut self.filters,state.filters.clone())));}
             if self.shared_file.as_ref().is_some_and(|own| Arc::ptr_eq(&own.0, &shared.0))
                 && self.shared_generation == state.generation { return false; }
-            (state.data.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
+            (state.data.clone(), state.source_stamp.clone(), state.comments.clone(), state.remote.clone(), state.generation)
         };
         if !self.data.as_ref().is_some_and(|current| Arc::ptr_eq(current, &data)) {
             self.install_shared_data(data);
         }
         comments.install(&mut self.comments);
+        if remote.is_some() {self.remote=remote;}
         let ids: Vec<_> = self.comments.list.list().iter().map(|comment| comment.id).collect();
         self.comment_selection.prune(&ids);
         if self.picked.is_some_and(|id| !ids.contains(&id)) {
@@ -1836,6 +1842,14 @@ impl View {
         self.edit_refresh = None;
         self.publish_shared_file();
         Ok(())
+    }
+
+    /// A server-verified save is built on the SSH worker. Share that one allocation with
+    /// every occurrence; never clone all samples on the drawing thread.
+    pub fn install_remote_saved(&mut self, data:Arc<ViewData>) {
+        self.install_shared_data(data);
+        self.edit_refresh=None;
+        self.publish_shared_file();
     }
 
     fn install_shared_data(&mut self, data: Arc<ViewData>) {

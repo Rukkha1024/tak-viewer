@@ -168,7 +168,7 @@ impl TakViewerApp {
                     Reference::Overlay(_) => self.overlay_marker_ui.get(&document).is_some_and(marker_edit::MarkerUi::has_pending_work),
                 };
                 let owner = match reference { Reference::Primary(_) => &self.views[slot], Reference::Overlay(_) => self.views[slot].overlay_owner().expect("overlay source") };
-                if busy || owner.comments.pending > 0 {
+                if busy || (owner.comments.pending > 0 && owner.remote.is_none()) {
                     self.notice = Some("읽기나 저장을 마친 뒤 다시 시도해 주세요.".into());
                     return true;
                 }
@@ -220,7 +220,7 @@ impl TakViewerApp {
             Reference::Primary(_) => std::mem::take(&mut uis[slot]),
             Reference::Overlay(_) => self.overlay_marker_ui.remove(&document).unwrap_or_default(),
         };
-        let safe = source_view.comments.pending == 0
+        let safe = (source_view.comments.pending == 0 || source_view.remote.is_some())
             && !(source_ui.has_pending_work() && target_ui.has_pending_work())
             && (!source_view.owns_shared_file_work() || source_view.transfer_shared_loads(target_view));
         if safe { source_ui.transfer_work_to(&mut target_ui, target_view.file_id); }

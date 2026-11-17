@@ -1156,7 +1156,8 @@ impl TakViewerApp {
     /// Publish a prepared marker edit as exactly one global history action. Stale/no-op jobs
     /// never call `History::push`; selection is carried inside the same patch.
     pub(super) fn commit_marker_edit(&mut self, slot: usize, patch: Arc<EditPatch>) -> Result<(), EditError> {
-        if self.no_persist { return Err(EditError::Other("명령 실행에서는 편집할 수 없어요".into())); }
+        let explicit_remote_probe=self.remote_write_probe && self.views.get(slot).is_some_and(|view|view.remote.is_some());
+        if self.no_persist && !explicit_remote_probe { return Err(EditError::Other("명령 실행에서는 편집할 수 없어요".into())); }
         self.observe(true);
         let file = self.views.get(slot).and_then(View::path).ok_or(EditError::NotLoaded)?.to_path_buf();
         self.views[slot].apply_marker_patch(&patch, true)?;
@@ -1951,6 +1952,26 @@ mod marker_edit_tests {
         app.layout_tabs.activate(before);
         assert!(app.switch_layout_tab_internal(id));
         id
+    }
+
+    #[test]
+    fn command_marker_commit_requires_explicit_remote_write_probe(){
+        for remote in [false,true] {for enabled in [false,true] {
+            let ctx=egui::Context::default();let mut app=app(&ctx);
+            let location=crate::ssh::RemoteLocation{host:"test-host".into(),path:"/a.tak".into()};
+            let key=location.memory_key();
+            show(&mut app,0,if remote {key.to_str().unwrap()} else {"local.tak"},1);
+            if remote {app.views[0].remote=Some(location);}
+            app.set_command_run();app.remote_write_probe=enabled;
+            let patch=prepare(&app,0,9.0);let written=patch.after_revision();
+            let result=app.commit_marker_edit(0,patch);
+            assert_eq!(result.is_ok(),remote&&enabled,"remote={remote}, explicit={enabled}");
+            assert_eq!(app.views[0].marker_dirty(),remote&&enabled);
+            if remote&&enabled {
+                assert_eq!(app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision(),written);
+                assert_eq!(app.history.undo.len(),1);
+            } else {assert!(app.history.undo.is_empty());}
+        }}
     }
 
     #[test]

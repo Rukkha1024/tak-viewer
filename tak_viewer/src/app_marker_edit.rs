@@ -87,8 +87,8 @@ pub(super) enum PanelSetting {
 
 #[derive(Clone)]
 pub(super) struct PreparedSession {
-    _original_version: FileVersion,
-    current_version: FileVersion,
+    _original_version: Option<FileVersion>,
+    current_version: Option<FileVersion>,
     creation: Arc<CreationStreams>,
 }
 
@@ -377,6 +377,9 @@ fn increment_order(state: &LabelingState, target: LabelKey) -> Vec<LabelKey> {
 }
 
 impl TakViewerApp {
+    pub(super) fn install_remote_marker_session(&mut self,id:DocumentId,creation:Arc<CreationStreams>){
+        self.marker_sessions.entry(id).or_insert(PreparedSession{_original_version:None,current_version:None,creation});
+    }
     pub(super) fn select_pattern_for_capture(&mut self, slot: usize) {
         self.refresh_marker_ui(slot);
         self.marker_ui[slot].tools.interpolation = FillMethod::PatternBased;
@@ -606,6 +609,7 @@ impl TakViewerApp {
 
     /// Apply a discard only after all batch decisions are complete.
     pub(super) fn discard_editor_work(&mut self, ctx: &egui::Context, slot: usize) -> bool {
+        self.discard_remote_comments(slot);
         let document = self.views[slot].document_id();
         for (view, ui) in self.views.iter().zip(&mut self.marker_ui) {
             if view.document_id() == document { ui.discard_work(); }
@@ -667,7 +671,7 @@ impl TakViewerApp {
         let saving = prompt.saving || self.marker_saving(slot);
         let computing =
             self.marker_job_running(slot) || self.views[slot].edit_refresh.is_some();
-        let pending_comments = self.views[slot].comments.pending > 0;
+        let pending_comments = self.views[slot].comments.pending > 0 && self.views[slot].remote.is_none();
         let stalled = (saving || pending_comments) && prompt.started.elapsed() >= Duration::from_secs(10);
         if saving || pending_comments { ctx.request_repaint_after(Duration::from_millis(250)); }
         let name = self.views[slot]
@@ -740,6 +744,7 @@ impl TakViewerApp {
     }
 
     pub(super) fn retry_comments_and_transition(&mut self, ctx: &egui::Context, slot: usize) {
+        if self.views[slot].remote.is_some() { self.save_remote(ctx, slot, true); return; }
         let tag = self.views[slot].file_id;
         if self.comment_registration_error.take().is_some() {
             drop_later(self.comment_writer.take());
@@ -809,6 +814,7 @@ impl TakViewerApp {
     }
 
     pub(super) fn marker_saving(&self, slot: usize) -> bool {
+        if self.remote_saving(slot) { return true; }
         if self.views.get(slot).and_then(View::document_id).and_then(|id| self.overlay_marker_ui.get(&id)).is_some_and(MarkerUi::has_save) { return true; }
         self.marker_ui.iter().enumerate().any(|(index, ui)| ui.has_save()
             && (index == slot || self.views.get(slot).is_some_and(|view| view.shares_document(&self.views[index]))))
@@ -911,8 +917,8 @@ impl TakViewerApp {
         }
         self.views[slot].sync_shared();
         let view = &self.views[slot];
-        if view.remote.is_some()
-            || self.no_persist
+        if view.remote.is_some() { self.save_remote(ctx, slot, close_after); return; }
+        if self.no_persist
             || view.data.is_none()
             || view.waiting_shared_path().is_some()
             || view.edit_refresh.is_some()
@@ -1068,9 +1074,9 @@ impl TakViewerApp {
                             };
                             let expected_destination =
                                 if std::fs::canonicalize(&destination).ok().as_deref()
-                                    == Some(session.current_version.path())
+                                    == Some(session.current_version.as_ref().expect("local version").path())
                                 {
-                                    session.current_version.clone()
+                                    session.current_version.clone().expect("local version")
                                 } else {
                                     FileVersion::capture(&destination)
                                         .map_err(|e| SaveFailure::Other(edit_error(e)))?
@@ -1100,7 +1106,7 @@ impl TakViewerApp {
                                     snapshot: snapshot.clone(),
                                     source,
                                     destination,
-                                    expected_source: session.current_version.clone(),
+                                    expected_source: session.current_version.clone().expect("local version"),
                                     expected_destination,
                                 }, &worker_cancelled)
                                 .map_err(|e| SaveFailure::Other(edit_error(e)))?;
@@ -1215,7 +1221,7 @@ impl TakViewerApp {
                             }
                         }
                         if let Some(session) = self.marker_sessions.get_mut(&document) {
-                            session.current_version = saved.outcome.version.clone();
+                            session.current_version = Some(saved.outcome.version.clone());
                         }
                         self.views[slot].edit_refresh = Some(saved.snapshot.revision());
                         if let Err(error) = self.publish_marker_view(slot, saved.view) {
@@ -1269,11 +1275,10 @@ impl TakViewerApp {
         self.views[slot].sync_shared();
         let now = ctx.input(|i| i.time);
         let view = &self.views[slot];
-        if self.no_persist
+        if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()))
             || self.dirty_prompt.is_some()
             || self.hold.is_some()
             || self.comment_edit.is_some()
-            || view.remote.is_some()
             || view.remote_loading.is_some()
             || view.loading.is_some()
             || view.waiting_shared_path().is_some()
@@ -1303,12 +1308,21 @@ impl TakViewerApp {
             self.start_prepared_command(ctx, slot, id, command);
             return;
         }
+        let remote = view.remote.as_ref().and_then(|location| self.ssh.documents.get(location)).cloned();
+        if view.remote.is_some() && remote.is_none() {self.takm_note=Some(("서버 편집 자료가 없어요. SSH 목록에서 파일을 다시 열어 주세요.".into(),now));return;}
         let stamp = view.source_stamp.clone();
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
             let prepare = || -> Result<Prepared, String> {
+                if let Some(remote) = remote {
+                    let (input, _) = remote.streams.prepare(&path, remote.file_size)?;
+                    let mut shown=data.take.clone(); shown.path=path.clone();
+                    if !input.matches_shown_take(&shown) { return Err("화면과 서버의 마커가 달라요. 다시 열어 주세요.".into()); }
+                    let creation = Arc::new(CreationStreams::from_streams(remote.streams.nodes.to_vec(), remote.streams.channels.to_vec()));
+                    return Ok(Prepared { input, session:PreparedSession { _original_version:None, current_version:None, creation } });
+                }
                 let expected = stamp
                     .as_ref()
                     .and_then(|s| s.lock().ok()?.clone())
@@ -1334,8 +1348,8 @@ impl TakViewerApp {
                 Ok(Prepared {
                     input,
                     session: PreparedSession {
-                        _original_version: before.clone(),
-                        current_version: before,
+                        _original_version: Some(before.clone()),
+                        current_version: Some(before),
                         creation,
                     },
                 })
@@ -1777,9 +1791,7 @@ impl TakViewerApp {
         ui.labeling.unlabeled = unlabeled;
         ui.labeling.armed = view.armed_label;
         ui.labeling.selected_labeled_count = selected_labeled_count;
-        ui.labeling.blocked_reason = if view.remote.is_some() {
-            Some("원격 파일은 편집할 수 없어요.".to_owned())
-        } else if self.dirty_prompt.is_some()
+        ui.labeling.blocked_reason = if self.dirty_prompt.is_some()
             || busy
             || view.edit_refresh.is_some()
             || view.loading.is_some()
@@ -2009,7 +2021,7 @@ impl TakViewerApp {
         }
     }
 
-    fn unlabel_selected(&mut self, ctx: &egui::Context, slot: usize) {
+    pub(super) fn unlabel_selected(&mut self, ctx: &egui::Context, slot: usize) {
         self.refresh_marker_ui(slot);
         if let Some(reason) = self.marker_ui[slot].labeling.unlabel_reason() {
             self.takm_note = Some((format!("Unlabel · {reason}"), ctx.input(|i| i.time)));

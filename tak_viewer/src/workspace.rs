@@ -54,6 +54,7 @@ pub fn split_entries(dir: &Path, entries: Vec<RawEntry>) -> (Vec<PathBuf>, Vec<W
 
 /// Read one folder level (no recursion).
 pub(crate) fn list_dir(dir: &Path) -> Listing {
+    if is_remote_root_key(dir) { return Listing::Failed("SSH 폴더는 서버 연결로 읽어요.".into()); }
     match std::fs::read_dir(dir) {
         Err(e) => Listing::Failed(e.to_string()),
         Ok(it) => {
@@ -76,6 +77,9 @@ pub(crate) fn list_dir(dir: &Path) -> Listing {
 
 /// A folder's own name on disk (the whole path for a drive root like `L:\`).
 pub fn folder_name(dir: &Path) -> String {
+    if let Some((root, location)) = remote_address(dir) {
+        if root.path == location.path { return root.label(); }
+    }
     dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string())
 }
 
@@ -93,6 +97,55 @@ pub fn ancestors_between(root: &Path, file: &Path) -> Option<Vec<PathBuf>> {
 
 /// Saved workspace folders (VS Code multi-root): at most this many.
 pub const MAX_ROOTS: usize = 10;
+
+/// Saved address only. The opaque key participates in the existing folder order, names and
+/// undo; it is never a local filesystem path. No connection state is persisted.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteRoot {
+    pub alias: String,
+    pub path: String,
+    pub platform: String,
+}
+
+impl RemoteRoot {
+    pub fn key(&self) -> PathBuf {
+        let bytes = serde_json::to_vec(self).expect("remote folder address");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        PathBuf::from("@ssh-workspace").join(hex)
+    }
+
+    pub fn label(&self) -> String { format!("SSH {}:{}", self.alias, self.path) }
+}
+
+/// Decode a saved root or a child key; reject traversal and malformed saved settings.
+pub fn remote_address(key: &Path) -> Option<(RemoteRoot, crate::ssh::RemoteLocation)> {
+    use std::path::Component;
+    let mut components = key.components();
+    if components.next()?.as_os_str() != "@ssh-workspace" { return None; }
+    let encoded = components.next()?.as_os_str().to_str()?;
+    if encoded.len() % 2 != 0 || encoded.len() > 262144 { return None; }
+    let bytes: Option<Vec<u8>> = encoded.as_bytes().chunks_exact(2).map(|b| {
+        let s = std::str::from_utf8(b).ok()?;
+        u8::from_str_radix(s, 16).ok()
+    }).collect();
+    let root: RemoteRoot = serde_json::from_slice(&bytes?).ok()?;
+    if root.alias.is_empty() || root.path.is_empty() || !matches!(root.platform.as_str(), "linux" | "windows") { return None; }
+    let separator = if root.platform == "windows" { '\\' } else { '/' };
+    let mut path = root.path.clone();
+    for part in components {
+        let Component::Normal(name) = part else { return None; };
+        let name = name.to_str()?;
+        if name.contains(['/', '\\', '\0']) || name == "." || name == ".." { return None; }
+        if !path.ends_with(['/', '\\']) { path.push(separator); }
+        path.push_str(name);
+    }
+    let location = crate::ssh::RemoteLocation { host: root.alias.clone(), path };
+    Some((root, location))
+}
+
+pub fn is_remote_root_key(key: &Path) -> bool {
+    key.components().next().is_some_and(|c| c.as_os_str() == "@ssh-workspace")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddRoot {
@@ -283,6 +336,9 @@ pub struct Workspace {
     reports_tx: Sender<Report>,
     reports: Receiver<Report>,
     minimized: bool,
+    remote_requests: HashSet<PathBuf>,
+    remote_started: HashSet<PathBuf>,
+    remote_connected: HashSet<String>,
 }
 
 impl Workspace {
@@ -307,6 +363,9 @@ impl Workspace {
             reports_tx,
             reports,
             minimized: false,
+            remote_requests: HashSet::new(),
+            remote_started: HashSet::new(),
+            remote_connected: HashSet::new(),
         }
     }
 
@@ -354,8 +413,9 @@ impl Workspace {
     /// folder, no copying of listings. Folders being read are skipped until they arrive.
     pub fn watch(&mut self, dirs: &[PathBuf]) {
         let Some(link) = &self.watch else { return };
-        let dirs = dirs.iter().map(|d| (d.clone(), self.listings.get(d).filter(|l| ***l != Listing::Loading).cloned())).collect();
-        let _ = link.cmds.send(Cmd::Set { dirs, roots: self.roots.clone(), missing: self.missing.clone() });
+        let dirs = dirs.iter().filter(|d| !is_remote_root_key(d)).map(|d| (d.clone(), self.listings.get(d).filter(|l| ***l != Listing::Loading).cloned())).collect();
+        let roots = self.roots.iter().filter(|r| !is_remote_root_key(r)).cloned().collect();
+        let _ = link.cmds.send(Cmd::Set { dirs, roots, missing: self.missing.clone() });
     }
 
     /// The window is minimized (no rounds) or shown again (one round at once). Sends only on
@@ -496,6 +556,11 @@ impl Workspace {
         }
         self.listings.insert(dir.to_path_buf(), Arc::new(Listing::Loading));
         self.revision += 1;
+        if is_remote_root_key(dir) {
+            self.remote_started.remove(dir);
+            self.remote_requests.insert(dir.to_path_buf());
+            return;
+        }
         let Some(ctx) = self.ctx.clone() else { return };
         let tx = self.tx.clone();
         let d = dir.to_path_buf();
@@ -569,10 +634,58 @@ impl Workspace {
     /// Forget every listing and re-read only `open_dirs` (the folders shown expanded).
     pub fn refresh(&mut self, open_dirs: &[PathBuf]) {
         self.listings.clear();
+        self.remote_requests.clear();
+        self.remote_started.clear();
         self.revision += 1;
         for p in open_dirs {
             self.request(p);
         }
+    }
+
+    pub fn remote_connected(&self, alias: &str) -> bool { self.remote_connected.contains(alias) }
+
+    /// Explicit expand/refresh is the only producer of remote requests. The manager does all
+    /// connection and listing work on its worker; the drawing thread copies cached names.
+    pub fn poll_remote(&mut self, manager: &mut crate::ssh::SshManager) {
+        let connected: HashSet<String> = manager.hosts.iter().filter(|h| h.state == crate::ssh::HostState::Connected).map(|h| h.alias.clone()).collect();
+        if self.remote_connected != connected { self.remote_connected = connected; self.revision += 1; }
+        let pending: Vec<PathBuf> = self.remote_requests.iter().cloned().collect();
+        for key in pending {
+            if !self.roots.iter().any(|r| key.starts_with(r)) { self.remote_requests.remove(&key); continue; }
+            let Some((root, location)) = remote_address(&key) else {
+                self.listings.insert(key.clone(), Arc::new(Listing::Failed("원격 폴더 주소를 확인해 주세요.".into())));
+                self.remote_requests.remove(&key);
+                continue;
+            };
+            let first = !self.remote_started.contains(&key);
+            match manager.workspace_list(&root, &location, &key, first) {
+                Ok(Some(listing)) => {
+                    self.listings.insert(key.clone(), Arc::new(listing));
+                    self.remote_requests.remove(&key);
+                    self.revision += 1;
+                }
+                Ok(None) => { self.remote_started.insert(key.clone()); }
+                Err(message) => {
+                    self.listings.insert(key.clone(), Arc::new(Listing::Failed(message)));
+                    self.remote_requests.remove(&key);
+                    self.revision += 1;
+                }
+            }
+        }
+    }
+
+    /// Find the opaque child key for highlighting an open remote file.
+    pub fn key_for_remote(&self, location: &crate::ssh::RemoteLocation) -> Option<PathBuf> {
+        self.roots.iter().filter_map(|key| {
+            let (root, _) = remote_address(key)?;
+            if root.alias != location.host { return None; }
+            let prefix = root.path.trim_end_matches(['/', '\\']);
+            let tail = location.path.strip_prefix(prefix)?;
+            if !tail.starts_with(['/', '\\']) { return None; }
+            let mut child = key.clone();
+            for part in tail.split(['/', '\\']).filter(|p| !p.is_empty()) { child.push(part); }
+            Some((prefix.len(), child))
+        }).max_by_key(|(depth, _)| *depth).map(|(_, child)| child)
     }
 
     /// `.tak` / `.takm` files next to `file` (same folder), if that folder is listed.

@@ -185,7 +185,7 @@ class HelperTests(unittest.TestCase):
 
     def start(self):
         if not self.process:
-            self.process = subprocess.Popen([sys.executable, "-u", "-c", HELPER.read_text(encoding="utf-8-sig")],
+            self.process = subprocess.Popen([sys.executable, "-B", "-u", str(HELPER)],
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def request(self, request):
@@ -438,8 +438,10 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(header["truncated"])
 
     def test_directory_header_respects_transport_limit(self):
-        for index in range(2300):
-            (self.directory / (str(index) + "x" * 220 + ".tak")).touch()
+        # Stay below Windows MAX_PATH even when the user's temporary root is long.
+        # More short names still exceed the same 1 MiB framing boundary.
+        for index in range(5000):
+            (self.directory / (str(index) + "x" * 120 + ".tak")).touch()
         header, blocks = self.request(dict(op="list", path=str(self.directory), limit=10000,
                                            max_bytes=10 << 20))
         self.assertFalse(header["ok"])
@@ -465,6 +467,168 @@ class HelperTests(unittest.TestCase):
         self.path.write_bytes(compound(self.streams))
         header, _ = self.request(dict(op="open", path=str(self.path), max_bytes=10, probe_bytes=128))
         self.assertEqual(header["error"], "payload_too_large")
+
+    def upload(self, header, path, nodes=b"", markers=b"", events=b""):
+        args = dict(path=str(path), expected_identity=header["identity"], max_bytes=1 << 20)
+        parts = [nodes, markers, events]
+        result, _ = self.request(dict(op="patch_begin", part_lengths=list(map(len, parts)), **args))
+        self.assertTrue(result["ok"], result)
+        for index, part in enumerate(parts):
+            for offset in range(0, len(part), 65536):
+                result, _ = self.request(dict(op="patch_chunk", part=index, offset=offset, hex=part[offset:offset + 65536].hex(), **args))
+                self.assertTrue(result["ok"], result)
+        return args
+
+    def read_takm(self, path):
+        raw = path.read_bytes()
+        offset, length, fixed = struct.unpack_from("<QQQ", raw, 16)
+        self.assertEqual(hashlib.sha256(raw[:fixed]).digest(), raw[fixed:fixed + 32])
+        table = json.loads(raw[offset:offset + length])
+        return {row["name"]:raw[row["offset"]:row["offset"] + row["size"]] for row in table["streams"]}, raw[fixed + 32:]
+
+    def test_server_convert_byte_exact_no_overwrite_changed_source_and_paths(self):
+        original = self.path.read_bytes()
+        header, _ = self.open()
+        args = dict(path=str(self.path), expected_identity=header["identity"], max_bytes=1 << 20)
+        outside = str(self.directory.parent / "outside.takm")
+        bad, _ = self.request(dict(op="takm_convert", destination=outside, **args))
+        self.assertEqual(bad["error"], "invalid_request")
+        converted, _ = self.request(dict(op="takm_convert", **args))
+        self.assertTrue(converted["ok"], converted)
+        output = self.path.with_suffix(".takm")
+        streams, _ = self.read_takm(output)
+        self.assertEqual(streams, self.streams)
+        output_before = output.read_bytes()
+        repeated, _ = self.request(dict(op="takm_convert", **args))
+        self.assertTrue(repeated["existing"])
+        self.assertEqual(output.read_bytes(), output_before)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.path.write_bytes(original + b"changed")
+        changed, _ = self.request(dict(op="takm_convert", **args))
+        self.assertEqual(changed["error"], "source_changed")
+        self.assertEqual(output.read_bytes(), output_before)
+        self.assertEqual(list(self.directory.glob("*.part")), [])
+        self.assertEqual(list(self.directory.glob("*.tak-viewer-lock")), [output.with_name(output.name + ".tak-viewer-lock")])
+
+    def test_marker_open_never_scans_legacy_csv_and_id_scan_is_explicit(self):
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("ssh_helper_marker_first", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        sidecar = self.path.with_suffix(".comments.csv")
+        sidecar.write_bytes(helper.COMMENT_HEADER + b"t,add,17,M,0,1,,old,1,,x.tak|10,\r\n")
+        server = helper.Server()
+        try:
+            with patch.object(helper, "complete_csv", side_effect=AssertionError("must not scan before markers")):
+                header, blocks = server.dispatch(dict(op="open", path=str(self.path), max_bytes=1 << 20, probe_bytes=128))
+            self.assertTrue(header["ok"])
+            self.assertEqual(header["next_comment_id"], 0)
+            self.assertEqual(blocks[2], channels([self.marker]))
+            ids, _ = server.dispatch(dict(op="comment_ids", path=str(self.path), expected_identity=header["identity"], max_bytes=1 << 20))
+            self.assertEqual(ids["next_comment_id"], 18)
+        finally:
+            server.close()
+
+    def test_server_convert_imports_complete_sidecar_rows_before_torn_multiline_or_utf8(self):
+        header = b"time,kind,comment_id,markers,frame_start,frame_end,comment_type,comment_text,shown_a,shown_b,file_a,file_b\r\n"
+        complete = b't,add,1,M,0,1,,"first line\nsecond line",1,,x.tak|10,\r\n'
+        fragments = [b't,add,2,M,0,1,,"torn line\nunfinished', b't,add,2,M,0,1,,torn \xec']
+        for fragment in fragments:
+            sidecar = self.path.with_suffix(".comments.csv")
+            sidecar.write_bytes(b"\xef\xbb\xbf" + header + complete + fragment)
+            opened, _ = self.open()
+            self.assertEqual(opened["next_comment_id"], 0)
+            ids, _ = self.request(dict(op="comment_ids", path=str(self.path), expected_identity=opened["identity"], max_bytes=1 << 20))
+            self.assertEqual(ids["next_comment_id"], 2)
+            converted, _ = self.request(dict(op="takm_convert", path=str(self.path), expected_identity=opened["identity"], max_bytes=1 << 20))
+            self.assertTrue(converted["ok"], converted)
+            self.assertEqual(converted["imported_comments"], 1)
+            output = self.path.with_suffix(".takm")
+            _, tail = self.read_takm(output)
+            self.assertEqual(tail, header + complete)
+            self.assertEqual(sidecar.read_bytes(), b"\xef\xbb\xbf" + header + complete + fragment)
+            output.unlink()
+
+    def test_killed_lock_owner_releases_server_save_and_existing_lock_data_is_untouched(self):
+        lock = self.path.with_suffix(".takm.tak-viewer-lock")
+        script = "import importlib.util,sys,time;spec=importlib.util.spec_from_file_location('helper',sys.argv[1]);h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h);fd=h.open_write_lock(sys.argv[2]);print('locked',flush=True);time.sleep(60)"
+        child = subprocess.Popen([sys.executable, "-B", "-u", "-c", script, str(HELPER), str(lock)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(child.stdout.readline().rstrip(b"\r\n"), b"locked")
+            opened, _ = self.open()
+            args = dict(path=str(self.path), expected_identity=opened["identity"], max_bytes=1 << 20)
+            blocked, _ = self.request(dict(op="takm_convert", **args))
+            self.assertFalse(blocked["ok"])
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+            child.stderr.close()
+        saved, _ = self.request(dict(op="takm_convert", **args))
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(lock.read_bytes(), b"")
+        lock.write_bytes(b"user file must remain")
+        refused, _ = self.request(dict(op="takm_convert", **args))
+        self.assertFalse(refused["ok"])
+        self.assertEqual(lock.read_bytes(), b"user file must remain")
+
+    def test_server_marker_patch_preserves_opaque_analog_and_metadata(self):
+        self.marker = channel("Translation", [0, 9, 120])
+        self.streams["Channels.dat"] = channels([self.analog, self.marker])
+        self.path.write_bytes(compound(self.streams))
+        header, _ = self.open()
+        replacement = channel("Translation", [99])
+        args = self.upload(header, self.path, nodes=b"new nodes", markers=channels([replacement]))
+        saved, _ = self.request(dict(op="takm_save_patch", **args))
+        self.assertTrue(saved["ok"], saved)
+        output = self.path.with_suffix(".takm")
+        streams, _ = self.read_takm(output)
+        self.assertEqual(streams["Nodes.dat"], b"new nodes")
+        self.assertEqual(streams["MetaData.dat"], self.streams["MetaData.dat"])
+        self.assertEqual(streams["Channels.dat"], channels([self.analog, replacement]))
+        self.assertEqual(self.path.read_bytes(), compound(self.streams))
+        opened, _ = self.request(dict(op="open", path=str(output), max_bytes=1 << 20, probe_bytes=128))
+        args = self.upload(opened, output, nodes=b"newer nodes", markers=channels([self.marker]))
+        again, _ = self.request(dict(op="takm_save_patch", **args))
+        self.assertTrue(again["ok"], again)
+        streams, _ = self.read_takm(output)
+        self.assertEqual(streams["Channels.dat"], self.streams["Channels.dat"])
+        self.assertEqual(streams["MetaData.dat"], self.streams["MetaData.dat"])
+
+    def test_server_append_preserves_prefix_deduplicates_and_rejects_stale_source(self):
+        header, _ = self.open()
+        converted, _ = self.request(dict(op="takm_convert", path=str(self.path), expected_identity=header["identity"], max_bytes=1 << 20))
+        output = self.path.with_suffix(".takm")
+        prefix = output.read_bytes()
+        event = b"@event:74657374:t,add,1,M,0,1,,note,1,,x.takm|10,,operation=test\r\n"
+        args = self.upload(converted, output, events=event)
+        appended, _ = self.request(dict(op="takm_append", **args))
+        self.assertTrue(appended["ok"], appended)
+        self.assertEqual(output.read_bytes(), prefix + event)
+        stale, _ = self.request(dict(op="patch_begin", part_lengths=[0, 0, len(event)], **args))
+        self.assertEqual(stale["error"], "source_changed")
+        args = self.upload(appended, output, events=event)
+        repeated, _ = self.request(dict(op="takm_append", **args))
+        self.assertTrue(repeated["ok"], repeated)
+        self.assertEqual(output.read_bytes(), prefix + event)
+        other = event.replace(b"operation=test", b"operation=other").replace(b"74657374", b"6f74686572")
+        args = self.upload(repeated, output, events=other)
+        collision, _ = self.request(dict(op="takm_append", **args))
+        self.assertEqual(collision["error"], "comment_conflict")
+        self.assertEqual(output.read_bytes(), prefix + event)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs Windows privileges")
+    def test_write_refuses_symlink_destination_and_source(self):
+        output = self.path.with_suffix(".takm")
+        innocent = self.directory / "innocent.dat"
+        innocent.write_bytes(b"untouched")
+        output.symlink_to(innocent)
+        header, _ = self.open()
+        bad, _ = self.request(dict(op="takm_convert", path=str(self.path), expected_identity=header["identity"], max_bytes=1 << 20))
+        self.assertEqual(bad["error"], "invalid_request")
+        self.assertEqual(innocent.read_bytes(), b"untouched")
+
 
 
 if __name__ == "__main__":

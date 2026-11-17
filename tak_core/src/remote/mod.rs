@@ -1,7 +1,9 @@
-//! Memory-only, read-only SSH access. Remote identity stays separate from local paths.
+//! Memory-only SSH reads and server-side TAKM patches. Identity stays separate from local paths.
 //! Complete markers are returned before analog; failed retries never replace loaded data.
 mod transport;
 mod command;
+mod write;
+pub use write::{RemoteEditStreams, RemoteWriteOutcome};
 pub use command::{python_tokens, PYTHON_NOT_FOUND};
 use crate::tak::Take;
 use serde_json::{json, Value};
@@ -95,12 +97,16 @@ pub struct RemoteSource {
     pub path: String,
     identity: Value,
 }
-/// Read-only remote snapshot. Never pass `take.path` to local save/comment APIs.
+/// Remote memory snapshot. Never pass `take.path` to local save/comment APIs.
+#[derive(Clone)]
 pub struct RemoteTake {
     pub take: Take,
     pub source: RemoteSource,
-    /// Existing TAKM comment tail, unchanged UTF-8 bytes. No write API is exposed.
+    /// Existing TAKM comment tail, unchanged UTF-8 bytes. Writes use the SSH session.
     pub comments: Vec<u8>,
+    pub edit_streams: RemoteEditStreams,
+    pub fixed_len: u64,
+    pub next_comment_id: u64,
     analog_pending: bool,
     marker_channels: Vec<u8>,
     channel_order: Vec<bool>,
@@ -283,6 +289,16 @@ impl RemoteSession {
                 _ => return Err("Incomplete analog device classification".into()),
             }
         }
+        // Ambiguous-device fallback returns complete channels for display. Keep only the
+        // marker/non-device records in the edit payload; the server preserves analog bytes.
+        let edit_inventory = crate::tak::channels::iter_channel_inventory(&blocks[2]).map_err(|e| e.to_string())?;
+        let edit_records: Vec<_> = edit_inventory.iter().filter(|r| !r.name.starts_with("AnalogChannel")).collect();
+        let mut edit_channels = crate::tak::channels::CHANNELS_HEADER.to_vec();
+        edit_channels.extend_from_slice(&(edit_records.len() as u32).to_le_bytes());
+        for row in edit_records { edit_channels.extend_from_slice(&blocks[2][row.start..row.end]); }
+        let edit_streams = RemoteEditStreams { nodes: blocks[0].clone().into(), channels: edit_channels.into(), metadata: blocks[1].clone().into() };
+        let fixed_len = header["fixed_len"].as_u64().unwrap_or(file_size as u64);
+        let next_comment_id = header["next_comment_id"].as_u64().unwrap_or(if header["format"] == "tak" { 0 } else { 1 });
         let comments = std::mem::take(&mut blocks[3]);
         let mut marker_channels = if analog_pending {
             std::mem::take(&mut blocks[2])
@@ -301,6 +317,7 @@ impl RemoteSession {
         }
         let channel_manifest = take.analog.iter().map(|d| d.channels.iter().map(|c| (c.name.clone(), c.kind.clone(), c.dim)).collect()).collect();
         Ok(RemoteTake {
+            edit_streams, fixed_len, next_comment_id,
             marker_channels,
             channel_order,
             take,

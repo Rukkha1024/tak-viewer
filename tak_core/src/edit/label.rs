@@ -129,6 +129,9 @@ pub struct CreationStreams {
     channels: Vec<u8>,
 }
 impl CreationStreams {
+    /// Retain server-verified marker streams without calling local filesystem APIs.
+    pub fn from_streams(nodes: Vec<u8>, channels: Vec<u8>) -> Self { Self { nodes, channels } }
+
     pub fn read_from_path(path: &Path) -> Result<Self, EditError> {
         let mut source = super::source::Source::read(path)?;
         let ni = source.streams.iter().position(|s|s.name=="Nodes.dat").ok_or(EditError::UnsupportedLayout)?;

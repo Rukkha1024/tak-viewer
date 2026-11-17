@@ -20,7 +20,13 @@ impl PreparedInput {
         let channel_bytes = &source.unique("Channels.dat")?.bytes;
         let meta_bytes = &source.unique("MetaData.dat")?.bytes;
         let streams = source.streams.iter().map(|s| StreamRef {index:s.index,name:s.name.clone()}).collect::<Vec<_>>();
-        let take = tak::decode_markers(path,source.len as usize,nodes_bytes,channel_bytes,meta_bytes,false).map_err(error)?;
+        Self::read_from_streams(path, source.len as usize, nodes_bytes, channel_bytes, meta_bytes, streams)
+    }
+
+    /// Prepare an SSH document from memory. Device samples can remain absent: the server
+    /// copies their exact source records during save. No local path is opened here.
+    pub fn read_from_streams(path: &Path, size: usize, nodes_bytes: &[u8], channel_bytes: &[u8], meta_bytes: &[u8], streams: Vec<StreamRef>) -> Result<(PreparedInput, Take), EditError> {
+        let take = tak::decode_markers(path,size,nodes_bytes,channel_bytes,meta_bytes,false).map_err(error)?;
         let assets = nodes::skeleton_asset_set(&nodes_bytes).map_err(error)?;
         let marker_nodes = nodes::parse_marker_nodes(&nodes_bytes, &assets).map_err(error)?;
         let properties = nodes::property_records(&nodes_bytes, &nodes::MARKER_SIGNATURES).map_err(error)?;

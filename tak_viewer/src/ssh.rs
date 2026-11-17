@@ -32,6 +32,7 @@ pub fn demo_state() -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SshAction {
+    AddWorkspace { location: RemoteLocation, platform: String },
     Open {
         location: RemoteLocation,
         side: bool,
@@ -267,6 +268,22 @@ struct WorkerHandle {
     operations: HashMap<u64, Operation>,
 }
 
+#[derive(Clone)]
+pub struct RemoteDocument {
+    pub source: tak_core::remote::RemoteSource,
+    pub streams: tak_core::remote::RemoteEditStreams,
+    pub fixed_len: u64,
+    pub file_size: usize,
+    pub next_comment_id:u64,
+}
+pub struct RemoteWritten {
+    pub outcome: tak_core::remote::RemoteWriteOutcome,
+    pub loaded: RemoteTake,
+    pub view: ViewData,
+    pub prepared: Option<tak_core::edit::PreparedInput>,
+    pub comments: Comments,
+    pub creation: Arc<tak_core::edit::label::CreationStreams>,
+}
 enum Command {
     List {
         id: u64,
@@ -286,10 +303,15 @@ enum Command {
         target: AnalogTarget,
         cancel: CancelToken,
     },
+    Write {
+        id: u64, location: RemoteLocation, snapshot: Option<tak_core::edit::DocumentSnapshot>,
+        events: Vec<comments::Event>, data: Arc<ViewData>, document:RemoteDocument, reply: Sender<Result<RemoteWritten, String>>, cancel: CancelToken,
+    },
     Stop,
 }
 
 enum WorkerEvent {
+    Editable(RemoteLocation, RemoteDocument),
     Aliases(Result<Vec<String>, String>),
     Connected(String),
     Metrics(u64),
@@ -343,6 +365,7 @@ pub struct SshManager {
     pub discovery_pending: bool,
     pub discovery_note: Option<String>,
     pub full_analog_probe: bool,
+    pub documents: HashMap<RemoteLocation, RemoteDocument>,
     ctx: egui::Context,
     tx: Sender<Envelope>,
     rx: Receiver<Envelope>,
@@ -365,6 +388,7 @@ impl SshManager {
             discovery_pending: false,
             discovery_note: None,
             full_analog_probe: false,
+            documents: HashMap::new(),
             ctx: ctx.clone(),
             tx,
             rx,
@@ -437,6 +461,46 @@ impl SshManager {
         match host.listings.get(&host.path)? {
             Listing::Ready(list) => Some(serde_json::json!({"path":list.path,"count":list.entries.len(),"truncated":list.truncated,"drive_source":list.drive_source,"entries":list.entries.iter().map(|e|serde_json::json!({"path":e.path,"name":e.name,"directory":e.directory})).collect::<Vec<_>>()})),
             _ => None,
+        }
+    }
+
+    /// WORKSPACE shares this host's worker and listing cache. Only called for an explicitly
+    /// expanded/refreshed remote folder; constructing/restoring saved roots never calls it.
+    pub fn workspace_list(&mut self, root: &crate::workspace::RemoteRoot, location: &RemoteLocation,
+        key: &std::path::Path, refresh: bool) -> Result<Option<crate::workspace::Listing>, String> {
+        self.add_host(&root.alias);
+        let index = self.hosts.iter().position(|h| h.alias == root.alias).unwrap();
+        match self.hosts[index].state {
+            HostState::Off | HostState::Lost => {
+                if !refresh { return Err(self.hosts[index].note.clone().unwrap_or_else(|| "SSH 연결이 끝났어요. ↻로 다시 연결해 주세요.".into())); }
+                self.set_platform(&root.alias, &root.platform);
+                self.connect_at(&root.alias, &location.path)?;
+                return Ok(None);
+            }
+            HostState::Connecting => return Ok(None),
+            HostState::Connected => {}
+        }
+        if refresh || !self.hosts[index].listings.contains_key(&location.path) {
+            // The connection's initial list is already in flight; don't enqueue it twice.
+            if !matches!(self.hosts[index].listings.get(&location.path), Some(Listing::Loading)) {
+                self.request_list(&root.alias, location.path.clone(), false)?;
+            }
+            return Ok(None);
+        }
+        match self.hosts[index].listings.get(&location.path) {
+            Some(Listing::Ready(list)) => {
+                let mut dirs = Vec::new();
+                let mut files = Vec::new();
+                for entry in &list.entries {
+                    if entry.name.contains(['/', '\\', '\0']) || matches!(entry.name.as_str(), "." | "..") { continue; }
+                    let path = key.join(&entry.name);
+                    if entry.directory { dirs.push(path); }
+                    else { files.push(crate::workspace::WsFile { path, name: entry.name.clone(), size: 0 }); }
+                }
+                Ok(Some(crate::workspace::Listing::Ready { dirs, files }))
+            }
+            Some(Listing::Failed(message)) => Err(message.clone()),
+            _ => Ok(None),
         }
     }
 
@@ -575,6 +639,21 @@ impl SshManager {
             .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
         worker.operations.insert(id, Operation { cancel, kind: OperationKind::Open });
         Ok(id)
+    }
+
+    /// Queue a write on the same SSH worker as reads; the caller only polls this receiver.
+    pub fn write(&mut self, location: RemoteLocation, snapshot: Option<tak_core::edit::DocumentSnapshot>,
+                 events: Vec<comments::Event>, data:Arc<ViewData>) -> Result<Receiver<Result<RemoteWritten, String>>, String> {
+        let id = self.id();
+        let document=self.documents.get(&location).cloned().ok_or("원격 편집 자료가 없어요. 파일을 다시 열어 주세요.")?;
+        let worker = self.hosts.iter_mut().find(|h| h.alias == location.host && h.state == HostState::Connected)
+            .and_then(|h| h.worker.as_mut()).ok_or("서버에 저장하려면 다시 연결해 주세요.")?;
+        let cancel = CancelToken::default();
+        let (reply, rx) = mpsc::channel();
+        worker.tx.send(Command::Write { id, location, snapshot, events, data, document, reply, cancel: cancel.clone() })
+            .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
+        worker.operations.insert(id, Operation { cancel, kind: OperationKind::Open });
+        Ok(rx)
     }
 
     pub fn navigate(&mut self, alias: &str, path: String) -> Result<(), String> {
@@ -778,6 +857,7 @@ impl SshManager {
                 WorkerEvent::Metrics(bytes) => host.received_bytes = bytes,
                 WorkerEvent::Progress(counter) => host.received_counter = Some(counter),
                 WorkerEvent::Diagnostic(error) => host.diagnostic = Some(error),
+                WorkerEvent::Editable(location, document) => { self.documents.insert(location, document); },
                 WorkerEvent::Connected(command) => {
                     self.python_settings.entry(host.alias.clone()).or_default().remembered = Some(command);
                     host.state = HostState::Connected;
@@ -1139,6 +1219,7 @@ fn host_worker(
     let mut analog: VecDeque<(u64, RemoteLocation, RemoteTake, AnalogTarget, CancelToken, AnalogStage)> =
         VecDeque::new();
     let mut deferred: HashMap<RemoteLocation, RemoteTake> = HashMap::new();
+    let mut editable: HashMap<RemoteLocation, RemoteDocument> = HashMap::new();
     let mut pending_access: VecDeque<(u64, RemoteLocation, AnalogTarget, CancelToken)> = VecDeque::new();
     loop {
         if let Some(index) = pending_access.iter().position(|(_, l, _, _)| !analog.iter().any(|(_, active, _, _, _, _)| active == l)) {
@@ -1233,6 +1314,10 @@ fn host_worker(
                             emit(WorkerEvent::Stopped { cancelled: true });
                             return;
                         }
+                        let document = RemoteDocument { source: loaded.source.clone(), streams: loaded.edit_streams.clone(),
+                            fixed_len: loaded.fixed_len, file_size: loaded.take.file_size as usize,next_comment_id:loaded.next_comment_id };
+                        editable.insert(location.clone(), document.clone());
+                        emit(WorkerEvent::Editable(location.clone(), document));
                         loaded.take.path = location.memory_key();
                         deferred.remove(&location);
                         let pending = if full { loaded.analog_pending() } else { loaded.initial_analog_pending() };
@@ -1272,6 +1357,12 @@ fn host_worker(
                         }) {
                             return;
                         }
+                        if loaded.next_comment_id==0 {
+                            match session.comment_id_floor(&loaded.source,&cancel) {
+                                Ok(next)=>{if let Some(document)=editable.get_mut(&location) {document.next_comment_id=next;emit(WorkerEvent::Editable(location.clone(),document.clone()));}},
+                                Err(error)=>{emit(WorkerEvent::Diagnostic(format!("Comment 번호를 준비하지 못했어요: {error}")));}
+                            }
+                        }
                         if pending {
                             analog.push_back((id, location, loaded, target, cancel, if full { AnalogStage::Full } else { AnalogStage::Initial }));
                         } else {
@@ -1296,6 +1387,55 @@ fn host_worker(
                         }
                     }
                 }
+            }
+            Some(Command::Write { id, location, snapshot, events, data, document, reply, cancel }) => {
+                editable.entry(location.clone()).or_insert(document);
+                let mut run = || -> Result<RemoteWritten, String> {
+                    let mut document = editable.get(&location).cloned().ok_or("파일을 다시 열어 저장 정보를 준비해 주세요.")?;
+                    let parts=snapshot.as_ref().map(|snapshot|document.streams.serialize(snapshot)).transpose()?;
+                    let outcome = if let Some(snapshot) = snapshot.as_ref() {
+                        session.save_patch(&document.source, snapshot, &document.streams, &events, &cancel)?
+                    } else if document.source.path.to_ascii_lowercase().ends_with(".takm") {
+                        session.append(&document.source, &events, &cancel)?
+                    } else {
+                        session.save_patch_parts(&document.source,&[],&[],&events,&cancel)?
+                    };
+                    // Record the verified successor before reopening: a failed display read
+                    // must not force a later retry to use the pre-write source identity.
+                    if !outcome.existing {
+                        document.source=outcome.source.clone(); document.fixed_len=outcome.fixed_len;
+                        document.file_size=outcome.output_bytes as usize;
+                        if let Some((nodes,channels))=parts {document.streams.nodes=nodes.into();document.streams.channels=channels.into();}
+                        editable.insert(location.clone(),document.clone());
+                        emit(WorkerEvent::Editable(location.clone(),document));
+                    }
+                    let loaded = session.open(&outcome.path, &cancel).map_err(|error|format!("서버 저장은 끝났지만 다시 읽지 못했어요: {error}"))?;
+                    let mut view = if let Some(snapshot) = snapshot.as_ref() { data.rebuild_markers(snapshot).map_err(|e| format!("{e:?}"))? } else { (*data).clone() };
+                    view.take.path = RemoteLocation {host:location.host.clone(),path:outcome.path.clone()}.memory_key();
+                    view.take.file_size = outcome.output_bytes;
+                    let prepared = if snapshot.is_none() { Some(loaded.edit_streams.prepare(&data.take.path,loaded.take.file_size as usize)?.0) } else { None };
+                    let comments=comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
+                    let creation=Arc::new(tak_core::edit::label::CreationStreams::from_streams(loaded.edit_streams.nodes.to_vec(),loaded.edit_streams.channels.to_vec()));
+                    Ok(RemoteWritten { outcome, loaded, view, prepared, comments, creation })
+                };
+                let result = run();
+                if let Ok(written) = &result {
+                    let next = RemoteLocation { host:location.host.clone(), path:written.outcome.path.clone() };
+                    let document = RemoteDocument { source:written.loaded.source.clone(), streams:written.loaded.edit_streams.clone(),
+                        fixed_len:written.loaded.fixed_len, file_size:written.loaded.take.file_size as usize,next_comment_id:written.loaded.next_comment_id };
+                    editable.insert(next.clone(), document.clone());
+                    deferred.remove(&location);
+                    if written.loaded.lazy_analog_pending() {deferred.insert(next.clone(),written.loaded.clone());}
+                    // Writes wait for initial analog completion. A queued user-demand job
+                    // keeps its target but receives the verified successor source.
+                    for (_,job_location,loaded,_,_,_) in &mut analog {
+                        if *job_location==location {*job_location=next.clone();*loaded=written.loaded.clone();}
+                    }
+                    emit(WorkerEvent::Editable(next, document));
+                }
+                let _ = reply.send(result);
+                emit(WorkerEvent::Metrics(session.received_bytes()));
+                emit(WorkerEvent::Done(id));
             }
             Some(Command::Analog { id, location, target, cancel }) => {
                 if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }

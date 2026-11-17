@@ -2,6 +2,7 @@
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Write;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct Fixture(std::path::PathBuf, crate::test_support::TempDir);
     impl Fixture {
@@ -322,6 +323,155 @@ os.scandir = scan
         v["maximum_payload_bytes"] = json!(0);
         assert!(RemoteConfig::from_json(&v.to_string()).is_err());
     }
+    fn write_event(id: u64) -> crate::comments::Event {
+        use crate::comments::{Comment, Event, Kind};
+        let item = Comment { id, markers:vec![], start:1,end:2,comment_type:String::new(),text:"remote write".into() };
+        let mut event = Event::of(Kind::Add, &item, "2026-11-17T00:00:00+00:00".into(), "test.takm|1".into());
+        event.operation = Some(format!("ssh-write-{id}"));
+        event
+    }
+
+    #[test]
+    fn server_conversion_preserves_all_streams_except_camera_and_refuses_changed_source() {
+        let fixture = Fixture::new(false);
+        let original = std::fs::read(&fixture.0).unwrap();
+        let original_container = crate::tak::container::Container::parse(&original).unwrap();
+        let mut remote = session(); let cancel = CancelToken::default();
+        let loaded = remote.open(fixture.0.to_str().unwrap(), &cancel).unwrap();
+        let outcome = remote.convert(&loaded.source, &cancel).unwrap();
+        assert!(outcome.verified && !outcome.existing);
+        let output = std::path::Path::new(&outcome.path);
+        crate::takm::verify_fixed(output).unwrap();
+        let index = crate::takm::read_index_path(output).unwrap();
+        let raw = std::fs::read(output).unwrap();
+        let expected: Vec<_> = original_container.streams().unwrap().into_iter().filter(|(name,_)| name != crate::takm::CAMERA_STREAM).collect();
+        assert_eq!(index.streams.len(), expected.len());
+        for (written, (name, entry)) in index.streams.iter().zip(expected) {
+            assert_eq!(written.name, name);
+            assert_eq!(&raw[written.offset as usize..(written.offset+written.size) as usize], original_container.read_stream(entry).unwrap());
+        }
+        assert!(remote.convert(&loaded.source,&cancel).unwrap().existing);
+        assert_eq!(std::fs::read(output).unwrap(), raw);
+        assert_eq!(std::fs::read(&fixture.0).unwrap(), original);
+        std::fs::OpenOptions::new().append(true).open(&fixture.0).unwrap().write_all(b"changed").unwrap();
+        assert!(remote.convert(&loaded.source,&cancel).unwrap_err().contains("source_changed"));
+        assert_eq!(std::fs::read(output).unwrap(), raw);
+    }
+
+    #[test]
+    fn server_marker_save_comment_append_and_reopen_keep_analog_byte_exact() {
+        use crate::edit::{EditDocument,EditPatch,TrackChange,EditSelection,AffectedFrames,EditResult,RawSample};
+        use std::sync::Arc;
+        let fixture = Fixture::new(false);
+        let original = std::fs::read(&fixture.0).unwrap();
+        let mut remote = session(); let cancel=CancelToken::default();
+        let loaded = remote.open(fixture.0.to_str().unwrap(),&cancel).unwrap();
+        let (prepared,_) = loaded.edit_streams.prepare(&fixture.0, original.len()).unwrap();
+        let mut document = EditDocument::unloaded(fixture.0.clone());
+        document.install_prepared(document.revision(),prepared).unwrap();
+        let before = document.snapshot();
+        let track = before.track(&before.track_order()[0]).unwrap().clone();
+        let mut after = (*track).clone(); let mut samples = after.samples.to_vec();
+        let mut xyz=samples[0].xyz();xyz[0]+=0.125;
+        samples[0]=RawSample::new(samples[0].frame(),xyz);after.samples=samples.into();
+        let patch=EditPatch::prepare(&before,vec![TrackChange {uid:track.uid,before:Some(track.clone()),after:Some(Arc::new(after))}],EditSelection::default(),EditSelection::default(),AffectedFrames {first:0,last:299},EditResult::default()).unwrap();
+        document.apply(&patch,true).unwrap();
+        let state=document.snapshot();
+        let saved=remote.save_patch(&loaded.source,&state,&loaded.edit_streams,&[write_event(1)],&cancel).unwrap();
+        assert!(saved.verified && !saved.existing);
+        let reopened=remote.open(&saved.path,&cancel).unwrap();
+        let (prepared,_)=reopened.edit_streams.prepare(Path::new(&saved.path),saved.output_bytes as usize).unwrap();
+        let mut doc=EditDocument::unloaded(saved.path.clone().into());doc.install_prepared(doc.revision(),prepared).unwrap();
+        assert_eq!(doc.snapshot().track(&track.uid).unwrap().samples,state.track(&track.uid).unwrap().samples);
+        let comments=crate::comments::parse(std::str::from_utf8(&reopened.comments).unwrap());
+        assert_eq!(comments.events.len(),1);
+        let appended=remote.append(&reopened.source,&[write_event(2)],&cancel).unwrap();
+        let prefix=std::fs::read(&saved.path).unwrap();
+        assert!(remote.append(&reopened.source,&[write_event(2)],&cancel).unwrap_err().contains("source_changed"));
+        let mut remote = session(); // A source-change error retires the stale read transport.
+        let refreshed=remote.open(&appended.path,&cancel).unwrap();
+        remote.append(&refreshed.source,&[write_event(2)],&cancel).unwrap();
+        assert_eq!(std::fs::read(&saved.path).unwrap(),prefix);
+        assert_eq!(crate::takm::read_comments(Path::new(&saved.path)).unwrap().events.len(),2);
+        let original_take=crate::tak::read_take(&fixture.0).unwrap();
+        let saved_take=crate::tak::read_take(Path::new(&saved.path)).unwrap();
+        assert_eq!(verification_data(&original_take)["analog_samples"],verification_data(&saved_take)["analog_samples"]);
+        assert_eq!(std::fs::read(&fixture.0).unwrap(),original);
+        crate::takm::verify_fixed(Path::new(&saved.path)).unwrap();
+    }
+
+    #[test]
+    fn server_unlabel_created_node_roundtrip_and_undo_save() {
+        use crate::edit::{EditDocument, EditSelection};
+        use crate::edit::label::{CreationStreams, LabelEditor, LabelOperations, LabelScope, UnlabelRequest};
+        let fixture=Fixture::new(true);
+        // The general display fixture intentionally has an invalid creation envelope.
+        // Construct a strict marker suffix with one assigned structural parent/slot.
+        let mut original=Vec::new();
+        crate::takm::write(&mut original,&crate::sample_tak::sample_tak(),"sample.tak","test").unwrap();
+        std::fs::write(&fixture.0,&original).unwrap();
+        let index=crate::takm::read_index_path(&fixture.0).unwrap();
+        let node=index.streams.iter().find(|row|row.name=="Nodes.dat").unwrap();
+        let start=node.offset as usize;let end=(node.offset+node.size) as usize;
+        let properties=crate::tak::nodes::property_records(&original[start..end],&crate::tak::nodes::MARKER_SIGNATURES).unwrap();
+        let tail=start+properties[0].end;
+        original[start]=2;original[start+1..start+5].copy_from_slice(&3u32.to_le_bytes());
+        original[tail+48..tail+64].copy_from_slice(&[4u8;16]);
+        original[tail+64..tail+68].copy_from_slice(&1i32.to_le_bytes());
+        use sha2::{Digest,Sha256};
+        let seal=Sha256::digest(&original[..index.fixed_len as usize]);
+        original[index.fixed_len as usize..index.fixed_len as usize+32].copy_from_slice(&seal);
+        std::fs::write(&fixture.0,&original).unwrap();
+        let mut remote=session();let cancel=CancelToken::default();
+        let loaded=remote.open(fixture.0.to_str().unwrap(),&cancel).unwrap();
+        let (prepared,_)=loaded.edit_streams.prepare(&fixture.0,original.len()).unwrap();
+        let mut document=EditDocument::unloaded(fixture.0.clone());document.install_prepared(document.revision(),prepared).unwrap();
+        let before=document.snapshot();
+        let chosen=before.tracks().find(|t|t.label.is_some() && t.records.serialization_verified && !t.samples.is_empty()).unwrap();
+        let frame=chosen.samples[0].frame();
+        let streams=CreationStreams::from_streams(loaded.edit_streams.nodes.to_vec(),loaded.edit_streams.channels.to_vec());
+        let proof=streams.verify(&before).unwrap();
+        let request=UnlabelRequest {tracks:vec![chosen.uid], current_frame:frame,
+            scope:LabelScope::SelectedOrAll {range:Some((frame,frame))}, backward:true, forward:true, selection:EditSelection::default()};
+        let patch=LabelEditor::with_creation(&proof).unlabel(&before,&request).unwrap().unwrap();
+        document.apply(&patch,true).unwrap();
+        let edited=document.snapshot();
+        assert_eq!(edited.tracks().count(),before.tracks().count()+1);
+        let saved=remote.save_patch(&loaded.source,&edited,&loaded.edit_streams,&[],&cancel).unwrap();
+        let reopened=remote.open(&saved.path,&cancel).unwrap();
+        let (prepared,_)=reopened.edit_streams.prepare(Path::new(&saved.path),saved.output_bytes as usize).unwrap();
+        let mut roundtrip=EditDocument::unloaded(saved.path.clone().into());roundtrip.install_prepared(roundtrip.revision(),prepared).unwrap();
+        for track in edited.tracks() {assert_eq!(roundtrip.snapshot().track(&track.uid).unwrap().samples,track.samples);}
+        // Retain the original PreparedInput while changing the generated track after save.
+        use crate::edit::{EditPatch, TrackChange, RawSample, AffectedFrames, EditResult};
+        use std::sync::Arc;
+        let generated=edited.tracks().find(|track|before.track(&track.uid).is_none()).unwrap().clone();
+        let mut changed=(*generated).clone();let mut samples=changed.samples.to_vec();
+        let mut xyz=samples[0].xyz();xyz[1]+=0.125;samples[0]=RawSample::new(samples[0].frame(),xyz);changed.samples=samples.into();
+        let edit_again=EditPatch::prepare(&edited,vec![TrackChange {uid:generated.uid,before:Some(generated.clone()),after:Some(Arc::new(changed))}],
+            EditSelection::default(),EditSelection::default(),AffectedFrames {first:frame,last:frame},EditResult::default()).unwrap();
+        document.apply(&edit_again,true).unwrap();
+        remote.save_patch(&reopened.source,&document.snapshot(),&reopened.edit_streams,&[],&cancel).unwrap();
+        let twice=remote.open(&saved.path,&cancel).unwrap();
+        let (prepared,_)=twice.edit_streams.prepare(Path::new(&saved.path),twice.source.file_size() as usize).unwrap();
+        let mut roundtrip=EditDocument::unloaded(saved.path.clone().into());roundtrip.install_prepared(roundtrip.revision(),prepared).unwrap();
+        for track in document.snapshot().tracks() {assert_eq!(roundtrip.snapshot().track(&track.uid).unwrap().samples,track.samples);}
+        document.apply(&edit_again,false).unwrap();
+        document.apply(&patch,false).unwrap();
+        remote.save_patch(&twice.source,&document.snapshot(),&twice.edit_streams,&[],&cancel).unwrap();
+        let undone=remote.open(&saved.path,&cancel).unwrap();
+        let (prepared,_)=undone.edit_streams.prepare(Path::new(&saved.path),undone.source.file_size() as usize).unwrap();
+        let mut roundtrip=EditDocument::unloaded(saved.path.into());roundtrip.install_prepared(roundtrip.revision(),prepared).unwrap();
+        assert_eq!(roundtrip.snapshot().tracks().count(),before.tracks().count());
+        for track in before.tracks() {assert_eq!(roundtrip.snapshot().track(&track.uid).unwrap().samples,track.samples);}
+        crate::takm::verify_fixed(&fixture.0).unwrap();
+        let output=std::fs::read(&fixture.0).unwrap();let output_index=crate::takm::read_index_path(&fixture.0).unwrap();
+        for old in &index.streams {
+            let restored=output_index.streams.iter().find(|row|row.name==old.name).unwrap();
+            assert_eq!(&original[old.offset as usize..(old.offset+old.size) as usize],&output[restored.offset as usize..(restored.offset+restored.size) as usize]);
+        }
+    }
+
 }
 
 /// These tests exercise session decoding and failures without running SSH or Python.

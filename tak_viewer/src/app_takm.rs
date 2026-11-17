@@ -87,7 +87,13 @@ impl TakViewerApp {
     /// looked at here (the thread does).
     pub(super) fn takm_allowed(&self, tak: Option<&Path>) -> Result<PathBuf, String> {
         let Some(tak) = tak else { return Err("지금 화면에 TAK를 열면 쓸 수 있어요.".into()) };
-        if remote_ui::is_remote_key(tak) { return Err("원격 파일은 서버에서 .takm으로 만들어 주세요.".into()); }
+        if remote_ui::is_remote_key(tak) {
+            let slot=self.views.iter().position(|view|view.path()==Some(tak)).ok_or("이 원격 TAK를 먼저 화면에 열어 주세요.")?;
+            if self.no_persist && !self.remote_write_probe {return Err("명령 실행은 서버에 쓰지 않아요.".into());}
+            if !tak_core::tak::is_take_path(tak) {return Err("이미 .takm 파일이에요.".into());}
+            if self.remote_saving(slot) {return Err("서버에 저장하는 중이에요.".into());}
+            return Ok(tak.to_path_buf());
+        }
         if !tak_core::tak::is_take_path(tak) {
             return Err("지금 화면의 파일이 TAK가 아니에요(이미 .takm).".into());
         }
@@ -111,6 +117,10 @@ impl TakViewerApp {
                 return;
             }
         };
+        if remote_ui::is_remote_key(&tak) {
+            if let Some(slot)=self.views.iter().position(|view|view.path()==Some(tak.as_path())) {self.save_remote(ctx,slot,false);}
+            return;
+        }
         let identities = self.takm_known_identities();
         if let Err(reason) = self.takm_source_ready(&tak, &identities) {
             self.takm_note = Some((reason, now));

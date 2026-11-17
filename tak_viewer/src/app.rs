@@ -143,7 +143,7 @@ impl Default for LayoutRuntime {
 pub struct Settings {
     pub scene: SceneOptions,
     pub recent: Vec<String>,
-    /// SSH platform and Python command only; never remote paths, contents or connection state.
+    /// SSH platform/Python settings; saved WORKSPACE addresses live in workspace_roots only.
     pub ssh_platforms: BTreeMap<String, String>,
     pub ssh_python: BTreeMap<String, crate::ssh::PythonSetting>,
     /// Old single workspace folder (before 2026-11-10). Moved into `workspace_roots` once.
@@ -441,6 +441,8 @@ pub struct TakViewerApp {
     ssh_sources: std::collections::HashMap<PathBuf, crate::ssh::RemoteLocation>,
     ssh_cache: std::collections::VecDeque<remote_ui::Cached>,
     ssh_reads: std::collections::HashMap<u64, remote_ui::RemoteRead>,
+    remote_edits: std::collections::HashMap<tak_core::edit::DocumentId, remote_ui::RemoteEdits>,
+    remote_write_probe: bool,
     ssh_note: Option<(String, f64)>,
     ssh_demo_applied: bool,
     explorer: ExplorerState,
@@ -651,6 +653,8 @@ impl TakViewerApp {
             ssh_sources: Default::default(),
             ssh_cache: Default::default(),
             ssh_reads: Default::default(),
+            remote_edits: Default::default(),
+            remote_write_probe: false,
             ssh_note: None,
             ssh_demo_applied: false,
             explorer: ExplorerState::default(),
@@ -713,7 +717,7 @@ impl TakViewerApp {
         }
         for r in app.settings.workspace_open.clone() {
             let r = PathBuf::from(r);
-            if app.workspace.roots().contains(&r) {
+            if app.workspace.roots().contains(&r) && !workspace::is_remote_root_key(&r) {
                 app.explorer.expand(&mut app.workspace, &r);
             }
         }
@@ -800,7 +804,7 @@ impl TakViewerApp {
             Some(f) if same => format!("{} · {f}", name(path)),
             _ => name(path),
         };
-        if self.views[slot].marker_dirty() { label.push('*'); }
+        if self.views[slot].marker_dirty() || (self.views[slot].remote.is_some() && self.views[slot].comments.pending > 0) { label.push('*'); }
         Some(label)
     }
 
@@ -821,7 +825,9 @@ impl TakViewerApp {
             ));
             return false;
         }
-        push_recent(&mut self.settings.recent_workspaces, root.to_string_lossy().into_owned());
+        if !workspace::is_remote_root_key(&root) {
+            push_recent(&mut self.settings.recent_workspaces, root.to_string_lossy().into_owned());
+        }
         if !dock::has(&self.dock, Pane::Explorer) {
             self.show_pane(Pane::Explorer);
         }
@@ -992,7 +998,7 @@ impl TakViewerApp {
             return;
         }
         if shared_elsewhere {
-            if self.comments_unsaved(slot) {
+            if self.comments_unsaved(slot) && self.views[slot].remote.is_none() {
                 self.discard_identity_candidate();
                 self.notice = Some("Comment 저장을 마친 뒤 다시 열어 주세요.".into());
                 return;
@@ -1107,7 +1113,7 @@ impl TakViewerApp {
         let shared_elsewhere = self.views[slot].target().is_some_and(|path| self.file_has_other_view(slot, path));
         if !self.restoring_layout && self.guard_view_removal(slot, marker_edit::PendingTransition::CloseView { slot }) { return; }
         if !self.restoring_layout && shared_elsewhere {
-            if self.comments_unsaved(slot) {
+            if self.comments_unsaved(slot) && self.views[slot].remote.is_none() {
                 self.notice = Some("Comment 저장을 마친 뒤 다시 닫아 주세요.".into());
                 return;
             }
@@ -1179,6 +1185,7 @@ impl TakViewerApp {
         }
         self.poll_comment_ids(ctx);
         self.poll_overlays(ctx);
+        self.poll_remote_writes(ctx);
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
         self.poll_ssh(ctx);
@@ -1634,7 +1641,7 @@ impl TakViewerApp {
     /// or Err(why not, plain Korean).
     fn comment_ready(&self, slot: usize) -> Result<String, String> {
         let path = self.comment_writable(slot)?;
-        if self.views[slot].comments.id_pool.as_ref().is_none_or(|ids| ids.is_empty()) {
+        if self.views[slot].remote.is_none() && self.views[slot].comments.id_pool.as_ref().is_none_or(|ids| ids.is_empty()) {
             return Err(self.views[slot].comments.id_error.clone().unwrap_or_else(|| "Preparing Comment IDs. Try again shortly.".into()));
         }
         if let Some(e) = &self.comment_edit {
@@ -1654,8 +1661,9 @@ impl TakViewerApp {
             n => format!("고른 마커 {n}개"),
         };
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let save_note=if v.remote.as_ref().is_some_and(|r|r.path.to_ascii_lowercase().ends_with(".tak")) {"Ctrl+S로 서버의 .takm에 저장해요."} else {"파일 안에 바로 저장해요."};
         Ok(format!(
-            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labeling에서 클릭, Ctrl+클릭 = 여러 개).\n{name} 안에 바로 저장해요. Ctrl+Z = 되돌리기."
+            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labeling에서 클릭, Ctrl+클릭 = 여러 개).\n{name} · {save_note} Ctrl+Z = 되돌리기."
         ))
     }
 
@@ -1668,7 +1676,13 @@ impl TakViewerApp {
         if v.data.is_none() {
             return Err("파일을 열면 Comment를 남길 수 있어요.".into());
         }
-        if v.remote.is_some() { return Err(remote_ui::REMOTE_NO_COMMENTS.into()); }
+        if v.remote.is_some() {
+            if self.no_persist && !self.remote_write_probe { return Err("명령 실행은 서버에 쓰지 않아요.".into()); }
+            if v.remote.as_ref().and_then(|location|self.ssh.documents.get(location)).is_some_and(|document|document.next_comment_id==0) {
+                return Err("서버의 Comment 번호를 준비하는 중이에요. 잠시 뒤 다시 눌러 주세요.".into());
+            }
+            return v.comments.target.as_ref().ok_or("Comment를 읽는 중이에요.")?.as_ref().map(|p| p.as_path()).map_err(Clone::clone);
+        }
         // A TAK takes no Comments (`.takm` step ③), also in a command run.
         if self.shows_tak(slot) {
             return Err(views::TAK_NO_COMMENTS.into());
@@ -1692,12 +1706,16 @@ impl TakViewerApp {
     /// None when nothing may be written (command run, no file, its comment file still being read
     /// or refused).
     fn comment_target(&self, slot: usize) -> Option<(PathBuf, String)> {
-        if self.no_persist || self.views[slot].remote.is_some() || self.marker_saving(slot) || self.exit_waiting_comments {
+        if (self.no_persist && !(self.remote_write_probe && self.views[slot].remote.is_some())) || self.marker_saving(slot) || self.exit_waiting_comments {
             return None;
         }
         let v = &self.views[slot];
         match (&v.data, &v.comments.target) {
-            (Some(d), Some(Ok(p))) => Some((p.clone(), v.comments.label.clone().unwrap_or_else(|| comments::file_label(&d.take.path, d.take.file_size)))),
+            (Some(d), Some(Ok(p))) => {
+                let remote_label=v.remote.as_ref().and_then(|location|self.ssh.documents.get(location)
+                    .map(|document|remote_ui::remote_comment_label(location,document.fixed_len,d.take.file_size)));
+                Some((p.clone(),remote_label.or_else(||v.comments.label.clone()).unwrap_or_else(||comments::file_label(&d.take.path,d.take.file_size))))
+            },
             _ => None,
         }
     }
@@ -1710,7 +1728,8 @@ impl TakViewerApp {
     /// `M`, the `Comment` button or `T` on a TAK: why nothing happens, in the status bar.
     fn say_no_comments(&mut self, ctx: &egui::Context, slot: usize) {
         if self.views[slot].remote.is_some() {
-            self.ssh_note = Some((remote_ui::REMOTE_NO_COMMENTS.into(), ctx.input(|i| i.time)));
+            let reason=self.comment_writable(slot).err().unwrap_or_else(||"진행 중인 작업을 마친 뒤 다시 눌러 주세요.".into());
+            self.ssh_note = Some((reason, ctx.input(|i| i.time)));
             return;
         }
         if self.shows_tak(slot) {
@@ -1766,7 +1785,10 @@ impl TakViewerApp {
     /// Ctrl+Z (the redo part goes). The range is cleared, the selection stays; the cleared range
     /// is part of the same undo action (v0.15.1).
     fn add_comment(&mut self, ctx: &egui::Context, slot: usize, markers: Vec<String>, start: i64, end: i64) {
-        let Some(id) = self.views[slot].comments.id_pool.as_mut().and_then(Iterator::next) else {
+        self.views[slot].sync_shared();
+        let next = if let Some(location)=&self.views[slot].remote { Some(self.views[slot].comments.list.next_id().max(self.ssh.documents.get(location).map_or(1,|doc|doc.next_comment_id))) }
+            else { self.views[slot].comments.id_pool.as_mut().and_then(Iterator::next) };
+        let Some(id) = next else {
             self.notice = Some("Preparing Comment IDs. Try again shortly.".into());
             return;
         };
@@ -2138,6 +2160,7 @@ impl TakViewerApp {
 
     /// Hand an event to the writer thread (started on the first comment).
     fn send_comment(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, event: Event) {
+        if self.views[slot].remote.is_some() { self.queue_remote_comments(ctx, slot, vec![event]); return; }
         self.ensure_comment_writer(ctx);
         let tag = self.views[slot].file_id;
         if let Some(reason) = self.comment_registration_error.clone() {
@@ -2174,6 +2197,7 @@ impl TakViewerApp {
     fn poll_comment_ids(&mut self, ctx: &egui::Context) {
         if self.no_persist { return; }
         for slot in self.open_views() {
+            if self.views[slot].remote.is_some() { continue; }
             let state = &mut self.views[slot].comments;
             if let Some(rx) = &state.id_rx {
                 match rx.try_recv() {
@@ -2304,7 +2328,7 @@ impl TakViewerApp {
             text += " · 저장 못 함";
             tip += &format!("\n\n새 Comment를 파일에 저장하지 못했어요. 화면에는 있지만 뷰어를 끄면 사라져요.\n이유: {e}");
         } else if c.pending > 0 {
-            text += " · saving…";
+            if self.views[slot].remote.as_ref().is_some_and(|r|r.path.to_ascii_lowercase().ends_with(".tak")) && !self.remote_saving(slot) {text += " · Ctrl+S";} else {text += " · saving…";}
         } else if c.saved_at.is_some_and(|t| now - t < SAVED_NOTE_S) {
             text += " · saved";
         }
@@ -2317,11 +2341,8 @@ impl TakViewerApp {
     fn comments_tab(&mut self, ui: &mut egui::Ui) {
         let slot = self.comment_edit.as_ref().map_or(self.active, |e| e.slot);
         let write = self.comment_writable(slot).map(|_| ());
-        if self.views[slot].remote.is_some() {
-            ui.add_space(6.0);
-            ui.label(RichText::new(remote_ui::REMOTE_NO_COMMENTS).size(12.0).color(theme::WARN));
-            ui.add(egui::Label::new(RichText::new(format!("있던 Comment {}개는 아래에서 볼 수 있어요. 달려면 서버에서 .takm을 만들어 주세요.", self.views[slot].comments.list.list().len())).size(11.0).color(theme::TEXT_DIM)).wrap());
-            if self.views[slot].comments.list.list().is_empty() { return; }
+        if self.views[slot].remote.as_ref().is_some_and(|r| !r.path.to_ascii_lowercase().ends_with(".takm")) {
+            ui.label(RichText::new("Comment는 화면에 두고 Ctrl+S로 서버의 .takm에 저장해요.").size(11.0).color(theme::TEXT_DIM));
         }
         if self.shows_tak(slot) {
             self.tak_comments_tab(ui, slot);
@@ -2353,7 +2374,7 @@ impl TakViewerApp {
         let live_markers = (self.marker_edit() == Some((slot, v.file_id))).then(|| v.selected_names().join(", "));
         let (first, last) = (v.pb.first, v.pb.last);
         let input = comment_list::ListIn { list: &v.comments.list, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, selection: &v.comment_selection, live_markers, first, last };
-        let show = if v.remote.is_some() { comment_list::show_remote } else { comment_list::show };
+        let show = comment_list::show;
         let mut out = show(ui, input, &mut self.comment_order, &mut self.comment_edit);
         #[cfg(test)]
         {
@@ -2909,6 +2930,37 @@ impl TakViewerApp {
     /// What a click in the Explorer asked for (applied after drawing).
     fn explorer_action(&mut self, ctx: &egui::Context, a: WsAction) {
         if self.dirty_prompt.is_some() { return; }
+        let remote = match &a {
+            WsAction::Open(p) | WsAction::OpenSide(p) | WsAction::OpenNewTab(p) | WsAction::Overlay(p) | WsAction::ToTakm(p) => workspace::remote_address(p),
+            _ => None,
+        };
+        if let Some((root, location)) = remote {
+            match a {
+                WsAction::Open(_) | WsAction::OpenSide(_) | WsAction::OpenNewTab(_) => {
+                    if !self.ssh.is_connected(&root.alias) {
+                        self.ssh_note = Some(("SSH 폴더를 펼쳐 연결한 뒤 열어 주세요.".into(), ctx.input(|i| i.time)));
+                        return;
+                    }
+                    let side = matches!(a, WsAction::OpenSide(_));
+                    let tab = if matches!(a, WsAction::OpenNewTab(_)) {
+                        if !self.allow_open_file(&location.memory_key(), None) { return; }
+                        Some(self.new_layout_tab())
+                    } else { None };
+                    self.remote_workspace_open(ctx, location, side);
+                    if let Some(id) = tab {
+                        self.observe(false);
+                        if let Some(snapshot) = self.tab_undo_snapshot(id) {
+                            if let Some([undo::Part::TabLifecycle { id: action_id, snapshot: saved, .. }]) =
+                                self.history.undo.last_mut().map(Vec::as_mut_slice) {
+                                if *action_id == id { *saved = snapshot; }
+                            }
+                        }
+                    }
+                }
+                _ => { self.ssh_note = Some(("원격 파일은 눌러서 열어 주세요.".into(), ctx.input(|i| i.time))); }
+            }
+            return;
+        }
         match a {
             WsAction::Open(p) => self.open(ctx, p),
             WsAction::OpenSide(p) => self.open_side(ctx, p),
@@ -3325,14 +3377,14 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 }
                 let editors_rect = egui::Rect::from_min_max(editors_min, egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
                 key_focus::region(ui, editors_rect, key_focus::Target::Editors);
-                let current = app.view().target().map(Path::to_path_buf);
+                let current = app.view().remote.as_ref().and_then(|l| app.workspace.key_for_remote(l)).or_else(|| app.view().target().map(Path::to_path_buf));
                 // Other open files: the other views' files and every laid-over file.
                 let mut others: Vec<PathBuf> = self
                     .open
                     .iter()
                     .copied()
                     .filter(|&k| k != app.active)
-                    .filter_map(|k| app.views[k].target().map(Path::to_path_buf))
+                    .filter_map(|k| app.views[k].remote.as_ref().and_then(|l| app.workspace.key_for_remote(l)).or_else(|| app.views[k].target().map(Path::to_path_buf)))
                     .collect();
                 others.extend(self.open.iter().flat_map(|&k| app.views[k].overlay_paths().map(Path::to_path_buf).collect::<Vec<_>>()));
                 // The menu offers "얹은 파일 내리기" while the active view has one.
@@ -3557,6 +3609,7 @@ impl TakViewerApp {
         // then the watcher gets the folders shown expanded (only when they changed) and whether
         // the window is minimized (no re-reading then; egui `None` = not minimized).
         self.workspace.poll();
+        self.workspace.poll_remote(&mut self.ssh);
         if self.workspace.is_watching() {
             let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
             self.workspace.set_minimized(minimized);
@@ -4153,7 +4206,7 @@ impl TakViewerApp {
     fn sync_settings(&mut self) {
         let s = |p: &PathBuf| p.to_string_lossy().into_owned();
         self.settings.workspace_roots = self.workspace.roots().iter().map(s).collect();
-        self.settings.workspace_open = self.explorer.open_roots(&self.workspace).iter().map(s).collect();
+        self.settings.workspace_open = self.explorer.open_roots(&self.workspace).iter().filter(|p| !workspace::is_remote_root_key(p)).map(s).collect();
         self.settings.workspace_names = self.workspace.names().map(|(p, n)| (s(p), n.clone())).collect();
         self.settings.layout = Some(self.dock.clone());
         self.settings.layout_version = dock::LAYOUT_VERSION;
@@ -4193,6 +4246,7 @@ mod tests {
     include!("app_tab_input_tests.rs");
     include!("app_freshness_tests.rs");
     include!("app_hidden_work_tests.rs");
+    include!("app_remote_workspace_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.

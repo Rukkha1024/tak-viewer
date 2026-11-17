@@ -116,6 +116,7 @@ impl TakViewerApp {
     }
 
     fn send_comment_events(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, events: Vec<Event>) {
+        if self.views[slot].remote.is_some() { self.queue_remote_comments(ctx, slot, events); return; }
         let tag = self.views[slot].file_id;
         self.ensure_comment_writer(ctx);
         if let Some(reason) = self.comment_registration_error.clone() {

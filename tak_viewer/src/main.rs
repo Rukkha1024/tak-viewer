@@ -66,6 +66,9 @@ fn main() -> eframe::Result<()> {
         let takm_args: Vec<String> = std::iter::once(args[1].clone()).chain(paths).collect();
         std::process::exit(tak_core::takm::run(&takm_args));
     }
+    if args.iter().any(|a| a == "--ssh-workspace") {
+        std::process::exit(ssh_probe::run_workspace(&args[1..]));
+    }
     if args.iter().any(|a| matches!(a.as_str(), "--ssh-open" | "--ssh-list")) {
         std::process::exit(ssh_probe::run(&args[1..]));
     }

@@ -4,7 +4,6 @@ use crate::ssh::{RemoteLocation, SshAction, SshErrorKind, SshEvent};
 use std::sync::Arc;
 use tak_core::view_data::ViewData;
 
-pub(super) const REMOTE_NO_COMMENTS: &str = "원격 파일에는 Comment를 달 수 없어요.";
 const LOST: &str = "⚠ 연결이 끊겼어요. 받은 마커는 계속 볼 수 있어요.";
 const CHANGED: &str = "⚠ 서버의 파일이 바뀌었어요. 다시 열면 처음부터 읽어요.";
 
@@ -65,7 +64,55 @@ pub(super) fn remote_name(location: &RemoteLocation) -> &str {
         .unwrap_or(&location.path)
 }
 
+/// TAKM Comment identity uses the sealed fixed region, so appending the tail never
+/// changes file_a. Plain TAK staging keeps the original file's byte size.
+pub(super) fn remote_comment_label(location:&RemoteLocation,fixed_len:u64,file_size:u64)->String {
+    let length=if location.path.to_ascii_lowercase().ends_with(".takm") {fixed_len} else {file_size};
+    format!("{}|{}",remote_name(location),length)
+}
+
 impl TakViewerApp {
+    /// Agent-only WORKSPACE restart proof. Settings travel through eframe's real RON path;
+    /// nothing is written to the user's app.ron and no process starts before explicit expand.
+    pub fn ssh_workspace_probe(&mut self, ctx: &egui::Context, host: &str, path: &str,
+        platform: &str, python: &str, expand: bool) -> Result<PathBuf, String> {
+        struct MemoryStorage(Option<String>);
+        impl eframe::Storage for MemoryStorage {
+            fn get_string(&self, key: &str) -> Option<String> { (key == eframe::APP_KEY).then(|| self.0.clone()).flatten() }
+            fn set_string(&mut self, key: &str, value: String) { if key == eframe::APP_KEY { self.0 = Some(value); } }
+            fn flush(&mut self) {}
+        }
+        let root = workspace::RemoteRoot { alias: host.into(), path: path.into(), platform: platform.into() };
+        let key = root.key();
+        self.workspace.add_root(key.clone());
+        self.sync_settings();
+        let mut storage = MemoryStorage(None);
+        eframe::set_value(&mut storage, eframe::APP_KEY, &self.settings);
+        let mut restarted = Self::build(ctx, Some(&storage), vec![], None, None);
+        restarted.set_command_run();
+        let dormant = !restarted.ssh.workers_running() && !restarted.ssh.is_busy()
+            && restarted.workspace.listing(&key).is_none() && !restarted.explorer.folds().0.contains(&key);
+        println!("{}", serde_json::json!({"stage":"workspace_restart","alias":host,"path":path,"platform":platform,"root_restored":restarted.workspace.roots().contains(&key),"not_connected":!restarted.ssh.is_connected(host),"collapsed":!restarted.explorer.folds().0.contains(&key),"no_startup_network":dormant}));
+        if !dormant || !restarted.workspace.roots().contains(&key) { return Err("WORKSPACE 복원 검사가 맞지 않아요.".into()); }
+        restarted.ssh.add_host(host);
+        restarted.ssh.set_platform(host, platform);
+        restarted.ssh.set_python(host, python)?;
+        if expand { restarted.explorer.expand(&mut restarted.workspace, &key); }
+        *self = restarted;
+        Ok(key)
+    }
+
+    pub fn ssh_workspace_probe_ready(&self, key: &Path) -> Result<bool, String> {
+        match self.workspace.listing(key) {
+            Some(workspace::Listing::Ready { dirs, files }) => {
+                println!("{}", serde_json::json!({"stage":"workspace_expanded","folders":dirs.len(),"files":files.len()}));
+                Ok(true)
+            }
+            Some(workspace::Listing::Failed(message)) => Err(message.clone()),
+            _ => Ok(false),
+        }
+    }
+
     fn remote_owner(&self, slot: usize) -> RemoteOwner {
         RemoteOwner { tab: self.layout_tabs.active_id(), slot }
     }
@@ -140,7 +187,7 @@ impl TakViewerApp {
         self.visit_remote_views(|_, view| {
             if view.path() == Some(key.as_path()) && view.waiting_shared_path().is_none() && view.remote_loading.is_none() {
                 view.remote = Some(location.clone());
-                view.comments.target = Some(Err(REMOTE_NO_COMMENTS.into()));
+                view.comments.target = view.path().map(|p| Ok(p.to_path_buf()));
             }
         });
     }
@@ -171,7 +218,7 @@ impl TakViewerApp {
             drop_later(view.show_shared_file(shared.clone(), next, speed, now));
             view.remote = Some(location.clone());
             view.remote_warning = None;
-            view.comments.target = Some(Err(REMOTE_NO_COMMENTS.into()));
+            view.comments.target = view.path().map(|p| Ok(p.to_path_buf()));
             view.picked = picked.filter(|id| view.comments.list.get(*id).is_some());
             if let (Some(selection), Some(data)) = (selection, view.data.as_ref()) {
                 view.selected = data.markers.iter().enumerate().filter_map(|(index, marker)| selection.selected.contains(&marker.uid).then_some(index)).collect();
@@ -185,7 +232,7 @@ impl TakViewerApp {
     }
     pub fn ssh_probe_start(&mut self, _ctx: &egui::Context, probe: &crate::ssh_probe::Probe) -> Result<(), String> {
         self.set_command_run();
-        self.ssh.full_analog_probe = probe.dump.is_some();
+        self.ssh.full_analog_probe = probe.dump.is_some() && !probe.markers_only;
         self.ssh.add_host(&probe.alias);
         self.ssh.set_platform(&probe.alias, &probe.platform);
         self.ssh.set_python(&probe.alias, &probe.python)?;
@@ -206,13 +253,23 @@ impl TakViewerApp {
             python:self.ssh.python_settings.get(alias).and_then(|s|s.remembered.clone()),
         }
     }
-    pub fn ssh_probe_dump(&self, path: &Path) -> Result<(), String> {
+    pub fn ssh_probe_edit_metadata_ready(&self)->bool {
+        self.view().remote.as_ref().and_then(|location|self.ssh.documents.get(location)).is_some_and(|document|document.next_comment_id>0)
+    }
+    pub fn ssh_probe_reconnect(&mut self,alias:&str,folder:&str)->Result<(),String>{
+        self.ssh_note=None;
+        for view in &mut self.views {if view.remote.as_ref().is_some_and(|location|location.host==alias) {view.remote_warning=None;}}
+        self.ssh.connect_at(alias,folder)
+    }
+    pub fn ssh_probe_dump(&self, path: &Path,markers_only:bool) -> Result<(), String> {
         if tak_core::tak::is_take_path(path) || tak_core::takm::is_takm_path(path) { return Err("TAK · TAKM 경로에는 출력할 수 없어요.".into()); }
         let data = self.view().data.as_ref().ok_or("읽은 마커가 없어요.")?;
         let file = std::fs::File::create(path).map_err(|e|e.to_string())?;
         use std::io::Write;
         let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &tak_core::remote::verification_data(&data.take)).map_err(|e|e.to_string())?;
+        let mut result=tak_core::remote::verification_data(&data.take);
+        if markers_only {result["markers_only"]=true.into();}
+        serde_json::to_writer(&mut writer,&result).map_err(|e|e.to_string())?;
         writer.flush().map_err(|e|e.to_string())
     }
     pub fn ssh_probe_capture(&mut self, auto: crate::shot::AutoShot) { self.auto = Some(auto); }
@@ -326,6 +383,9 @@ impl TakViewerApp {
 
     fn remote_action(&mut self, ctx: &egui::Context, action: SshAction) {
         match action {
+            SshAction::AddWorkspace { location, platform } => {
+                self.add_remote_workspace(ctx, location, platform);
+            }
             SshAction::Notice(s) => self.ssh_note = Some((s, ctx.input(|i| i.time))),
             SshAction::Open { location, side } => {
                 let key = location.memory_key();
@@ -350,6 +410,27 @@ impl TakViewerApp {
         }
     }
 
+    pub(super) fn remote_workspace_open(&mut self, ctx: &egui::Context, location: RemoteLocation, side: bool) {
+        self.remote_action(ctx, SshAction::Open { location, side });
+    }
+
+    pub(super) fn add_remote_workspace(&mut self, ctx: &egui::Context, location: RemoteLocation, platform: String) {
+        let root = workspace::RemoteRoot { alias: location.host, path: location.path, platform };
+        if root.path.is_empty() { self.ssh_note = Some(("원격 폴더를 먼저 골라 주세요.".into(), ctx.input(|i| i.time))); return; }
+        self.observe(true);
+        let result = self.workspace.add_root(root.key());
+        self.ssh_note = Some((match result {
+            AddRoot::Full => format!("저장 폴더는 {MAX_ROOTS}개까지예요. 하나 뺀 뒤 추가해 주세요."),
+            AddRoot::AlreadyThere => "이미 WORKSPACE에 있는 SSH 폴더예요.".into(),
+            AddRoot::Added => format!("{} WORKSPACE에 넣었어요.", root.label()),
+        }, ctx.input(|i| i.time)));
+        if result == AddRoot::Added {
+            self.explorer.filter.clear();
+            if !dock::has(&self.dock, Pane::Explorer) { self.show_pane(Pane::Explorer); }
+        }
+        self.observe(true);
+    }
+
     pub(super) fn open_remote_in(
         &mut self,
         ctx: &egui::Context,
@@ -367,7 +448,7 @@ impl TakViewerApp {
             && self.guard_dirty(slot, marker_edit::PendingTransition::Remote { slot, location: location.clone(), cached }) { return; }
         if shared_elsewhere {
             let work = self.views[slot].owns_shared_file_work() || self.marker_ui[slot].has_pending_work();
-            if self.comments_unsaved(slot) || (!self.handoff_shared_owner(slot, false) && work) {
+            if (self.comments_unsaved(slot) && self.views[slot].remote.is_none()) || (!self.handoff_shared_owner(slot, false) && work) {
                 self.notice = Some("읽기나 편집을 마친 뒤 다시 열어 주세요.".into());
                 return;
             }
@@ -388,7 +469,7 @@ impl TakViewerApp {
                 drop_later(self.views[slot].take_overlay());
                 drop_later(self.views[slot].show_shared_file(shared, self.next_file_id, self.settings.speed, ctx.input(|i| i.time)));
                 self.views[slot].remote = Some(location);
-                self.views[slot].comments.target = Some(Err(REMOTE_NO_COMMENTS.into()));
+                self.views[slot].comments.target = self.views[slot].path().map(|p| Ok(p.to_path_buf()));
                 self.record_implicit_file_open(created);
                 return;
             }
@@ -453,6 +534,7 @@ impl TakViewerApp {
         let file_id = self.next_file_id;
         let speed = self.settings.speed;
         let (_, rx) = std::sync::mpsc::channel();
+        let comment_label=self.ssh.documents.get(&location).map(|document|remote_comment_label(&location,document.fixed_len,data.take.file_size));
         let v = self.remote_view_mut(owner)?;
         drop_later(v.take_overlay());
         drop_later(v.show_shared(
@@ -466,9 +548,13 @@ impl TakViewerApp {
         v.analog_rx = None;
         v.comments_rx = None;
         v.comments.list = list;
-        v.comments.target = Some(Err(REMOTE_NO_COMMENTS.into()));
+        v.comments.target = Some(Ok(location.memory_key()));
+        v.comments.label=comment_label;
         v.remote = Some(location);
         v.remote_warning = None;
+        let document=v.document_id();
+        let saved=v.comments.list.clone();
+        if let Some(document)=document {self.remote_edits.entry(document).or_default().saved=saved;}
         Some(file_id)
     }
 
@@ -674,7 +760,7 @@ impl TakViewerApp {
             return false;
         };
         ui.label(text(format!(
-            "{} · {} · 읽기만",
+            "{} · {}",
             remote_name(location),
             location.host
         )));
@@ -733,7 +819,7 @@ impl TakViewerApp {
             if let Some(data) = v.data.as_mut().and_then(Arc::get_mut) {
                 data.take.path = key.clone();
             }
-            v.comments.target = Some(Err(REMOTE_NO_COMMENTS.into()));
+            v.comments.target = Some(Ok(location.memory_key()));
             for (id, start, end, text) in [
                 (1, 450, 620, "서버의 기존 Comment"),
                 (2, 900, 930, "읽기 전용 예시"),
@@ -810,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_remote_open_waits_once_then_shares_force_data_and_read_only_policy() {
+    fn duplicate_remote_open_shares_force_data_and_editable_comment_target() {
         let ctx = egui::Context::default();
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         let first = app.layout_tabs.active_id();
@@ -829,8 +915,8 @@ mod tests {
         assert!(Arc::ptr_eq(app.views[0].data.as_ref().unwrap(), app.remote_view(owner).unwrap().data.as_ref().unwrap()));
         assert!(app.views[0].shares_document(app.remote_view(owner).unwrap()));
         assert_eq!(app.views[0].remote.as_ref(), Some(&location));
-        assert_eq!(app.comment_writable(0).unwrap_err(), REMOTE_NO_COMMENTS);
-        assert!(app.takm_allowed(Some(&key)).unwrap_err().contains("원격"));
+        assert!(app.comment_writable(0).is_ok());
+        assert!(app.takm_allowed(Some(&key)).is_err());
         app.views[0].pb.set_frame(7, 0.0);
         app.views[0].select(0, false);
         let target = app.views[0].data.as_ref().unwrap().analog_target();
@@ -938,7 +1024,7 @@ mod tests {
         app.remote_action(&ctx, SshAction::Open { location: first, side: true });
         assert_eq!(app.open_views().len(), opened + 1);
         assert!(app.views[0].shares_document(&app.views[1]));
-        assert_eq!(app.comment_writable(1).unwrap_err(), REMOTE_NO_COMMENTS);
+        assert!(app.comment_writable(1).is_ok());
     }
 
     #[test]
@@ -1000,7 +1086,7 @@ mod tests {
         assert_eq!(alias.data.as_ref().unwrap().markers[alias.primary.unwrap()].uid, [2; 16]);
         assert_eq!(alias.pb.frame, 6);
         assert_eq!(alias.remote.as_ref(), Some(&location));
-        assert!(matches!(&alias.comments.target, Some(Err(reason)) if reason == REMOTE_NO_COMMENTS));
+        assert!(matches!(&alias.comments.target, Some(Ok(path)) if path == &location.memory_key()));
     }
 
     #[test]
@@ -1026,7 +1112,7 @@ mod tests {
         assert_eq!(app.views[0].remote.as_ref(), Some(&location));
         assert!(app.views[0].data.is_some());
         assert!(app.views[0].loading.is_none() && app.ssh_reads.is_empty());
-        assert_eq!(app.comment_writable(0).unwrap_err(), REMOTE_NO_COMMENTS);
+        assert!(app.comment_writable(0).is_ok());
     }
     fn remote(ctx: &egui::Context) -> TakViewerApp {
         let mut app = TakViewerApp::build(ctx, None, vec![], None, None);
@@ -1052,26 +1138,30 @@ mod tests {
     }
 
     #[test]
-    fn remote_boundaries_refuse_every_local_write_and_persistence_entry() {
+    fn remote_edits_use_memory_queue_and_never_local_writer_or_persistence() {
         let ctx = egui::Context::default();
         let mut app = remote(&ctx);
         let key = app.views[0].path().unwrap().to_path_buf();
-        assert_eq!(app.comment_writable(0).unwrap_err(), REMOTE_NO_COMMENTS);
-        assert!(app.comment_target(0).is_none());
-        assert!(app.takm_allowed(Some(&key)).unwrap_err().contains("원격"));
+        assert!(app.comment_writable(0).is_ok());
+        assert_eq!(app.comment_target(0).unwrap().0,key);
+        assert!(app.takm_allowed(Some(&key)).is_err());
         app.overlay_on(&ctx, PathBuf::from("b.tak"));
         assert!(app.overlay_note.as_ref().unwrap().0.contains("원격"));
         let c = app.views[0].comments.list.get(1).unwrap().clone();
-        assert!(!app.write_change(&ctx, 0, EventKind::Delete, &c));
-        assert_eq!(app.views[0].comments.list.list().len(), 1);
+        assert!(app.write_change(&ctx, 0, EventKind::Delete, &c));
+        assert!(app.views[0].comments.list.is_empty());
+        assert_eq!(app.views[0].comments.pending,1);
+        assert!(app.comments_unsaved(0));
+        assert!(app.comment_writer.is_none());
         app.start_menu_capture();
         assert!(app.capture.is_none());
         app.sync_settings();
         assert!(app.settings.views.is_empty());
         assert!(app.settings.recent.is_empty());
         assert!(app.settings.file_memory.is_empty());
-        app.say_no_comments(&ctx, 0);
-        assert_eq!(app.ssh_note.as_ref().unwrap().0, REMOTE_NO_COMMENTS);
+        app.set_command_run();
+        assert!(app.comment_writable(0).is_err(),"ordinary headless runs remain read-only");
+        assert!(app.comment_target(0).is_none());
         assert!(app.comment_writer.is_none() && app.takm_job.is_none());
     }
 
@@ -1315,5 +1405,365 @@ mod tests {
             assert!(app.views[0].data.as_ref().unwrap().take.warnings.is_empty());
             assert!(app.views[0].remote_warning.is_none());
         }
+    }
+}
+
+/// Remote Comments and save requests stay in memory; no opaque SSH identity reaches a disk API.
+#[derive(Default)]
+pub(super) struct RemoteEdits {
+    queued: Vec<comments::Event>,
+    saved: comments::Comments,
+    job: Option<RemoteWriteJob>,
+}
+struct RemoteWriteJob {
+    location: RemoteLocation,
+    rx: std::sync::mpsc::Receiver<Result<crate::ssh::RemoteWritten, String>>,
+    snapshot: Option<tak_core::edit::DocumentSnapshot>,
+    count: usize,
+    discard: bool,
+}
+impl TakViewerApp {
+    pub(super) fn remote_saving(&self, slot: usize) -> bool {
+        self.views.get(slot).and_then(View::document_id).and_then(|id| self.remote_edits.get(&id))
+            .is_some_and(|state| state.job.is_some())
+    }
+    pub(super) fn queue_remote_comments(&mut self, ctx: &egui::Context, slot:usize, events:Vec<comments::Event>) {
+        let Some(document) = self.views[slot].document_id() else { return };
+        let state = self.remote_edits.entry(document).or_default();
+        self.views[slot].comments.pending += events.len();
+        self.views[slot].comments.pending_since.get_or_insert_with(Instant::now);
+        state.queued.extend(events);
+        self.views[slot].publish_shared_file();
+        if self.views[slot].remote.as_ref().is_some_and(|r| !r.path.to_ascii_lowercase().ends_with(".takm")) {
+            self.takm_note = Some(("Comment를 화면에 두었어요. Ctrl+S로 서버에 저장해 주세요.".into(),ctx.input(|i|i.time)));
+        }
+        ctx.request_repaint();
+    }
+    pub(super) fn discard_remote_comments(&mut self, slot:usize) {
+        let Some(id) = self.views[slot].document_id() else { return };
+        let saved=if let Some(state) = self.remote_edits.get_mut(&id) {
+            state.queued.clear();
+            if let Some(job) = &mut state.job { job.discard = true; }
+            Some(state.saved.clone())
+        } else {None};
+        if let Some(saved)=saved {self.visit_remote_views(|_,view| {if view.document_id()==Some(id){view.comments.list=saved.clone();view.comments.pending=0;view.comments.failed=None;view.publish_shared_file();}});}
+    }
+    pub(super) fn save_remote(&mut self, ctx: &egui::Context, slot:usize, close_after:bool) {
+        if (self.no_persist && !self.remote_write_probe) || self.remote_saving(slot) || self.marker_job_running(slot)
+            || self.views[slot].edit_refresh.is_some() || self.views[slot].remote_loading.is_some()
+            || self.comment_edit.is_some() || self.hold.is_some() {
+            self.takm_note = Some(("진행 중인 작업이 끝나면 서버에 저장할 수 있어요.".into(),ctx.input(|i|i.time))); return;
+        }
+        self.views[slot].sync_shared();
+        if self.views[slot].analog_work_pending() || self.views[slot].data.as_ref().is_some_and(|data|data.analog_pending) {
+            self.takm_note=Some(("파일을 읽는 중이에요. 잠시 뒤 서버에 저장해 주세요.".into(),ctx.input(|i|i.time)));return;
+        }
+        let Some(location) = self.views[slot].remote.clone() else { return };
+        let Some(id) = self.views[slot].document_id() else { return };
+        if self.ssh_reads.values().any(|read|read.document==Some(id)) {
+            self.takm_note=Some(("서버의 아날로그를 읽는 중이에요. 잠시 뒤 저장해 주세요.".into(),ctx.input(|i|i.time)));return;
+        }
+        let Some(data) = self.views[slot].data.clone() else { return };
+        let snapshot = self.views[slot].marker_dirty().then(||self.views[slot].edit_document.as_ref()
+            .and_then(|doc| doc.lock().ok().map(|doc|doc.snapshot()))).flatten();
+        self.start_remote_write(ctx,id,location,data,snapshot,close_after);
+    }
+    fn start_remote_write(&mut self, ctx:&egui::Context, id:tak_core::edit::DocumentId, location:RemoteLocation,
+                          data:Arc<ViewData>, snapshot:Option<tak_core::edit::DocumentSnapshot>, close_after:bool) {
+        let state = self.remote_edits.entry(id).or_default();
+        if state.job.is_some() { return; }
+        let events = state.queued.clone();
+        let count = events.len();
+        match self.ssh.write(location.clone(),snapshot.clone(),events,data) {
+            Ok(rx) => {
+                state.job = Some(RemoteWriteJob {location:location.clone(),rx,snapshot,count,discard:false});
+                self.visit_remote_views(|_,view| {if view.document_id()==Some(id) {view.comments.failed=None;view.publish_shared_file();}});
+                if close_after { if let Some(prompt) = &mut self.dirty_prompt {prompt.saving=true;prompt.started=Instant::now();} }
+                let progress=if location.path.to_ascii_lowercase().ends_with(".tak") {format!("서버에 {}.takm 만드는 중…",remote_name(&location).get(..remote_name(&location).len()-4).unwrap_or("파일"))}
+                    else {format!("서버에 {} 저장하는 중…",remote_name(&location))};
+                self.takm_note = Some((progress,ctx.input(|i|i.time)));
+            }
+            Err(reason) => {
+                self.visit_remote_views(|_,view| {if view.document_id()==Some(id) {view.comments.failed=Some(reason.clone());view.publish_shared_file();}});
+                self.takm_note = Some((format!("서버에 저장 못 했어요: {reason}"),ctx.input(|i|i.time)));
+                if let Some(prompt)=&mut self.dirty_prompt {prompt.saving=false;}
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(30));
+    }
+    fn reconcile_remote_write_prompt(&mut self,ctx:&egui::Context,id:tak_core::edit::DocumentId){
+        let matches=self.dirty_prompt.as_ref().is_some_and(|prompt|self.views.get(prompt.slot).and_then(View::document_id)==Some(id));
+        if !matches {return;}
+        if let Some(prompt)=&mut self.dirty_prompt {prompt.saving=false;}
+        let dirty=self.find_remote_owner(|_,view|view.document_id()==Some(id) && (view.marker_dirty()||view.comments.pending>0||view.comments.failed.is_some())).is_some();
+        if !dirty {if let Some(prompt)=self.dirty_prompt.take(){self.finish_transition(ctx,prompt.transition);}}
+    }
+    pub(super) fn poll_remote_writes(&mut self,ctx:&egui::Context) {
+        let ids:Vec<_> = self.remote_edits.keys().copied().collect();
+        for id in ids {
+            let Some(job) = self.remote_edits.get_mut(&id).and_then(|state|state.job.take()) else { continue };
+            match job.rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.remote_edits.get_mut(&id).unwrap().job=Some(job);
+                    ctx.request_repaint_after(Duration::from_millis(30));
+                }
+                result => {
+                    let result=result.unwrap_or_else(|_|Err("SSH 저장 작업이 중단됐어요.".into()));
+                    match result {
+                        Err(reason) => {
+                            let reason=if reason.contains("source_changed") || reason.contains("Source changed") || reason.contains("Source differs") {"파일을 연 뒤 서버의 원본이 바뀌었어요. 덮어쓰지 않았어요. 다시 열어 주세요.".into()} else {reason};
+                            self.visit_remote_views(|_,view| {if view.document_id()==Some(id) {view.comments.failed=Some(reason.clone());view.publish_shared_file();}});
+                            self.takm_note=Some((format!("서버에 저장 못 했어요: {reason}"),ctx.input(|i|i.time)));
+                            if let Some(prompt)=&mut self.dirty_prompt {prompt.saving=false;}
+                        }
+                        Ok(written) if written.outcome.existing => {
+                            let next=RemoteLocation{host:job.location.host.clone(),path:written.outcome.path.clone()};
+                            self.takm_note=Some(("서버에 같은 이름의 .takm이 있어 그 파일을 열어요. 원본의 편집은 저장하지 않고 남겨 둬요.".into(),ctx.input(|i|i.time)));
+                            let prompt=self.dirty_prompt.take();
+                            self.remote_action(ctx,SshAction::Open{location:next,side:true});
+                            self.dirty_prompt=prompt;
+                            if let Some(prompt)=&mut self.dirty_prompt {prompt.saving=false;}
+                            drop_later(Some(written));
+                        }
+                        Ok(mut written) => {
+                            let next=RemoteLocation{host:job.location.host.clone(),path:written.outcome.path.clone()};
+                            let key=next.memory_key();
+                            let old=job.location.memory_key();
+                            self.ssh_sources.insert(key.clone(),next.clone());
+                            let mut parsed=written.comments;
+                            let fixed=written.outcome.fixed_len;
+                            let label=remote_comment_label(&next,fixed,written.outcome.output_bytes);
+                            let now=ctx.input(|i|i.time);
+                            let remaining={let state=self.remote_edits.get_mut(&id).unwrap();
+                                if !job.discard {state.queued.drain(..job.count.min(state.queued.len())); state.saved=parsed.clone();}
+                                for event in &state.queued {parsed.apply(event);}
+                                state.queued.len()};
+                            let snapshot=job.snapshot;
+                            let mut prepared=written.prepared.take();
+                            let saved_view=Arc::new(written.view);
+                            self.visit_remote_views(|_,view| {
+                                if view.document_id()!=Some(id) {return;}
+                                view.sync_shared();
+                                if !job.discard {
+                                    apply_remote_saved_markers(view,snapshot.as_ref(),&key,old!=key,&mut prepared,&saved_view);
+                                    view.remote=Some(next.clone());
+                                    view.comments.list=parsed.clone();
+                                    view.comments.target=Some(Ok(key.clone()));
+                                    view.comments.label=Some(label.clone());
+                                    view.comments.pending=remaining;
+                                    view.comments.pending_since=(remaining>0).then(Instant::now);
+                                    view.comments.failed=None;
+                                    view.comments.saved_at=Some(now);
+                                    view.publish_shared_file();
+                                }
+                            });
+                            self.install_remote_marker_session(id,written.creation);
+                            self.rebind_saved_history(&old,&key,id);
+                            self.takm_note=Some((format!("서버에 {} 저장했어요 · {:.1} MB → {:.1} MB · SHA-256 확인{}",remote_name(&next),written.outcome.source_bytes as f64/1e6,written.outcome.output_bytes as f64/1e6,if written.outcome.verified {" 완료"} else {" 못 함"}),now));
+                            drop_later(Some(written.loaded));
+                            if !job.discard {self.reconcile_remote_write_prompt(ctx,id);}
+                        }
+                    }
+                }
+            }
+        }
+        // Auto-append only TAKM tails. TAK Comments remain staged until explicit Save.
+        let requests:Vec<_>=self.remote_edits.iter().filter(|(_,state)|state.job.is_none()&&!state.queued.is_empty())
+            .filter_map(|(&id,_)|self.find_remote_owner(|_,v|v.document_id()==Some(id)&&v.remote.as_ref().is_some_and(|r|r.path.to_ascii_lowercase().ends_with(".takm"))
+                &&v.comments.failed.is_none()&&!v.analog_work_pending()&&!v.data.as_ref().is_some_and(|d|d.analog_pending)).and_then(|owner|self.remote_view(owner).and_then(|v|Some((id,v.remote.clone()?,v.data.clone()?))))).collect();
+        for (id,location,data) in requests {
+            let computing=self.views.iter().zip(&self.marker_ui).any(|(view,ui)|view.document_id()==Some(id)&&ui.has_marker_job())
+                || self.hidden_document_work(id,hidden_work::DocumentWork::Marker);
+            if !computing && !self.ssh_reads.values().any(|read|read.document==Some(id)) {self.start_remote_write(ctx,id,location,data,None,false);}
+        }
+    }
+}
+
+/// Comment-tail appends never advance the marker save baseline or publish an older marker
+/// snapshot. A conversion/marker write binds the written revision, preserving later edits.
+fn apply_remote_saved_markers(view:&mut View,snapshot:Option<&tak_core::edit::DocumentSnapshot>,
+    destination:&Path,path_changed:bool,prepared:&mut Option<tak_core::edit::PreparedInput>,data:&Arc<ViewData>){
+    if snapshot.is_none() && !path_changed {return;}
+    if let Some(doc)=&view.edit_document {if let Ok(mut doc)=doc.lock(){
+        if !doc.snapshot().is_loaded() {if let Some(input)=prepared.take(){let revision=doc.revision();let _=doc.install_prepared(revision,input);}}
+        let current=snapshot.cloned().unwrap_or_else(||doc.snapshot());
+        let _=doc.mark_saved(&current,destination.to_path_buf());
+    }}
+    let newer=doc_revision(view).is_some_and(|current|snapshot.is_some_and(|s|current!=s.revision()));
+    view.install_remote_saved(data.clone());
+    if newer {view.edit_refresh=doc_revision(view);}
+}
+
+fn doc_revision(view:&View)->Option<tak_core::edit::Revision>{view.edit_document.as_ref()?.lock().ok().map(|doc|doc.revision())}
+
+impl TakViewerApp {
+    /// Explicit write-test hooks are the sole exception to command-run remote read-only mode.
+    pub fn ssh_probe_enable_writes(&mut self) { self.remote_write_probe=true; }
+    pub fn ssh_probe_add_comment(&mut self,ctx:&egui::Context,text:&str)->Result<(),String>{
+        let slot=self.active;
+        self.comment_writable(slot)?;
+        let start=self.views[slot].pb.frame;
+        self.add_comment(ctx,slot,Vec::new(),start,start);
+        let id=self.views[slot].picked.ok_or("Comment를 만들지 못했어요.")?;
+        let mut comment=self.views[slot].comments.list.get(id).cloned().ok_or("Comment가 없어요.")?;
+        comment.text=text.into();
+        self.edit_comment(ctx,slot,comment);
+        self.show_pane(Pane::Comments);
+        Ok(())
+    }
+    pub fn ssh_probe_unlabel(&mut self,ctx:&egui::Context)->Result<(),String>{
+        let slot=self.active;
+        let (index,frame)=self.views[slot].data.as_ref().and_then(|data|data.markers.iter().enumerate()
+            .find(|(_,m)|m.parent.is_some()&&m.slot.is_some()&&m.n_samples>0)
+            .map(|(i,m)|(i,m.span.map_or(data.start_frame,|s|s.0))))
+            .ok_or("시험 파일에 이름이 붙은 마커가 없어요. 라벨이 있는 TAK를 골라 주세요.")?;
+        self.views[slot].select(index,false);
+        self.views[slot].pb.set_frame(frame,ctx.input(|i|i.time));
+        self.views[slot].range=Some((frame,frame));
+        self.unlabel_selected(ctx,slot);
+        Ok(())
+    }
+    pub fn ssh_probe_save(&mut self,ctx:&egui::Context){self.save_remote(ctx,self.active,false);}
+    pub fn ssh_probe_edit_result(&self)->serde_json::Value{
+        let view=self.view();
+        serde_json::json!({"remote_path":view.remote.as_ref().map(|r|&r.path),"comments":view.comments.list.list().iter().map(|c|serde_json::json!({"id":c.id,"text":c.text,"start":c.start,"end":c.end})).collect::<Vec<_>>(),
+            "dirty":view.marker_dirty(),"pending_comments":view.comments.pending,"failed":view.comments.failed,"status":self.takm_note.as_ref().map(|n|&n.0)})
+    }
+    pub fn ssh_probe_edit_busy(&self)->bool{self.marker_job_running(self.active)||self.marker_saving(self.active)||self.views[self.active].edit_refresh.is_some()}
+}
+
+#[cfg(test)]
+mod remote_edit_tests {
+    use super::*;
+    fn staged(ctx:&egui::Context)->TakViewerApp {
+        let mut app=TakViewerApp::build(ctx,None,vec![],None,None);
+        let location=RemoteLocation{host:"offline-test".into(),path:"/data/a.tak".into()};
+        let key=location.memory_key();
+        app.ssh_sources.insert(key.clone(),location.clone());
+        app.show_remote(ctx,0,location,Arc::new(views::sample_data(key.to_str().unwrap(),&["M"])),comments::Comments::default());
+        app.history=History::default();app.observe(false);
+        app
+    }
+    #[test]
+    fn remote_tak_comments_stage_share_undo_and_discard_without_local_disk_access(){
+        let ctx=egui::Context::default();let mut app=staged(&ctx);
+        let location=app.views[0].remote.clone().unwrap();
+        app.remote_action(&ctx,SshAction::Open{location,side:true});
+        assert!(app.views[0].shares_document(&app.views[1]));
+        app.make_comment(&ctx,0);
+        app.views[1].sync_shared();
+        assert_eq!(app.views[0].comments.list.len(),1);
+        assert_eq!(app.views[1].comments.list.len(),1);
+        assert_eq!(app.views[1].comments.pending,1);
+        assert!(app.comments_unsaved(0));assert!(app.comment_writer.is_none());
+        app.undo_redo(&ctx,false);
+        assert!(app.views[0].comments.list.is_empty());
+        app.undo_redo(&ctx,true);
+        assert_eq!(app.views[0].comments.list.len(),1);
+        let transition=marker_edit::PendingTransition::CloseView{slot:0};
+        assert!(!app.guard_view_removal(0,transition.clone()),"another live alias keeps document open");
+        app.close_view(1);
+        assert!(app.views[0].data.is_some());assert!(app.views[1].data.is_none());
+        app.discard_remote_comments(0);
+        app.views[1].sync_shared();
+        assert!(app.views[0].comments.list.is_empty());assert!(app.views[1].comments.list.is_empty());
+        assert_eq!(app.views[0].comments.pending,0);assert!(app.comment_writer.is_none());
+    }
+    #[test]
+    fn failed_remote_save_keeps_pending_comment_for_retry_and_close_cancel(){
+        let ctx=egui::Context::default();let mut app=staged(&ctx);
+        app.make_comment(&ctx,0);app.poll_remote_writes(&ctx);
+        assert!(app.views[0].comments.failed.is_none(),"TAK waits for manual Save");
+        app.save_remote(&ctx,0,false);
+        assert!(app.views[0].comments.failed.is_some());
+        assert_eq!(app.views[0].comments.pending,1);
+        assert_eq!(app.views[0].comments.list.len(),1);
+        assert!(app.guard_dirty(0,marker_edit::PendingTransition::CloseView{slot:0}));
+        app.cancel_dirty_transition(&ctx);
+        assert!(app.views[0].data.is_some());assert!(app.comments_unsaved(0));
+        app.retry_comments_and_transition(&ctx,0);
+        assert_eq!(app.views[0].comments.pending,1);
+        assert!(app.comment_writer.is_none());
+    }
+    #[test]
+    fn append_completion_resolves_a_close_waiting_on_the_last_document(){
+        let ctx=egui::Context::default();let mut app=staged(&ctx);
+        app.make_comment(&ctx,0);
+        assert!(app.guard_primary_dirty(0,marker_edit::PendingTransition::CloseView{slot:0}));
+        app.dirty_prompt.as_mut().unwrap().saving=true;
+        let id=app.views[0].document_id().unwrap();
+        app.views[0].comments.pending=0;
+        app.remote_edits.get_mut(&id).unwrap().queued.clear();
+        app.reconcile_remote_write_prompt(&ctx,id);
+        assert!(app.dirty_prompt.is_none());
+        assert!(app.views[0].data.is_none(),"the completed append must not leave Saving disabled forever");
+    }
+    #[test]
+    fn closed_remote_alias_follows_server_save_location_from_shared_document(){
+        let ctx=egui::Context::default();let mut app=staged(&ctx);
+        let shared=app.views[0].shared_file().unwrap();
+        let mut closed=View::default();closed.show_shared_file(shared,77,1.0,0.0);
+        let next=RemoteLocation{host:"offline-test".into(),path:"/data/a.takm".into()};
+        app.views[0].remote=Some(next.clone());
+        app.views[0].publish_shared_file();
+        closed.sync_shared();
+        assert_eq!(closed.remote,Some(next));
+    }
+}
+
+#[cfg(test)]
+mod remote_append_marker_tests {
+    use super::*;
+    use tak_core::edit::{DocumentInput,PreparedInput,RawTrack,RawSample,RecordBytes};
+    fn dirty_view()->View{
+        let mut view=View::default();
+        let (_tx,rx)=std::sync::mpsc::channel();
+        view.show(views::sample_data("remote.takm",&["M"]),rx,1,1.0,0.0);
+        let tracks=view.data.as_ref().unwrap().take.trajectories.iter().map(|track|RawTrack{uid:track.uid,name:track.name.clone(),label:None,
+            records:RecordBytes{node:Arc::from([1]),translation_header:Arc::from([2]),serialization_verified:true},
+            samples:track.frames.iter().zip(&track.xyz).map(|(&frame,&xyz)|RawSample::new(frame,xyz)).collect::<Vec<_>>().into()}).collect();
+        let mut doc=view.edit_document.as_ref().unwrap().lock().unwrap();let revision=doc.revision();
+        doc.install_prepared(revision,PreparedInput::new(DocumentInput{streams:Arc::from([]),nodes_prefix:Arc::from([]),channels_prefix:Arc::from([]),tracks,labels:vec![],first_frame:0,last_frame:9}).unwrap()).unwrap();
+        let before=doc.snapshot();let uid=before.track_order()[0];
+        let patch=tak_core::edit::delete::delete_samples(&before,&tak_core::edit::delete::DeleteRequest{selection:tak_core::edit::EditSelection{selected:std::collections::BTreeSet::from([uid]),..Default::default()},range:None,current_frame:0}).unwrap().patch.unwrap();
+        doc.apply(&patch,true).unwrap();drop(doc);view
+    }
+    #[test]
+    fn comment_append_keeps_unsaved_marker_revision_and_current_display(){
+        let mut view=dirty_view();
+        let before=view.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let saved=view.edit_document.as_ref().unwrap().lock().unwrap().saved_revision();
+        let shown=view.data.clone().unwrap();
+        let stale=Arc::new(views::sample_data("remote.takm",&["older"]));
+        apply_remote_saved_markers(&mut view,None,Path::new("remote.takm"),false,&mut None,&stale);
+        assert!(view.marker_dirty());
+        let doc=view.edit_document.as_ref().unwrap().lock().unwrap();
+        assert_eq!(doc.revision(),before.revision());assert_eq!(doc.saved_revision(),saved);
+        assert!(Arc::ptr_eq(view.data.as_ref().unwrap(),&shown));
+    }
+    #[test]
+    fn explicit_marker_write_marks_only_written_revision_saved(){
+        let mut view=dirty_view();let written=view.edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+        let data=Arc::new(view.data.as_ref().unwrap().rebuild_markers(&written).unwrap());
+        apply_remote_saved_markers(&mut view,Some(&written),Path::new("remote.takm"),false,&mut None,&data);
+        assert!(!view.marker_dirty());assert!(Arc::ptr_eq(view.data.as_ref().unwrap(),&data));
+    }
+}
+
+#[cfg(test)]
+mod remote_comment_identity_tests {
+    use super::*;
+    #[test]
+    fn remote_takm_comment_identity_stays_fixed_across_growing_tails_and_reopen(){
+        let location=RemoteLocation{host:"lab".into(),path:r"E:\trials\sample.TAKM".into()};
+        let fixed=14_830_691;
+        let initial=remote_comment_label(&location,fixed,fixed+32);
+        for tail in [455,487,4096,1_048_576] {
+            let reopened=remote_comment_label(&location,fixed,fixed+32+tail);
+            assert_eq!(reopened,initial,"tail size must not change Comment file_a");
+            assert_eq!(reopened,"sample.TAKM|14830691");
+        }
+        let tak=RemoteLocation{host:"lab".into(),path:r"E:\trials\sample.tak".into()};
+        assert_eq!(remote_comment_label(&tak,fixed,32_800_000),"sample.tak|32800000","TAK staging retains source identity");
     }
 }

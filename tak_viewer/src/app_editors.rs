@@ -201,14 +201,18 @@ impl TakViewerApp {
                     view.overlay_load.is_some()
                 },
                 dirty: if index == 0 {
-                    view.marker_dirty()
+                    view.marker_dirty() || (view.remote.is_some() && (view.comments.pending > 0 || view.comments.failed.is_some()))
                 } else {
                     view.overlay_marker_dirty()
                 },
                 add_folder: if index == 0
                     && (view.remote.is_some() || view.remote_loading.is_some())
                 {
-                    None
+                    view.remote.as_ref().or_else(|| view.remote_loading.as_ref().map(|(_, l, _)| l)).and_then(|location| {
+                        let root = workspace::RemoteRoot { alias: location.host.clone(), path: crate::ssh::parent_path(&location.path), platform: self.ssh.platform(&location.host).to_owned() };
+                        let key = root.key();
+                        self.workspace.key_for_remote(location).is_none().then_some(key)
+                    })
                 } else {
                     self.folder_outside_workspace(path)
                 },
@@ -282,7 +286,9 @@ impl TakViewerApp {
                 }
             }
             EditorAction::AddFolder(dir) => {
-                self.open_workspace(dir);
+                if let Some((root, location)) = workspace::remote_address(&dir) {
+                    self.add_remote_workspace(ctx, location, root.platform);
+                } else { self.open_workspace(dir); }
             }
             EditorAction::Full => {
                 let why = format!("폴더를 추가할 수 없어요: WORKSPACE가 다 찼어요 ({MAX_ROOTS}/{MAX_ROOTS}). WORKSPACE에서 폴더를 오른쪽 클릭 → 목록에서 빼기로 하나 뺀 뒤 다시 누르세요.");
@@ -408,6 +414,22 @@ mod tests {
         );
         app.activate(0);
         (app, first, second)
+    }
+
+    #[test]
+    fn remote_comment_pending_and_failed_states_mark_primary_editor_dirty() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        show_file(&mut app.views[0], "remote.tak");
+        app.views[0].remote = Some(crate::ssh::RemoteLocation { host: "lab-server".into(), path: r"E:\agent\remote.tak".into() });
+        assert!(!app.editor_groups(&[0])[0].entries[0].dirty);
+        app.views[0].comments.pending = 1;
+        assert!(app.editor_groups(&[0])[0].entries[0].dirty, "staged remote Comment requires save");
+        app.views[0].comments.pending = 0;
+        app.views[0].comments.failed = Some("서버에 저장하지 못했어요.".into());
+        assert!(app.editor_groups(&[0])[0].entries[0].dirty, "failed remote Comment remains unsaved");
+        app.views[0].comments.failed = None;
+        assert!(!app.editor_groups(&[0])[0].entries[0].dirty, "successful save clears the badge");
     }
 
     #[test]
