@@ -466,8 +466,8 @@ fn device_manifest(records: &[Record]) -> Result<(Vec<AnalogDevice>, Vec<Vec<usi
             name: r.name.clone(),
             kind: r.kind.clone(),
             dim: r.dim,
-            frames: Vec::new(),
-            values: Vec::new(),
+            frames: Vec::new().into(),
+            values: Vec::new().into(),
         });
         device_records.last_mut().unwrap().push(ri);
     }

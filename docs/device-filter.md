@@ -5,11 +5,11 @@
 장치마다 자유롭게 순서를 정하는 처리 목록 하나를 둔다. 같은 파일을 보는 여러 화면·탭과 장치 채널 전체가 목록을 공유한다. 처음 목록은 비어 있고 Filter는 꺼져 있다. Show raw는 켜져 있다. 파일 값, 저장, 마커 편집과 되돌리기는 건드리지 않는다. 설정은 실행 중에만 기억하며 app.ron에 쓰지 않는다. agent 정함: 표시 전용 설정은 앱 Ctrl+Z/Ctrl+Y에도 넣지 않는다.
 
 - 장치 안 그래프 위: `Filter` 체크 · `fs = N Hz` · `Show raw`. `+ Add`에는 Demean, Low-pass, High-pass, Band-pass, Band-stop, Rectify, Moving RMS.
-- 한 단계 한 줄. 이름 → 주파수 Hz(대역이면 Low/High) 또는 Window ms → order 1–8 → Zero-lag → ↑ ↓ ×. 반복 추가 허용. 좁으면 가로 스크롤, 한 단계의 순서는 유지. Apply 버튼 없이 즉시 계산.
+- 한 단계 한 줄. 이름 → 주파수 Hz(대역이면 아래–위) 또는 Window ms → order 1–8 → Zero-lag → ↑ ↓ ×. 반복 추가 허용. 좁으면 가로 스크롤, 한 단계의 순서는 유지. Apply 버튼 없이 즉시 계산.
 - 잘못된 입력 필드는 빨강. 짧은 영어 이유, 마지막 유효한 결과 유지. 계산 중에는 `Computing…`와 이전 곡선 유지. 그래프 이름 뒤 파란 바탕 #094771·흰 글씨 배지에 완료된 순서 요약; 긴 글은 ….
-- 설명은 `Display only · file values unchanged` 한 줄. 필터 블록의 모든 글은 영어. 기존 장치 창 배치 유지, 향후 격자 배치 제외. Figma 동기화는 현재 중지 상태 유지.
+- 설명은 `Display only · file values unchanged` 한 줄. 필터 블록의 모든 글은 영어. Devices 목록 안 장치를 펼치면 필터 행 다음 채널 목록. 같은 장치의 모든 grid 칸에 적용([배치 기준](device-grid.md)). Figma 동기화는 현재 중지 상태 유지.
 - orchestrator 정함, 사용자 확인 전: 새 Low-pass 6 Hz, High-pass 20 Hz, Band-pass 20–450 Hz, Band-stop 59–61 Hz, order 4, Zero-lag 켬, Moving RMS 50 ms. 새 단계만 fs/2 아래로 잘라 유효하게 시작; 사용자가 고친 숫자는 자동 보정하지 않는다.
-- agent 정함: 힘판은 기존 프레임 평균을 입력으로 쓰고 fs=촬영 FrameRate. 힘판 현재값 표·바닥 색은 원자료 유지. 비힘판 아날로그는 전체 유효 표본을 fs=프레임당 표본 수×FrameRate로 처리. 구조에서 표본 수를 입증하지 못하면 고주파 처리를 거부하고 이유 표시. EMG라는 생리학적 장치 이름은 추측하지 않는다.
+- agent 정함: 힘판은 기존 프레임 평균을 입력으로 쓰고 fs=촬영 FrameRate. 3D 바닥 색은 원자료 유지; Devices의 현재값 표는 제거. 비힘판 아날로그는 전체 유효 표본을 fs=프레임당 표본 수×FrameRate로 처리. 구조에서 표본 수를 입증하지 못하면 고주파 처리를 거부하고 이유 표시. EMG라는 생리학적 장치 이름은 추측하지 않는다.
 
 ## 수치 정의
 

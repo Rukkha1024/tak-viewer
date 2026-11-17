@@ -371,7 +371,7 @@ mod tests {
         let (s, rest) = parse(&a);
         assert_eq!(s.unwrap().plate.as_deref(), Some("2"));
         assert_eq!(rest, vec!["a.tak".to_string(), "b.tak".to_string()]);
-        let plate = |name: &str| PlateView { name: name.into(), corners: [tak_core::geom::v3(0.0, 0.0, 0.0); 4], fz: vec![], fz_abs_max: 0.0, fz_signal: Default::default() };
+        let plate = |name: &str| PlateView { name: name.into(), corners: [tak_core::geom::v3(0.0, 0.0, 0.0); 4], fz: vec![].into(), fz_abs_max: 0.0, fz_signal: Default::default() };
         let plates = [plate("Force Plate 1"), plate("1"), plate("Force Plate 3")];
         assert_eq!(find_plate(&plates, "Force Plate 3"), Some(2), "by name");
         assert_eq!(find_plate(&plates, "1"), Some(1), "a name first");

@@ -59,7 +59,7 @@ fn empty_ui_all_panes_render_as_active_tabs_and_detached_windows() {
                 app.show_pane(pane);
             }
             let out = empty_ui_output(&ctx, &mut app);
-            let hint = if matches!(pane, Pane::Labeling | Pane::EditTools) {
+            let hint = if matches!(pane, Pane::Labeling | Pane::EditTools | Pane::Devices) {
                 "Open a file from the Explorer."
             } else {
                 "파일을 열면 여기에 나와요."

@@ -2,6 +2,7 @@
 //! statistics, groups, marker sticks, force plates and analog channels.
 //! Colors are recorded as a [`ColorSource`] only; the viewer theme turns them into screen colors.
 
+use crate::shared_vec::SharedVec;
 use crate::geom::{v3, Vec3};
 use crate::edit::{DocumentSnapshot, EditError, Revision};
 use crate::marker_sets;
@@ -44,7 +45,7 @@ pub struct MarkerView {
     /// First/last sampled frame; None when the trajectory has no samples.
     pub span: Option<(i64, i64)>,
     /// Dense positions over `span` (NaN = no sample), display units (metres).
-    dense: Vec<[f32; 3]>,
+    dense: SharedVec<[f32; 3]>,
     pub n_samples: usize,
     pub fill_pct: f32,
     /// Missing ranges inside [start_frame, end_frame] (`src/trajectory.py` `gaps`).
@@ -89,7 +90,7 @@ pub struct PlateView {
     pub name: String,
     pub corners: [Vec3; 4],
     /// Per-frame Fz (mean of valid subsamples), NaN = missing. Units unverified.
-    pub fz: Vec<f32>,
+    pub fz: SharedVec<f32>,
     pub fz_abs_max: f32,
     /// Prepared on the reader, including the no-device display fallback.
     pub fz_signal: Arc<SignalView>,
@@ -101,7 +102,7 @@ pub struct ChannelView {
     pub dim: usize,
     /// Per-frame mean of declared valid slots (legacy first min(dim, VALID_SUBSAMPLES)
     /// fallback when metadata is unproven), NaN = missing.
-    pub per_frame: Vec<f32>,
+    pub per_frame: SharedVec<f32>,
     /// Plot topology prepared by the reader, shared without copying samples on the UI thread.
     pub signal: Arc<SignalView>,
     /// True input rate for graph processing. Forceplates use their frame-average series.
@@ -224,7 +225,7 @@ pub struct ViewData {
     pub start_frame: i64,
     pub end_frame: i64,
     /// Per frame: share of labeled markers without a sample (Motive navigation-bar red marks).
-    pub occlusion: Vec<f32>,
+    pub occlusion: SharedVec<f32>,
     /// Force plate forces / EMG are still being read (markers-first open, `tak::fast_read`).
     /// Set by the caller; `attach_analog` clears it.
     pub analog_pending: bool,
@@ -353,7 +354,7 @@ impl MarkerView {
 /// Per-trajectory display tables (independent of the other trajectories).
 struct Track {
     span: Option<(i64, i64)>,
-    dense: Vec<[f32; 3]>,
+    dense: SharedVec<[f32; 3]>,
     /// Box around the finite samples (display units).
     bounds: Option<(Vec3, Vec3)>,
     in_range: usize,
@@ -393,7 +394,7 @@ fn track(t: &Trajectory, start: i64, end: i64, scale: f32) -> Track {
     let in_range = t.frames.iter().filter(|&&f| start <= f as i64 && f as i64 <= end).count();
     let gap_list = gaps(&t.frames, start, end);
     let max_gap = gap_list.iter().map(|(a, b)| b - a + 1).max().unwrap_or(0);
-    Track { span, dense, bounds, in_range, gaps: gap_list, max_gap, segments: segments(&t.frames) }
+    Track { span, dense: dense.into(), bounds, in_range, gaps: gap_list, max_gap, segments: segments(&t.frames) }
 }
 
 /// Preserve the original finite-value summation order without allocating one vector per row.
@@ -454,7 +455,7 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
                 } else {
                     (Arc::new(SignalView::prepare(&raw_min, start, end)), Arc::new(SignalView::prepare(&raw_max, start, end)))
                 };
-                ChannelView { name: c.name.clone(), dim: c.dim, per_frame, signal,
+                ChannelView { name: c.name.clone(), dim: c.dim, per_frame: per_frame.into(), signal,
                     sample_rate_hz: input_rate, samples_per_frame, raw_min, raw_max }
             })
             .collect();
@@ -735,7 +736,7 @@ impl ViewData {
             bounds: robust.or(bounds).or(bounds_all),
             start_frame: start,
             end_frame: end,
-            occlusion,
+            occlusion: occlusion.into(),
             take,
             analog_pending: false,
             emg_pending: false,
@@ -784,7 +785,7 @@ impl ViewData {
                             (Some(label.parent), Some(label.slot), kind, asset.then_some(label.parent))
                         }
                     };
-                    Trajectory { uid, name: raw.name.clone(), parent_uid, slot_raw: slot.map(|s| s as u32), slot, kind, asset_uid, frames: Vec::new(), xyz: Vec::new(), raw16_sha256: String::new(), lenient_membership: false }
+                    Trajectory { uid, name: raw.name.clone(), parent_uid, slot_raw: slot.map(|s| s as u32), slot, kind, asset_uid, frames: Vec::new().into(), xyz: Vec::new().into(), raw16_sha256: String::new(), lenient_membership: false }
                 }
             };
             trajectory.frames = raw.samples.iter().map(|s| s.frame()).collect();
@@ -905,8 +906,8 @@ mod tests {
             name: name.into(),
             kind: "Analog".into(),
             dim: 2,
-            frames: vec![0, 1, 3],
-            values: vec![base, base + 2.0, f32::NAN, base, base + 1.0, base + 1.0],
+            frames: vec![0, 1, 3].into(),
+            values: vec![base, base + 2.0, f32::NAN, base, base + 1.0, base + 1.0].into(),
         };
         let device = AnalogDevice { channels: (0..3).map(|k| channel(&format!("AnalogChannel{k}"), k as f32)).collect() };
         let take = Take {
@@ -957,7 +958,7 @@ mod tests {
     fn selective_stages_preserve_ordered_manifest_forceplate_mapping_and_prior_samples() {
         let device = |base: f32| AnalogDevice { channels: (0..3).map(|i| AnalogChannel {
             name: format!("AnalogChannel{i}"), kind: "Analog".into(), dim: 1,
-            frames: vec![0, 2], values: vec![base + i as f32, base + i as f32 + 1.0],
+            frames: vec![0, 2].into(), values: vec![base + i as f32, base + i as f32 + 1.0].into(),
         }).collect() };
         let full = vec![device(10.0), device(100.0), device(20.0)];
         let mut manifest = full.clone();
@@ -1009,7 +1010,7 @@ mod tests {
         values[..3].copy_from_slice(&[-3.0, 0.0, 3.0]);
         values[16..19].copy_from_slice(&[-6.0, f32::NAN, 9.0]);
         let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
-            dim: 16, frames: vec![100, 102], values };
+            dim: 16, frames: vec![100, 102].into(), values: values.into() };
         let take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 300.0, samples_per_frame: 3 }));
         let raw_bits: Vec<_> = take.analog[0].channels[0].values.iter().map(|v| v.to_bits()).collect();
         let view = ViewData::build(take);
@@ -1047,7 +1048,7 @@ mod tests {
             values.extend([f32::MAX, f32::NAN, f32::INFINITY, -0.0, 123.0, -456.0]);
         }
         values[50 * 16 + 2] = f32::NAN;
-        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(), dim: 16, frames, values };
+        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(), dim: 16, frames: frames.into(), values: values.into() };
         let mut take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 }));
         take.end_frame = 199;
         let view = ViewData::build(take);
@@ -1072,7 +1073,7 @@ mod tests {
     #[test]
     fn full_rate_requires_sampling_metadata_matching_frame_rate_and_capacity() {
         let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
-            dim: 16, frames: vec![100], values: vec![1.0; 16] };
+            dim: 16, frames: vec![100].into(), values: vec![1.0; 16].into() };
         for sampling in [None,
             Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 9 }),
             Some(DeviceSampling { rate_hz: 1700.0, samples_per_frame: 17 })] {
@@ -1086,7 +1087,7 @@ mod tests {
         assert_eq!(view.devices[0].channels[0].sample_rate_hz, Some(1000.0));
         assert_eq!(view.devices[0].channels[0].samples_per_frame, 10);
         let scalar = AnalogChannel { name: "AnalogChannel0".into(), kind: "FloatChannel".into(),
-            dim: 1, frames: vec![100], values: vec![1.0] };
+            dim: 1, frames: vec![100].into(), values: vec![1.0].into() };
         let view = ViewData::build(analog_test_take(scalar, None));
         assert_eq!(view.devices[0].channels[0].sample_rate_hz, Some(100.0));
     }
@@ -1094,7 +1095,7 @@ mod tests {
     #[test]
     fn full_rate_manifest_stays_allocation_free_for_unrequested_channels() {
         let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
-            dim: 16, frames: vec![], values: vec![] };
+            dim: 16, frames: vec![].into(), values: vec![].into() };
         let mut take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 }));
         take.end_frame = 100_000_000;
         // Avoid the marker occlusion allocation in build: directly exercise analog preparation.

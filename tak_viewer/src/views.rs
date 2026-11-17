@@ -279,8 +279,9 @@ pub fn recall<'a>(list: &'a [Spot], path: &Path) -> Option<&'a Spot> {
 
 /// Free a file's view data on another thread (big files take a moment).
 pub fn drop_later<T: Send + 'static>(old: Option<T>) {
+        let _span=crate::bench_timing::span("retire.enqueue");
     if let Some(old) = old {
-        std::thread::spawn(move || drop(old));
+        crate::work_queue::retire(old);
     }
 }
 
@@ -497,7 +498,7 @@ pub struct View {
     pub emg_failure: Option<String>,
     pub analog_fallback: Option<String>,
     analog_queue: Vec<AnalogPart>,
-    analog_merge: Option<Receiver<(Arc<ViewData>, ViewData, AnalogPart)>>,
+    analog_merge: Option<Receiver<(Arc<ViewData>, ViewData, AnalogPart, [f64;2])>>,
     /// Set when the file being read is no longer wanted.
     load_cancel: Arc<AtomicBool>,
     /// Put the file being read here once its markers arrive (remembered `Spot`).
@@ -834,6 +835,7 @@ impl View {
     /// save). A stale view cannot replace a newer publication: it consumes that publication
     /// instead and returns false. The app must sync before accepting input on an old tab.
     pub fn publish_shared_file(&mut self) -> bool {
+        let _span=crate::bench_timing::span("shared.publish");
         self.editor_revision = self.editor_revision.wrapping_add(1);
         let Some(shared) = self.shared_file.clone() else { return true };
         let Some(data) = self.data.as_ref() else { return false };
@@ -864,6 +866,7 @@ impl View {
     /// selection by UID. The handle always reads live state, so an old handle cannot roll back
     /// a save, rename, Comment write, or marker edit.
     pub fn sync_shared_file(&mut self, shared: &SharedFile) -> bool {
+        let _span=crate::bench_timing::span("shared.sync");
         let (data, stamp, comments, remote, generation) = {
             let Ok(state) = shared.0.lock() else { return false };
             if !self.edit_document.as_ref().is_some_and(|doc| Arc::ptr_eq(doc, &state.document)) { return false; }
@@ -1493,6 +1496,7 @@ impl View {
     }
 
     fn attach_queued_analog(&mut self) {
+        let _span=crate::bench_timing::span("analog.attach");
         if self.analog_merge.is_some() { return; }
         let Some(part) = self.analog_queue.pop() else { return };
         let Some(data) = self.data.as_mut() else { drop_later(Some(part)); return };
@@ -1504,10 +1508,15 @@ impl View {
             let source = data.clone();
             let (tx, rx) = channel();
             self.analog_merge = Some(rx);
+            let trace=crate::headless::BENCH_TRACE.load(std::sync::atomic::Ordering::Relaxed);
             std::thread::spawn(move || {
+                let start=trace.then(Instant::now);
                 let mut updated = source.as_ref().clone();
+                let cloned=start.map_or(0.0,|s|s.elapsed().as_secs_f64()*1000.0);
+                let merge=trace.then(Instant::now);
                 drop(updated.swap_prepared(part.clone()));
-                let _ = tx.send((source, updated, part));
+                let merged=merge.map_or(0.0,|s|s.elapsed().as_secs_f64()*1000.0);
+                let _ = tx.send((source, updated, part, [cloned,merged]));
             });
         }
     }
@@ -1601,6 +1610,7 @@ impl View {
 
     /// Forceplate startup and explicitly requested EMG arrive independently.
     pub fn poll_analog(&mut self) {
+        let _span=crate::bench_timing::span("analog.poll");
         self.sync_shared();
         let previous_data = self.data.as_ref().map(Arc::as_ptr);
         for initial in [true, false] {
@@ -1631,7 +1641,9 @@ impl View {
             }
         }
         if let Some(rx) = &self.analog_merge {
-            if let Ok((source, updated, retry)) = rx.try_recv() {
+            if let Ok((source, updated, retry, timing)) = rx.try_recv() {
+                crate::bench_timing::background("analog.clone_worker",timing[0]);
+                crate::bench_timing::background("analog.merge_worker",timing[1]);
                 self.analog_merge = None;
                 if self.data.as_ref().is_some_and(|current| Arc::ptr_eq(current, &source)) {
                     drop_later(self.data.replace(Arc::new(updated)));
@@ -1853,6 +1865,18 @@ impl View {
     }
 
     fn install_shared_data(&mut self, data: Arc<ViewData>) {
+        let _span=crate::bench_timing::span("shared.install");
+        // Analog publication preserves all marker buffers and the edit revision. Keep the
+        // already prepared graph/labels instead of rebuilding every view at EMG readiness.
+        if self.data.as_ref().is_some_and(|old| old.take.path == data.take.path
+            && old.edit_revision == data.edit_revision
+            && old.take.trajectories.len() == data.take.trajectories.len()
+            && old.take.trajectories.iter().zip(&data.take.trajectories).all(|(a,b)|
+                a.frames.shares_storage(&b.frames) && a.xyz.shares_storage(&b.xyz))) {
+            self.plate = self.plate.filter(|&plate| data.analog_pending || plate < data.plates.len());
+            drop_later(self.data.replace(data));
+            return;
+        }
         let filter = self.labels.filter.clone();
         let folds = self.data.as_ref().map(|old| panels::fold_keys(old, &self.labels.collapsed)).unwrap_or_default();
         let old_groups: std::collections::HashSet<_> = self.data.as_ref().map(|old| (0..old.groups.len())
@@ -2628,7 +2652,7 @@ mod tests {
         drop_later(owner.clear());
         assert!(!cancellation.load(Ordering::SeqCst));
         lazy_tx.send((None, None)).unwrap();
-        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![42.0].into() }] }];
         tx.send(LoadMsg::Analog(Ok(AnalogPart::prepare(analog, None, &target)), 1.0)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while other.analog_work_pending() {
@@ -2774,7 +2798,7 @@ mod tests {
         view.show(data, rx, 7, 1.0, 0.0);
         assert_eq!(Arc::strong_count(view.data.as_ref().unwrap()), 1);
         assert!(view.edit_document.is_some());
-        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![42.0].into() }] }];
         tx.send(LoadMsg::Analog(Ok(AnalogPart::prepare(analog, None, &target)), 1.0)).unwrap();
         view.poll_analog();
         assert!(!view.data.as_ref().unwrap().analog_pending);
@@ -2792,7 +2816,7 @@ mod tests {
         view.show(data, rx, 77, 1.0, 0.0);
         let shared = view.data.as_ref().unwrap().clone();
         view.analog_rx = None;
-        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![42.0].into() }] }];
         view.queue_analog(AnalogPart::prepare(analog, None, &target));
         assert!(view.analog_merge.is_some(), "shared data must be merged on a worker");
         // Simulate a marker view finishing while that worker owns the previous Arc.
@@ -2823,7 +2847,7 @@ mod tests {
         let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
         view.edit_refresh = Some(revision);
         stale.edit_revision = Some(revision);
-        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0] }] }];
+        let analog = vec![AnalogDevice { channels: vec![AnalogChannel { name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![42.0].into() }] }];
         let part = AnalogPart::prepare(analog, None, &view.data.as_ref().unwrap().analog_target());
         view.queue_analog(part);
         assert!(matches!(view.publish_edited_view(stale), Err(EditError::StaleRevision)));

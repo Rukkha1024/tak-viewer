@@ -22,6 +22,7 @@ pub(crate) mod par;
 pub mod playback;
 /// Read-only per-device signal processing for display graphs.
 pub mod signal;
+pub mod shared_vec;
 /// Memory-only read-only SSH access; connects only when explicitly requested.
 pub mod remote;
 #[doc(hidden)]

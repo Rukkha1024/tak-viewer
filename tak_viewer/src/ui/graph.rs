@@ -175,10 +175,11 @@ fn nice_step(span: f64, target: f64) -> f64 {
 
 /// One lane as it is drawn: min / max over the frames in view and its lines thinned out to
 /// at most four points per pixel column, in (frame, value).
+#[derive(Clone)]
 struct DrawnLane {
     lo: f64,
     hi: f64,
-    runs: Vec<Vec<[f64; 2]>>,
+    runs: std::sync::Arc<Vec<Vec<[f64; 2]>>>,
 }
 
 /// Frame range in view (bits of lo, hi) and the number of columns `thin` worked for.
@@ -218,7 +219,8 @@ struct BackgroundPrepared {
 /// Shapes are rebuilt only when their inputs (`ShapesKey`) change.
 struct LaneShapes {
     key: ShapesKey,
-    shapes: Vec<Shape>,
+    shapes: std::sync::Arc<Vec<Shape>>,
+    stream: Option<ShapeStream>,
     /// A complete compact single-marker lane may become a mesh after this application frame.
     promote_after: Option<u64>,
     #[cfg(test)]
@@ -228,6 +230,7 @@ struct LaneShapes {
 impl LaneShapes {
     /// Promote only cached screen points; no trajectory samples or hover shapes are revisited.
     fn promote(&mut self) {
+        let _span=crate::bench_timing::span("graph.mesh_promote");
         let mut tess = egui::epaint::Tessellator::new(self.key.pixels_per_point, self.key.options, [1, 1], vec![]);
         tess.set_clip_rect(self.key.clip);
         let mut mesh = egui::Mesh::default();
@@ -235,15 +238,42 @@ impl LaneShapes {
         let flush = |mesh: &mut egui::Mesh, shapes: &mut Vec<Shape>| {
             if !mesh.is_empty() { shapes.push(Shape::mesh(std::mem::take(mesh))); }
         };
-        for shape in std::mem::take(&mut self.shapes) {
+        for shape in std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.shapes)) {
             match shape {
                 Shape::Path(path) => tess.tessellate_shape(Shape::Path(path), &mut mesh),
                 other => { flush(&mut mesh, &mut promoted); promoted.push(other); }
             }
         }
         flush(&mut mesh, &mut promoted);
-        self.shapes = promoted;
+        self.shapes = std::sync::Arc::new(promoted);
         self.promote_after = None;
+    }
+}
+
+/// Epaint owns mesh buffers. Prepare two exact frame copies ahead, then move them
+/// into the painter; cloning the cached mesh on the UI would copy megabytes per frame.
+struct ShapeStream {
+    tx: std::sync::mpsc::SyncSender<Vec<Shape>>,
+    rx: std::sync::mpsc::Receiver<Vec<Shape>>,
+}
+impl LaneShapes {
+    fn stream(&mut self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        for _ in 0..2 { let _ = tx.send(self.shapes.as_ref().clone()); }
+        self.stream = Some(ShapeStream { tx, rx });
+    }
+    fn paint(&mut self, painter: &egui::Painter) {
+        if let Some(stream) = &self.stream {
+            if let Ok(shapes) = stream.rx.try_recv() {
+                let source = self.shapes.clone();
+                let tx = stream.tx.clone();
+                crate::work_queue::geometry(move || { let _ = tx.send(source.as_ref().clone()); });
+                painter.extend(shapes);
+                return;
+            }
+        }
+        // Complete identical geometry remains visible if a background copy is late.
+        painter.extend(self.shapes.iter().cloned());
     }
 }
 
@@ -261,6 +291,8 @@ struct ShapesKey {
     clip: Rect,
     pixels_per_point: f32,
     options: egui::epaint::TessellationOptions,
+    /// Multiple tinted curves retain paths so egui applies tint before AA tessellation.
+    untinted: bool,
 }
 
 type FontAtlas = egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>;
@@ -545,11 +577,12 @@ struct Work {
     put_off: bool,
     put_off_before: bool,
     mesh_promoted: bool,
+    started: Option<std::time::Instant>,
 }
 
 thread_local! {
     static WORK: std::cell::Cell<Work> =
-        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false, mesh_promoted: false }) };
+        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false, mesh_promoted: false, started: None }) };
 }
 
 /// Start of a pass of the app's frame `frame` (the input time's bits: the same for the passes of
@@ -562,7 +595,7 @@ pub fn start_frame(frame: u64, budget: Option<usize>) -> bool {
         if work.frame == frame {
             work.left = work.kept;
         } else {
-            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off, mesh_promoted: false };
+            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off, mesh_promoted: false, started: Some(std::time::Instant::now()) };
         }
         w.set(work);
         work.put_off_before
@@ -580,6 +613,11 @@ pub fn end_frame() {
 
 /// One optional mesh optimization across every view and every pass of an application frame.
 /// The complete compact curve is already visible while its promotion waits.
+/// Real wall-time budget shared by all views and sizing passes. Work itself is on workers.
+fn claim_geometry_publication() -> bool {
+    WORK.with(|cell| cell.get().started.is_none_or(|start| start.elapsed().as_secs_f64() < 0.004))
+}
+
 fn claim_mesh_promotion(created: u64) -> bool {
     WORK.with(|cell| {
         let mut work = cell.get();
@@ -652,9 +690,12 @@ pub struct Drawn {
     version: u64,
     /// Per lane, its curves as painted (`LaneShapes`).
     shapes: Vec<Option<LaneShapes>>,
+    mesh_rx: Vec<Option<(ShapesKey, std::sync::mpsc::Receiver<LaneShapes>)>>,
     decorations: Decorations,
     #[cfg(test)]
     force_immediate_mesh: bool,
+    #[cfg(test)]
+    force_worker_mesh: bool,
     /// v0.29.0 hover: the graphed markers' names in graph order (`set_names`; a marker graph).
     /// Empty = no hover (force plate and device graphs).
     names: Vec<String>,
@@ -828,8 +869,10 @@ impl Drawn {
         }
     }
 
+    pub fn enable_background(&mut self) { self.background = true; self.key = None; }
+
     pub fn background_pending(&self) -> bool {
-        self.background && (self.background_rx.is_some() || self.key.is_none())
+        self.background && (self.background_rx.is_some() || self.key.is_none() || self.mesh_rx.iter().any(Option::is_some))
     }
 
     /// The second file laid over the view (None = none); what was worked out is done again.
@@ -998,6 +1041,7 @@ const COLUMN_W: f32 = 2.0;
 /// is never dropped and the number of points depends on the width (and the number of gaps),
 /// not on how many samples the file has. Also the min / max over the frames in view.
 fn thin(lane: &Lane, vr: &ViewRange, cols: usize) -> DrawnLane {
+    let mut span=crate::bench_timing::span("graph.decimate");span.counts(||(lane.runs.iter().map(Vec::len).sum(),0));
     // (column, first, lowest, highest, last)
     type Column = (i64, [f64; 2], [f64; 2], [f64; 2], [f64; 2]);
     fn flush(out: &mut Vec<[f64; 2]>, (_, first, min, max, last): Column) {
@@ -1052,7 +1096,7 @@ fn thin(lane: &Lane, vr: &ViewRange, cols: usize) -> DrawnLane {
             runs.push(out);
         }
     }
-    DrawnLane { lo, hi, runs }
+    DrawnLane { lo, hi, runs: runs.into() }
 }
 
 /// The points of a run (frames in increasing order) that `thin` looks at: frames in view and one
@@ -1081,6 +1125,7 @@ fn curve_shapes<'a>(
     dot: f32,
     mesh_single: bool,
 ) -> (Vec<Shape>, Drew) {
+    let _span=crate::bench_timing::span("graph.build_shapes");
     let mut shapes: Vec<Shape> = Vec::new();
     let mut drew = Drew { colors: vec![vec![]], dash_colors: vec![vec![]], ..Drew::default() };
     let mut mesh = egui::Mesh::default();
@@ -1093,7 +1138,7 @@ fn curve_shapes<'a>(
         if !d.runs.is_empty() {
             drew.dash_colors[0].push(color);
         }
-        for run in &d.runs {
+        for run in d.runs.iter() {
             let pts: Vec<Pos2> = run.iter().map(|p| pos2(x_of(p[0]), y_of(p[1]))).collect();
             drew.dashed += 1;
             if pts.len() == 1 {
@@ -1114,7 +1159,7 @@ fn curve_shapes<'a>(
         if !t.runs.is_empty() {
             drew.colors[0].push(color);
         }
-        for run in &t.runs {
+        for run in t.runs.iter() {
             drew.solid += 1;
             let pts: Vec<Pos2> = run.iter().map(|p| pos2(x_of(p[0]), y_of(p[1]))).collect();
             if pts.len() == 1 {
@@ -1455,8 +1500,47 @@ fn show_inner(
             clip: lane_painter.clip_rect(),
             pixels_per_point,
             options,
+            untinted,
         };
-        if drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) {
+        let worker_mesh = untinted && !cfg!(test);
+        #[cfg(test)] let worker_mesh = worker_mesh || (untinted && drawn.force_worker_mesh);
+        if drawn.mesh_rx.len() <= li { drawn.mesh_rx.resize_with(li + 1, || None); }
+        if worker_mesh {
+            if drawn.mesh_rx[li].as_ref().is_some_and(|(key, _)| *key != shapes_key) {
+                crate::views::drop_later(drawn.mesh_rx[li].take());
+            }
+            if claim_geometry_publication() {
+                if let Some((_, rx)) = &drawn.mesh_rx[li] {
+                    if let Ok(ready) = rx.try_recv() {
+                        crate::views::drop_later(drawn.shapes[li].replace(ready));
+                        drawn.mesh_rx[li] = None;
+                    }
+                }
+            }
+            if drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) && drawn.mesh_rx[li].is_none() {
+                let dashed: Vec<_> = dashed.map(|d| (d.clone(),lane.color)).into_iter()
+                    .chain(drawn.more_pair_lanes.iter().zip(&drawn.more).filter_map(|(p,m)| Some((p.lanes.get(li)?.clone(),m.get(li)?.color))))
+                    .filter(|_|show_second).collect();
+                let solid: Vec<_> = std::iter::once((thinned.clone(),lane.color))
+                    .chain(drawn.more_lanes.iter().zip(&drawn.more).filter_map(|(p,m)| Some((p.lanes.get(li)?.clone(),m.get(li)?.color))))
+                    .filter(|_|show_first).collect();
+                let key = shapes_key.clone();
+                let (tx,rx) = std::sync::mpsc::channel();
+                let wake = ui.ctx().clone();
+                drawn.mesh_rx[li] = Some((key.clone(),rx));
+                crate::work_queue::geometry(move || {
+                    let mut tess = egui::epaint::Tessellator::new(key.pixels_per_point,key.options,[1,1],vec![]);
+                    tess.set_clip_rect(key.clip);
+                    let (shapes,_drew) = curve_shapes(&mut tess, dashed.iter().map(|(d,c)|(d,*c)),solid.iter().map(|(d,c)|(d,*c)), |f|map.x(f), |v|map.y(v),LINE_W,DOT_R,true);
+                    let mut ready = LaneShapes {key,shapes:std::sync::Arc::new(shapes),stream:None,promote_after:None, #[cfg(test)] drew:_drew};
+                    ready.promote();
+                    ready.stream();
+                    let _ = tx.send(ready); wake.request_repaint();
+                });
+            }
+            if drawn.mesh_rx[li].is_some() { ui.ctx().request_repaint(); }
+        }
+        if !worker_mesh && drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) {
             // The second file's curves first, dashed, so the first file's solid lines are on
             // top: the (first) marker's, then the other markers' of a graph of several
             // (v0.27.0), all in the lane's color (v0.29.0; v0.27.0 had a color per marker).
@@ -1468,12 +1552,13 @@ fn show_inner(
             let mut tess = egui::epaint::Tessellator::new(pixels_per_point, options, [1, 1], vec![]);
             tess.set_clip_rect(shapes_key.clip);
             let (shapes, _lane_drew) = curve_shapes(&mut tess, dashed, solid, |f| x_of(f, &vr), y_of, LINE_W, DOT_R, immediate_mesh);
-            let promote_after = (!immediate_mesh && _lane_drew.colors.first().is_some_and(|colors| colors.len() == 1)
+            let promote_after = (!immediate_mesh
                 && shapes.iter().any(|shape| matches!(shape, Shape::Path(_))))
                 .then(|| WORK.with(|work| work.get().frame));
             drawn.shapes[li] = Some(LaneShapes {
                 key: shapes_key.clone(),
-                shapes,
+                shapes: std::sync::Arc::new(shapes),
+                stream: None,
                 promote_after,
                 #[cfg(test)]
                 drew: _lane_drew,
@@ -1489,8 +1574,10 @@ fn show_inner(
                 else { ui.ctx().request_repaint(); }
             }
         }
-        if let Some(m) = &drawn.shapes[li] {
-            lane_painter.extend(m.shapes.iter().cloned());
+        if let Some(m) = &mut drawn.shapes[li] {
+            let mut span=crate::bench_timing::span("graph.publish_shapes");
+            span.counts(||(m.shapes.iter().map(|s|if let Shape::Path(p)=s{p.points.len()}else{0}).sum(),m.shapes.iter().map(|s|if let Shape::Mesh(m)=s{m.vertices.len()}else{0}).sum()));
+            m.paint(&lane_painter);
             #[cfg(test)]
             drew.add(&m.drew);
         }
@@ -1751,6 +1838,43 @@ mod tests {
         graph
     }
 
+    #[test]
+    fn worker_geometry_and_owned_frame_copies_match_reference_pixels() {
+        let mut reference = promotion_graph(true);
+        let mut worker = promotion_graph(true);
+        worker.drawn.force_worker_mesh = true;
+        worker.pass = 1_000_000;
+        let mut ready = false;
+        for _ in 0..100 {
+            let a = reference.render(vec![]);
+            let b = worker.render(vec![]);
+            if worker.drawn.shapes.iter().filter(|s|s.is_some()).count() == 3
+                && worker.drawn.mesh_rx.iter().all(Option::is_none) {
+                assert_eq!(a.0,b.0,"worker tessellation preserves every vertex and index");
+                assert_eq!(a.1.pixels,b.1.pixels,"queued owned copies preserve exact pixels");
+                ready=true;break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ready,"worker must publish every lane");
+        for _ in 0..5 {
+            let a=reference.render(vec![]);let b=worker.render(vec![]);
+            assert_eq!(a.0,b.0);assert_eq!(a.1.pixels,b.1.pixels);
+        }
+    }
+
+    #[test]
+    fn geometry_publication_obeys_wall_clock_budget_across_views() {
+        let frame=0x123456;
+        super::start_frame(frame,Some(100));
+        super::WORK.with(|w| {let mut state=w.get();state.started=Some(std::time::Instant::now()-std::time::Duration::from_millis(5));w.set(state);});
+        assert!(!super::claim_geometry_publication());
+        super::start_frame(frame,Some(100));
+        assert!(!super::claim_geometry_publication(),"a second layout pass cannot reset the wall budget");
+        super::start_frame(frame+1,Some(100));
+        assert!(super::claim_geometry_publication());super::end_frame();
+    }
+
     fn pending_promotions(graph: &DecorationGraph) -> usize {
         graph.drawn.shapes.iter().filter(|lane| lane.as_ref().is_some_and(|lane| lane.promote_after.is_some())).count()
     }
@@ -1783,6 +1907,38 @@ mod tests {
                 assert_eq!(delayed.drawn.drew.remade, 0);
             }
             if matches!(frame, 2 | 3) { assert_eq!(delayed.drawn.drew.hover_made, 0, "promotion must retain hover caches"); }
+        }
+    }
+
+    #[test]
+    fn multiple_marker_and_device_overlay_promotions_preserve_all_geometry_and_pixels() {
+        for curves in [2, 8] {
+            let mut delayed = promotion_graph(false);
+            let mut reference = promotion_graph(false);
+            for graph in [&mut delayed, &mut reference] {
+                for k in 1..curves {
+                    let mut lanes = graph.lanes.clone();
+                    for lane in &mut lanes {
+                        lane.color = lane.color.gamma_multiply(if k % 2 == 0 { 0.22 } else { 0.7 });
+                    }
+                    graph.drawn.push_more(lanes);
+                }
+            }
+            for frame in 0..8 {
+                for graph in [&mut delayed, &mut reference] {
+                    if frame == 5 {graph.enabled=false;}
+                    if frame == 6 {graph.enabled=true;graph.opacity=0.55;}
+                    if frame == 7 {graph.opacity=1.0;}
+                }
+                // Keep the comparison graph on its complete compact first-frame paths.
+                reference.pass = 0;
+                let b = reference.render(vec![]);
+                delayed.frame = reference.frame;
+                let a = delayed.render(vec![]);
+                assert!(a.0 == b.0, "geometry: curves={curves}, frame={frame}");
+                assert!(a.1.pixels == b.1.pixels, "pixels: curves={curves}, frame={frame}");
+                if frame < 5 {assert_eq!(pending_promotions(&delayed), 3usize.saturating_sub(frame));}
+            }
         }
     }
 
@@ -2010,13 +2166,13 @@ mod tests {
         use super::{curve_shapes, DrawnLane, DOT_R, HOVER_DOT_R, HOVER_W, LINE_W};
         use eframe::egui::{self, pos2, Color32, Pos2, Rect, Shape, Stroke};
 
-        let dashed = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[3.0, 14.0], [31.0, 18.0], [58.0, 10.0]]] };
+        let dashed = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[3.0, 14.0], [31.0, 18.0], [58.0, 10.0]]].into() };
         let red = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![
             vec![[2.0, 8.0], [18.0, 15.0], [39.0, 7.0], [60.0, 20.0]],
             vec![[28.0, 24.0]], // A circle must stay between the two red runs.
             vec![[5.0, 36.0], [54.0, 29.0]],
-        ] };
-        let blue = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[8.0, 34.0], [45.0, 13.0], [62.0, 34.0]]] };
+        ].into() };
+        let blue = DrawnLane { lo: 0.0, hi: 1.0, runs: vec![vec![[8.0, 34.0], [45.0, 13.0], [62.0, 34.0]]].into() };
         let clip = Rect::from_min_max(pos2(8.0, 4.0), pos2(56.0, 44.0));
         let options = egui::epaint::TessellationOptions::default();
         let tess = || {
@@ -2042,7 +2198,7 @@ mod tests {
         let (mut previous, _) = curve_shapes(&mut maker, std::iter::once((&dashed, Color32::GREEN)), empty(), |x| x as f32, |y| y as f32, LINE_W, DOT_R, true);
         let mut solid_mesh = egui::Mesh::default();
         for (lane, color) in solids() {
-            for run in &lane.runs {
+            for run in lane.runs.iter() {
                 let pts: Vec<Pos2> = run.iter().map(|p| pos2(p[0] as f32, p[1] as f32)).collect();
                 if pts.len() == 1 {
                     if !solid_mesh.is_empty() { previous.push(Shape::mesh(std::mem::take(&mut solid_mesh))); }
@@ -2321,6 +2477,8 @@ mod tests {
         let ctx = egui::Context::default();
         (0..n)
             .map(|k| {
+                // These tests isolate thinning/painter reuse; promotion has pixel tests above.
+                for lane in drawn.shapes.iter_mut().flatten() {lane.promote_after=None;}
                 start_frame(k as u64, budget);
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0))),
@@ -2403,7 +2561,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut original = None;
         for (iteration, frame) in [100, 101, 2000, 3999].into_iter().enumerate() {
-            start_frame(iteration as u64, None);
+            start_frame(0, None); // keep first-frame representation; promotion parity tested separately
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0))),
                 time: Some(iteration as f64),
@@ -2607,7 +2765,7 @@ mod tests {
 
     /// A thinned curve of `runs` (frame, value).
     fn drawn_lane(runs: Vec<Vec<[f64; 2]>>) -> super::DrawnLane {
-        super::DrawnLane { lo: 0.0, hi: 100.0, runs }
+        super::DrawnLane { lo: 0.0, hi: 100.0, runs: runs.into() }
     }
 
     fn flat_run(a: i64, b: i64, v: f64) -> Vec<[f64; 2]> {

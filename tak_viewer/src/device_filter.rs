@@ -324,103 +324,129 @@ pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
     egui::ScrollArea::horizontal()
         .id_salt("filter_rows")
         .show(ui, |ui| {
-            for (i, step) in device.settings.steps.iter_mut().enumerate() {
-                ui.push_id(i, |ui| {
-                    let name = match step {
-                        Step::LowPass { .. } => "Low-pass",
-                        Step::HighPass { .. } => "High-pass",
-                        Step::BandPass { .. } => "Band-pass",
-                        Step::BandStop { .. } => "Band-stop",
-                        _ => "",
-                    };
-                    let error =
-                        signal::validate(std::slice::from_ref(step), fs.unwrap_or(f64::NAN)).err();
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if !name.is_empty() {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for style in [
+                    egui::TextStyle::Body,
+                    egui::TextStyle::Button,
+                    egui::TextStyle::Monospace,
+                ] {
+                    ui.style_mut()
+                        .text_styles
+                        .insert(style, egui::FontId::proportional(10.0));
+                }
+                egui::Grid::new("steps")
+                    .num_columns(5)
+                    .spacing([4.0, 3.0])
+                    .show(ui, |ui| {
+                        for (i, step) in device.settings.steps.iter_mut().enumerate() {
+                            let name = match step {
+                                Step::Demean => NAMES[0],
+                                Step::LowPass { .. } => NAMES[1],
+                                Step::HighPass { .. } => NAMES[2],
+                                Step::BandPass { .. } => NAMES[3],
+                                Step::BandStop { .. } => NAMES[4],
+                                Step::Rectify => NAMES[5],
+                                Step::MovingRms { .. } => NAMES[6],
+                            };
                             ui.label(name);
-                        }
-                        match step {
-                            Step::Demean => {
-                                ui.label(NAMES[0]);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().interact_size.x = 18.0;
+                                match step {
+                                    Step::MovingRms { window_ms } => number(
+                                        ui,
+                                        window_ms,
+                                        " ms",
+                                        !window_ms.is_finite() || *window_ms <= 0.0,
+                                    ),
+                                    Step::LowPass { cutoff_hz, .. }
+                                    | Step::HighPass { cutoff_hz, .. } => {
+                                        number(ui, cutoff_hz, " Hz", cutoff_invalid(*cutoff_hz, fs))
+                                    }
+                                    Step::BandPass {
+                                        low_hz, high_hz, ..
+                                    }
+                                    | Step::BandStop {
+                                        low_hz, high_hz, ..
+                                    } => {
+                                        number(
+                                            ui,
+                                            low_hz,
+                                            "",
+                                            cutoff_invalid(*low_hz, fs) || *low_hz >= *high_hz,
+                                        );
+                                        ui.label("–");
+                                        number(
+                                            ui,
+                                            high_hz,
+                                            " Hz",
+                                            cutoff_invalid(*high_hz, fs) || *low_hz >= *high_hz,
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label("");
+                                    }
+                                }
+                            });
+                            match step {
+                                Step::LowPass {
+                                    order, zero_phase, ..
+                                }
+                                | Step::HighPass {
+                                    order, zero_phase, ..
+                                }
+                                | Step::BandPass {
+                                    order, zero_phase, ..
+                                }
+                                | Step::BandStop {
+                                    order, zero_phase, ..
+                                } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("order");
+                                        if !(1..=8).contains(order) {
+                                            ui.visuals_mut().override_text_color =
+                                                Some(Color32::LIGHT_RED);
+                                        }
+                                        ui.add(egui::DragValue::new(order).range(1..=8));
+                                    });
+                                    ui.checkbox(zero_phase, "Zero-lag");
+                                }
+                                _ => {
+                                    ui.label("");
+                                    ui.label("");
+                                }
                             }
-                            Step::Rectify => {
-                                ui.label(NAMES[5]);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().button_padding = egui::vec2(1.0, 0.0);
+                                if ui
+                                    .add_enabled(i > 0, egui::Button::new("↑").small())
+                                    .clicked()
+                                {
+                                    swap = Some((i, i - 1));
+                                }
+                                if ui
+                                    .add_enabled(i + 1 < len, egui::Button::new("↓").small())
+                                    .clicked()
+                                {
+                                    swap = Some((i, i + 1));
+                                }
+                                if ui.small_button("×").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            ui.end_row();
+                            if let Err(error) =
+                                signal::validate(std::slice::from_ref(step), fs.unwrap_or(f64::NAN))
+                            {
+                                ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
+                                for _ in 0..4 {
+                                    ui.label("");
+                                }
+                                ui.end_row();
                             }
-                            Step::MovingRms { window_ms } => {
-                                ui.label(NAMES[6]);
-                                number(
-                                    ui,
-                                    window_ms,
-                                    " ms",
-                                    !window_ms.is_finite() || *window_ms <= 0.0,
-                                );
-                            }
-                            Step::LowPass {
-                                cutoff_hz,
-                                order,
-                                zero_phase,
-                            }
-                            | Step::HighPass {
-                                cutoff_hz,
-                                order,
-                                zero_phase,
-                            } => {
-                                // Variant name is captured before the mutable field match below.
-
-                                number(ui, cutoff_hz, " Hz", cutoff_invalid(*cutoff_hz, fs));
-                                params(ui, order, zero_phase);
-                            }
-                            Step::BandPass {
-                                low_hz,
-                                high_hz,
-                                order,
-                                zero_phase,
-                            }
-                            | Step::BandStop {
-                                low_hz,
-                                high_hz,
-                                order,
-                                zero_phase,
-                            } => {
-                                ui.label("Low");
-                                number(
-                                    ui,
-                                    low_hz,
-                                    " Hz",
-                                    cutoff_invalid(*low_hz, fs) || *low_hz >= *high_hz,
-                                );
-                                ui.label("High");
-                                number(
-                                    ui,
-                                    high_hz,
-                                    " Hz",
-                                    cutoff_invalid(*high_hz, fs) || *low_hz >= *high_hz,
-                                );
-                                params(ui, order, zero_phase);
-                            }
-                        }
-                        if ui
-                            .add_enabled(i > 0, egui::Button::new("↑").small())
-                            .clicked()
-                        {
-                            swap = Some((i, i - 1));
-                        }
-                        if ui
-                            .add_enabled(i + 1 < len, egui::Button::new("↓").small())
-                            .clicked()
-                        {
-                            swap = Some((i, i + 1));
-                        }
-                        if ui.small_button("×").clicked() {
-                            remove = Some(i);
                         }
                     });
-                    if let Some(error) = error {
-                        ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
-                    }
-                });
-            }
+            });
         });
     if let Some(i) = remove {
         device.settings.steps.remove(i);
@@ -479,16 +505,6 @@ fn number(ui: &mut Ui, value: &mut f64, suffix: &str, invalid: bool) {
                 .max_decimals(3),
         );
     });
-}
-fn params(ui: &mut Ui, order: &mut usize, zero_phase: &mut bool) {
-    ui.label("order");
-    ui.scope(|ui| {
-        if !(1..=8).contains(order) {
-            ui.visuals_mut().override_text_color = Some(Color32::LIGHT_RED);
-        }
-        ui.add(egui::DragValue::new(order).range(1..=8));
-    });
-    ui.checkbox(zero_phase, "Zero-lag");
 }
 pub fn badge(ui: &mut Ui, text: &str) {
     egui::Frame::none()

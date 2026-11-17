@@ -97,7 +97,7 @@ impl Pane {
             Pane::EditTools => "Edit Tools",
             Pane::Selected => "선택 마커",
             Pane::Graph => "GRAPH",
-            Pane::Devices => "장치",
+            Pane::Devices => "Devices",
             Pane::Comments => "COMMENTS",
         }
     }

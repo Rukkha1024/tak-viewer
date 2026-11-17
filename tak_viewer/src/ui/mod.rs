@@ -15,6 +15,7 @@
 //! - `theme`: all colors and fonts (VS Code frame, Motive inside; `apps/docs/design.md`).
 pub mod comment_list;
 pub mod dock;
+pub mod device_grid;
 pub mod explorer;
 pub mod edit_tools;
 pub mod empty;

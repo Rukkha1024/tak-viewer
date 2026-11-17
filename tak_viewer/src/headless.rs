@@ -122,13 +122,24 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         let emg_was_pending = emg_started.is_some() && app.bench_emg_pending();
         let since_open_ms = if trace.enabled() { ms(opened) } else { 0.0 };
         let cpu_start = trace.cpu_mark();
+        crate::bench_timing::begin_details(trace.enabled());
         let t = Instant::now();
-        let out = ctx.run(frame_input(screen, start, vec![]), |ctx| app.frame(ctx));
+        let out = ctx.run(frame_input(screen, start, vec![]), |ctx| {let _span=crate::bench_timing::span("app.frame");app.frame(ctx)});
         let ui_took = ms(t);
         let cpu_ui = trace.cpu_mark();
         let shapes = out.shapes.len();
+        fn geometry_counts(shape: &egui::Shape) -> (usize, usize) {
+            match shape {
+                egui::Shape::Path(path) => (path.points.len(), 0),
+                egui::Shape::Mesh(mesh) => (0, mesh.vertices.len()),
+                egui::Shape::Vec(shapes) => shapes.iter().map(geometry_counts).fold((0,0), |a,b| (a.0+b.0,a.1+b.1)),
+                _ => (0,0),
+            }
+        }
+        let counts = if trace.enabled() {out.shapes.iter().map(|s|geometry_counts(&s.shape)).fold((0,0),|a,b|(a.0+b.0,a.1+b.1))} else {(0,0)};
         let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
         let primitive_count = primitives.len();
+        let output_vertices = if trace.enabled() {primitives.iter().map(|p|match &p.primitive {egui::epaint::Primitive::Mesh(m)=>m.vertices.len(),_=>0}).sum()} else {0};
         drop(primitives);
         let took = ms(t);
         let cpu_end = trace.cpu_mark();
@@ -136,6 +147,11 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             let phase = if analog.is_none() { "startup" } else if emg_started.is_some() && emg_ready.is_none() { "emg" } else { "playing" };
             let mut record = FrameTiming::new(loading.len() + playing.len(), phase, since_open_ms, shapes, primitive_count, ui_took, took, [cpu_start, cpu_ui, cpu_end]);
             record.ui_passes = out.platform_output.num_completed_passes;
+            record.path_points = counts.0;
+            record.cached_mesh_vertices = counts.1;
+            record.output_vertices = output_vertices;
+            let details=crate::bench_timing::take_details();
+            if took>=8.0 || phase=="emg" {record.details=details;}
             trace.push(record);
         }
         let st = app.bench_state();
@@ -198,6 +214,10 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     let st = app.bench_state();
     let stats = |v: &[f64]| (v.iter().sum::<f64>() / v.len().max(1) as f64, v.iter().cloned().fold(0.0, f64::max));
     println!("bench: {} file(s), window {}x{}", st.views.len(), size[0], size[1]);
+    if crate::device_grid::PROBE.get().is_some_and(|p|p.size.is_some()) {
+        let (cells, filtered) = app.bench_grid_cells();
+        println!("  device grid: {cells} graph cells prepared, {filtered} with completed filter output");
+    }
     println!("  app start (no file): {started:.0} ms");
     println!("  memory: actual whole-process resident/working set; per-file readiness samples overlap across files");
     println!("  no-file app baseline: {}", ProcessMemory::describe(memory_baseline));

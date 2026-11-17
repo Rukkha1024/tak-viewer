@@ -5,14 +5,14 @@ use super::graph::{self, Lane, Look};
 use super::graph_float::{LaneSet, PLATE_LANES};
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, FontId, Id, Rect, RichText, Sense, Stroke, Ui};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tak_core::comments::Comments;
 use tak_core::playback::Playback;
 use tak_core::tak::{uid_hex, MarkerKind};
-use tak_core::view_data::{DeviceView, GroupKind, ViewData, FZ_CHANNEL, VALID_SUBSAMPLES};
-use crate::device_filter::{self, Display, SharedFilters};
+use tak_core::view_data::{DeviceView, GroupKind, ViewData, FZ_CHANNEL};
+use crate::device_filter::{self, Display};
 
 /// User action produced by a pane.
 pub enum Action {
@@ -251,8 +251,8 @@ pub(crate) fn label_cell(rect: Rect, column: usize, columns: usize) -> Rect {
 /// cache per graph (pane or floating). Several markers (v0.27.0, `graphed`): the first one's
 /// lanes here, the others' in `graph::Drawn::push_more`, every marker in the lanes' colours
 /// X red, Y green, Z blue (v0.29.0; v0.27.0 gave each marker a colour of its own).
-/// The first marker is built at once; the others as far as the frame's work allows
-/// (`graph::spend`), the rest in the next frames (v0.27.0 speed fix).
+/// The visible graph builds all selected markers on a worker, then publishes them together.
+/// The synchronous path remains for tests of the older frame-budget behavior.
 #[derive(Default)]
 pub struct LaneCache {
     /// `--hover` / `--bench-hover` (agent only, v0.29.0): the graph is drawn as if the pointer
@@ -277,6 +277,43 @@ pub struct LaneCache {
     /// How many times the second file's lanes were built (tests).
     #[cfg(test)]
     pub pair_builds: usize,
+    async_mode: bool,
+    async_key: Option<MarkerJobKey>,
+    async_job: Option<MarkerJob>,
+    async_source: Option<std::sync::Arc<ViewData>>,
+    async_overlay: Option<std::sync::Arc<ViewData>>,
+}
+
+impl Drop for LaneCache {
+    fn drop(&mut self) {
+        if let Some(job) = &self.async_job {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkerJobKey {
+    file_id: usize,
+    source: usize,
+    revision: Option<tak_core::edit::Revision>,
+    markers: Vec<usize>,
+    overlay: Option<(PathBuf, usize)>,
+}
+
+struct MarkerJob {
+    rx: std::sync::mpsc::Receiver<PreparedMarkers>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PreparedMarkers {
+    key: MarkerJobKey,
+    lanes: Vec<Lane>,
+    more: Vec<Vec<Lane>>,
+    pair: Option<graph::Pair>,
+    more_pairs: Vec<Vec<Lane>>,
+    gaps: Vec<(i64, i64)>,
+    names: Vec<String>,
 }
 
 /// The marker of `other` with the name of `data`'s marker `mi` (plan step 9, dashed lanes): none
@@ -299,6 +336,172 @@ fn marker_cost(data: &ViewData, mi: usize) -> usize {
 }
 
 impl LaneCache {
+    /// Marker topology is built from shared, immutable file data on a worker. This path is
+    /// called only for a visible marker graph; `get` below then returns the published cache
+    /// without walking the file's samples. A key change discards old curves and invalidates
+    /// the previous worker, so a pending selection cannot display another marker's curve.
+    pub fn prepare_arc(
+        &mut self,
+        data: &std::sync::Arc<ViewData>,
+        file_id: usize,
+        markers: &[usize],
+        over: Option<(&Path, &std::sync::Arc<ViewData>)>,
+        shown: [bool; 2],
+        ctx: &egui::Context,
+    ) {
+        if markers.is_empty() || markers.iter().any(|&mi| mi >= data.markers.len()) {
+            return;
+        }
+        let key = MarkerJobKey {
+            file_id,
+            source: data.take.trajectories.first().map_or(std::sync::Arc::as_ptr(data) as usize, |t|t.xyz.as_ptr() as usize),
+            revision: data.edit_revision,
+            markers: markers.to_vec(),
+            overlay: over.map(|(path, source)| {
+                (path.to_path_buf(), std::sync::Arc::as_ptr(source) as usize)
+            }),
+        };
+        self.async_mode = true;
+        if self.async_key.as_ref() != Some(&key) || (self.async_job.is_none() && self.built == 0) {
+            if let Some(job) = self.async_job.take() {
+                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::views::drop_later(Some(job));
+            }
+            self.async_key = Some(key.clone());
+            crate::views::drop_later(Some((self.async_source.replace(data.clone()),
+                std::mem::replace(&mut self.async_overlay, over.map(|(_, source)| source.clone())))));
+            self.key = Some((file_id, markers.to_vec()));
+            self.pair_key = key.overlay.as_ref().map(|(path, _)| path.clone());
+            self.built = 0;
+            self.pairs_built = 0;
+            crate::views::drop_later(Some((
+                std::mem::take(&mut self.lanes),
+                std::mem::take(&mut self.gaps),
+                std::mem::take(&mut self.drawn),
+            )));
+            let data = data.clone();
+            let overlay = over.map(|(_, source)| source.clone());
+            let wake = ctx.clone();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancelled = cancel.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::Relaxed);
+                let mut lanes = Vec::new();
+                let mut more = Vec::new();
+                let mut pair = None;
+                let mut more_pairs = Vec::new();
+                for (index, &mi) in key.markers.iter().enumerate() {
+                    if is_cancelled() {
+                        return;
+                    }
+                    let built = marker_lanes(&data, mi);
+                    if index == 0 {
+                        lanes = built;
+                    } else {
+                        more.push(built);
+                    }
+                    if let Some(other) = overlay.as_deref() {
+                        let shift = (data.start_frame - other.start_frame) as f64;
+                        let mut dashed = same_name(&data, mi, other)
+                            .map_or_else(Vec::new, |found| marker_lanes(other, found));
+                        for point in dashed
+                            .iter_mut()
+                            .flat_map(|lane| std::sync::Arc::make_mut(&mut lane.runs).iter_mut())
+                            .flatten()
+                        {
+                            point[0] += shift;
+                        }
+                        if index == 0 {
+                            pair = Some(graph::Pair {
+                                lanes: dashed,
+                                shown: [true, true],
+                            });
+                        } else {
+                            more_pairs.push(dashed);
+                        }
+                    }
+                }
+                if is_cancelled() {
+                    return;
+                }
+                let gaps = if key.markers.len() > 1 {
+                    merged(
+                        key.markers
+                            .iter()
+                            .map(|&mi| data.markers[mi].gaps.as_slice()),
+                    )
+                } else {
+                    data.markers[key.markers[0]].gaps.clone()
+                };
+                let names = key
+                    .markers
+                    .iter()
+                    .map(|&mi| data.markers[mi].name.clone())
+                    .collect();
+                let _ = tx.send(PreparedMarkers {
+                    key,
+                    lanes,
+                    more,
+                    pair,
+                    more_pairs,
+                    gaps,
+                    names,
+                });
+                wake.request_repaint();
+            });
+            self.async_job = Some(MarkerJob { rx, cancel });
+        }
+        if let Some(job) = &self.async_job {
+            match job.rx.try_recv() {
+                Ok(result) => {
+                    self.async_job = None;
+                    if self.async_key.as_ref() == Some(&result.key) {
+                        let count = result.key.markers.len();
+                        self.lanes = result.lanes;
+                        self.gaps = result.gaps;
+                        self.drawn = graph::Drawn::background();
+                        self.drawn.set_names(result.names);
+                        if let Some(pair) = result.pair {
+                            self.drawn.set_pair(Some(pair));
+                        }
+                        for lanes in result.more {
+                            self.drawn.push_more(lanes);
+                        }
+                        for lanes in result.more_pairs {
+                            self.drawn.push_more_pair(lanes);
+                        }
+                        self.built = count;
+                        self.pairs_built = if self.pair_key.is_some() { count } else { 0 };
+                        #[cfg(test)]
+                        {
+                            self.builds += 1;
+                            if self.pair_key.is_some() {
+                                self.pair_builds += 1;
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.async_job = None;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.drawn.set_shown(shown);
+        self.drawn.set_hover_force(self.hover_at);
+    }
+
+    /// Includes both topology and the subsequent pixel-column thinning worker. The caller
+    /// may wait for this in headless captures without forcing work on the drawing thread.
+    pub fn pending_arc(&self) -> bool {
+        self.async_mode
+            && (self.built == 0 || self.async_job.is_some() || self.drawn.background_pending())
+    }
+
+    pub fn preparing(&self) -> bool { self.pending_arc() }
+
     /// Plan step 9: with a file laid over the view (`over` = its path and data), its marker of the
     /// same name goes into the lanes of each graphed marker (`markers`, `graphed`; the first
     /// one's `graph::Pair`, the others' `Drawn::push_more_pair`) as dashed lines in the lane's
@@ -307,6 +510,10 @@ impl LaneCache {
     /// overlay (the first marker's at once, the others' as far as the frame's work allows, after
     /// their solid lanes).
     pub fn pair(&mut self, data: &ViewData, file_id: usize, markers: &[usize], over: Option<(&Path, &ViewData)>, shown: [bool; 2]) {
+        if self.async_mode {
+            self.drawn.set_shown(shown);
+            return;
+        }
         if markers.is_empty() || markers.iter().any(|m| *m >= data.markers.len()) {
             return;
         }
@@ -376,6 +583,10 @@ impl LaneCache {
     }
 
     pub fn get(&mut self, data: &ViewData, file_id: usize, markers: &[usize]) -> (&[Lane], &[(i64, i64)], &mut graph::Drawn) {
+        if self.async_mode {
+            self.drawn.set_hover_force(self.hover_at);
+            return (&self.lanes, &self.gaps, &mut self.drawn);
+        }
         let several = markers.len() > 1;
         let lanes_of = |k: usize| marker_lanes(data, markers[k]);
         if !self.is_for(file_id, markers) {
@@ -576,7 +787,10 @@ impl PlateCache {
             }
             self.kept = pool;
             self.gaps = merged(self.shown.iter().map(|(_, g)| g.as_slice()));
-            self.drawn = if display.output.is_some() || previous_drawn.is_some(){graph::Drawn::background()}else{graph::Drawn::default()};
+            #[cfg(not(test))]
+            { self.drawn = graph::Drawn::background(); }
+            #[cfg(test)]
+            { self.drawn = if display.output.is_some() || previous_drawn.is_some(){graph::Drawn::background()}else{graph::Drawn::default()}; }
             if display.output.is_some() && display.show_raw {
                 let raw:Vec<_>=set.iter().map(|ch|self.build(data,pi,ch).0).collect();
                 let processed=std::mem::replace(&mut self.lanes,raw);
@@ -656,6 +870,7 @@ fn runs_and_gaps(per_frame: &[f32], start: i64, end: i64) -> (Vec<Vec<[f64; 2]>>
 }
 
 fn marker_lanes(data: &ViewData, mi: usize) -> Vec<Lane> {
+    let mut span=crate::bench_timing::span("marker.topology");span.counts(||(data.markers[mi].n_samples*3,0));
     let m = &data.markers[mi];
     let t = &data.take.trajectories[m.traj];
     // Motive Graph View shows millimetres; file units assumed metres (unverified).
@@ -774,143 +989,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
 
 // ───────────────────────────── Devices ─────────────────────────────
 
-#[derive(Default)]
-pub struct DevicesState {
-    pub channel: HashMap<usize, usize>,
-    /// Set whenever a non-forceplate header/graph is open; consumed by the file loader.
-    pub request_emg: bool,
-    /// Benchmark forces the same existing header open; ordinary input leaves this unset.
-    pub open_device: Option<usize>,
-    pub only_device: bool,
-    graphs: HashMap<(usize, usize, usize), DeviceGraph>,
-}
-
-struct DeviceGraph {
-    signal: std::sync::Arc<tak_core::view_data::SignalView>,
-    lanes: [Lane; 1],
-    drawn: graph::Drawn,
-    processing_key: (usize,bool),
-}
-
-impl DevicesState {
-    pub fn reset_graphs(&mut self) {
-        self.request_emg = false;
-        self.open_device = None;
-        crate::views::drop_later(Some(std::mem::take(&mut self.graphs)));
-    }
-    pub fn graphs_pending(&self) -> bool {
-        self.graphs.values().any(|g| g.drawn.background_pending())
-    }
-}
-
-impl DeviceGraph {
-    fn new(channel: &tak_core::view_data::ChannelView, signal: std::sync::Arc<tak_core::view_data::SignalView>, display:&Display, ch:usize) -> Self {
-        let make=|s:&std::sync::Arc<tak_core::view_data::SignalView>,color|Lane { letter: channel.name.trim_start_matches("AnalogChannel").to_owned(),color,runs:s.runs.clone(),unit:"" };
-        let mut drawn=graph::Drawn::background();
-        let processed=display.output.is_some();
-        let raw=processed && display.show_raw;
-        let base=if raw{make(&channel.signal,theme::ACCENT.gamma_multiply(0.22))}else{make(&signal,theme::ACCENT)};
-        // Raw min/max keeps full-rate bursts visible even when the frame mean cancels.
-        if !processed || raw {
-            let color=theme::ACCENT.gamma_multiply(if raw{0.14}else{0.35});
-            drawn.push_more(vec![make(&channel.raw_min,color)]);
-            drawn.push_more(vec![make(&channel.raw_max,color)]);
-        }
-        if raw {drawn.push_more(vec![make(&signal,theme::ACCENT)]);}
-        if let Some((min,max))=display.output.as_ref().and_then(|o|o.bands.get(ch)).and_then(Option::as_ref){
-            drawn.push_more(vec![make(min,theme::ACCENT.gamma_multiply(0.35))]);
-            drawn.push_more(vec![make(max,theme::ACCENT.gamma_multiply(0.35))]);
-        }
-        Self {signal,lanes:[base],drawn,processing_key:(display.output.as_ref().map_or(0,|o|std::sync::Arc::as_ptr(o) as usize),display.show_raw)}
-    }
-}
-
-pub fn devices_pane(ui: &mut Ui, data: &std::sync::Arc<ViewData>, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>, emg_failure: Option<&str>, filters:&SharedFilters) -> Option<Action> {
-    if data.analog_pending {
-        ui.add_space(4.0);
-        ui.label(RichText::new("힘판 힘을 불러오는 중이에요 (마커를 먼저 보여 줘요).").color(theme::TEXT_DIM));
-    }
-    if data.plates.is_empty() && data.devices.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new("이 파일에는 forceplate·아날로그 장치가 없어요.").color(theme::TEXT_DIM));
-        return None;
-    }
-    let idx = frame - data.start_frame;
-    let mut action = None;
-    if !data.plates.is_empty() {
-        egui::Grid::new("plates").num_columns(4).spacing([12.0, 3.0]).striped(true).show(ui, |ui| {
-            ui.label(RichText::new("Force plate").color(theme::TEXT_DIM));
-            ui.label(RichText::new("현재 Fz").color(theme::TEXT_DIM));
-            ui.label(RichText::new("최대 |Fz|").color(theme::TEXT_DIM));
-            ui.label("");
-            ui.end_row();
-            for (pi, p) in data.plates.iter().enumerate() {
-                let on = chosen == Some(pi);
-                ui.label(if on { RichText::new(&p.name).color(theme::PLATE_CHOSEN).strong() } else { RichText::new(&p.name) });
-                let v = if idx >= 0 { p.fz.get(idx as usize).copied() } else { None };
-                ui.label(match v {
-                    Some(v) if v.is_finite() => format!("{v:.1}"),
-                    _ => "-".into(),
-                });
-                ui.label(format!("{:.1}", p.fz_abs_max));
-                let tip = if on { "3D 위 그래프를 닫아요" } else { "이 판의 그래프를 지금 3D 화면 위에 띄워요 (3D에서 판을 눌러도 돼요)" };
-                if ui.add(egui::Button::new(RichText::new("3D 위로").small()).small().selected(on)).on_hover_text(tip).clicked() {
-                    action = Some(Action::ChoosePlate(pi));
-                }
-                ui.end_row();
-            }
-        });
-        ui.label(RichText::new("바닥의 판 색 진하기 = |Fz| ÷ 모든 판 중 최대 |Fz| (단위 미확인)").small().color(theme::TEXT_DIM));
-    }
-    for (di, d) in data.devices.iter().enumerate() {
-        egui::CollapsingHeader::new(&d.title).id_salt(("device", file_id, di)).default_open(d.plate.is_some()).open(st.open_device.map(|open| di == open || (!st.only_device && d.plate.is_some()))).show(ui, |ui| {
-            if d.plate.is_none() && data.emg_pending { st.request_emg = true; }
-            if d.channels.is_empty() {
-                ui.label("채널 없음");
-                return;
-            }
-            let mut filters=filters.lock().unwrap();
-            let filter=filters.devices.entry(di).or_default();
-            device_filter::controls(ui,filter,device_filter::sample_rate(data,di));
-            if !(d.plate.is_none() && data.emg_pending) {filter.update(data,di,ui.ctx());}
-            let display=filter.display();
-            drop(filters);
-            let default = if d.plate.is_some() { FZ_CHANNEL.min(d.channels.len() - 1) } else { 0 };
-            let ch = st.channel.entry(di).or_insert(default);
-            *ch = (*ch).min(d.channels.len() - 1);
-            egui::ComboBox::from_id_salt(("device_ch", di)).selected_text(d.channels[*ch].name.clone()).show_ui(ui, |ui| {
-                for (k, c) in d.channels.iter().enumerate() {
-                    ui.selectable_value(ch, k, format!("{} ({}값/프레임)", c.name, c.dim));
-                }
-            });
-            let c = &d.channels[*ch];
-            if d.plate.is_none() {
-                if let Some(reason) = emg_failure { ui.label(RichText::new(reason).color(theme::TEXT_DIM)); return; }
-                if data.emg_pending { ui.label(RichText::new("Loading EMG…").color(theme::TEXT_DIM)); return; }
-            }
-            let signal=display.output.as_ref().and_then(|o|o.channels.get(*ch)).cloned().unwrap_or_else(||c.signal.clone());
-            let graph = st.graphs.entry((file_id, di, *ch)).or_insert_with(|| DeviceGraph::new(c,signal.clone(),&display,*ch));
-            let key=(display.output.as_ref().map_or(0,|o|std::sync::Arc::as_ptr(o) as usize),display.show_raw);
-            if !std::sync::Arc::ptr_eq(&graph.signal,&signal) || graph.processing_key!=key {
-                let mut replacement=DeviceGraph::new(c,signal,&display,*ch);
-                let mut previous=std::mem::take(&mut graph.drawn);
-                previous.retarget_background(std::mem::take(&mut replacement.drawn));
-                replacement.drawn=previous;
-                crate::views::drop_later(Some(std::mem::replace(graph,replacement)));
-            }
-            ui.horizontal(|ui|{ui.label(&c.name);if let Some(output)=&display.output{device_filter::badge(ui,&output.badge);}});
-            if let Some(f) = graph::show(ui, Id::new(("device_graph", file_id, di, *ch)), &graph.lanes, data.start_frame, data.end_frame, frame, &graph.signal.gaps, 110.0, &Look::pane(), Some(&mut graph.drawn), &[]) {
-                action = Some(Action::GotoFrame(f));
-            }
-            ui.label(
-                RichText::new(format!("프레임마다 앞 {}개 값의 평균 · EMG 장치인지는 파일에서 확인되지 않아요", if d.plate.is_some(){c.dim.min(VALID_SUBSAMPLES)}else{c.samples_per_frame}))
-                    .small()
-                    .color(theme::TEXT_DIM),
-            );
-        });
-    }
-    action
-}
+pub use super::device_grid::{State as DevicesState, show as devices_pane};
 
 // ─────────────────────────── Playback bar (one under each 3D view) ───────────────────────────
 
@@ -2018,6 +2097,42 @@ mod deck_tests {
             (tr.kind, tr.parent_uid, tr.asset_uid, tr.slot) = (MarkerKind::Template, Some(asset), Some(asset), Some(k as i32 + 1));
         }
         ViewData::build(t)
+    }
+
+    #[test]
+    fn async_marker_topology_matches_exact_sync_sources_and_rejects_stale_selection() {
+        let data = std::sync::Arc::new(labeled_data(&["A", "B", "C"]));
+        let other = std::sync::Arc::new(labeled_data(&["A", "B", "C"]));
+        let path = Path::new("overlay.tak");
+        let order = [2, 1, 0];
+        let mut expected = LaneCache::default();
+        expected.pair(&data, 7, &order, Some((path, &other)), [true, false]);
+        let (expected_lanes, expected_gaps, _) = expected.get(&data, 7, &order);
+        let expected_lanes = expected_lanes.to_vec();
+        let expected_gaps = expected_gaps.to_vec();
+        let expected_pair = expected.pair_now().unwrap().lanes.clone();
+        let ctx = egui::Context::default();
+        let mut actual = LaneCache::default();
+        actual.prepare_arc(&data, 7, &order[..1], Some((path, &other)), [true, true], &ctx);
+        actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while actual.built() != (3, 3) {
+            assert!(std::time::Instant::now() < deadline, "marker worker must publish");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx);
+        }
+        let (lanes, gaps, drawn) = actual.get(&data, 7, &order);
+        assert_eq!(gaps, expected_gaps);
+        for (a, b) in lanes.iter().zip(expected_lanes.iter()) {
+            assert_eq!((a.letter.as_str(), a.color, a.runs.as_ref()), (b.letter.as_str(), b.color, b.runs.as_ref()));
+        }
+        assert_eq!(drawn.more_len(), order.len() - 1);
+        let pair = actual.pair_now().unwrap();
+        assert_eq!(pair.shown, [true, false]);
+        for (a, b) in pair.lanes.iter().zip(expected_pair.iter()) {
+            assert_eq!((a.letter.as_str(), a.color, a.runs.as_ref()), (b.letter.as_str(), b.color, b.runs.as_ref()));
+        }
+        assert!(actual.pending_arc(), "pixel-column thinning remains on its worker until the graph is drawn");
     }
 
     #[test]

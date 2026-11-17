@@ -186,6 +186,7 @@ pub struct Settings {
     /// Lanes (Fx … Mz) each view's force plate graph shows, by view slot (its "줄" list). Not
     /// in settings saved before v0.12.0 (then Fx · Fy · Fz).
     pub plate_channels: Vec<LaneSet>,
+    pub device_layouts: Vec<crate::device_grid::Layout>,
 }
 
 impl Default for Settings {
@@ -214,6 +215,7 @@ impl Default for Settings {
             graph_boxes: vec![GraphBox::default(); MAX_VIEWS],
             plate_boxes: vec![GraphBox::default(); MAX_VIEWS],
             plate_channels: vec![LaneSet::default(); MAX_VIEWS],
+            device_layouts: Vec::new(),
         }
     }
 }
@@ -1176,6 +1178,7 @@ impl TakViewerApp {
     /// Markers, comment files or force plates arrived in any view; comment writes finished.
     fn poll_loads(&mut self, ctx: &egui::Context) {
         for slot in self.open_views() {
+            let _span=crate::bench_timing::span_view("view.load",Some(slot));
             if let Some(loaded) = self.views[slot].poll_markers() {
                 self.finish_load(ctx, slot, loaded);
             }
@@ -1258,7 +1261,7 @@ impl TakViewerApp {
         let waiting = open.iter().any(|&k| self.views[k].busy()) || self.view().data.is_none() || self.graph_put_off;
         let processing_wait=auto.stage>0 && open.iter().any(|&k|{
             let v=&self.views[k]; v.analog_work_pending() || (v.emg_requested && v.data.as_ref().is_some_and(|d|d.emg_pending))
-                || v.filters.lock().unwrap().devices.values().any(|device|device.pending()) || v.devices.graphs_pending()
+                || v.lanes.preparing() || v.filters.lock().unwrap().devices.values().any(|device|device.pending()) || v.devices.graphs_pending()
         });
         if waiting || processing_wait || self.workspace.is_loading() {
             ctx.request_repaint();
@@ -1268,12 +1271,15 @@ impl TakViewerApp {
         match auto.stage {
             0 => {
                 let mut show_devices=false;
-                for &k in &open {show_devices |= crate::device_filter::apply_probe(&mut self.views[k],ctx,true);}
+                for &k in &open {show_devices |= crate::device_filter::apply_probe(&mut self.views[k],ctx,true);show_devices |= crate::device_grid::apply_probe(&mut self.views[k]);}
                 if show_devices{
                     // Agent picture: expand the existing draggable Devices pane so each
                     // complete filter sentence and graph can be inspected in one image.
                     for pane in [Pane::Labeling,Pane::EditTools,Pane::Selected,Pane::Devices]{dock::hide(&mut self.dock,pane);}
-                    self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(),0.64,vec![Pane::Devices]);
+                    if crate::device_grid::PROBE.get().is_some_and(|p|p.size.is_some()) {
+                        for pane in [Pane::Explorer,Pane::Graph]{dock::hide(&mut self.dock,pane);}
+                        self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(),0.16,vec![Pane::Devices]);
+                    } else {self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(),0.64,vec![Pane::Devices]);}
                 }
                 // `--frame` / `--select` / `--plate` / `--range` apply to every view (several
                 // files compared side by side).
@@ -2762,7 +2768,7 @@ impl TakViewerApp {
                         (Pane::Labeling, "Labeling"),
                         (Pane::EditTools, "Edit Tools"),
                         (Pane::Selected, "선택 마커"),
-                        (Pane::Devices, "장치 (forceplate · EMG)"),
+                        (Pane::Devices, "Devices"),
                         (Pane::Comments, "Comments 목록"),
                         (Pane::Graph, "Graph 패널 (선택 마커 X·Y·Z, 3D 아래)"),
                     ] {
@@ -3097,6 +3103,7 @@ impl TakViewerApp {
         };
         let out = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(input), |ui| {
+                let _span=crate::bench_timing::span_view("scene.build",Some(slot));
                 scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, v.plate, &hud, layers)
             })
             .inner;
@@ -3177,7 +3184,7 @@ impl TakViewerApp {
             // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
             let (graphed, total) = panels::graphed(d, &v.selected, mi);
             // Plan step 9: the file laid over the view, dashed in the same lanes.
-            v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), o.data.as_ref())), v.shown);
+            v.lanes.prepare_arc(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown, ui.ctx());
             let (lanes, gaps, drawn) = v.lanes.get(d, v.file_id, &graphed);
             let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
             let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
@@ -3328,6 +3335,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         let app = &mut *self.app;
+        let _span=crate::bench_timing::span_view(tab.title(),Some(if let Pane::View(k)=*tab{usize::from(k)}else{app.active}));
         if app.dirty_prompt.is_some() { ui.disable(); }
         let key_target = match *tab {
             Pane::View(slot) => key_focus::Target::Markers(usize::from(slot)),
@@ -3443,7 +3451,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
                 let (graphed, total) = v.primary.filter(|m| *m < d.markers.len()).map_or((vec![], 0), |mi| panels::graphed(d, &v.selected, mi));
                 // Plan step 9: the file laid over the view, dashed in the same lanes.
-                v.lanes.pair(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), o.data.as_ref())), v.shown);
+                v.lanes.prepare_arc(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown, ui.ctx());
                 // The Comment bands of the graphed markers (step 6).
                 let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
                 let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
@@ -3451,7 +3459,14 @@ impl egui_dock::TabViewer for Tabs<'_> {
             }
             Pane::Devices => {
                 ui.add_space(4.0);
-                panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate, v.emg_failure.as_deref(), &v.filters)
+                if let Some(size) = crate::device_grid::PROBE.get().and_then(|p|p.pane) {
+                    let rect=egui::Rect::from_min_size(ui.cursor().min,egui::vec2(size[0],size[1]));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect),|ui| {
+                        panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts)
+                    }).inner
+                } else {
+                    panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts)
+                }
             }
             Pane::Empty | Pane::LayoutTabs | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
         };
@@ -3515,7 +3530,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn scroll_bars(&self, tab: &Pane) -> [bool; 2] {
         match tab {
-            Pane::Selected | Pane::Devices => [false, true],
+            Pane::Selected => [false, true],
             _ => [false, false],
         }
     }
@@ -3694,6 +3709,7 @@ impl TakViewerApp {
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 if !dock_enabled { ui.disable(); }
+                let _span=crate::bench_timing::span("egui.dock_layout");
                 DockArea::new(&mut dock_state)
                     .id(egui::Id::new("panes"))
                     .style(style)
@@ -3937,7 +3953,7 @@ impl TakViewerApp {
                     for (k, v) in [
                         ("왼쪽 클릭", "마커 선택 (Ctrl+클릭 = 여러 개)"),
                         ("왼쪽 드래그", "네모 안 마커 모두 선택 (Ctrl = 기존 선택에 더하기)"),
-                        ("3D의 forceplate 클릭", "그 판의 그래프(처음은 Fx · Fy · Fz)를 3D 위에 띄우기 · 다시 누르면 닫기 (마커 선택은 그대로, 장치 패널의 \"3D 위로\"도 같아요)"),
+                        ("3D의 forceplate 클릭", "그 판의 그래프(처음은 Fx · Fy · Fz)를 3D 위에 띄우기 · 다시 누르면 닫기 (마커 선택은 그대로, Devices 패널의 \"3D\"도 같아요)"),
                         ("오른쪽 드래그", "가운데 점을 중심으로 회전"),
                         ("가운데(휠) 드래그", "화면 이동"),
                         ("휠 굴리기", "확대 / 축소"),
@@ -4077,6 +4093,7 @@ impl TakViewerApp {
         for k in self.open_views() {
             let v = &mut self.views[k];
             crate::device_filter::apply_probe(v,&egui::Context::default(),false);
+            crate::device_grid::apply_probe(v);
             if v.data.as_ref().is_some_and(|d| !d.markers.is_empty()) {
                 v.select(0, false);
             }
@@ -4094,6 +4111,10 @@ impl TakViewerApp {
             let pb = &mut v.pb;
             pb.set_frame(pb.first, now);
             pb.play(now);
+        }
+        if crate::device_grid::PROBE.get().is_some_and(|p|p.size.is_some()) {
+            for pane in [Pane::Explorer,Pane::Graph,Pane::Labeling,Pane::EditTools,Pane::Selected,Pane::Devices] {dock::hide(&mut self.dock,pane);}
+            self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(),0.16,vec![Pane::Devices]);
         }
         plates
     }
@@ -4119,9 +4140,13 @@ impl TakViewerApp {
         self.open_views().into_iter().any(|slot| {
             let view = &self.views[slot];
             (view.emg_requested && view.data.as_ref().is_some_and(|d| d.emg_pending))
-                || view.analog_work_pending() || view.devices.graphs_pending()
+                || view.analog_work_pending() || view.lanes.preparing() || view.devices.graphs_pending()
                 || view.filters.lock().unwrap().devices.values().any(|device|device.pending())
         })
+    }
+
+    pub fn bench_grid_cells(&self) -> (usize, usize) {
+        self.views[self.active].devices.ready_cells()
     }
 
     /// `--bench-hover` (v0.29.0): before playing frame `i`, every view's marker graph hovered as if
@@ -5099,13 +5124,14 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 2);
         app.activate(1);
+        app.views[1].devices.folded=Some(false);
         // The devices pane is the tab next to the selected marker: to the front.
         let loc = app.dock.find_tab(&Pane::Devices).expect("devices pane in the first layout");
         app.dock.set_active_tab(loc);
         frame_with(&ctx, &mut app, vec![]);
         let place = place_of(&app, Pane::Devices);
         let buttons = |app: &mut TakViewerApp| {
-            let mut b: Vec<egui::Rect> = text_rects(&frame_with(&ctx, app, vec![]), "3D 위로").into_iter().filter(|r| place.contains(r.center())).collect();
+            let mut b: Vec<egui::Rect> = text_rects(&frame_with(&ctx, app, vec![]), "3D").into_iter().filter(|r| place.contains(r.center())).collect();
             b.sort_by(|x, y| x.top().total_cmp(&y.top()));
             b
         };
@@ -5122,39 +5148,35 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_device_manifest_opens_loading_emg_and_channel_choice_undo_redo() {
+    fn device_metadata_expansion_is_lazy_and_click_placement_demands_visible_samples() {
         use tak_core::tak::{AnalogDevice, AnalogChannel};
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 1);
         let mut take = views::sample_data("a.tak", &["M"]).take;
         take.analog.push(AnalogDevice { channels: (0..2).map(|i| AnalogChannel {
             name: format!("AnalogChannel{i}"), kind: "Analog".into(), dim: 1,
-            frames: vec![], values: vec![],
+            frames: vec![].into(), values: vec![].into(),
         }).collect() });
         let mut data = tak_core::view_data::ViewData::build(take);
         data.emg_pending = true;
         app.views[0].data = Some(std::sync::Arc::new(data));
+        app.views[0].devices.layout=Some(crate::device_grid::Layout::default());
+        app.views[0].devices.folded=Some(false);
+        app.views[0].devices.open_device=Some(0);
         dock::show(&mut app.dock, Pane::Devices);
-        let out = frame_with(&ctx, &mut app, vec![]);
-        let header = text_rects(&out, "아날로그 장치 1");
-        assert_eq!(header.len(), 1, "manifest header is visible before any sample read");
-        assert!(text_rects(&out, "Loading EMG…").is_empty());
-        assert!(!app.views[0].devices.request_emg);
-        let mut out = click_at(&ctx, &mut app, header[0].center());
-        for _ in 0..3 { out = frame_with(&ctx, &mut app, vec![]); }
-        assert!(!text_rects(&out, "Loading EMG…").is_empty());
-        assert!(app.views[0].devices.request_emg, "opening the existing header must request lazy samples");
-        assert_eq!(app.views[0].devices.channel.get(&0), Some(&0));
-        let choose = text_rects(&out, "AnalogChannel0");
-        let out = click_at(&ctx, &mut app, choose.last().unwrap().center());
-        let choice = text_rects(&out, "AnalogChannel1 (1값/프레임)");
-        assert!(!choice.is_empty(), "channel headers remain selectable while loading");
-        click_at(&ctx, &mut app, choice[0].center());
-        assert_eq!(app.views[0].devices.channel.get(&0), Some(&1));
-        app.undo_redo(&ctx, false);
-        assert_eq!(app.views[0].devices.channel.get(&0), Some(&0));
-        app.undo_redo(&ctx, true);
-        assert_eq!(app.views[0].devices.channel.get(&0), Some(&1));
+        let out=frame_with(&ctx,&mut app,vec![]);
+        assert!(!text_rects(&out,"Filter").is_empty());
+        assert!(!app.views[0].devices.request_emg,"metadata/filter controls do not read samples");
+        let source=text_rects(&out,"●  AnalogChannel1");assert_eq!(source.len(),1);
+        let out=click_at(&ctx,&mut app,source[0].center());
+        assert!(!app.views[0].devices.request_emg,"arming a source does not read samples");
+        let target=text_rects(&out,"Drop here");assert_eq!(target.len(),4);
+        click_at(&ctx,&mut app,target[0].center());
+        frame_with(&ctx,&mut app,vec![]);
+        assert!(app.views[0].devices.request_emg,"a visible placed channel requests shared lazy samples");
+        assert!(matches!(&app.views[0].devices.layout.as_ref().unwrap().cells[0],Some(crate::device_grid::Cell::Channel{channel,..}) if channel=="AnalogChannel1"));
+        let settings=ron::to_string(&app.settings).unwrap();
+        let restored:Settings=ron::from_str(&settings).unwrap();assert!(restored.device_layouts.is_empty());
     }
 
     #[test]
@@ -5281,11 +5303,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 1);
         app.views[0].plate = Some(0);
-        std::sync::Arc::get_mut(app.views[0].data.as_mut().unwrap()).unwrap().analog_pending = true;
+        std::sync::Arc::make_mut(app.views[0].data.as_mut().unwrap()).analog_pending = true;
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].plate_rect.is_none() && app.views[0].graph_rect.is_some());
         assert_eq!(app.views[0].plate_lanes.builds, 0, "no lane made from forces not read yet");
-        std::sync::Arc::get_mut(app.views[0].data.as_mut().unwrap()).unwrap().analog_pending = false;
+        std::sync::Arc::make_mut(app.views[0].data.as_mut().unwrap()).analog_pending = false;
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].plate_rect.is_some());
     }
@@ -10803,7 +10825,7 @@ mod tests {
                     asset_uid: named.then_some(asset),
                     slot: named.then_some(k as i32 + 1),
                     xyz: frames.iter().map(|_| [x, base[k][1], base[k][2]]).collect(),
-                    frames,
+                    frames: frames.into(),
                     ..t.trajectories[k].clone()
                 }
             })
@@ -11056,6 +11078,15 @@ mod tests {
         (app, f)
     }
 
+    fn wait_marker_graphs(ctx: &egui::Context, app: &mut TakViewerApp) {
+        for _ in 0..200 {
+            frame_with(ctx, app, vec![]);
+            if app.open_views().iter().all(|&slot| !app.views[slot].lanes.preparing()) { return; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("marker graphs did not become ready");
+    }
+
     fn marker_index(app: &TakViewerApp, name: &str) -> usize {
         app.views[0].data.as_ref().unwrap().markers.iter().position(|m| m.name == name).unwrap()
     }
@@ -11069,7 +11100,9 @@ mod tests {
         let n = marker_index(&app, "N");
         app.views[0].select(n, false);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         assert!(app.views[0].graph_rect.is_some(), "the graph floats");
         // Without an overlay: solid lines only, no legend.
         let alone = app.views[0].lanes.drew().clone();
@@ -11081,6 +11114,7 @@ mod tests {
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive_as(&ctx, &mut app, 0, pair_take(&f[1], &["M", "N", "U"], true));
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         let pair = app.views[0].lanes.pair_now().expect("a second file");
         assert_eq!(pair.lanes.len(), 3);
         let frames = |run: &Vec<[f64; 2]>| (run[0][0], run.last().unwrap()[0]);
@@ -11097,6 +11131,7 @@ mod tests {
         for (key, shown, solid, dashed) in [(Key::Num2, [true, false], 3, 0), (Key::Num1, [false, false], 0, 0), (Key::Num2, [false, true], 0, 6), (Key::Num1, [true, true], 3, 6)] {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, key)]);
             frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
             let d = app.views[0].lanes.drew().clone();
             assert_eq!((app.views[0].shown, d.solid, d.dashed, d.legend), (shown, solid, dashed, true), "{key:?}");
             assert_eq!(d.ranges, both.ranges, "same scale shown or hidden ({shown:?})");
@@ -11106,23 +11141,29 @@ mod tests {
         // The GRAPH pane draws the same.
         app.set_graph_float(false);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         let pane = app.views[0].lanes.drew().clone();
         assert!(dock::has(&app.dock, Pane::Graph) && app.views[0].graph_rect.is_none());
         assert_eq!((pane.solid, pane.dashed, pane.legend, pane.ranges), (3, 6, true, both.ranges.clone()));
         app.set_graph_float(true);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
 
         // M is the same in both files: dashed under the solid line.
         app.views[0].select(marker_index(&app, "M"), false);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         let m = app.views[0].lanes.drew().clone();
         assert_eq!((m.solid, m.dashed, m.legend, m.ranges[0]), (3, 3, true, (0.0, 0.0)), "x of M = 0 in both");
         // Q is not in b, U is unlabeled: nothing extra, the graph as without an overlay.
         for name in ["Q", "U"] {
             app.views[0].select(marker_index(&app, name), false);
             frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
             let d = app.views[0].lanes.drew().clone();
             assert!(app.views[0].lanes.pair_now().is_some_and(|p| p.lanes.is_empty()), "{name}");
             assert_eq!((d.solid, d.dashed, d.legend), (3, 0, false), "{name}");
@@ -11130,9 +11171,12 @@ mod tests {
         // Taken off: N's graph exactly as before the overlay.
         app.views[0].select(n, false);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         app.overlay_off(0);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graphs(&ctx, &mut app);
         assert!(app.views[0].lanes.pair_now().is_none());
         assert_eq!(*app.views[0].lanes.drew(), alone);
     }
@@ -11481,7 +11525,7 @@ mod tests {
         let (m, n, q) = (marker_index(&app, "M"), marker_index(&app, "N"), marker_index(&app, "Q"));
         let two_frames = |app: &mut TakViewerApp| {
             frame_with(&ctx, app, vec![]);
-            frame_with(&ctx, app, vec![]);
+            wait_marker_graphs(&ctx, app);
             app.views[0].lanes.drew().clone()
         };
         // One marker: X red, Y green, Z blue, as before.

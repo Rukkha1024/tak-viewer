@@ -395,7 +395,7 @@ pub fn analog_devices(channels: &[u8], inventory: &[ChannelRecord]) -> Result<Ve
                 values.push(f32_at(channels, at + 4 + 4 * d)?);
             }
         }
-        device.channels.push(AnalogChannel { name: record.name.clone(), kind: record.kind.clone(), dim, frames, values });
+        device.channels.push(AnalogChannel { name: record.name.clone(), kind: record.kind.clone(), dim, frames: frames.into(), values: values.into() });
     }
     Ok(devices)
 }

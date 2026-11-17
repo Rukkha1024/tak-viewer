@@ -921,7 +921,7 @@ mod tests {
         app.views[0].select(0, false);
         let target = app.views[0].data.as_ref().unwrap().analog_target();
         let analog = vec![tak_core::tak::AnalogDevice { channels: vec![tak_core::tak::AnalogChannel {
-            name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![42.0],
+            name: "AnalogChannel0".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![42.0].into(),
         }] }];
         app.apply_ssh_events(&ctx, vec![SshEvent::Analog { request_id: 92, location: location.clone(), part: tak_core::view_data::AnalogPart::prepare(analog, None, &target) }]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1035,7 +1035,7 @@ mod tests {
         let location = app.views[0].remote.clone().unwrap();
         let mut take = app.views[0].data.as_ref().unwrap().take.clone();
         take.analog = vec![tak_core::tak::AnalogDevice { channels: vec![tak_core::tak::AnalogChannel {
-            name: "EMG".into(), kind: "Analog".into(), dim: 1, frames: vec![], values: vec![],
+            name: "EMG".into(), kind: "Analog".into(), dim: 1, frames: vec![].into(), values: vec![].into(),
         }] }];
         let mut data = ViewData::build(take);
         data.emg_pending = true;
@@ -1048,7 +1048,7 @@ mod tests {
         let target = app.views[0].data.as_ref().unwrap().analog_target();
         app.switch_layout_tab_internal(first);
         let analog = vec![tak_core::tak::AnalogDevice { channels: vec![tak_core::tak::AnalogChannel {
-            name: "EMG".into(), kind: "Analog".into(), dim: 1, frames: vec![0], values: vec![17.0],
+            name: "EMG".into(), kind: "Analog".into(), dim: 1, frames: vec![0].into(), values: vec![17.0].into(),
         }] }];
         app.apply_ssh_events(&ctx, vec![SshEvent::Analog { request_id: 96, location,
             part: tak_core::view_data::AnalogPart::prepare_selected(analog, None, &target, vec![0], false) }]);
@@ -1343,7 +1343,7 @@ mod tests {
                 let mut take = app.views[0].data.as_ref().unwrap().take.clone();
                 take.analog = vec![tak_core::tak::AnalogDevice { channels:(0..3).map(|i| tak_core::tak::AnalogChannel {
                     name:format!("AnalogChannel{i}"), kind:"FloatChannel".into(), dim:1,
-                    frames:vec![0, 1], values:vec![i as f32 + 1.0, i as f32 + 2.0],
+                    frames:vec![0, 1].into(), values:vec![i as f32 + 1.0, i as f32 + 2.0].into(),
                 }).collect() }];
                 take.plates = vec![tak_core::tak::ForcePlate { name:"받은 힘판".into(), corners:[[0.0; 3]; 4] }];
                 let mut data = ViewData::build(take);

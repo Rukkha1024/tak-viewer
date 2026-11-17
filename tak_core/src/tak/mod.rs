@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod nodes;
 pub mod skeleton;
 
+use crate::shared_vec::SharedVec;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -85,9 +86,9 @@ pub struct Trajectory {
     /// Skeleton asset UID when the parent is a Skeleton asset.
     pub asset_uid: Option<Uid>,
     /// Absolute frame numbers, strictly increasing, inside [start_frame, end_frame].
-    pub frames: Vec<u32>,
+    pub frames: SharedVec<u32>,
     /// Same length as `frames`. Original float32 values.
-    pub xyz: Vec<[f32; 3]>,
+    pub xyz: SharedVec<[f32; 3]>,
     /// Hex SHA-256 of the original sample bytes (n * 16 bytes `<Ifff`); verification only.
     pub raw16_sha256: String,
     /// true = parent/slot/kind come from the viewer-only lenient trailer profile
@@ -175,9 +176,9 @@ pub struct AnalogChannel {
     pub kind: String,
     /// Floats per sample (1 or 16 observed).
     pub dim: usize,
-    pub frames: Vec<u32>,
+    pub frames: SharedVec<u32>,
     /// `frames.len() * dim` values, row-major.
-    pub values: Vec<f32>,
+    pub values: SharedVec<f32>,
 }
 
 /// A device = consecutive analog channels starting at `AnalogChannel0`
@@ -364,8 +365,8 @@ pub(crate) fn decode_markers(
                 slot: n.slot,
                 kind: n.kind,
                 asset_uid: n.asset_uid,
-                frames,
-                xyz,
+                frames: frames.into(),
+                xyz: xyz.into(),
                 raw16_sha256,
                 lenient_membership: false,
             }
@@ -491,8 +492,8 @@ mod tests {
             slot: None,
             kind: MarkerKind::Unknown,
             asset_uid: None,
-            frames: vec![],
-            xyz: vec![],
+            frames: vec![].into(),
+            xyz: vec![].into(),
             raw16_sha256: String::new(),
             lenient_membership: false,
         }
