@@ -401,6 +401,12 @@ fn markers_from(
         Err(e) => (None, Some(e.0)),
     };
     // Headers alone are safe to publish; full `run` still reproduces the original decode.
+    take.device_sampling = if fallback.is_none() { device_records.iter().map(|rows| {
+        let uid = walked.records[rows[0]].uid;
+        if rows.iter().any(|&ri| walked.records[ri].uid != uid) { return None; }
+        typed.iter().find(|node| node.uid == uid).and_then(|node| node.sampling)
+            .filter(|sampling| rows.iter().all(|&ri| sampling.samples_per_frame <= walked.records[ri].dim))
+    }).collect() } else { vec![None; manifest.len()] };
     take.analog = manifest.clone();
     let indices = (0..manifest.len()).collect();
     let job = AnalogJob {
@@ -1201,6 +1207,10 @@ mod tests {
             } // Optional local reference data is not distributed.
             let full = super::super::read_take(&path).unwrap();
             let read = read_take_fast(&path, true).unwrap();
+            assert_eq!(read.take.device_sampling, full.device_sampling, "sampling descriptors must agree: {relative}");
+            for sampling in read.take.device_sampling.iter().flatten() {
+                assert!((sampling.rate_hz - sampling.samples_per_frame as f64 * read.take.frame_rate).abs() <= sampling.rate_hz * 1e-6);
+            }
             let job = read.analog.expect("reference must use marker-first path");
             assert!(job.fallback_reason().is_none(), "{relative}: {:?}", job.fallback_reason());
             let plate_map = job.plate_devices().unwrap().to_vec();
@@ -1741,7 +1751,7 @@ mod tests {
         let samples:Vec<_>=walked.records.iter().filter(|r|r.analog).map(|r|(r.data_start,r.end)).collect();
         assert_eq!(overlap(&reads,&samples),0);
         let (_,groups)=device_manifest(&walked.records).unwrap();
-        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None}];
+        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None,sampling:None}];
         assert!(selective_layout_for_nodes(&typed,&walked.records,&groups).unwrap_err().0.contains("channel count"));
     }
 
@@ -1750,7 +1760,7 @@ mod tests {
         use super::super::nodes::{tests::node,MARKER_SIGNATURES};
         let mut nodes=node(MARKER_SIGNATURES[0],"a",[2;16],[0;16],0);
         nodes.extend(node(MARKER_SIGNATURES[0],"a",[2;16],[0;16],0));
-        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None}];
+        let typed=[super::super::nodes::DeviceNode {uid:[1;16],forceplate:false,channel_count:Some(1),plate:None,sampling:None}];
         let failure=marker_tail_plan(&nodes,&typed).err().unwrap();
         assert!(failure.0.contains("duplicate marker UID"));
     }

@@ -12,6 +12,7 @@ use tak_core::comments::Comments;
 use tak_core::playback::Playback;
 use tak_core::tak::{uid_hex, MarkerKind};
 use tak_core::view_data::{DeviceView, GroupKind, ViewData, FZ_CHANNEL, VALID_SUBSAMPLES};
+use crate::device_filter::{self, Display, SharedFilters};
 
 /// User action produced by a pane.
 pub enum Action {
@@ -516,6 +517,8 @@ pub fn plate_offer(data: &ViewData, pi: usize) -> LaneSet {
 /// Call it only once the forces are in (`ViewData::analog_pending` false).
 #[derive(Default)]
 pub struct PlateCache {
+    processing_key: (usize, bool),
+    processing_source: Option<std::sync::Arc<device_filter::Output>>,
     key: Option<(usize, usize)>,
     /// The lanes in `lanes`.
     set: LaneSet,
@@ -537,8 +540,18 @@ impl PlateCache {
     /// The lanes `set` (`LaneSet::shown`) of plate `pi`, the frames where one of them has no
     /// value, and what the graph worked out for them.
     pub fn get(&mut self, data: &ViewData, file_id: usize, pi: usize, set: LaneSet) -> (&[Lane], &[(i64, i64)], &mut graph::Drawn) {
+        self.get_processed(data,file_id,pi,set,&Display::default())
+    }
+
+    pub fn get_processed(&mut self,data:&ViewData,file_id:usize,pi:usize,set:LaneSet,display:&Display)->(&[Lane],&[(i64,i64)],&mut graph::Drawn) {
+        let processing_key=(display.output.as_ref().map_or(0,|v|std::sync::Arc::as_ptr(v) as usize),display.show_raw);
+        let previous_drawn = (self.key.is_some() && self.processing_key != processing_key && (self.processing_key.0!=0 || processing_key.0!=0)).then(||std::mem::take(&mut self.drawn));
+        if self.processing_key != processing_key {
+            crate::views::drop_later(Some(std::mem::take(self)));
+            self.processing_key=processing_key;
+        }
         if self.key != Some((file_id, pi)) {
-            *self = PlateCache { key: Some((file_id, pi)), set: LaneSet(0), #[cfg(test)] builds: self.builds, ..PlateCache::default() };
+            *self = PlateCache { processing_key, processing_source:display.output.clone(), key: Some((file_id, pi)), set: LaneSet(0), #[cfg(test)] builds: self.builds, ..PlateCache::default() };
         }
         if self.set != set {
             let mut pool: Vec<(usize, Lane, Vec<(i64, i64)>)> = self.shown.drain(..).zip(self.lanes.drain(..)).map(|((ch, gaps), lane)| (ch, lane, gaps)).collect();
@@ -549,16 +562,31 @@ impl PlateCache {
                         let (_, lane, gaps) = pool.swap_remove(at);
                         (lane, gaps)
                     }
-                    None => self.build(data, pi, ch),
+                    None => {
+                        let (mut lane,gaps)=self.build(data,pi,ch);
+                        if let Some(signal)=display.output.as_ref().and_then(|o|o.channels.get(ch)){lane.runs=signal.runs.clone();}
+                        (lane,gaps)
+                    },
                 };
+                let mut lane=lane;
+                lane.color=PLATE_LANES[ch].1;
+                if let Some(signal)=display.output.as_ref().and_then(|o|o.channels.get(ch)){lane.runs=signal.runs.clone();}
                 self.lanes.push(lane);
                 self.shown.push((ch, gaps));
             }
             self.kept = pool;
             self.gaps = merged(self.shown.iter().map(|(_, g)| g.as_slice()));
-            self.drawn = graph::Drawn::default();
+            self.drawn = if display.output.is_some() || previous_drawn.is_some(){graph::Drawn::background()}else{graph::Drawn::default()};
+            if display.output.is_some() && display.show_raw {
+                let raw:Vec<_>=set.iter().map(|ch|self.build(data,pi,ch).0).collect();
+                let processed=std::mem::replace(&mut self.lanes,raw);
+                for lane in &mut self.lanes {lane.color=lane.color.gamma_multiply(0.22);}
+                self.drawn.push_more(processed);
+            }
             self.set = set;
         }
+        if self.processing_source.as_ref().map(std::sync::Arc::as_ptr)!=display.output.as_ref().map(std::sync::Arc::as_ptr) {self.processing_source=display.output.clone();}
+        if let Some(mut previous)=previous_drawn {previous.retarget_background(std::mem::take(&mut self.drawn));self.drawn=previous;}
         (&self.lanes, &self.gaps, &mut self.drawn)
     }
 
@@ -753,6 +781,7 @@ pub struct DevicesState {
     pub request_emg: bool,
     /// Benchmark forces the same existing header open; ordinary input leaves this unset.
     pub open_device: Option<usize>,
+    pub only_device: bool,
     graphs: HashMap<(usize, usize, usize), DeviceGraph>,
 }
 
@@ -760,6 +789,7 @@ struct DeviceGraph {
     signal: std::sync::Arc<tak_core::view_data::SignalView>,
     lanes: [Lane; 1],
     drawn: graph::Drawn,
+    processing_key: (usize,bool),
 }
 
 impl DevicesState {
@@ -774,16 +804,28 @@ impl DevicesState {
 }
 
 impl DeviceGraph {
-    fn new(channel: &tak_core::view_data::ChannelView) -> Self {
-        Self {
-            signal: channel.signal.clone(),
-            lanes: [Lane { letter: channel.name.trim_start_matches("AnalogChannel").to_owned(), color: theme::ACCENT, runs: channel.signal.runs.clone(), unit: "" }],
-            drawn: graph::Drawn::background(),
+    fn new(channel: &tak_core::view_data::ChannelView, signal: std::sync::Arc<tak_core::view_data::SignalView>, display:&Display, ch:usize) -> Self {
+        let make=|s:&std::sync::Arc<tak_core::view_data::SignalView>,color|Lane { letter: channel.name.trim_start_matches("AnalogChannel").to_owned(),color,runs:s.runs.clone(),unit:"" };
+        let mut drawn=graph::Drawn::background();
+        let processed=display.output.is_some();
+        let raw=processed && display.show_raw;
+        let base=if raw{make(&channel.signal,theme::ACCENT.gamma_multiply(0.22))}else{make(&signal,theme::ACCENT)};
+        // Raw min/max keeps full-rate bursts visible even when the frame mean cancels.
+        if !processed || raw {
+            let color=theme::ACCENT.gamma_multiply(if raw{0.14}else{0.35});
+            drawn.push_more(vec![make(&channel.raw_min,color)]);
+            drawn.push_more(vec![make(&channel.raw_max,color)]);
         }
+        if raw {drawn.push_more(vec![make(&signal,theme::ACCENT)]);}
+        if let Some((min,max))=display.output.as_ref().and_then(|o|o.bands.get(ch)).and_then(Option::as_ref){
+            drawn.push_more(vec![make(min,theme::ACCENT.gamma_multiply(0.35))]);
+            drawn.push_more(vec![make(max,theme::ACCENT.gamma_multiply(0.35))]);
+        }
+        Self {signal,lanes:[base],drawn,processing_key:(display.output.as_ref().map_or(0,|o|std::sync::Arc::as_ptr(o) as usize),display.show_raw)}
     }
 }
 
-pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>, emg_failure: Option<&str>) -> Option<Action> {
+pub fn devices_pane(ui: &mut Ui, data: &std::sync::Arc<ViewData>, frame: i64, st: &mut DevicesState, file_id: usize, chosen: Option<usize>, emg_failure: Option<&str>, filters:&SharedFilters) -> Option<Action> {
     if data.analog_pending {
         ui.add_space(4.0);
         ui.label(RichText::new("힘판 힘을 불러오는 중이에요 (마커를 먼저 보여 줘요).").color(theme::TEXT_DIM));
@@ -821,12 +863,18 @@ pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesSt
         ui.label(RichText::new("바닥의 판 색 진하기 = |Fz| ÷ 모든 판 중 최대 |Fz| (단위 미확인)").small().color(theme::TEXT_DIM));
     }
     for (di, d) in data.devices.iter().enumerate() {
-        egui::CollapsingHeader::new(&d.title).id_salt(("device", file_id, di)).default_open(d.plate.is_some()).open(st.open_device.map(|open| di == open || d.plate.is_some())).show(ui, |ui| {
+        egui::CollapsingHeader::new(&d.title).id_salt(("device", file_id, di)).default_open(d.plate.is_some()).open(st.open_device.map(|open| di == open || (!st.only_device && d.plate.is_some()))).show(ui, |ui| {
             if d.plate.is_none() && data.emg_pending { st.request_emg = true; }
             if d.channels.is_empty() {
                 ui.label("채널 없음");
                 return;
             }
+            let mut filters=filters.lock().unwrap();
+            let filter=filters.devices.entry(di).or_default();
+            device_filter::controls(ui,filter,device_filter::sample_rate(data,di));
+            if !(d.plate.is_none() && data.emg_pending) {filter.update(data,di,ui.ctx());}
+            let display=filter.display();
+            drop(filters);
             let default = if d.plate.is_some() { FZ_CHANNEL.min(d.channels.len() - 1) } else { 0 };
             let ch = st.channel.entry(di).or_insert(default);
             *ch = (*ch).min(d.channels.len() - 1);
@@ -840,15 +888,22 @@ pub fn devices_pane(ui: &mut Ui, data: &ViewData, frame: i64, st: &mut DevicesSt
                 if let Some(reason) = emg_failure { ui.label(RichText::new(reason).color(theme::TEXT_DIM)); return; }
                 if data.emg_pending { ui.label(RichText::new("Loading EMG…").color(theme::TEXT_DIM)); return; }
             }
-            let graph = st.graphs.entry((file_id, di, *ch)).or_insert_with(|| DeviceGraph::new(c));
-            if !std::sync::Arc::ptr_eq(&graph.signal, &c.signal) {
-                crate::views::drop_later(Some(std::mem::replace(graph, DeviceGraph::new(c))));
+            let signal=display.output.as_ref().and_then(|o|o.channels.get(*ch)).cloned().unwrap_or_else(||c.signal.clone());
+            let graph = st.graphs.entry((file_id, di, *ch)).or_insert_with(|| DeviceGraph::new(c,signal.clone(),&display,*ch));
+            let key=(display.output.as_ref().map_or(0,|o|std::sync::Arc::as_ptr(o) as usize),display.show_raw);
+            if !std::sync::Arc::ptr_eq(&graph.signal,&signal) || graph.processing_key!=key {
+                let mut replacement=DeviceGraph::new(c,signal,&display,*ch);
+                let mut previous=std::mem::take(&mut graph.drawn);
+                previous.retarget_background(std::mem::take(&mut replacement.drawn));
+                replacement.drawn=previous;
+                crate::views::drop_later(Some(std::mem::replace(graph,replacement)));
             }
+            ui.horizontal(|ui|{ui.label(&c.name);if let Some(output)=&display.output{device_filter::badge(ui,&output.badge);}});
             if let Some(f) = graph::show(ui, Id::new(("device_graph", file_id, di, *ch)), &graph.lanes, data.start_frame, data.end_frame, frame, &graph.signal.gaps, 110.0, &Look::pane(), Some(&mut graph.drawn), &[]) {
                 action = Some(Action::GotoFrame(f));
             }
             ui.label(
-                RichText::new(format!("프레임마다 앞 {}개 값의 평균 · EMG 장치인지는 파일에서 확인되지 않아요", c.dim.min(VALID_SUBSAMPLES)))
+                RichText::new(format!("프레임마다 앞 {}개 값의 평균 · EMG 장치인지는 파일에서 확인되지 않아요", if d.plate.is_some(){c.dim.min(VALID_SUBSAMPLES)}else{c.samples_per_frame}))
                     .small()
                     .color(theme::TEXT_DIM),
             );

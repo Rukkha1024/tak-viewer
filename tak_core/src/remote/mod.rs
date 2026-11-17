@@ -242,7 +242,10 @@ impl RemoteSession {
         }
         if !analog_pending {
             let (analog, warning) = crate::tak::decode_analog(&blocks[2]);
-            if header["full_fallback"] == true { take.analog = analog; }
+            if header["full_fallback"] == true {
+                take.device_sampling = crate::tak::sampling_from_streams(&blocks[0], &blocks[2]).unwrap_or_default();
+                take.analog = analog;
+            }
             take.warnings.extend(warning);
         }
         let mut plate_devices = None;
@@ -258,6 +261,7 @@ impl RemoteSession {
             if warning.is_some() && header["device_types"].is_array() {
                 return Err("Invalid analog header manifest".into());
             }
+            take.device_sampling = crate::tak::sampling_from_streams(&blocks[0], &blocks[4]).unwrap_or_default();
             take.analog = manifest;
             match (header["device_types"].as_array(), header["plate_devices"].as_array()) {
                 (Some(kinds), Some(plates)) => {

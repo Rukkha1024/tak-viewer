@@ -20,6 +20,8 @@ pub mod geom;
 pub mod marker_sets;
 pub(crate) mod par;
 pub mod playback;
+/// Read-only per-device signal processing for display graphs.
+pub mod signal;
 /// Memory-only read-only SSH access; connects only when explicitly requested.
 pub mod remote;
 #[doc(hidden)]

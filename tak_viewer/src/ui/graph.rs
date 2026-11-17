@@ -193,6 +193,26 @@ struct Thinned {
     lanes: Vec<DrawnLane>,
 }
 
+/// Source descriptors travel with a background result so colors, curve counts and samples
+/// are published together. Pending settings never recolor the previous complete graph.
+#[derive(Clone, Default)]
+struct BackgroundSources {
+    pair: Option<Pair>,
+    more: Vec<Vec<Lane>>,
+    more_pairs: Vec<Vec<Lane>>,
+}
+
+/// One worker prepares every curve of a device graph together, so faint raw extrema and
+/// processed overlays never enter the ordinary marker path's UI thinning loop.
+struct BackgroundPrepared {
+    primary: Vec<Lane>,
+    sources: BackgroundSources,
+    lanes: Vec<DrawnLane>,
+    pair_lanes: Vec<DrawnLane>,
+    more_lanes: Vec<Thinned>,
+    more_pair_lanes: Vec<Thinned>,
+}
+
 /// One lane's complete curves: compact solid points first, then a mesh for one marker when
 /// its later-frame promotion is allowed; dots and dashed meshes retain painter order.
 /// Shapes are rebuilt only when their inputs (`ShapesKey`) change.
@@ -603,7 +623,10 @@ fn thin_cost(lanes: &[Lane], vr: &ViewRange) -> usize {
 pub struct Drawn {
     /// Device graphs share source runs and thin them on a worker, including zoom/resize.
     background: bool,
-    background_rx: Option<(ThinKey, std::sync::mpsc::Receiver<Vec<DrawnLane>>)> ,
+    background_rx: Option<(ThinKey, u64, std::sync::mpsc::Receiver<BackgroundPrepared>)>,
+    background_generation: u64,
+    background_primary: Vec<Lane>,
+    background_sources: Option<BackgroundSources>,
     /// Frame range in view and the number of columns of the lanes below.
     key: Option<ThinKey>,
     lanes: Vec<DrawnLane>,
@@ -648,7 +671,7 @@ pub struct Drawn {
 /// "겹쳐 보기"): its marker of the same name is drawn as a dashed line of the lane's color under
 /// the first file's solid line. Each lane's vertical range covers both curves whether they are
 /// shown or hidden, so hiding one (name tag 1 / 2, key 1 / 2) does not move the other.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Pair {
     /// The second file's lanes, in the order of the first file's (X, Y, Z), frames counted as
     /// the first file's; empty when it has no marker of that name (nothing extra is drawn).
@@ -722,14 +745,45 @@ impl Drawn {
 
     pub fn background() -> Self { Self { background: true, ..Self::default() } }
 
+    /// Replace a device graph's sources without dropping its last complete picture. The
+    /// caller passes the new primary lanes to `show`; replacement supplies pair/extra lanes.
+    /// The worker publishes their samples and descriptor colors together when ready.
+    pub fn retarget_background(&mut self, mut replacement: Drawn) {
+        if !replacement.background {
+            crate::views::drop_later(Some(std::mem::replace(self, replacement)));
+            return;
+        }
+        // A raw forceplate cache can opt into workers at its first processed result.
+        // Ordinary marker caches never change mode unless this method is called explicitly.
+        self.background = true;
+        let sources = BackgroundSources {
+            pair: replacement.pair.take(),
+            more: std::mem::take(&mut replacement.more),
+            more_pairs: std::mem::take(&mut replacement.more_pairs),
+        };
+        crate::views::drop_later(self.background_sources.replace(sources));
+        self.invalidate_background_source();
+        crate::views::drop_later(Some(replacement));
+    }
+
     fn prepare_background(&mut self, lanes: &[Lane], vr: ViewRange, cols: usize, key: ThinKey, ctx: &egui::Context) {
-        if let Some((pending_key, rx)) = &self.background_rx {
+        if let Some((pending_key, pending_generation, rx)) = &self.background_rx {
             match rx.try_recv() {
                 Ok(prepared) => {
-                    let prepared_key = *pending_key;
+                    let (prepared_key, prepared_generation) = (*pending_key, *pending_generation);
                     self.background_rx = None;
-                    if prepared_key == key {
-                        let retired = std::mem::replace(&mut self.lanes, prepared);
+                    if prepared_key == key && prepared_generation == self.background_generation {
+                        let retired = (
+                            std::mem::replace(&mut self.lanes, prepared.lanes),
+                            std::mem::replace(&mut self.pair_lanes, prepared.pair_lanes),
+                            std::mem::replace(&mut self.more_lanes, prepared.more_lanes),
+                            std::mem::replace(&mut self.more_pair_lanes, prepared.more_pair_lanes),
+                            std::mem::replace(&mut self.background_primary, prepared.primary),
+                            std::mem::replace(&mut self.pair, prepared.sources.pair),
+                            std::mem::replace(&mut self.more, prepared.sources.more),
+                            std::mem::replace(&mut self.more_pairs, prepared.sources.more_pairs),
+                            self.background_sources.take(),
+                        );
                         crate::views::drop_later(Some(retired));
                         self.key = Some(key);
                         self.version += 1;
@@ -740,23 +794,47 @@ impl Drawn {
             }
         }
         if self.key != Some(key) && self.background_rx.is_none() {
-            let source = lanes.to_vec(); // Arc-backed runs: O(number of lanes), never O(samples).
+            // Lane copies share Arc-backed samples. The UI visits curve descriptors only;
+            // all sample scanning, including extrema and overlays, happens on this worker.
+            let source = lanes.to_vec();
+            let sources = self.background_sources.clone().unwrap_or_else(|| BackgroundSources {
+                pair: self.pair.clone(), more: self.more.clone(), more_pairs: self.more_pairs.clone(),
+            });
             let wake = ctx.clone();
             let (tx, rx) = std::sync::mpsc::channel();
-            self.background_rx = Some((key, rx));
+            self.background_rx = Some((key, self.background_generation, rx));
             std::thread::spawn(move || {
-                let result = source.iter().map(|lane| thin(lane, &vr, cols)).collect();
+                let all = |sources: &[Vec<Lane>]| sources.iter().map(|lanes| Thinned {
+                    key: Some(key), lanes: lanes.iter().map(|lane| thin(lane, &vr, cols)).collect(),
+                }).collect();
+                let result = BackgroundPrepared {
+                    lanes: source.iter().map(|lane| thin(lane, &vr, cols)).collect(),
+                    pair_lanes: sources.pair.as_ref().map_or_else(Vec::new, |pair| pair.lanes.iter().map(|lane| thin(lane, &vr, cols)).collect()),
+                    more_lanes: all(&sources.more),
+                    more_pair_lanes: all(&sources.more_pairs),
+                    primary: source,
+                    sources,
+                };
                 let _ = tx.send(result);
                 wake.request_repaint();
             });
         }
     }
+
+    fn invalidate_background_source(&mut self) {
+        if self.background {
+            self.background_generation = self.background_generation.wrapping_add(1);
+            self.key = None;
+        }
+    }
+
     pub fn background_pending(&self) -> bool {
         self.background && (self.background_rx.is_some() || self.key.is_none())
     }
 
     /// The second file laid over the view (None = none); what was worked out is done again.
     pub fn set_pair(&mut self, pair: Option<Pair>) {
+        self.invalidate_background_source();
         self.pair = pair;
         self.key = None;
     }
@@ -777,6 +855,7 @@ impl Drawn {
     /// v0.27.0: the other markers' lanes of a graph of several (`Drawn::more`).
     #[cfg(test)]
     pub fn set_more(&mut self, more: Vec<Vec<Lane>>) {
+        self.invalidate_background_source();
         self.more_lanes = more.iter().map(|_| Thinned::default()).collect();
         self.more = more;
         self.version += 1;
@@ -785,12 +864,14 @@ impl Drawn {
     /// One more marker's lanes, after those given (`panels::LaneCache` builds them a few per
     /// frame); thinned and drawn from the next `show` on.
     pub fn push_more(&mut self, lanes: Vec<Lane>) {
+        self.invalidate_background_source();
         self.more.push(lanes);
         self.more_lanes.push(Thinned::default());
     }
 
     /// v0.27.0: their laid-over file's lanes (`Drawn::more_pairs`).
     pub fn set_more_pairs(&mut self, pairs: Vec<Vec<Lane>>) {
+        self.invalidate_background_source();
         self.more_pair_lanes = pairs.iter().map(|_| Thinned::default()).collect();
         self.more_pairs = pairs;
         self.version += 1;
@@ -798,6 +879,7 @@ impl Drawn {
 
     /// The laid-over file's lanes of the next marker (`push_more`).
     pub fn push_more_pair(&mut self, lanes: Vec<Lane>) {
+        self.invalidate_background_source();
         self.more_pairs.push(lanes);
         self.more_pair_lanes.push(Thinned::default());
     }
@@ -1253,19 +1335,28 @@ fn show_inner(
     } else if !drawn.prepare_primary(lanes, vr, cols, key) {
         ui.ctx().request_repaint();
     }
+    // A retargeted background graph still paints its complete old descriptor colors until
+    // the matching source generation arrives. These shallow lane copies never scan samples.
+    let retained_primary;
+    let lanes = if drawn.background && !drawn.background_primary.is_empty() {
+        retained_primary = drawn.background_primary.clone();
+        retained_primary.as_slice()
+    } else { lanes };
     // v0.27.0: the other markers of a graph of several, and their dashed lanes, as far as the
     // frame's work allows (`spend`), each marker with its dashed lanes; the others in the next
     // frames (drawn as thinned before, or not yet).
-    let mut put_off = false;
-    for k in 0..drawn.more_lanes.len().max(drawn.more_pair_lanes.len()) {
-        for (all, thinned) in [(&drawn.more, &mut drawn.more_lanes), (&drawn.more_pairs, &mut drawn.more_pair_lanes)] {
-            let (Some(m), Some(t)) = (all.get(k), thinned.get_mut(k)) else { continue };
-            if t.key != Some(key) && !put_off {
-                if spend(thin_cost(m, &vr), false) {
-                    *t = Thinned { key: Some(key), lanes: m.iter().map(|l| thin(l, &vr, cols)).collect() };
-                    drawn.version += 1;
-                } else {
-                    put_off = true;
+    if !drawn.background {
+        let mut put_off = false;
+        for k in 0..drawn.more_lanes.len().max(drawn.more_pair_lanes.len()) {
+            for (all, thinned) in [(&drawn.more, &mut drawn.more_lanes), (&drawn.more_pairs, &mut drawn.more_pair_lanes)] {
+                let (Some(m), Some(t)) = (all.get(k), thinned.get_mut(k)) else { continue };
+                if t.key != Some(key) && !put_off {
+                    if spend(thin_cost(m, &vr), false) {
+                        *t = Thinned { key: Some(key), lanes: m.iter().map(|l| thin(l, &vr, cols)).collect() };
+                        drawn.version += 1;
+                    } else {
+                        put_off = true;
+                    }
                 }
             }
         }
@@ -2331,6 +2422,171 @@ mod tests {
             if let Some(original) = &original { assert_eq!(&cached, original); }
             else { original = Some(cached); }
         }
+    }
+
+    #[test]
+    fn background_curves_include_raw_extrema_and_overlays_without_ui_sample_work() {
+        use super::{Drawn, Look, Pair, WORK, end_frame, show, start_frame};
+        use eframe::egui;
+        let source = Lane { letter: "EMG".into(), color: Color32::LIGHT_BLUE, unit: "",
+            runs: vec![(0..100_000).map(|i| [i as f64, (i as f64 * 0.05).sin()]).collect()].into() };
+        let lanes = vec![source.clone()];
+        let mut drawn = Drawn::background();
+        drawn.set_pair(Some(Pair { lanes: lanes.clone(), shown: [true, true] }));
+        drawn.push_more(lanes.clone()); // Raw minimum.
+        drawn.push_more(lanes.clone()); // Raw maximum / processed overlay.
+        drawn.push_more_pair(lanes.clone());
+        let ctx = egui::Context::default();
+        let mut complete = false;
+        for iteration in 0..2000 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0))),
+                time: Some(iteration as f64 / 100.0), ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                start_frame(iteration as u64, Some(1));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, egui::Id::new("background_all_curves"), &lanes, 0, 99_999, 100,
+                        &[], 110.0, &Look::pane(), Some(&mut drawn), &[]);
+                });
+                WORK.with(|work| {
+                    assert_eq!(work.get().left, Some(1), "background extras must not spend UI samples");
+                    assert!(!work.get().some_done, "no primary, pair, extrema or overlay may thin on UI");
+                });
+                end_frame();
+            });
+            if !drawn.background_pending() { complete = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(complete, "background graph did not complete");
+        let key = drawn.key.unwrap();
+        let vr = ViewRange { lo: f64::from_bits(key.0), hi: f64::from_bits(key.1) };
+        let expected = thin(&source, &vr, key.2);
+        let same = |actual: &super::DrawnLane| {
+            assert_eq!((actual.lo, actual.hi), (expected.lo, expected.hi));
+            assert_eq!(actual.runs, expected.runs, "worker and ordinary thinning must match exactly");
+        };
+        same(&drawn.lanes[0]); same(&drawn.pair_lanes[0]);
+        assert_eq!(drawn.more_lanes.len(), 2);
+        for extra in drawn.more_lanes.iter().chain(&drawn.more_pair_lanes) {
+            assert_eq!(extra.key, Some(key)); same(&extra.lanes[0]);
+        }
+        assert!(!drawn.pending());
+    }
+
+    #[test]
+    fn background_source_changes_reject_old_jobs_and_zoom_keeps_previous_curves() {
+        use super::{BackgroundPrepared, Drawn};
+        let source = Lane { letter: "A".into(), color: Color32::RED, unit: "",
+            runs: vec![(0..4000).map(|i| [i as f64, (i as f64 * 0.01).sin()]).collect()].into() };
+        let lanes = vec![source.clone()];
+        let ctx = eframe::egui::Context::default();
+        let mut drawn = Drawn::background();
+        let range = ViewRange { lo: 0.0, hi: 3999.0 };
+        let key = (range.lo.to_bits(), range.hi.to_bits(), 200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drawn.background_rx = Some((key, drawn.background_generation, rx));
+        drawn.push_more(lanes.clone()); // Invalidates an in-flight result of the same range.
+        assert!(tx.send(BackgroundPrepared { primary: Vec::new(), sources: Default::default(),
+            lanes: Vec::new(), pair_lanes: Vec::new(),
+            more_lanes: Vec::new(), more_pair_lanes: Vec::new() }).is_ok());
+        drawn.prepare_background(&lanes, range, 200, key, &ctx);
+        assert!(drawn.key.is_none(), "a matching range must not accept an obsolete source generation");
+        for _ in 0..2000 {
+            drawn.prepare_background(&lanes, range, 200, key, &ctx);
+            if !drawn.background_pending() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(drawn.key, Some(key));
+        assert_eq!(drawn.more_lanes.len(), 1);
+        let previous = drawn.lanes[0].runs.clone();
+        let zoom = ViewRange { lo: 1000.0, hi: 2000.0 };
+        let zoom_key = (zoom.lo.to_bits(), zoom.hi.to_bits(), 300);
+        drawn.prepare_background(&lanes, zoom, 300, zoom_key, &ctx);
+        assert_eq!(drawn.lanes[0].runs, previous, "keep the previous curve until the zoom worker finishes");
+        for _ in 0..2000 {
+            drawn.prepare_background(&lanes, zoom, 300, zoom_key, &ctx);
+            if !drawn.background_pending() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(drawn.key, Some(zoom_key));
+        let expected = thin(&source, &zoom, 300);
+        assert_eq!(drawn.lanes[0].runs, expected.runs);
+        assert_eq!(drawn.more_lanes[0].lanes[0].runs, expected.runs);
+        assert_eq!(drawn.more_lanes[0].key, Some(zoom_key));
+    }
+
+    #[test]
+    fn background_retarget_keeps_complete_old_curves_and_colors_until_atomic_replacement() {
+        use super::{Drawn, Look, show};
+        use eframe::egui;
+        let lane = |color, offset| Lane { letter: "A".into(), color, unit: "",
+            runs: vec![(0..4000).map(|i| [i as f64, offset + (i as f64 * 0.01).sin()]).collect()].into() };
+        let old = vec![lane(Color32::RED, 0.0)];
+        let new = vec![lane(Color32::LIGHT_BLUE.gamma_multiply(0.22), 5.0)];
+        let ctx = egui::Context::default();
+        let range = ViewRange { lo: 0.0, hi: 3999.0 };
+        let key = (range.lo.to_bits(), range.hi.to_bits(), 200);
+        let mut drawn = Drawn::background();
+        drawn.push_more(vec![lane(Color32::GREEN, 1.0)]);
+        drawn.push_more(vec![lane(Color32::YELLOW, 2.0)]);
+        for _ in 0..2000 {
+            drawn.prepare_background(&old, range, 200, key, &ctx);
+            if !drawn.background_pending() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(drawn.key, Some(key));
+        let previous = drawn.lanes[0].runs.clone();
+        let previous_extras: Vec<_> = drawn.more_lanes.iter().map(|extra| extra.lanes[0].runs.clone()).collect();
+        let mut replacement = Drawn::background();
+        replacement.push_more(vec![lane(Color32::WHITE, 6.0)]);
+        drawn.retarget_background(replacement);
+        assert_eq!(drawn.lanes[0].runs, previous);
+        assert_eq!(drawn.more.len(), 2, "pending descriptor count must not hide old extras");
+        assert_eq!(drawn.more_lanes.iter().map(|extra| extra.lanes[0].runs.clone()).collect::<Vec<_>>(), previous_extras);
+        // Hold the next result so rendering with the new primary input deterministically
+        // exercises the pending state, including descriptor colors of all old curves.
+        let (hold, rx) = std::sync::mpsc::channel();
+        drawn.background_rx = Some((key, drawn.background_generation, rx));
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, egui::Id::new("retarget_continuity"), &new, 0, 3999, 100,
+                    &[], 110.0, &Look::pane(), Some(&mut drawn), &[]);
+            });
+        });
+        assert_eq!(drawn.drew.colors[0], vec![Color32::RED, Color32::GREEN, Color32::YELLOW],
+            "new faint-primary input must not recolor or hide the previous complete graph");
+        drop(hold);
+        for _ in 0..2000 {
+            drawn.prepare_background(&new, range, 200, key, &ctx);
+            if !drawn.background_pending() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(drawn.key, Some(key));
+        assert!(drawn.background_sources.is_none());
+        assert_eq!(drawn.background_primary[0].color, new[0].color);
+        assert_eq!(drawn.more.len(), 1);
+        assert_eq!(drawn.more[0][0].color, Color32::WHITE);
+        assert_eq!(drawn.more_lanes.len(), 1);
+        assert_eq!(drawn.lanes[0].runs, thin(&new[0], &range, 200).runs);
+        assert_eq!(drawn.more_lanes[0].lanes[0].runs, thin(&drawn.more[0][0], &range, 200).runs);
+    }
+
+    #[test]
+    fn background_retarget_can_preserve_a_previously_synchronous_raw_plate_cache() {
+        let source = Lane { letter: "Fz".into(), color: Color32::BLUE, unit: "",
+            runs: vec![vec![[0.0, 1.0], [1.0, 2.0]]].into() };
+        let mut drawn = super::Drawn::default();
+        let vr = ViewRange { lo: 0.0, hi: 1.0 };
+        assert!(drawn.prepare_primary(&[source], vr, 200, (0.0f64.to_bits(), 1.0f64.to_bits(), 200)));
+        let previous = drawn.lanes[0].runs.clone();
+        drawn.retarget_background(super::Drawn::background());
+        assert!(drawn.background);
+        assert_eq!(drawn.lanes[0].runs, previous);
+        assert!(drawn.background_pending());
     }
 
     #[test]

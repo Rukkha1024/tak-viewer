@@ -25,6 +25,7 @@ mod app;
 mod bench_load;
 mod bench_timing;
 mod camera;
+mod device_filter;
 mod comment_selection;
 mod capture;
 mod headless;
@@ -42,6 +43,10 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str)==Some("--dump-device-signal") {
+        let result=device_filter::dump(&args[2..]);if let Err(error)=&result{eprintln!("{error}");}std::process::exit(if result.is_ok(){0}else{1});
+    }
+    if let Err(error)=device_filter::take_probe(&mut args){eprintln!("{error}");std::process::exit(2);}
     if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
         println!("{}", version::VERSION);
         std::process::exit(0);

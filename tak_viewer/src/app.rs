@@ -1243,13 +1243,25 @@ impl TakViewerApp {
         // complete (v0.27.0 speed fix: markers past a frame's work come in the next frames).
         let open = self.open_views();
         let waiting = open.iter().any(|&k| self.views[k].busy()) || self.view().data.is_none() || self.graph_put_off;
-        if waiting || self.workspace.is_loading() {
+        let processing_wait=auto.stage>0 && open.iter().any(|&k|{
+            let v=&self.views[k]; v.analog_work_pending() || (v.emg_requested && v.data.as_ref().is_some_and(|d|d.emg_pending))
+                || v.filters.lock().unwrap().devices.values().any(|device|device.pending()) || v.devices.graphs_pending()
+        });
+        if waiting || processing_wait || self.workspace.is_loading() {
             ctx.request_repaint();
             return;
         }
         let mut next = auto.clone();
         match auto.stage {
             0 => {
+                let mut show_devices=false;
+                for &k in &open {show_devices |= crate::device_filter::apply_probe(&mut self.views[k],ctx,true);}
+                if show_devices{
+                    // Agent picture: expand the existing draggable Devices pane so each
+                    // complete filter sentence and graph can be inspected in one image.
+                    for pane in [Pane::Labeling,Pane::EditTools,Pane::Selected,Pane::Devices]{dock::hide(&mut self.dock,pane);}
+                    self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(),0.64,vec![Pane::Devices]);
+                }
                 // `--frame` / `--select` / `--plate` / `--range` apply to every view (several
                 // files compared side by side).
                 for &k in &open {
@@ -3113,6 +3125,7 @@ impl TakViewerApp {
             let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
             let keys = panels::graph_keys(d, &graphed, frame);
             let g = graph_float::Graph {
+                badge: None,
                 name: &m.name,
                 name_color: if m.present(frame) { theme::LABEL_TRACKED } else { theme::LABEL_UNTRACKED },
                 mark: theme::color(m.color),
@@ -3135,8 +3148,12 @@ impl TakViewerApp {
             self.graph_to_panel |= out.to_panel;
         }
         if let (Some((pi, kind @ Kind::Plate { shown, .. })), Some(d)) = (graph_plate, v.data.as_ref()) {
-            let (lanes, gaps, drawn) = v.plate_lanes.get(d, v.file_id, pi, shown);
+            let display = if let Some(di)=d.devices.iter().position(|device|device.plate==Some(pi)) {
+                let mut filters=v.filters.lock().unwrap();let filter=filters.devices.entry(di).or_default();filter.update(d,di,ui.ctx());filter.display()
+            } else {crate::device_filter::Display::default()};
+            let (lanes, gaps, drawn) = v.plate_lanes.get_processed(d, v.file_id, pi, shown, &display);
             let g = graph_float::Graph {
+                badge: display.output.as_ref().map(|o|o.badge.as_str()),
                 name: &d.plates[pi].name,
                 name_color: theme::LABEL_TRACKED,
                 mark: theme::PLATE_CHOSEN,
@@ -3376,7 +3393,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
             }
             Pane::Devices => {
                 ui.add_space(4.0);
-                panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate, v.emg_failure.as_deref())
+                panels::devices_pane(ui, d, frame, &mut v.devices, v.file_id, v.plate, v.emg_failure.as_deref(), &v.filters)
             }
             Pane::Empty | Pane::LayoutTabs | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
         };
@@ -4015,6 +4032,7 @@ impl TakViewerApp {
         let mut plates = 0;
         for k in self.open_views() {
             let v = &mut self.views[k];
+            crate::device_filter::apply_probe(v,&egui::Context::default(),false);
             if v.data.as_ref().is_some_and(|d| !d.markers.is_empty()) {
                 v.select(0, false);
             }
@@ -4042,6 +4060,7 @@ impl TakViewerApp {
         let mut count = 0;
         for slot in self.open_views() {
             let view = &mut self.views[slot];
+            crate::device_filter::apply_probe(view,ctx,false);
             view.devices.open_device = view.data.as_ref().and_then(|d| d.devices.iter().position(|device| device.plate.is_none()));
             if view.devices.open_device.is_some() {
                 view.devices.request_emg = true;
@@ -4057,6 +4076,7 @@ impl TakViewerApp {
             let view = &self.views[slot];
             (view.emg_requested && view.data.as_ref().is_some_and(|d| d.emg_pending))
                 || view.analog_work_pending() || view.devices.graphs_pending()
+                || view.filters.lock().unwrap().devices.values().any(|device|device.pending())
         })
     }
 

@@ -5,7 +5,7 @@
 use crate::geom::{v3, Vec3};
 use crate::edit::{DocumentSnapshot, EditError, Revision};
 use crate::marker_sets;
-use crate::tak::{uid_hex, AnalogDevice, ForcePlate, MarkerKind, Take, Trajectory, Uid};
+use crate::tak::{uid_hex, AnalogChannel, AnalogDevice, DeviceSampling, ForcePlate, MarkerKind, Take, Trajectory, Uid};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -99,10 +99,80 @@ pub struct PlateView {
 pub struct ChannelView {
     pub name: String,
     pub dim: usize,
-    /// Per-frame mean of the first min(dim, VALID_SUBSAMPLES) values, NaN = missing.
+    /// Per-frame mean of declared valid slots (legacy first min(dim, VALID_SUBSAMPLES)
+    /// fallback when metadata is unproven), NaN = missing.
     pub per_frame: Vec<f32>,
     /// Plot topology prepared by the reader, shared without copying samples on the UI thread.
     pub signal: Arc<SignalView>,
+    /// True input rate for graph processing. Forceplates use their frame-average series.
+    pub sample_rate_hz: Option<f64>,
+    /// Declared valid slots per frame for nonplates; 1 for frame-average forceplates,
+    /// 0 when full-rate sampling cannot be proven from device metadata.
+    pub samples_per_frame: usize,
+    /// Frame extrema preserve raw analog bursts that a signed mean would cancel.
+    pub raw_min: Arc<SignalView>,
+    pub raw_max: Arc<SignalView>,
+}
+
+impl ChannelView {
+    /// Expand only the declared valid slots, preserving missing frames as NaN. Call on a
+    /// processing worker; the immutable raw `AnalogChannel` is never changed. Forceplates
+    /// use `per_frame` directly rather than this nonplate full-rate accessor.
+    pub fn full_rate(&self, raw: &AnalogChannel, start: i64, end: i64) -> Option<Vec<f64>> {
+        let valid = self.samples_per_frame;
+        self.sample_rate_hz?;
+        if valid == 0 || valid > raw.dim || raw.dim == 0
+            || raw.values.len() != raw.frames.len().checked_mul(raw.dim)? { return None; }
+        let frames = usize::try_from(end.checked_sub(start)?.checked_add(1)?).ok()?;
+        let mut values = vec![f64::NAN; frames.checked_mul(valid)?];
+        for (row, &frame) in raw.frames.iter().enumerate() {
+            let frame = i64::from(frame);
+            if frame < start || frame > end { continue; }
+            let to = (frame - start) as usize * valid;
+            for j in 0..valid { values[to + j] = raw.values[row * raw.dim + j] as f64; }
+        }
+        Some(values)
+    }
+}
+
+/// Frame-rate drawing data reduced on a worker after full-rate processing. Min/max and
+/// mean use finite values only; an empty frame remains a gap in every curve.
+#[derive(Clone, Debug)]
+pub struct FrameSignal {
+    pub mean: Vec<f32>,
+    pub signal: Arc<SignalView>,
+    pub min: Arc<SignalView>,
+    pub max: Arc<SignalView>,
+}
+
+pub fn reduce_full_rate(values: &[f64], samples_per_frame: usize, start: i64, end: i64) -> FrameSignal {
+    let frames = (end - start + 1).max(0) as usize;
+    let mut mean = vec![f32::NAN; frames];
+    let mut min = vec![f32::NAN; frames];
+    let mut max = vec![f32::NAN; frames];
+    if samples_per_frame != 0 {
+        for (i, row) in values.chunks(samples_per_frame).take(frames).enumerate() {
+            let mut count = 0usize;
+            let (mut sum, mut lo, mut hi) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+            for &value in row.iter().filter(|v| v.is_finite()) {
+                count += 1;
+                sum += value;
+                lo = lo.min(value);
+                hi = hi.max(value);
+            }
+            if count != 0 {
+                mean[i] = (sum / count as f64) as f32;
+                min[i] = lo as f32;
+                max[i] = hi as f32;
+            }
+        }
+    }
+    FrameSignal {
+        signal: Arc::new(SignalView::prepare(&mean, start, end)),
+        min: Arc::new(SignalView::prepare(&min, start, end)),
+        max: Arc::new(SignalView::prepare(&max, start, end)),
+        mean,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -175,6 +245,8 @@ pub struct AnalogTarget {
     end: i64,
     scale: f32,
     plate_devices: Option<Vec<usize>>,
+    frame_rate: f64,
+    device_sampling: Vec<Option<DeviceSampling>>,
 }
 
 /// Force plates / EMG of stage 2, prepared off the drawing thread (`ViewData::attach_prepared`).
@@ -190,7 +262,7 @@ pub struct AnalogPart {
 
 impl AnalogPart {
     pub fn prepare(analog: Vec<AnalogDevice>, warning: Option<String>, target: &AnalogTarget) -> AnalogPart {
-        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref());
+        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref(), target.frame_rate, &target.device_sampling);
         AnalogPart { analog, warning, devices, plates, selected: None, initial: true }
     }
 
@@ -333,17 +405,34 @@ fn finite_mean(row: &[f32]) -> Option<f32> {
 
 /// Analog devices -> per-frame means, and force plates (corners in display units, Fz per frame
 /// from the device of the same index). Shared by `build` and `AnalogPart::prepare`.
-fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32, plate_devices: Option<&[usize]>) -> (Vec<DeviceView>, Vec<PlateView>) {
+fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32, plate_devices: Option<&[usize]>, frame_rate: f64, device_sampling: &[Option<DeviceSampling>]) -> (Vec<DeviceView>, Vec<PlateView>) {
     let n = (end - start + 1) as usize;
     let mut devices = Vec::new();
     for (di, d) in analog.iter().enumerate() {
+        let plate = match plate_devices {
+            Some(map) => map.iter().position(|&device| device == di),
+            None => (di < plates.len()).then_some(di),
+        };
         let channels = d
             .channels
             .iter()
             .map(|c| {
                 // Header-only channels must not allocate or scan one value per file frame.
                 let mut per_frame = if c.frames.is_empty() { Vec::new() } else { vec![f32::NAN; n] };
-                let valid = c.dim.min(VALID_SUBSAMPLES).max(1);
+                let sampling = device_sampling.get(di).copied().flatten().filter(|sampling| {
+                    sampling.samples_per_frame > 0 && sampling.samples_per_frame <= c.dim
+                        && frame_rate.is_finite() && frame_rate > 0.0
+                        && (sampling.rate_hz - frame_rate * sampling.samples_per_frame as f64).abs()
+                            <= sampling.rate_hz * 1e-6
+                });
+                let input_rate = if plate.is_some() || c.dim == 1 {
+                    (frame_rate.is_finite() && frame_rate > 0.0).then_some(frame_rate)
+                } else { sampling.map(|sampling| sampling.rate_hz) };
+                let samples_per_frame = if plate.is_some() || c.dim == 1 { 1 }
+                    else { sampling.map_or(0, |sampling| sampling.samples_per_frame) };
+                let valid = sampling.map_or(c.dim.min(VALID_SUBSAMPLES).max(1), |sampling| sampling.samples_per_frame);
+                let mut raw_min = if plate.is_none() && !c.frames.is_empty() { vec![f32::NAN; n] } else { Vec::new() };
+                let mut raw_max = raw_min.clone();
                 for (k, &f) in c.frames.iter().enumerate() {
                     let f = f as i64;
                     if f < start || f > end {
@@ -351,17 +440,24 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
                     }
                     let row = &c.values[k * c.dim..k * c.dim + valid];
                     if let Some(mean) = finite_mean(row) {
-                        per_frame[(f - start) as usize] = mean;
+                        let index = (f - start) as usize;
+                        per_frame[index] = mean;
+                        if plate.is_none() {
+                            raw_min[index] = row.iter().copied().filter(|v| v.is_finite()).fold(f32::INFINITY, f32::min);
+                            raw_max[index] = row.iter().copied().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+                        }
                     }
                 }
                 let signal = Arc::new(SignalView::prepare(&per_frame, start, end));
-                ChannelView { name: c.name.clone(), dim: c.dim, per_frame, signal }
+                let (raw_min, raw_max) = if plate.is_some() || c.dim == 1 {
+                    (signal.clone(), signal.clone())
+                } else {
+                    (Arc::new(SignalView::prepare(&raw_min, start, end)), Arc::new(SignalView::prepare(&raw_max, start, end)))
+                };
+                ChannelView { name: c.name.clone(), dim: c.dim, per_frame, signal,
+                    sample_rate_hz: input_rate, samples_per_frame, raw_min, raw_max }
             })
             .collect();
-        let plate = match plate_devices {
-            Some(map) => map.iter().position(|&device| device == di),
-            None => (di < plates.len()).then_some(di),
-        };
         let title = match plate {
             Some(p) => format!("Force plate: {}", plates[p].name),
             None => format!("아날로그 장치 {}", di + 1),
@@ -578,7 +674,7 @@ impl ViewData {
         }
 
         let n = (end - start + 1) as usize;
-        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale, plate_devices.as_deref());
+        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale, plate_devices.as_deref(), take.frame_rate, &take.device_sampling);
 
         // Robust bounds (2–98 percentile per axis) of labeled markers, so stray points do not
         // shrink the initial view.
@@ -707,7 +803,7 @@ impl ViewData {
     pub fn analog_generation(&self) -> u64 { self.analog_generation }
 
     pub fn analog_target(&self) -> AnalogTarget {
-        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale, plate_devices: self.plate_devices.clone() }
+        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale, plate_devices: self.plate_devices.clone(), frame_rate: self.take.frame_rate, device_sampling: self.take.device_sampling.clone() }
     }
 
     /// Stage 2 of the markers-first open: the analog devices arrive. Gives the same devices and
@@ -825,6 +921,7 @@ mod tests {
             label_groups: vec![],
             plates: vec![ForcePlate { name: "P1".into(), corners: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]] }],
             analog: vec![device.clone(), device],
+            device_sampling: vec![],
             warnings: vec![],
         };
         let full = ViewData::build(take.clone());
@@ -869,7 +966,7 @@ mod tests {
             path: "x.tak".into(), file_size: 0, metadata: vec![], frame_rate: 100.0,
             start_frame: 0, end_frame: 2, trajectories: vec![], assets: vec![], label_groups: vec![],
             plates: vec![ForcePlate { name: "P1".into(), corners: [[0.0; 3]; 4] }],
-            analog: manifest.clone(), warnings: vec![],
+            analog: manifest.clone(), device_sampling: vec![], warnings: vec![],
         };
         let mut view = ViewData::build_with_plate_devices(take, Some(vec![1]));
         view.analog_pending = true;
@@ -895,6 +992,116 @@ mod tests {
         view.attach_prepared(failed);
         assert_eq!(view.plates[0].fz.as_ptr(), force_buffer);
         assert_eq!(view.take.warnings, vec!["failed"]);
+    }
+
+    fn analog_test_take(channel: AnalogChannel, sampling: Option<DeviceSampling>) -> Take {
+        Take {
+            path: "fullrate.tak".into(), file_size: 0, metadata: vec![], frame_rate: 100.0,
+            start_frame: 100, end_frame: 103, trajectories: vec![], assets: vec![], label_groups: vec![],
+            plates: vec![], analog: vec![AnalogDevice { channels: vec![channel] }],
+            device_sampling: vec![sampling], warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn full_rate_declared_slots_preserve_gaps_extrema_and_raw_bytes() {
+        let mut values = vec![f32::MAX; 32];
+        values[..3].copy_from_slice(&[-3.0, 0.0, 3.0]);
+        values[16..19].copy_from_slice(&[-6.0, f32::NAN, 9.0]);
+        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
+            dim: 16, frames: vec![100, 102], values };
+        let take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 300.0, samples_per_frame: 3 }));
+        let raw_bits: Vec<_> = take.analog[0].channels[0].values.iter().map(|v| v.to_bits()).collect();
+        let view = ViewData::build(take);
+        let channel = &view.devices[0].channels[0];
+        assert_eq!(channel.sample_rate_hz, Some(300.0));
+        assert_eq!(channel.samples_per_frame, 3);
+        let full = channel.full_rate(&view.take.analog[0].channels[0], 100, 103).unwrap();
+        assert_eq!(&full[..3], &[-3.0, 0.0, 3.0]);
+        assert!(full[3..6].iter().all(|v| v.is_nan()));
+        assert_eq!((full[6], full[8]), (-6.0, 9.0));
+        assert!(full[7].is_nan() && full[9..].iter().all(|v| v.is_nan()));
+        assert_eq!(channel.raw_min.runs.as_ref(), &vec![vec![[100.0, -3.0]], vec![[102.0, -6.0]]]);
+        assert_eq!(channel.raw_max.runs.as_ref(), &vec![vec![[100.0, 3.0]], vec![[102.0, 9.0]]]);
+        // Worker-owned processing/reduction changes its copy only, never ViewData/Take.
+        let processed = crate::signal::process(&full, 300.0, &[crate::signal::Step::Rectify]).unwrap();
+        let reduced = reduce_full_rate(&processed.values, 3, 100, 103);
+        assert_eq!(reduced.mean[0], 2.0);
+        assert_eq!(reduced.mean[2], 7.5);
+        assert_eq!(reduced.min.runs.as_ref(), &vec![vec![[100.0, 0.0]], vec![[102.0, 6.0]]]);
+        assert_eq!(reduced.max.runs.as_ref(), &vec![vec![[100.0, 3.0]], vec![[102.0, 9.0]]]);
+        assert_eq!(reduced.signal.gaps.as_ref(), &vec![(101, 101), (103, 103)]);
+        assert_eq!(raw_bits, view.take.analog[0].channels[0].values.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(channel.per_frame[0], 0.0);
+    }
+
+    #[test]
+    fn full_rate_filter_chain_never_changes_view_data_raw_values() {
+        let frames: Vec<_> = (100..200).collect();
+        let mut values = Vec::new();
+        for &frame in &frames {
+            for j in 0..10 {
+                let phase = ((frame - 100) * 10 + j) as f32;
+                values.push((phase * 0.1).sin() + 0.25);
+            }
+            values.extend([f32::MAX, f32::NAN, f32::INFINITY, -0.0, 123.0, -456.0]);
+        }
+        values[50 * 16 + 2] = f32::NAN;
+        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(), dim: 16, frames, values };
+        let mut take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 }));
+        take.end_frame = 199;
+        let view = ViewData::build(take);
+        let raw = &view.take.analog[0].channels[0];
+        let channel = &view.devices[0].channels[0];
+        let raw_bits: Vec<_> = raw.values.iter().map(|v| v.to_bits()).collect();
+        let mean_bits: Vec<_> = channel.per_frame.iter().map(|v| v.to_bits()).collect();
+        let full = channel.full_rate(raw, 100, 199).unwrap();
+        let chain = [crate::signal::Step::Demean,
+            crate::signal::Step::HighPass { cutoff_hz: 20.0, order: 3, zero_phase: true },
+            crate::signal::Step::Rectify,
+            crate::signal::Step::LowPass { cutoff_hz: 6.0, order: 3, zero_phase: true }];
+        let processed = crate::signal::process(&full, 1000.0, &chain).unwrap();
+        let reduced = reduce_full_rate(&processed.values, 10, 100, 199);
+        assert!(processed.values[502].is_nan());
+        assert!(processed.values.iter().zip(&full).any(|(a, b)| a.is_finite() && (a - b).abs() > 0.01));
+        assert!(!reduced.signal.runs.is_empty());
+        assert_eq!(raw_bits, raw.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(mean_bits, channel.per_frame.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn full_rate_requires_sampling_metadata_matching_frame_rate_and_capacity() {
+        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
+            dim: 16, frames: vec![100], values: vec![1.0; 16] };
+        for sampling in [None,
+            Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 9 }),
+            Some(DeviceSampling { rate_hz: 1700.0, samples_per_frame: 17 })] {
+            let view = ViewData::build(analog_test_take(channel.clone(), sampling));
+            let c = &view.devices[0].channels[0];
+            assert_eq!(c.sample_rate_hz, None);
+            assert_eq!(c.samples_per_frame, 0);
+            assert!(c.full_rate(&view.take.analog[0].channels[0], 100, 103).is_none());
+        }
+        let view = ViewData::build(analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 })));
+        assert_eq!(view.devices[0].channels[0].sample_rate_hz, Some(1000.0));
+        assert_eq!(view.devices[0].channels[0].samples_per_frame, 10);
+        let scalar = AnalogChannel { name: "AnalogChannel0".into(), kind: "FloatChannel".into(),
+            dim: 1, frames: vec![100], values: vec![1.0] };
+        let view = ViewData::build(analog_test_take(scalar, None));
+        assert_eq!(view.devices[0].channels[0].sample_rate_hz, Some(100.0));
+    }
+
+    #[test]
+    fn full_rate_manifest_stays_allocation_free_for_unrequested_channels() {
+        let channel = AnalogChannel { name: "AnalogChannel0".into(), kind: "Float16Channel".into(),
+            dim: 16, frames: vec![], values: vec![] };
+        let mut take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 }));
+        take.end_frame = 100_000_000;
+        // Avoid the marker occlusion allocation in build: directly exercise analog preparation.
+        let (devices, _) = analog_views(&take.analog, &[], 100, take.end_frame, 1.0, None, 100.0, &take.device_sampling);
+        let c = &devices[0].channels[0];
+        assert_eq!(c.sample_rate_hz, Some(1000.0));
+        assert!(c.per_frame.is_empty() && c.signal.runs.is_empty() && c.raw_min.runs.is_empty() && c.raw_max.runs.is_empty());
     }
 
     #[test]

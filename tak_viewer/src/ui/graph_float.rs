@@ -174,6 +174,7 @@ pub struct Edges {
 
 /// What the graph shows: its lanes and its name tag.
 pub struct Graph<'a> {
+    pub badge: Option<&'a str>,
     /// Name on the tag, its color, and the color of the mark (● / ■) in front of it.
     pub name: &'a str,
     pub name_color: Color32,
@@ -474,8 +475,10 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
     // room for the buttons and the first lane's max value text right of the tag.
     let buttons_w: f32 = kind.button_ws().iter().map(|w| w + BTN_GAP).sum();
     let multi = (!g.keys.is_empty()).then(|| multi_tag(ui.painter(), g.keys, g.left_out, size_in(kind, b, area).x - 2.0 * TAG_PAD - buttons_w - VALUE_ROOM));
-    let plain_w = multi.as_ref().map_or_else(|| plain_tag_w(galley.size().x), |t| t.w);
-    let full_w = multi.as_ref().map_or_else(|| full_tag_w(kind, galley.size().x), |t| t.w + buttons_w);
+    let badge=g.badge.map(|text|ui.painter().layout_no_wrap(text.to_owned(),FontId::proportional(10.5),Color32::WHITE));
+    let badge_w=badge.as_ref().map_or(0.0,|g|g.size().x+12.0);
+    let plain_w = badge_w + multi.as_ref().map_or_else(|| plain_tag_w(galley.size().x), |t| t.w);
+    let full_w = plain_w + buttons_w;
     let tag_size = vec2(full_w, TAG_H);
     // The plate graph's lane list (an egui popup above everything, so the graph and the 3D
     // under it do not get its clicks); while it is open the buttons stay.
@@ -573,6 +576,11 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
             }
         }
         painter.galley(pos2(tag_min.x + 21.0, tag_rect.center().y - galley.size().y / 2.0), galley, g.name_color);
+    }
+    if let Some(badge)=badge {
+        let r=Rect::from_min_size(pos2(handle.right()-badge_w,tag_rect.top()+2.0),vec2(badge_w-3.0,TAG_H-4.0));
+        painter.rect_filled(r,2.0,Color32::from_rgb(9,71,113));
+        painter.galley(r.min+vec2(4.0,(r.height()-badge.size().y)/2.0),badge,Color32::WHITE);
     }
     if hot {
         let rects = button_rects(kind, handle);

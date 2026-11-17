@@ -187,6 +187,14 @@ pub struct AnalogDevice {
     pub channels: Vec<AnalogChannel>,
 }
 
+/// Declared device sampling, joined to channel headers by structural UID. The storage
+/// width (`AnalogChannel::dim`) is a capacity, not the number of valid samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceSampling {
+    pub rate_hz: f64,
+    pub samples_per_frame: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Take {
     pub path: PathBuf,
@@ -202,6 +210,8 @@ pub struct Take {
     pub label_groups: Vec<LabelGroup>,
     pub plates: Vec<ForcePlate>,
     pub analog: Vec<AnalogDevice>,
+    /// Same device order as `analog`; None when the stored sampling cannot be proven.
+    pub device_sampling: Vec<Option<DeviceSampling>>,
     /// Non-fatal problems (unsupported SKL, unreadable sticks, analog parse issue...).
     pub warnings: Vec<String>,
 }
@@ -273,8 +283,32 @@ pub(crate) fn decode_streams(path: &Path, file_size: usize, nodes: &[u8], channe
     let mut take = decode_markers(path, file_size, nodes, channels, meta, true)?;
     let (analog, warning) = decode_analog(channels);
     take.analog = analog;
+    take.device_sampling = sampling_from_streams(nodes, channels).unwrap_or_default();
     take.warnings.extend(warning);
     Ok(take)
+}
+
+/// Header-only sampling lookup shared by full and SSH reads. Unknown, duplicated or
+/// inconsistent device identities leave the descriptor unproven; never inspect values to
+/// guess which of a Float16 row's sixteen slots happen to be meaningful.
+pub(crate) fn sampling_from_streams(nodes: &[u8], channels: &[u8]) -> Result<Vec<Option<DeviceSampling>>> {
+    let typed = nodes::analog_device_nodes(nodes)?;
+    let inventory = channels::iter_channel_inventory(channels)?;
+    let mut groups: Vec<Vec<&channels::ChannelRecord>> = Vec::new();
+    for record in inventory.iter().filter(|r| r.name.starts_with("AnalogChannel")) {
+        if record.name == "AnalogChannel0" { groups.push(Vec::new()); }
+        let Some(group) = groups.last_mut() else { return err("analog channel before AnalogChannel0") };
+        group.push(record);
+    }
+    let unique: HashSet<_> = groups.iter().map(|group| group[0].uid).collect();
+    if unique.len() != groups.len() { return err("reused analog channel device UID"); }
+    Ok(groups.into_iter().map(|group| {
+        let uid = group[0].uid;
+        if group.iter().enumerate().any(|(i, r)| r.uid != uid || r.name != format!("AnalogChannel{i}")) { return None; }
+        let node = typed.iter().find(|n| n.uid == uid)?;
+        if node.channel_count.is_some_and(|n| n != group.len()) { return None; }
+        node.sampling.filter(|sampling| group.iter().all(|r| sampling.samples_per_frame <= r.dim()))
+    }).collect())
 }
 
 /// Everything except the analog devices (`analog` empty). `channels` may hold only the
@@ -365,6 +399,7 @@ pub(crate) fn decode_markers(
         label_groups,
         plates,
         analog: Vec::new(),
+        device_sampling: Vec::new(),
         warnings,
     })
 }

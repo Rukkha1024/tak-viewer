@@ -50,6 +50,7 @@ impl RetainedDocument {
 pub struct SharedFile(Arc<Mutex<SharedFileState>>);
 
 struct SharedFileState {
+    filters: crate::device_filter::SharedFilters,
     generation: u64,
     data: Arc<ViewData>,
     document: EditSession,
@@ -474,6 +475,7 @@ pub struct View {
     pub comments_rx: Option<Receiver<CommentsLoad>>,
     pub labels: LabelsState,
     pub devices: DevicesState,
+    pub filters: crate::device_filter::SharedFilters,
     /// Lanes of the selected marker's graph and of the chosen plate's graph.
     pub lanes: LaneCache,
     pub plate_lanes: PlateCache,
@@ -572,6 +574,7 @@ impl Default for View {
             comments_rx: None,
             labels: LabelsState::default(),
             devices: DevicesState::default(),
+            filters: Arc::default(),
             lanes: LaneCache::default(),
             plate_lanes: PlateCache::default(),
             heat: HeatCache::default(),
@@ -689,6 +692,7 @@ impl View {
         if self.shared_file.is_none() {
             self.shared_file = Some(SharedFile(Arc::new(Mutex::new(SharedFileState {
                 generation: 0,
+                filters: self.filters.clone(),
                 data: self.data.clone()?,
                 document: self.edit_document.clone()?,
                 source_stamp: self.source_stamp.clone(),
@@ -741,6 +745,7 @@ impl View {
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
         let (_tx, rx) = channel();
         let old = self.show_shared(data, rx, file_id, speed, now);
+        self.filters = shared.0.lock().unwrap().filters.clone();
         // A follower never invents an analog receiver or reloads the Comment tail.
         self.analog_rx = None;
         self.comments_rx = None;
@@ -797,6 +802,8 @@ impl View {
         let frame = self.pb.frame;
         let plate_name = self.plate.and_then(|index| self.data.as_ref()?.plates.get(index).map(|plate| plate.name.clone()));
         self.cancel_load();
+        let filters=shared.0.lock().unwrap().filters.clone();
+        drop_later(Some(std::mem::replace(&mut self.filters,filters)));
         drop_later(self.edit_document.replace(document));
         self.edit_refresh = None;
         self.edit_selection = Some(selection);
@@ -855,6 +862,7 @@ impl View {
         let (data, stamp, comments, generation) = {
             let Ok(state) = shared.0.lock() else { return false };
             if !self.edit_document.as_ref().is_some_and(|doc| Arc::ptr_eq(doc, &state.document)) { return false; }
+            if !Arc::ptr_eq(&self.filters,&state.filters) {drop_later(Some(std::mem::replace(&mut self.filters,state.filters.clone())));}
             if self.shared_file.as_ref().is_some_and(|own| Arc::ptr_eq(&own.0, &shared.0))
                 && self.shared_generation == state.generation { return false; }
             (state.data.clone(), state.source_stamp.clone(), state.comments.clone(), state.generation)
@@ -1433,6 +1441,7 @@ impl View {
         self.analog_rx = data.analog_pending.then_some((file_id, rx));
         if !data.analog_pending { self.analog_ms = self.markers_ms; }
         self.devices.reset_graphs();
+        drop_later(Some(std::mem::replace(&mut self.filters, Arc::default())));
         drop_later(Some(std::mem::take(&mut self.plate_lanes)));
         self.labels.reset(&data, file_id);
         if let Some(anchors) = self.restore_list_anchors.take() { self.labels.list_selection = anchors; }
@@ -2093,6 +2102,7 @@ pub(crate) fn sample_take(path: &str, names: &[&str]) -> tak_core::tak::Take {
         })
         .collect();
     Take {
+        device_sampling: Vec::new(),
         path: path.into(),
         file_size: 0,
         metadata: vec![],

@@ -373,6 +373,8 @@ pub(crate) struct DeviceNode {
     pub channel_count: Option<usize>,
     /// Geometry order in `extract_plates`, independent of channel/device order.
     pub plate: Option<usize>,
+    /// Rate and valid slots explicitly declared in this node, independent of storage width.
+    pub sampling: Option<super::DeviceSampling>,
 }
 
 /// A known class signature is required for selective device decoding. Independently inspect
@@ -448,7 +450,14 @@ pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
         let channel_count = record.props.get("DeviceNode_ChannelCount")
             .and_then(|v| super::metadata::python_int(&py_str(v)).ok())
             .and_then(|v| usize::try_from(v).ok());
-        out.push(DeviceNode { uid: record.uid, forceplate, channel_count, plate: geometry });
+        let sampling = (|| {
+            let rate = record.props.get("DeviceNode_Rate").and_then(|v| py_str(v).parse::<f64>().ok())?;
+            let multiple = record.props.get("DeviceNode_Multiple").and_then(|v| py_str(v).parse::<f64>().ok())?;
+            if !rate.is_finite() || rate <= 0.0 || !multiple.is_finite()
+                || multiple < 1.0 || multiple.fract() != 0.0 || multiple > 16.0 { return None; }
+            Some(super::DeviceSampling { rate_hz: rate, samples_per_frame: multiple as usize })
+        })();
+        out.push(DeviceNode { uid: record.uid, forceplate, channel_count, plate: geometry, sampling });
     }
     Ok(out)
 }
@@ -550,6 +559,32 @@ pub(crate) mod tests {
         out.extend_from_slice(&parent);
         out.extend_from_slice(&slot.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn analog_sampling_uses_declared_rate_and_integral_multiple() {
+        for (rate, multiple, expected) in [
+            ("1000", "10", Some(super::super::DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 })),
+            ("2000", "16", Some(super::super::DeviceSampling { rate_hz: 2000.0, samples_per_frame: 16 })),
+            ("0", "10", None), ("NaN", "10", None), ("1000", "0", None),
+            ("1000", "10.5", None), ("1000", "17", None), ("1000", "NaN", None),
+        ] {
+            let text = serde_json::json!({"properties":[
+                {"name":"NodeName","value":"device"},
+                {"name":"DeviceNode_DeviceType","value":"1"},
+                {"name":"DeviceNode_Rate","value":rate},
+                {"name":"DeviceNode_Multiple","value":multiple},
+            ]}).to_string();
+            let kind = "class MoCapCore::cDeviceNode<float,16>";
+            let mut bytes = (kind.len() as u16).to_le_bytes().to_vec();
+            bytes.extend(kind.as_bytes());
+            bytes.extend((text.encode_utf16().count() as u16).to_le_bytes());
+            bytes.extend(utf16(&text));
+            bytes.extend([0u8; 19]); bytes.extend([1u8; 16]); bytes.extend([0u8; 33]);
+            let nodes = analog_device_nodes(&bytes).unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].sampling, expected, "rate={rate}, multiple={multiple}");
+        }
     }
 
     #[test]
