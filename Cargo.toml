@@ -7,7 +7,7 @@ resolver = "2"
 members = ["tak_core", "tak_viewer"]
 
 [workspace.package]
-version = "0.66.1"
+version = "0.66.2"
 edition = "2021"
 publish = false
 

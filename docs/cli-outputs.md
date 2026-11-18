@@ -21,6 +21,7 @@ Syntax → [Agent commands](../tak_viewer/README.md#agent-commands).
 | `--only` | Decimal PID line when the window initializes | — | 0 normal close, 1 file/registration failure, 2 arguments or Session 0 |
 | `--dump-device-signal` | Signal object in requested file | Unversioned | 0 exported, 1 error (including arguments) |
 | `--bench` | Timing text and optional `bench-trace-json:` line | Trace 1 | 0 done, 1 failure, 2 arguments |
+| `--bench-value-zoom`, `--bench-time-zoom`, `--bench-pan` | Gesture timing and final extent text, optional `bench-trace-json:` line and settled PNG | Trace 1 | 0 done, 1 failure, 2 arguments |
 | `--bench-load` | Timing text and `bench-load-json:` line | 1 | 0 done, 1 load failure, 2 arguments |
 | `--bench-progress` | One progress timing line per readable file | — | 0 done, 1 read failure, 2 no files |
 | `--ssh-list`, `--ssh-open` | JSON stage lines to stdout. Open can save screenshot and `--ssh-dump` JSON | Unversioned stages. Dump 1 | 0 done, 1 failure, 2 arguments |
@@ -165,6 +166,7 @@ Ready means marker data and requested startup controls are applied. Deferred ana
 | `tak_ssh` | List JSON, or read-stage lines with `stage`, `elapsed_ms`, `markers`, `frames`, `analog_devices`, `analog_pending` and optional `data`. `reference-stdin` emits a reader dump with the SSH sample fields | Unversioned stages. Nested dump schema 1. 0 done, 1 failure or bad arguments |
 | `--ssh-workspace` | Screenshot of restart state. The `workspace_restart` JSON line carries `alias`, `path`, `platform`, `root_restored`, `not_connected`, `collapsed` and `no_startup_network` | Unversioned |
 | `--bench` text | Marker-on-screen and forceplate-ready time, open phase ms, memory, loading/playing frame time average and max, and graph completion after N playing frames. Includes any requested workspace, overlay and EMG measurements | No JSON without trace |
+| GRAPH gesture benchmarks | Gesture, layout, marker and frame counts, changed frames, mean and max ms. Final settle time and value/time extents. `--bench-trace` adds the same trace shape with phase `gesture` | Trace 1 when requested |
 | `--bench-progress` text | File, file bytes, saved progress label, bytes read and elapsed ms | Unversioned |
 
 Bench-load `files[]` fields = `file`, `file_bytes`, `markers_ready_ms`, `forceplates_ready_ms`, nullable `markers_memory` and `forceplates_memory`, `deferred_analog_devices`, `analog_values_loaded`, `full_read_fallback`, nullable `analog_fallback_reason`, and `steps_ms` as `[name,ms]` pairs. Memory objects carry `resident_bytes` and lifetime `peak_resident_bytes`. Failed inputs can be absent from `files`.

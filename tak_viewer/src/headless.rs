@@ -18,6 +18,9 @@ use crate::capture::CapturePlan;
 use crate::shot::AutoShot;
 use crate::soft_render::{self, Textures};
 
+#[path = "bench_graph_gesture.rs"]
+pub(crate) mod graph_gesture;
+
 /// Give up after this long (a stuck load or capture must not hang an agent forever).
 const TIMEOUT: Duration = Duration::from_secs(600);
 /// eframe's default clear color (`App::clear_color`), premultiplied. Panels cover it anyway.

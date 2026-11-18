@@ -314,19 +314,31 @@ impl LaneShapes {
         for _ in 0..2 { let _ = tx.send(self.shapes.as_ref().clone()); }
         self.stream = Some(ShapeStream { tx, rx });
     }
-    fn paint(&mut self, painter: &egui::Painter) {
+    fn paint(&mut self, painter: &egui::Painter, value_transform: Option<(f32, f32, f32)>) {
+        let transform = |mut shape| {
+            if let Some((pivot, scale, offset)) = value_transform {
+                let shift = |p: &mut Pos2| p.y = (p.y - pivot) * scale + pivot + offset;
+                match &mut shape {
+                    Shape::Mesh(mesh) => mesh.vertices.iter_mut().for_each(|v| shift(&mut v.pos)),
+                    Shape::Path(path) => path.points.iter_mut().for_each(shift),
+                    Shape::Circle(dot) => shift(&mut dot.center),
+                    _ => {}
+                }
+            }
+            shape
+        };
         if let Some(stream) = &self.stream {
             if let Ok(shapes) = stream.rx.try_recv() {
                 let source = self.shapes.clone();
                 let tx = stream.tx.clone();
                 crate::work_queue::geometry(move || { let _ = tx.send(source.as_ref().clone()); });
-                painter.extend(shapes);
+                painter.extend(shapes.into_iter().map(transform));
                 return;
             }
         }
         // Complete identical geometry remains visible if a background copy is late.
         let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("graph.stream_fallback_copy"));
-        painter.extend(self.shapes.iter().cloned());
+        painter.extend(self.shapes.iter().cloned().map(transform));
     }
 }
 
@@ -346,6 +358,22 @@ struct ShapesKey {
     options: egui::epaint::TessellationOptions,
     /// Multiple tinted curves retain paths so egui applies tint before AA tessellation.
     untinted: bool,
+}
+
+impl ShapesKey {
+    fn same_except_value(&self, other: &Self) -> bool {
+        Self { y: other.y, ..self.clone() } == *other && self.y.2 == other.y.2
+    }
+
+    /// Convert the cached Y mapping to the live one. Approximate stroke joins and dash
+    /// lengths only until the exact mesh for the new value extent is installed.
+    fn value_transform(&self, target: &Self) -> (f32, f32, f32) {
+        let (lo, hi, keep) = self.y;
+        let (target_lo, target_hi, _) = target.y;
+        let span = target_hi - target_lo;
+        let offset = ((target_lo - lo) / span) as f32 * (self.lane.height() - 6.0 - keep);
+        (self.lane.bottom() - 3.0, ((hi - lo) / span) as f32, offset)
+    }
 }
 
 type FontAtlas = egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>;
@@ -1413,6 +1441,7 @@ fn show_inner(
     });
     let pan = if resp.dragged_by(egui::PointerButton::Middle) { resp.drag_delta().x } else { 0.0 };
     vr.navigate(full, plot, zoom, pan);
+    let mut value_drag_lane = None;
     if let Some(zoom) = value_zoom.as_deref_mut().filter(|_|
         ui.is_enabled() && resp.dragged_by(egui::PointerButton::Secondary)
             && ui.input(|i| i.modifiers.is_none()) && !crate::app::key_focus::keys_blocked(ui.ctx())) {
@@ -1420,6 +1449,7 @@ fn show_inner(
             let lane = ((origin.y - plot.top()) / lane_h) as usize;
             if lane < lanes.len() {
                 zoom.drag(lane, resp.drag_delta().y);
+                value_drag_lane = Some(lane);
             }
         }
     }
@@ -1593,11 +1623,22 @@ fn show_inner(
             options,
             untinted,
         };
+        // During a value drag, keep one mesh request for this time extent and lane layout.
+        // Each pointer step transforms the prepared picture instead of replacing its job.
+        let mut mesh_key = shapes_key.clone();
+        if value_drag_lane == Some(li) {
+            let pending = drawn.mesh_rx.get(li).and_then(Option::as_ref).map(|(key, _)| key);
+            let prepared = drawn.shapes[li].as_ref().map(|shapes| &shapes.key);
+            if let Some(key) = pending.into_iter().chain(prepared).find(|key| key.same_except_value(&shapes_key)) {
+                mesh_key.y = key.y;
+            }
+        }
         let worker_mesh = untinted && !cfg!(test);
         #[cfg(test)] let worker_mesh = worker_mesh || (untinted && drawn.force_worker_mesh);
         if drawn.mesh_rx.len() <= li { drawn.mesh_rx.resize_with(li + 1, || None); }
         if worker_mesh {
-            if drawn.mesh_rx[li].as_ref().is_some_and(|(key, _)| *key != shapes_key) {
+            if drawn.mesh_rx[li].as_ref().is_some_and(|(key, _)| *key != mesh_key) {
+                let _span = crate::bench_timing::span("graph.discard_worker_mesh");
                 crate::views::drop_later(drawn.mesh_rx[li].take());
             }
             if claim_geometry_publication() {
@@ -1610,14 +1651,16 @@ fn show_inner(
                     }
                 }
             }
-            if drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) && drawn.mesh_rx[li].is_none() {
+            if drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&mesh_key) && drawn.mesh_rx[li].is_none() {
+                let _span = crate::bench_timing::span("graph.queue_worker_mesh");
                 let dashed: Vec<_> = dashed.map(|d| (d.clone(),lane.color)).into_iter()
                     .chain(drawn.more_pair_lanes.iter().zip(&drawn.more).filter_map(|(p,m)| Some((p.lanes.get(li)?.clone(),m.get(li)?.color))))
                     .filter(|_|show_second).collect();
                 let solid: Vec<_> = std::iter::once((thinned.clone(),lane.color))
                     .chain(drawn.more_lanes.iter().zip(&drawn.more).filter_map(|(p,m)| Some((p.lanes.get(li)?.clone(),m.get(li)?.color))))
                     .filter(|_|show_first).collect();
-                let key = shapes_key.clone();
+                let key = mesh_key.clone();
+                let map = Map { ylo: key.y.0, yhi: key.y.1, ..map };
                 let (tx,rx) = std::sync::mpsc::channel();
                 let wake = ui.ctx().clone();
                 drawn.mesh_rx[li] = Some((key.clone(),rx));
@@ -1636,7 +1679,7 @@ fn show_inner(
                 ui.ctx().request_repaint();
             }
         }
-        if !worker_mesh && drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) {
+        if !worker_mesh && drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&mesh_key) {
             // The second file's curves first, dashed, so the first file's solid lines are on
             // top: the (first) marker's, then the other markers' of a graph of several
             // (v0.27.0), all in the lane's color (v0.29.0; v0.27.0 had a color per marker).
@@ -1647,12 +1690,13 @@ fn show_inner(
             // The dashes' triangles as egui makes them for this lane (`curve_shapes`).
             let mut tess = egui::epaint::Tessellator::new(pixels_per_point, options, [1, 1], vec![]);
             tess.set_clip_rect(shapes_key.clip);
-            let (shapes, _lane_drew) = curve_shapes(&mut tess, dashed, solid, |f| x_of(f, &vr), y_of, LINE_W, DOT_R, immediate_mesh);
+            let mesh_map = Map { ylo: mesh_key.y.0, yhi: mesh_key.y.1, ..map };
+            let (shapes, _lane_drew) = curve_shapes(&mut tess, dashed, solid, |f| x_of(f, &vr), |v| mesh_map.y(v), LINE_W, DOT_R, immediate_mesh);
             let promote_after = (!immediate_mesh
                 && shapes.iter().any(|shape| matches!(shape, Shape::Path(_))))
                 .then(|| WORK.with(|work| work.get().frame));
             drawn.shapes[li] = Some(LaneShapes {
-                key: shapes_key.clone(),
+                key: mesh_key,
                 shapes: std::sync::Arc::new(shapes),
                 stream: None,
                 promote_after,
@@ -1671,9 +1715,15 @@ fn show_inner(
             }
         }
         if let Some(m) = &mut drawn.shapes[li] {
+            let value_transform = (value_zoom.is_some() && m.key.y != shapes_key.y && m.key.same_except_value(&shapes_key))
+                .then(|| m.key.value_transform(&shapes_key));
+            let _preview = value_transform.map(|_| crate::bench_timing::span("graph.preview_value_zoom"));
+            if m.key.y != shapes_key.y && value_transform.is_none() {
+                let _span = crate::bench_timing::span("graph.curve_extent_pending");
+            }
             let mut span=crate::bench_timing::span("graph.publish_shapes");
             span.counts(||(m.shapes.iter().map(|s|if let Shape::Path(p)=s{p.points.len()}else{0}).sum(),m.shapes.iter().map(|s|if let Shape::Mesh(m)=s{m.vertices.len()}else{0}).sum()));
-            m.paint(&lane_painter);
+            m.paint(&lane_painter, value_transform);
             #[cfg(test)]
             drew.add(&m.drew);
         }

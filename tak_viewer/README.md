@@ -325,11 +325,13 @@ Directory lists sort by path. `--recursive` descends without following directory
 tak_viewer.exe --bench [frames] file.takm [more files …] [--overlay file …] [--bench-select N] [--bench-hover] [--bench-emg] [--bench-trace] [--bench-workspace DIR]
 tak_viewer.exe --bench-load file1.tak file2.takm …
 tak_viewer.exe --bench-progress file.tak file.takm …
+tak_viewer.exe --bench-value-zoom FRAMES file.tak [--graph-layout channels|combined] [--bench-select N] [--bench-detached] [--bench-trace] [--bench-screenshot out.png]
 ~~~
 
 - `--bench` runs up to four views without a window. Default 300 playing frames. Add one overlay per view in view order. `--bench-select N` selects the first N markers. `--bench-hover` alternates curves and outside every two frames. `--bench-emg` includes demand loading and device graphs. `--bench-trace` records per-frame wall and main-thread CPU time. `--bench-workspace DIR` lists one local folder before timing normal file open. Combine graph layout and device hooks when measuring those panels.
 - `--bench-load` retains 1–30 file models concurrently without views. Memory samples overlap across the whole process.
 - `--bench-progress` reads only saved Progress. All benchmark commands leave settings untouched. [Output fields](../docs/cli-outputs.md#diagnostic-outputs)
+- `--bench-value-zoom`, `--bench-time-zoom` and `--bench-pan` send right-drag, wheel or middle-drag at 60 Hz to a paused GRAPH. Use 4–10,000 frames and a local TAK. Choose Channels (default) or Combined, and 1–8 markers. Use `--bench-detached` for the detached graph. `--bench-screenshot` saves the settled graph after release. Compare UI and tessellation time and check the trace for curve builds and stale extents. [Output fields](../docs/cli-outputs.md#diagnostic-outputs)
 
 ### Device filter and grid hooks
 

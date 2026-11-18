@@ -6,6 +6,41 @@ use graph::{
 };
 
 impl TakViewerApp {
+    pub(crate) fn bench_graph_pane(&mut self, ctx: &egui::Context, layout: Layout, detached: bool, count: usize, pan: bool) -> Option<usize> {
+        let view = &mut self.views[self.active];
+        let data = view.data.as_ref()?;
+        let mut markers: Vec<_> = data.groups.iter().flat_map(|g| g.members.iter().copied()).take(count).collect();
+        if count == 1 && !data.markers.is_empty() {
+            markers = vec![0];
+        }
+        if markers.len() != count { return None; }
+        let file_id = view.file_id;
+        if pan {
+            let quarter = (data.end_frame - data.start_frame) / 4;
+            tracks::set_zoom(ctx, file_id, (data.start_frame + quarter, data.end_frame - quarter), data);
+        }
+        view.select_many(markers, None, false);
+        view.primary = view.selected.first().copied();
+        self.settings.graph_layout = layout;
+        self.set_graph_float(false);
+        if detached {
+            super::dock::hide(&mut self.dock, Pane::Graph);
+            let surface = self.dock.add_window(vec![Pane::Graph]);
+            self.dock.get_window_state_mut(surface).unwrap()
+                .set_position(egui::pos2(365.0, 325.0))
+                .set_size(egui::vec2(850.0, 380.0));
+        }
+        Some(file_id)
+    }
+
+    pub(crate) fn bench_graph_zoom(&mut self, layout: Layout) -> conveniences::ValueZoom {
+        self.view_mut().graph_view.zoom(layout == Layout::Combined).clone()
+    }
+
+    pub(crate) fn bench_graph_ready(&self) -> bool {
+        !self.view().lanes.preparing() && !self.graph_put_off
+    }
+
     pub(super) fn graph_tab(&mut self, ui: &mut Ui) -> Option<Action> {
         let slot = self.active;
         let view = &mut self.views[slot];

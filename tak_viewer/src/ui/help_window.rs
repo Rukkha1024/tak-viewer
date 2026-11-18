@@ -124,7 +124,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("Graph wheel / Middle drag", "Zoom / move along time. In Tracks, do this on the time ruler."),
         ("Wheel over Tracks rows", "Scroll the marker list."),
         ("Left drag to the right of a Tracks name", "Drag sideways to pick a yellow edit range. Keep your picks and frame."),
-        ("Graph right drag / Auto Extents", "Zoom the values where you drag / reset the value scale."),
+        ("Graph right drag / Auto Extents", "Zoom the values as you drag / reset the value scale."),
         ("F / Shift+F in a graph", "Click the graph first. Fit the edit range / the whole file."),
         ("Zoom Fit / Lock Selection", "Fit the edit range / hold or free the marker picks in Channels and Combined."),
         ("Drag a graph tag or corner in 3D", "Drag the tag to move it or a corner to resize it. Double-click the tag to fold or open it."),

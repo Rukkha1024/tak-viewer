@@ -151,6 +151,9 @@ fn main() -> eframe::Result<()> {
     if headless {
         args.retain(|a| a != "--headless");
     }
+    if let Some(gesture) = args.get(1).and_then(|a| headless::graph_gesture::Gesture::parse(a)) {
+        std::process::exit(headless::graph_gesture::run(gesture, &args[2..]));
+    }
     if let Err(error) = ui::graph::tracks::parse_probe(&mut args) {
         eprintln!("{error}");
         std::process::exit(2);
@@ -300,6 +303,8 @@ fn usage() -> String {
         "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         "GRAPH screenshot or benchmark: --graph-layout channels|tracks|combined and --graph-zoom A-B",
+        "Graph gestures:\n  tak_viewer --bench-value-zoom FRAMES FILE\n  tak_viewer --bench-time-zoom FRAMES FILE\n  tak_viewer --bench-pan FRAMES FILE",
+        "Graph gesture options: choose Channels or Combined, then use --bench-select N, --bench-detached, --bench-trace, --bench-screenshot out.png",
         "Headless playback: --working-range A-B and --reverse-playing",
         "GRAPH screenshot: --graph-fit-range, --graph-y-zoom N and --graph-lock NAME[,NAME…] with --graph-layout",
         "Headless drop preview: --drop-preview x,y <incoming files …> last, with --screenshot",

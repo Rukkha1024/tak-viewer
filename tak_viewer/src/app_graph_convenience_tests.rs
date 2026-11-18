@@ -120,9 +120,20 @@ fn graph_value_drag_changes_only_the_pressed_lane_and_toolbar_resets_it() {
         pos, pressed, button: egui::PointerButton::Secondary, modifiers: Modifiers::NONE,
     };
     frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(at), down(at, true)]);
-    let above = at - egui::vec2(0.0, 35.0);
-    frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(above)]);
+    let source_builds = app.views[0].lanes.builds;
+    let mut above = at;
+    let mut last_range = before[1];
+    for dy in [22.0, 13.0, -5.0] {
+        above.y -= dy;
+        frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(above)]);
+        let drew = app.views[0].lanes.drew();
+        assert_ne!(drew.ranges[1], last_range, "every move changes the live value extent");
+        assert_eq!(drew.remade, 0, "drag reuses the prepared curve shapes");
+        assert_eq!(app.views[0].lanes.builds, source_builds);
+        last_range = drew.ranges[1];
+    }
     let out = frame_with(&ctx, &mut app, vec![down(above, false)]);
+    assert_eq!(app.views[0].lanes.drew().remade, 1, "release prepares exact shapes once for the dragged lane");
     let after = &app.views[0].lanes.drew().ranges;
     assert_eq!(after[0], before[0]);
     assert_eq!(after[2], before[2]);
@@ -132,12 +143,51 @@ fn graph_value_drag_changes_only_the_pressed_lane_and_toolbar_resets_it() {
     click_at(&ctx, &mut app, extent);
     assert_eq!(app.views[0].lanes.drew().ranges, before);
     assert!(app.views[0].graph_view.zoom(false).is_auto());
+    assert_eq!(app.views[0].lanes.builds, source_builds, "reset reuses the source curves");
 
     app.views[0].set_range(4, 4);
     let out = frame_with(&ctx, &mut app, vec![]);
     click_at(&ctx, &mut app, text_rects(&out, "Zoom Fit")[0].center());
     assert_eq!(graph::tracks::zoom_extent(&ctx, app.views[0].file_id), Some((3.5, 4.5)));
     assert_eq!(app.views[0].range, Some((4, 4)));
+}
+
+#[test]
+fn graph_tracks_wheel_scrolls_rows_without_changing_time_extent() {
+    let ctx = egui::Context::default();
+    let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+    let names: Vec<_> = (0..80).map(|i| format!("Track {i:02}")).collect();
+    let refs: Vec<_> = names.iter().map(String::as_str).collect();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.views[0].show(views::sample_data("scroll.tak", &refs), rx, 10, 1.0, 0.0);
+    app.settings.graph_layout = graph::tracks::Layout::Tracks;
+    app.set_graph_float(false);
+    let file_id = app.views[0].file_id;
+    let plot = graph::tracks::graph_id(file_id).with("tracks_body");
+    let wait = std::time::Instant::now();
+    let body = loop {
+        let out = frame_with(&ctx, &mut app, vec![]);
+        if !text_rects(&out, &names[0]).is_empty() {
+            break ctx.read_response(plot).unwrap().interact_rect;
+        }
+        assert!(wait.elapsed() < std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    let extent = graph::tracks::zoom_extent(&ctx, file_id);
+    frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(body.center())]);
+    frame_with(&ctx, &mut app, vec![egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -620.0), modifiers: Modifiers::NONE,
+    }]);
+    let mut out = frame_with(&ctx, &mut app, vec![]);
+    let later_row_visible = |out: &egui::FullOutput| names[20..].iter().any(|name|
+        text_rects(out, name).iter().any(|rect| body.contains(rect.center())));
+    for _ in 0..12 {
+        if later_row_visible(&out) { break; }
+        out = frame_with(&ctx, &mut app, vec![]);
+    }
+    assert!(text_rects(&out, &names[0]).iter().all(|rect| !body.contains(rect.center())));
+    assert!(later_row_visible(&out));
+    assert_eq!(graph::tracks::zoom_extent(&ctx, file_id), extent);
 }
 
 #[test]

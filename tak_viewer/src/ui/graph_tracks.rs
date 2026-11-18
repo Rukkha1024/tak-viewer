@@ -545,7 +545,6 @@ pub(crate) fn set_zoom(ctx: &egui::Context, file_id: usize, (a, b): (i64, i64), 
     ctx.data_mut(|d| d.insert_temp(graph_id(file_id), ViewRange::full(a, b)));
 }
 
-#[cfg(test)]
 pub(crate) fn zoom_extent(ctx: &egui::Context, file_id: usize) -> Option<(f64, f64)> {
     ctx.data(|d| d.get_temp::<ViewRange>(graph_id(file_id))).map(|vr| (vr.lo, vr.hi))
 }
