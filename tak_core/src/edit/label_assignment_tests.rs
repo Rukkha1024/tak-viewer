@@ -135,7 +135,7 @@ fn two_click_swap_preserves_raw_bytes_and_round_trips_each_state() {
     assert!(first
         .result
         .message
-        .contains("4프레임 이름 변경 · 3프레임 Unlabeled"));
+        .contains("4 frames relabeled · 3 to Unlabeled"));
     assert_eq!(first.selection_before, request.selection);
     assert_eq!(first.selection_after.order, vec![A]);
     assert_eq!(first.selection_after.primary, Some(A));
@@ -163,7 +163,7 @@ fn two_click_swap_preserves_raw_bytes_and_round_trips_each_state() {
     assert!(second
         .result
         .message
-        .contains("3프레임 이름 변경 · 0프레임 Unlabeled"));
+        .contains("3 frames relabeled · 0 to Unlabeled"));
     for frame in [3, 5, 7] {
         assert_eq!(sample(&repaired, B, frame), sample(&original, A, frame));
     }

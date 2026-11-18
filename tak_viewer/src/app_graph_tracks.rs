@@ -65,27 +65,27 @@ impl TakViewerApp {
         ctx: &egui::Context,
     ) -> Result<[usize; 2], &'static str> {
         let view = &self.views[slot];
-        let data = view.data.as_ref().ok_or("파일을 먼저 열어 주세요.")?;
+        let data = view.data.as_ref().ok_or("Open a take first")?;
         if view.selected.len() != 2 {
-            return Err("마커 줄을 두 개 선택해 주세요.");
+            return Err("Select two marker rows");
         }
-        if let Some(reason) = self.marker_command_block(slot, self.merge_keys_capture()) {
+        if let Some(reason) = self.marker_command_block(slot, self.merge_keys_capture(), false) {
             return Err(reason);
         }
         if self.typing(ctx)
             || ctx.memory(|m| m.any_popup_open())
             || ctx.input(|i| i.key_down(egui::Key::M))
         {
-            return Err("지금 하는 작업을 먼저 마쳐 주세요.");
+            return Err("Finish the current action");
         }
         let rows = view.tracks
             .selected_pair(data, &view.selected)
-            .ok_or("마커 줄을 두 개 선택해 주세요.")?;
+            .ok_or("Select two marker rows")?;
         if rows.iter().any(|&row| {
             let trajectory = &data.take.trajectories[data.markers[row].traj];
             trajectory.parent_uid.is_none() || trajectory.lenient_membership
         }) {
-            return Err("선택한 줄은 이 파일에서 편집할 수 없어요.");
+            return Err("Can't edit these rows");
         }
         Ok(rows)
     }
@@ -109,7 +109,7 @@ impl TakViewerApp {
             Some(Some(range)) => Some(range),
             Some(None) => {
                 self.takm_note = Some((
-                    "선택한 프레임 범위를 확인해 주세요.".into(),
+                    "Invalid frame range".into(),
                     ctx.input(|i| i.time),
                 ));
                 return;

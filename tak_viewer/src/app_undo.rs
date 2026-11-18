@@ -1734,9 +1734,9 @@ impl TakViewerApp {
                 let prior = pb.working_range();
                 pb.restore_controls(pick(redo, *before, *after), now);
                 let (a, b) = pb.working_range();
-                if prior != (a, b) { format!("재생 구간 {a}–{b}") }
-                else if pb.reverse() { "역재생".into() }
-                else { "앞으로 재생".into() }
+                if prior != (a, b) { format!("Working Range {a}–{b}") }
+                else if pb.reverse() { "Reverse playback".into() }
+                else { "Forward playback".into() }
             }
             Part::Plate { before, after, .. } => {
                 let v = &mut self.views[k];
@@ -1748,7 +1748,7 @@ impl TakViewerApp {
             }
             Part::GraphLock { before, after, .. } => {
                 let lock = pick(redo, before, after).clone();
-                let words = if lock.is_some() { "그래프 마커 고정" } else { "그래프 마커 고정 해제" };
+                let words = if lock.is_some() { "Selection locked" } else { "Selection unlocked" };
                 self.views[k].graph_view.lock = lock;
                 words.into()
             }

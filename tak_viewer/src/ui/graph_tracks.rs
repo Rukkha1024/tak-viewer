@@ -453,7 +453,7 @@ pub(crate) fn show(
             painter.text(
                 body.center(),
                 egui::Align2::CENTER_CENTER,
-                "이 파일에 마커가 없어요.",
+                "No markers in this take",
                 FontId::proportional(12.0),
                 theme::TEXT_DIM,
             );
@@ -463,7 +463,7 @@ pub(crate) fn show(
         painter.text(
             body.center(),
             egui::Align2::CENTER_CENTER,
-            "마커 줄을 준비하고 있어요.",
+            "Loading tracks…",
             FontId::proportional(12.0),
             theme::TEXT_DIM,
         );

@@ -1007,7 +1007,7 @@ impl<'a> LabelEditor<'a> {
                     .find(|track| track.label.is_none() && strict_track(track).is_ok())
                     .map(Arc::as_ref)
                     .or_else(|| common_marker(&destination).then_some(destination.as_ref()))
-                    .ok_or_else(|| other("이름 없는 마커 기록을 만들 수 없어요."))?;
+                    .ok_or_else(|| other("Can't create an Unlabeled track"))?;
                 let name = next_unlabeled_name(&input.tracks().map(|t| t.name.clone()).collect());
                 let uid = new_uid(&proof, input, &HashSet::new());
                 let created = new_track(donor, uid, name, None, displaced)?;
@@ -1046,13 +1046,13 @@ impl<'a> LabelEditor<'a> {
             _ => request.target,
         });
         let mut message = format!(
-            "Label · {destination_name} · {}–{} · {}프레임 이름 변경 · {displaced_count}프레임 Unlabeled",
+            "Label · {destination_name} · {}–{} · {} frames relabeled · {displaced_count} to Unlabeled",
             affected.first,
             affected.last,
             moved.len()
         );
         if increment == IncrementResult::NoNextLabel {
-            message.push_str(" · 다음 라벨 없음");
+            message.push_str(" · No next label");
         }
         let result = EditResult {
             tracks: 1,
@@ -1520,7 +1520,7 @@ mod tests {
         assert_eq!(o.increment, IncrementResult::NoNextLabel);
         let p = o.patch.unwrap();
         assert_eq!(p.selection_after.armed_label, Some(key(1)));
-        assert!(p.result.message.ends_with("다음 라벨 없음"));
+        assert!(p.result.message.ends_with("No next label"));
         assert_eq!(
             next_label_in_order(&[key(1), key(1)], key(1)),
             Err(EditError::AmbiguousLabel)

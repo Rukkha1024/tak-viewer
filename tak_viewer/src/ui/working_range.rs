@@ -43,15 +43,15 @@ impl Endpoint {
         let frame = text
             .trim()
             .parse::<i64>()
-            .map_err(|_| "재생 구간에는 프레임 번호를 써 주세요.")?;
+            .map_err(|_| "Enter a frame number")?;
         if !(pb.first..=pb.last).contains(&frame) {
-            return Err("파일에 있는 프레임 번호를 써 주세요.");
+            return Err("Frame outside take");
         }
         let (_, other) = self.split(pb.working_range());
         match self {
             Self::Start if frame <= other => Ok((frame, other)),
             Self::End if frame >= other => Ok((other, frame)),
-            _ => Err("재생 구간의 시작은 끝보다 뒤에 올 수 없어요."),
+            _ => Err("Start must be before or at end"),
         }
     }
 }
@@ -86,8 +86,8 @@ pub fn strip(
         (Endpoint::End, x_end, (x_end - 6.0).max(mid), x_end + 6.0),
     ] {
         let (name, tip) = match which {
-            Endpoint::Start => ("start", "끌어서 재생 구간 시작 바꾸기"),
-            Endpoint::End => ("end", "끌어서 재생 구간 끝 바꾸기"),
+            Endpoint::Start => ("start", "Drag range start"),
+            Endpoint::End => ("end", "Drag range end"),
         };
         let hit = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom()));
         let resp = ui
@@ -148,14 +148,14 @@ pub fn strip(
 
 pub fn fields(ui: &mut Ui, id: Id, pb: &mut Playback, now: f64) -> Option<&'static str> {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("재생 구간").color(theme::TIMELINE_GREEN));
-        ui.label("시작");
+        ui.label(RichText::new("Working Range").color(theme::TIMELINE_GREEN));
+        ui.label("Start");
         let start = field(ui, id.with("start"), Endpoint::Start, pb, now);
-        ui.label("끝");
+        ui.label("End");
         let end = field(ui, id.with("end"), Endpoint::End, pb, now);
         if ui
-            .button("전체 구간")
-            .on_hover_text("파일 전체를 재생 구간으로 (Shift+[ / Shift+])")
+            .button("Reset")
+            .on_hover_text("Use full take (Shift+[ / Shift+])")
             .clicked()
         {
             pb.set_working_range(pb.first, pb.last, now);
@@ -215,7 +215,7 @@ fn field(
         let (value, _) = which.split(pb.working_range());
         let resp = ui
             .add_sized(size, Button::new(value.to_string()))
-            .on_hover_text("눌러서 프레임 번호 쓰기 (Enter)");
+            .on_hover_text("Click to type a frame (Enter)");
         if resp.clicked() {
             let draft = value.to_string();
             select_number(ui, id, &draft, &resp);

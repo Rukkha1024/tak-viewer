@@ -96,7 +96,7 @@ fn playback_working_range_controls_commit_cancel_and_restore() {
     type_start(&mut app, "8");
     run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Enter)]);
     assert_eq!(app.views[0].pb.working_range(), (2, 5));
-    assert!(takm_note(&app).contains("시작은 끝보다"));
+    assert!(takm_note(&app).contains("Start must be before or at end"));
     assert!(app.history.kinds().is_empty());
 
     type_start(&mut app, "4");
@@ -141,7 +141,7 @@ fn playback_working_range_controls_commit_cancel_and_restore() {
     redo_key(&ctx, &mut app);
     assert!(app.views[0].pb.reverse());
 
-    let reset = find(&mut app, "전체 구간");
+    let reset = find(&mut app, "Reset");
     click_at(&ctx, &mut app, reset);
     assert_eq!(app.views[0].pb.working_range(), (0, 9));
     assert!(app.views[0].pb.reverse());
@@ -283,11 +283,11 @@ fn wide_deck_keeps_working_bounds_on_the_transport_row() {
     app.views[0].pb.set_frame(2_600, 0.0);
     app.views[0].pb.set_working_range(1_800, 3_400, 0.0);
     let out = frame_with(&ctx, &mut app, vec![]);
-    let bounds = text_rects(&out, "재생 구간")[0];
+    let bounds = text_rects(&out, "Working Range")[0];
     let reverse = text_rects(&out, "Reverse")[0];
     assert!((bounds.center().y - reverse.center().y).abs() < 3.0);
     assert!(bounds.left() > reverse.right());
-    let reset = text_rects(&out, "전체 구간")[0];
+    let reset = text_rects(&out, "Reset")[0];
     let comment = text_rects(&out, "Comment")[0];
     assert!(reset.right() < comment.left(), "reset {reset:?}, Comment {comment:?}");
     assert!(comment.right() < app.views[0].scene_rect.right());

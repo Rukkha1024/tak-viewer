@@ -207,7 +207,7 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     assert!(assigned.is_loaded(), "{:?}", app.takm_note);
     check_assigned(&assigned);
     assert_eq!(app.views[0].armed_label, Some(target));
-    assert!(app.takm_note.as_ref().is_some_and(|(note, _)| note.contains("다음 라벨 없음")));
+    assert!(app.takm_note.as_ref().is_some_and(|(note, _)| note.contains("No next label")));
     assert_eq!(app.history.undo.len(), count + 1);
 
     app.undo_redo(&ctx, false);

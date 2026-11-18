@@ -77,8 +77,8 @@ fn merge_keys_scopes_overlap_refusal_and_move_to_inclusive_range() {
     let EditError::Other(reason) = refusal else {
         panic!("{refusal:?}")
     };
-    assert!(reason.contains("겹치는 프레임이 2개"));
-    assert!(reason.contains("처음 겹치는 프레임은 7"));
+    assert!(reason.contains("2 frames overlap"));
+    assert!(reason.contains("first 7"));
     assert_eq!(doc.snapshot().revision(), base.revision());
     assert!(!doc.is_dirty());
 
@@ -115,7 +115,7 @@ fn merge_keys_scopes_overlap_refusal_and_move_to_inclusive_range() {
         editor
             .merge_keys(&base, &request(Some((8, 10))))
             .unwrap_err(),
-        other("보내는 줄에 옮길 점이 없어요.")
+        other("No points to move")
     );
     let mut one = request(None);
     one.selection.selected.remove(&destination.uid);
@@ -123,7 +123,7 @@ fn merge_keys_scopes_overlap_refusal_and_move_to_inclusive_range() {
     let missing = merge_request(source.uid, uid(9), None);
     assert_eq!(
         editor.merge_keys(&base, &missing).unwrap_err(),
-        other("선택한 마커가 없어요.")
+        other("Selected marker missing")
     );
 }
 

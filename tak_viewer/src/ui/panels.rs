@@ -1012,7 +1012,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
         if total > markers.len() {
             ui.label(RichText::new(left_out_text(markers.len(), total)).small().color(theme::TEXT));
         }
-        ui.label(RichText::new("· 드래그 = 구간 선택 · 오른쪽 드래그 = 값 확대 · 휠 = 시간 확대").small().color(theme::TEXT_DIM));
+        ui.label(RichText::new("· Drag = range · Right-drag = value zoom · Wheel = time zoom").small().color(theme::TEXT_DIM));
     });
     crate::app::key_focus::region(ui, footer.response.rect, crate::app::key_focus::Target::Blocked);
     if over {
@@ -1618,7 +1618,7 @@ fn step_buttons(ui: &mut Ui, pb: &mut Playback, now: f64, working_enabled: bool)
         pb.toggle(now);
     }
     let reverse = egui::Button::new("Reverse").selected(pb.reverse()).min_size(vec2(30.0, 24.0));
-    if ui.add_enabled(working_enabled, reverse).on_hover_text("재생 방향 바꾸기").clicked() {
+    if ui.add_enabled(working_enabled, reverse).on_hover_text("Switch playback direction").clicked() {
         pb.set_reverse(!pb.reverse(), now);
     }
     if btn(ui, "▶|", "+1 프레임 (→)") {

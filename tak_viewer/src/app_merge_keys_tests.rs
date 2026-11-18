@@ -93,8 +93,8 @@ fn merge_keys_buttons_move_by_row_order_and_use_one_history_action() {
     click_at(&ctx, &mut app, button(&out, "Merge Keys Up"));
     wait(&mut app, &settled);
     let note = &app.takm_note.as_ref().unwrap().0;
-    assert!(note.contains("겹치는 프레임이 260개"), "{note}");
-    assert!(note.contains("처음 겹치는 프레임은 0"), "{note}");
+    assert!(note.contains("260 frames overlap"), "{note}");
+    assert!(note.contains("first 0"), "{note}");
     assert_eq!(steps(&app, 0), history);
     assert_base(&snapshot(&app));
 

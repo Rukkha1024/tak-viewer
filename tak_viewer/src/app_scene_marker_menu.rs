@@ -86,7 +86,7 @@ fn show_labels(ui: &mut Ui, rows: &[CatalogRow]) -> Option<LabelKey> {
     const WIDTH: f32 = 200.0;
     ui.set_width(WIDTH);
     if rows.is_empty() {
-        ui.label("이 파일에 붙일 라벨이 없어요.");
+        ui.label("No labels to assign");
         return None;
     }
     let row_height = ui.spacing().interact_size.y;
@@ -121,7 +121,7 @@ fn show_labels(ui: &mut Ui, rows: &[CatalogRow]) -> Option<LabelKey> {
 
 fn marker_info(ui: &mut Ui, count: usize, marker: &MarkerView, frame: i64) {
     if count > 1 {
-        ui.label(format!("선택 {count}개 · 마지막으로 고른 마커"));
+        ui.label(format!("{count} selected · last picked"));
     }
     let name = if marker.kind == MarkerKind::Unlabeled {
         "Unlabeled"
@@ -134,7 +134,7 @@ fn marker_info(ui: &mut Ui, count: usize, marker: &MarkerView, frame: i64) {
             ui.label(format!("{axis}  {:.2} mm", value * 1000.0));
         }
     } else {
-        ui.label("현재 프레임에 점이 없어요.");
+        ui.label("No point at this frame");
     }
 }
 

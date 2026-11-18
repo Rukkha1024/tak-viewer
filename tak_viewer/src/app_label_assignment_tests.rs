@@ -88,7 +88,7 @@ mod label_assignment {
             .as_ref()
             .unwrap()
             .0
-            .contains("3프레임 Unlabeled"));
+            .contains("3 to Unlabeled"));
 
         undo_key(&ctx, &mut app);
         wait(&ctx, &mut app, |app| app.views[0].edit_refresh.is_none());
@@ -122,7 +122,7 @@ mod label_assignment {
         let history = steps(&app, 0);
         let point = marker_on_screen(&app, 0);
         click_at(&ctx, &mut app, point);
-        assert_eq!(app.takm_note.as_ref().unwrap().0, "이미 이 라벨이에요.");
+        assert_eq!(app.takm_note.as_ref().unwrap().0, "Already this label");
         assert_eq!(app.views[0].edit_selection_state(), before);
         assert_eq!(steps(&app, 0), history);
         assert!(!snapshot(&app).is_loaded());

@@ -39,7 +39,7 @@ impl Measurement {
     }
 
     pub fn name(self) -> &'static str {
-        if self.angle { "각도" } else { "거리" }
+        if self.angle { "Angle" } else { "Distance" }
     }
 
     pub fn text(self) -> String {

@@ -106,7 +106,7 @@ impl Default for LabelingState {
             scroll_to: None,
             scroll_to_track: None,
             selected_labeled_count: 0,
-            label_marker_reason: Some("3D에서 점을 하나만 선택해 주세요."),
+            label_marker_reason: Some("Select one 3D point"),
             blocked_reason: None,
         }
     }
@@ -618,7 +618,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                 }
                                 if gesture.is_none() { resp.context_menu(|ui| {
                                     let label_reason = if row.key.is_none() {
-                                        Some("이 행에 지정할 수 있는 이름이 없어요.")
+                                        Some("No label for this row")
                                     } else {
                                         state.label_marker_reason
                                     };

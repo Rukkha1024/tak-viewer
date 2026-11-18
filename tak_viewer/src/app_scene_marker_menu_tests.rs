@@ -199,7 +199,7 @@ mod scene_marker_menu {
         menu_item(&output, "Selected Markers (2)");
 
         let info = hover(&ctx, &mut app, menu_item(&output, "Marker Info").center());
-        menu_item(&info, "선택 2개 · 마지막으로 고른 마커");
+        menu_item(&info, "2 selected · last picked");
         let p = app.views[0].data.as_ref().unwrap().markers[1]
             .position(5)
             .unwrap();

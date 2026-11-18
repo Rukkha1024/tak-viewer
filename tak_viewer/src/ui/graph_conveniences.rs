@@ -103,13 +103,13 @@ pub(in crate::ui) fn axis_legend(ui: &mut Ui) {
 
 pub(crate) fn fit_button(ui: &mut Ui, has_range: bool) -> bool {
     ui.add_enabled(has_range, egui::Button::new("Zoom Fit").small())
-        .on_hover_text("노란 구간에 맞춰요 (F). 전체 구간은 Shift+F")
+        .on_hover_text("Fit yellow range (F) · Full take (Shift+F)")
         .clicked()
 }
 
 pub(crate) fn auto_button(ui: &mut Ui, zoom: &mut ValueZoom) {
     if ui.add_enabled(!zoom.is_auto(), egui::Button::new("Auto Extents").small())
-        .on_hover_text("값 축을 다시 자동으로 맞춰요.")
+        .on_hover_text("Reset value zoom")
         .clicked()
     {
         *zoom = ValueZoom::default();
@@ -118,7 +118,7 @@ pub(crate) fn auto_button(ui: &mut Ui, zoom: &mut ValueZoom) {
 
 pub(crate) fn lock_button(ui: &mut Ui, locked: bool, available: bool) -> bool {
     ui.add_enabled(available || locked, egui::Button::new("Lock Selection").small().selected(locked))
-        .on_hover_text("지금 그래프에 보이는 마커를 고정해요. 다시 누르면 현재 선택을 따라가요.")
+        .on_hover_text("Pin graph markers · Click again to unpin")
         .clicked()
 }
 

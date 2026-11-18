@@ -254,9 +254,9 @@ fn run_marker_command(
     match command {
         MarkerCommand::Merge(request) => {
             let patch = LabelEditor::new().merge_keys(snapshot, &request).map_err(|error| match error {
-                EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
+                EditError::InvalidRange => "Invalid frame range".into(),
                 EditError::Other(message) => message,
-                _ => "이 파일의 마커 기록을 합칠 수 없어요.".into(),
+                _ => "Can't merge in this file".into(),
             })?;
             let message = patch.result.message.clone();
             Ok((Some(patch), message))
@@ -269,10 +269,10 @@ fn run_marker_command(
             let mut outcome = LabelEditor::with_creation_streams(&session.creation)
                 .label_with_outcome(snapshot, &request)
                 .map_err(|error| match error {
-                    EditError::AmbiguousLabel => "마커가 여러 개여서 라벨을 붙일 수 없어요.".into(),
-                    EditError::MissingDeclaration => "붙일 라벨을 찾을 수 없어요.".into(),
-                    EditError::UnsupportedLayout => "이 마커 기록의 형식은 편집할 수 없어요.".into(),
-                    EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
+                    EditError::AmbiguousLabel => "Multiple markers match this label".into(),
+                    EditError::MissingDeclaration => "Label missing".into(),
+                    EditError::UnsupportedLayout => "Can't edit this track format".into(),
+                    EditError::InvalidRange => "Invalid frame range".into(),
                     other => edit_error(other),
                 })?;
             if let Some(patch) = outcome.patch.as_mut().filter(|_| keep_armed) {
@@ -284,9 +284,9 @@ fn run_marker_command(
                 .map(|p| p.result.message.clone())
                 .unwrap_or_else(|| {
                     if outcome.already_assigned {
-                        "이미 이 라벨이에요.".into()
+                        "Already this label".into()
                     } else {
-                        "선택한 범위에 바꿀 점이 없어요.".into()
+                        "No points to relabel in range".into()
                     }
                 });
             Ok((outcome.patch, message))
@@ -404,13 +404,13 @@ fn increment_order(state: &LabelingState, target: LabelKey, moving_at_frame: Opt
 
 fn label_marker_source(view: &View) -> Result<Uid, &'static str> {
     if view.selected.len() != 1 {
-        return Err("3D에서 점을 하나만 선택해 주세요.");
+        return Err("Select one 3D point");
     }
     view.data.as_ref()
         .and_then(|data| data.markers.get(*view.selected.first()?))
         .filter(|marker| (view.shown[0] || view.overlay.is_none()) && marker.present(view.pb.frame))
         .map(|marker| marker.uid)
-        .ok_or("현재 프레임의 3D 화면에서 점을 선택해 주세요.")
+        .ok_or("Pick a 3D point at this frame")
 }
 
 impl TakViewerApp {
@@ -1306,10 +1306,10 @@ impl TakViewerApp {
         }
     }
 
-    pub(super) fn marker_command_block(&self, slot: usize, allow_capture: bool) -> Option<&'static str> {
+    pub(super) fn marker_command_block(&self, slot: usize, allow_capture: bool, legacy_notice: bool) -> Option<&'static str> {
         let view = &self.views[slot];
         if view.edit_document.is_none() || view.data.is_none() {
-            return Some("이 파일은 편집할 수 없어요.");
+            return Some("Can't edit this file");
         }
         if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !allow_capture)
             || self.dirty_prompt.is_some()
@@ -1322,10 +1322,18 @@ impl TakViewerApp {
             || self.marker_job_running(slot)
             || self.marker_saving(slot)
         {
-            return Some("지금은 마커를 편집할 수 없어요.");
+            return Some(if legacy_notice {
+                "지금은 마커를 편집할 수 없어요."
+            } else {
+                "Can't edit markers now"
+            });
         }
         if view.analog_rx.is_some() || view.data.as_ref().is_some_and(|data| data.analog_pending) {
-            return Some("파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요.");
+            return Some(if legacy_notice {
+                "파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요."
+            } else {
+                "Wait for the take to load"
+            });
         }
         None
     }
@@ -1342,7 +1350,8 @@ impl TakViewerApp {
             MarkerCommand::Merge(_) => slot == self.active && self.merge_keys_capture(),
             _ => false,
         };
-        if let Some(reason) = self.marker_command_block(slot, allow_capture) {
+        let legacy_notice = !matches!(command, MarkerCommand::Label { .. } | MarkerCommand::Merge(_));
+        if let Some(reason) = self.marker_command_block(slot, allow_capture, legacy_notice) {
             self.takm_note = Some((reason.into(), now));
             return;
         }
@@ -1851,7 +1860,7 @@ impl TakViewerApp {
         ui.labeling.label_marker_reason = label_marker_source(view).err().or_else(|| {
             (busy || self.dirty_prompt.is_some() || self.hold.is_some() || self.comment_edit.is_some()
                 || view.edit_refresh.is_some() || view.loading.is_some() || data.analog_pending)
-                .then_some("지금은 마커를 편집할 수 없어요.")
+                .then_some("Can't edit markers now")
         });
         ui.labeling.blocked_reason = if self.dirty_prompt.is_some()
             || busy
@@ -2170,7 +2179,7 @@ impl TakViewerApp {
             marker.uid == source && marker.parent == Some(target.parent) && marker.slot == Some(target.slot)
                 && marker.present(view.pb.frame)
         })) {
-            self.takm_note = Some(("이미 이 라벨이에요.".into(), ctx.input(|i| i.time)));
+            self.takm_note = Some(("Already this label".into(), ctx.input(|i| i.time)));
             return;
         }
         let Ok(current_frame) = u32::try_from(view.pb.frame) else {

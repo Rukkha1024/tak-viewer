@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.60.1 — 2026-11-18
+
+- Use short English for new UI text from v0.50.0–v0.59.0. Covers label edits, Marker Info, camera and measurement controls, Tracks, graph tools, and playback range.
+
 ## v0.60.0 — 2026-11-18
 
 - **One-command check:** `--check <trusted file> [<file2> … up to 4] --out <dir> [--roles copy,agent,raw] [--frames <spec>|auto[:N]] [--views …] [--select A,B] [--top N] [--no-pictures]`. Per file: `--summary` facts + the normal headless capture set (same frames, views, selection for every file) under `<out>/<role>_<stem>/`; all facts in `<out>/check.json`; short Korean text on stdout. No window, no settings.

@@ -36,7 +36,7 @@ impl TakViewerApp {
     pub(super) fn camera_menu(&mut self, ui: &mut egui::Ui) {
         let view = self.view_mut();
         ui.add_enabled_ui(view.camera_ready(), |ui| {
-            ui.menu_button("보는 방향", |ui| {
+            ui.menu_button("View Direction", |ui| {
                 for preset in Preset::ALL {
                     if ui.selectable_label(view.cam.preset == preset, preset.label()).clicked() {
                         view.cam.preset = preset;

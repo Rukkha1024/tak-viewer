@@ -2848,7 +2848,7 @@ impl TakViewerApp {
                         (Pane::Selected, "선택 마커"),
                         (Pane::Devices, "Devices"),
                         (Pane::Comments, "Comments 목록"),
-                        (Pane::Graph, "Graph 패널 (마커 그래프, 3D 아래)"),
+                        (Pane::Graph, "Graph (Below 3D)"),
                     ] {
                         let mut on = dock::has(&self.dock, pane);
                         if ui.checkbox(&mut on, label).changed() {
@@ -2877,14 +2877,14 @@ impl TakViewerApp {
                     let s = &mut self.settings.scene;
                     ui.checkbox(&mut s.grid, "바닥 격자");
                     ui.checkbox(&mut s.axes, "원점 축");
-                    ui.checkbox(&mut s.names, "마커 이름 표시 (L)");
+                    ui.checkbox(&mut s.names, "Marker Names (L)");
                     ui.checkbox(&mut s.unlabeled, "Unlabeled 마커");
                     ui.checkbox(&mut s.sticks, "Marker Sticks (마커 사이 선)");
                     ui.add_enabled_ui(s.sticks, |ui| ui.checkbox(&mut s.standard_sticks, "  파일에 선이 없으면 표준 선 표시"));
                     ui.checkbox(&mut s.plates, "Force plate");
                     ui.checkbox(&mut s.asset_names, "Asset 이름표");
                     ui.checkbox(&mut s.history, "선택 마커 지나온 길 (250 프레임)");
-                    ui.checkbox(&mut s.measurements, "마커 거리·각도");
+                    ui.checkbox(&mut s.measurements, "Distance / Angle");
                     ui.checkbox(&mut s.marker_colors, "마커 색 (끄면 흰색)");
                     ui.add_enabled(false, egui::Checkbox::new(&mut s.bones, "스켈레톤 뼈 (준비 중)"));
                     ui.separator();
@@ -4076,8 +4076,8 @@ impl TakViewerApp {
             egui::Window::new("조작키").open(&mut open).collapsible(false).show(ctx, |ui| {
                 egui::Grid::new("help").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
                     for (k, v) in [
-                        ("왼쪽 클릭 / Ctrl+클릭 / Shift+클릭", "마커 선택 / 선택 켜고 끄기 / 선택에 더하기"),
-                        ("3D 화면에서 Ctrl+A", "지금 보이는 마커 모두 선택"),
+                        ("Click / Ctrl+click / Shift+click", "Select / toggle / add marker"),
+                        ("Ctrl+A in 3D", "Select visible markers"),
                         ("왼쪽 드래그", "네모 안 마커 모두 선택 (Ctrl = 기존 선택에 더하기)"),
                         ("3D의 forceplate 클릭", "그 판의 그래프(처음은 Fx · Fy · Fz)를 3D 위에 띄우기 · 다시 누르면 닫기 (마커 선택은 그대로, Devices 패널의 \"3D\"도 같아요)"),
                         ("오른쪽 드래그", "가운데 점을 중심으로 회전"),
@@ -4120,8 +4120,8 @@ impl TakViewerApp {
                         ("저장 폴더 연필 / 오른쪽 클릭", "이름 바꾸기 (보이는 이름만, 폴더는 그대로). Enter = 저장, Esc = 취소"),
                         ("Ctrl+L", "경로로 열기 (WSL 경로 /home/…, /mnt/c/… 가능)"),
                         ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),
-                        ("G", "고른 3D 화면에서 선택 마커 따라가기 켜기 / 끄기"),
-                        ("L", "3D 마커 이름 켜기 / 끄기 (가리킨 마커 이름은 표시)"),
+                        ("G", "Toggle Follow Selected in 3D"),
+                        ("L", "Toggle marker names in 3D (hover still shows names)"),
                         ("Ctrl+Shift+S", "화면 캡처 저장 (지금 각도 + 위·옆·앞, repo 안)"),
                     ] {
                         ui.label(RichText::new(k).strong());
