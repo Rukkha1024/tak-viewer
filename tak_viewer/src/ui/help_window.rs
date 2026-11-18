@@ -5,7 +5,7 @@ use super::theme;
 const DEFAULT_BODY: [f32; 2] = [610.0, 540.0];
 const KEY_WIDTH: f32 = 154.0;
 const COLUMN_GAP: f32 = 12.0;
-const OVERLAY_INPUT: &str = "Explorer 파일 오른쪽 클릭 → 이 화면에 얹기";
+const OVERLAY_INPUT: &str = "Right-click a file in EXPLORER";
 
 pub(crate) fn show(ctx: &egui::Context, open: &mut bool, workspace: Rect) -> Option<egui::Response> {
     let bounds = workspace.shrink(8.0);
@@ -17,7 +17,7 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool, workspace: Rect) -> Opt
     let max_body = (bounds.size() - chrome).max(egui::Vec2::ZERO);
     let body = egui::Vec2::from(DEFAULT_BODY).min(max_body);
 
-    egui::Window::new("조작키")
+    egui::Window::new("Controls")
         .open(open)
         .collapsible(false)
         .default_pos(bounds.center() - 0.5 * (body + chrome))
@@ -51,7 +51,10 @@ fn draw_sections(ui: &mut egui::Ui) {
         ui.add_space(3.0);
         for &(input, action) in *rows {
             let description = if input == OVERLAY_INPUT {
-                RichText::new(format!("{action} 서로 다른 파일은 전체에서 {}개까지", crate::MAX_OPEN_FILES))
+                RichText::new(format!(
+                    "{action} Up to {} different files across all tabs.",
+                    crate::MAX_OPEN_FILES
+                ))
             } else {
                 RichText::new(action)
             };
@@ -73,88 +76,88 @@ fn draw_sections(ui: &mut egui::Ui) {
 type Rows = &'static [(&'static str, &'static str)];
 
 const SECTIONS: &[(&str, Rows)] = &[
-    ("3D 화면", &[
-        ("왼쪽 클릭 / Ctrl+클릭 / Shift+클릭", "마커 선택 / 선택 켜고 끄기 / 선택에 더하기"),
-        ("Alt+클릭", "라벨을 붙이지 않고 마커 하나 보기"),
-        ("Ctrl+A", "마지막으로 누른 3D 화면에서 지금 보이는 마커 모두 선택"),
-        ("왼쪽 드래그 / Ctrl+드래그", "네모 안 마커 선택 / 기존 선택에 더하기"),
-        ("오른쪽 드래그", "가운데 점을 중심으로 회전"),
-        ("가운데 버튼 드래그 / 휠", "화면 이동 / 확대·축소"),
-        ("더블클릭 또는 F / Shift+F", "선택 마커에 맞추기 / 전체 보기"),
-        ("G / 보기 → Follow Selected (G)", "선택한 마커 따라가기 켜고 끄기"),
-        ("L / 보기 → Marker Names (L)", "마커 이름 켜고 끄기. 꺼도 가리킨 마커의 이름은 보여요"),
-        ("보기 → View Direction", "Perspective / Front / Back / Left / Right / Top / Bottom 중 고르기"),
-        ("보기 → Distance / Angle", "두 점의 거리 또는 세 점의 각도 켜고 끄기. 각도 꼭짓점은 두 번째로 골라요"),
-        ("3D 마커 오른쪽 클릭", "Marker Info에서 좌표 보기. Label Marker / Unlabel Marker(s) / Remove Marker로 편집"),
-        ("힘판 클릭 / Devices의 3D", "힘판 그래프 열기 / 다시 누르면 닫기"),
+    ("3D View", &[
+        ("Left click / Ctrl+click / Shift+click", "Pick one marker / add or remove it / add it to your picks."),
+        ("Alt+click", "Look at one marker without adding a label."),
+        ("Ctrl+A", "Pick all markers you can see in the last 3D view you clicked."),
+        ("Left drag / Ctrl+drag", "Pick markers in a box / add them to your picks."),
+        ("Right drag", "Turn the view around its center."),
+        ("Middle drag / Wheel", "Move the view / zoom in or out."),
+        ("Double-click or F / Shift+F", "Fit the view to your picks / fit all markers."),
+        ("G / Follow Selected (G)", "Turn marker tracking on or off."),
+        ("L / Marker Names (L)", "Show or hide names. Point at a marker to see its name at any time."),
+        ("View Direction", "Pick Perspective, Front, Back, Left, Right, Top, or Bottom."),
+        ("Distance / Angle", "Show or hide distance between two points or angle between three. Pick the corner point second."),
+        ("Right-click a 3D marker", "See its position in Marker Info. Edit with Label Marker, Unlabel Marker(s), or Remove Marker."),
+        ("Click a force plate / 3D in Devices", "Open the plate graph. Click again to close it."),
     ]),
-    ("재생과 프레임", &[
-        ("Space / Reverse", "재생·정지 / 재생 방향 바꾸기"),
-        ("→ / ← / ↑ / ↓", "다음·이전 1 프레임 / 다음·이전 10 프레임"),
-        ("Home / End", "첫 프레임 / 마지막 프레임"),
-        ("재생 막대 위 칸 클릭·드래그", "그 프레임으로 이동"),
-        ("재생 막대 아래 띠 드래그·클릭", "노란 편집 구간 잡기 / 빈 곳을 눌러 구간 풀기"),
-        ("[ 또는 V / ] 또는 B", "지금 프레임을 편집 구간의 시작 / 끝으로"),
-        ("Shift+B / Shift+V", "편집 구간 풀기 / 전체 파일을 편집 구간으로"),
-        ("초록 손잡이 / Working Range", "손잡이를 끌거나 Start·End 숫자를 바꿔 재생 구간 정하기"),
-        ("Shift+[ / Shift+] / Reset", "재생 구간을 전체 파일로 되돌리기"),
-        ("Z / Shift+Z", "선택 마커의 다음 빈 구간 시작 / 이전 빈 구간 끝으로"),
+    ("Play and Move", &[
+        ("Space / Reverse", "Play or stop / change play direction."),
+        ("→ / ← / ↑ / ↓", "Forward 1 / back 1 / forward 10 / back 10 frames."),
+        ("Home / End", "Go to the first / last frame."),
+        ("Click or drag on the time ruler", "Go to that frame."),
+        ("Drag or click the bar below the ruler", "Drag to pick a yellow edit range. Click an empty spot to clear it."),
+        ("[ or V / ] or B", "Set the edit range start / end to this frame."),
+        ("Shift+B / Shift+V", "Clear the edit range / select the whole file."),
+        ("Green handles / Working Range", "Drag the handles or change Start and End to set where to play."),
+        ("Shift+[ / Shift+] / Reset", "Set the play range back to the whole file."),
+        ("Z / Shift+Z", "Go to the start of the next gap / end of the previous gap for your picks."),
     ]),
-    ("탭과 파일", &[
-        ("Ctrl+O / Ctrl+Shift+O / Ctrl+L", "파일 열기 / 폴더 추가 / 경로로 열기"),
-        ("Ctrl+T / Ctrl+Shift+T", "빈 탭 만들기 / 마지막으로 닫은 화면 또는 탭 다시 열기"),
-        ("Ctrl+Tab / Ctrl+PageDown", "다음 탭"),
-        ("Ctrl+Shift+Tab / Ctrl+PageUp", "이전 탭"),
-        ("위쪽 탭 줄에서 휠", "아래로 굴리면 뒤쪽 탭, 위로 굴리면 앞쪽 탭이 보여요. Shift와 휠 또는 가로 스크롤도 돼요"),
-        ("F2", "현재 탭 이름 바꾸기. Enter로 확정, Esc로 취소"),
-        ("Ctrl+W", "선택한 3D 화면 닫기. 마지막 화면이면 탭 닫기"),
-        ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),
-        ("Explorer 클릭 / Ctrl+클릭", "지금 화면에 열기 / 옆 화면에 열기 (3D 화면 최대 4개, 2×2까지)"),
-        (OVERLAY_INPUT, "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 메뉴 또는 이름표 2의 ×로 제거."),
-        ("1 / 2 또는 이름표", "처음 파일 / 얹은 파일의 마커 숨기기·다시 보이기"),
-        ("3D 화면 클릭 / 화면 탭 닫기", "키와 패널이 따를 화면 고르기 / 그 화면 닫기"),
-        ("저장 폴더 연필 / 오른쪽 클릭", "Explorer에서 폴더에 보이는 이름 바꾸기"),
+    ("Tabs and Files", &[
+        ("Ctrl+O / Ctrl+Shift+O / Ctrl+L", "Open a file / add a folder / open by path."),
+        ("Ctrl+T / Ctrl+Shift+T", "Open an empty tab / reopen the last closed view or tab."),
+        ("Ctrl+Tab / Ctrl+PageDown", "Go to the next tab."),
+        ("Ctrl+Shift+Tab / Ctrl+PageUp", "Go to the previous tab."),
+        ("Wheel over the top tab bar", "Scroll down for later tabs or up for earlier tabs. Shift+wheel and sideways scrolling work too."),
+        ("F2", "Rename this tab. Enter saves. Esc cancels."),
+        ("Ctrl+W", "Close this 3D view. If it is the last view, close the tab."),
+        ("PageDown / PageUp", "Open the next / previous file in this folder."),
+        ("Click a file in EXPLORER / Ctrl+click", "Open here / open beside this view. Up to four 3D views per tab in a 2×2 grid."),
+        (OVERLAY_INPUT, "Choose to show the file as white rings in this view. Both files need the same frame count and rate. Use the menu or × on tag 2 to remove it."),
+        ("1 / 2 or file tags", "Hide or show markers from the first / second file."),
+        ("Click a 3D view / Click × on its tab", "Make it the active view for keys and panels / close that view."),
+        ("Pencil or right-click on a saved folder", "Change the name shown in EXPLORER."),
     ]),
-    ("그래프", &[
-        ("Channels / Tracks / Combined", "좌표별 선 / 마커별 기록 띠 / 세 좌표를 한 칸에 보기"),
-        ("그래프 클릭 / 왼쪽 드래그", "프레임 이동 / 노란 편집 구간 선택"),
-        ("그래프 휠 / 가운데 버튼 드래그", "시간 축 확대·축소 / 이동. Tracks는 시간 눈금 위에서 조작"),
-        ("Tracks 행 위에서 휠", "마커 목록 스크롤"),
-        ("Tracks 행의 이름 오른쪽에서 왼쪽 드래그", "가로로 끌어 노란 편집 구간 선택. 고른 마커와 현재 프레임은 그대로"),
-        ("그래프 오른쪽 드래그 / Auto Extents", "누른 칸의 값 축 확대·축소 / 값 축을 처음 크기로"),
-        ("그래프에서 F / Shift+F", "그래프를 누른 뒤 편집 구간 / 전체 파일에 맞추기"),
-        ("Zoom Fit / Lock Selection", "편집 구간에 맞추기 / Channels·Combined에 표시할 마커 고정·풀기"),
-        ("Merge Keys Up / Merge Keys Down", "Tracks의 두 행에서 아래 / 위 행의 점을 다른 행으로 옮기기. 같은 프레임에 점이 겹치면 중단"),
-        ("3D 위 그래프 이름표·모서리 끌기", "이름표로 이동, 모서리로 크기 조절. 이름표 두 번 누르면 접기·펴기"),
-        ("3D 위 그래프 안 클릭·드래그 / 휠", "프레임 이동 / 시간 축 확대·축소"),
-        ("3D 위 그래프에 마우스 올리기", "접기·펴기, 마커 그래프를 Graph (Below 3D)로 보내기, 힘판 그래프의 줄 선택·닫기"),
+    ("Graphs", &[
+        ("Channels / Tracks / Combined", "Separate lines for X, Y, Z / a bar per marker / all three lines in one graph."),
+        ("Graph click / Left drag", "Go to a frame / pick a yellow edit range."),
+        ("Graph wheel / Middle drag", "Zoom / move along time. In Tracks, do this on the time ruler."),
+        ("Wheel over Tracks rows", "Scroll the marker list."),
+        ("Left drag to the right of a Tracks name", "Drag sideways to pick a yellow edit range. Keep your picks and frame."),
+        ("Graph right drag / Auto Extents", "Zoom the values where you drag / reset the value scale."),
+        ("F / Shift+F in a graph", "Click the graph first. Fit the edit range / the whole file."),
+        ("Zoom Fit / Lock Selection", "Fit the edit range / hold or free the marker picks in Channels and Combined."),
+        ("Merge Keys Up / Merge Keys Down", "Move points from the lower / upper Tracks row to the other row. The move stops if both have a point on the same frame."),
+        ("Drag a graph tag or corner in 3D", "Drag the tag to move it or a corner to resize it. Double-click the tag to fold or open it."),
+        ("3D graph click or drag / Wheel", "Go to a frame / zoom time."),
+        ("Point at a graph in 3D", "Fold or open it. Send marker graphs to Graph (Below 3D). Pick lines or close a plate graph."),
     ]),
-    ("마커 편집", &[
-        ("목록에서 Ctrl+클릭 / Shift+클릭 / Ctrl+A", "선택 켜고 끄기 / 사이 행 선택 / 모두 선택"),
-        ("Tracks에서 Ctrl+Shift+클릭", "기존 선택에 사이 행을 더하기"),
-        ("D / Q", "QuickLabel Mode와 Select Mode 전환 / Select Mode로 바꾸기"),
-        ("S / A", "다음 / 이전 라벨"),
-        ("Shift+D", "선택 마커의 라벨 떼기"),
-        ("Delete", "마지막으로 누른 곳에 따라 마커 점·Comment 지우기 또는 열린 파일 닫기"),
-        ("C / Shift+C", "Cubic / Pattern Based로 빈 구간 채우기"),
-        ("X / Shift+X / Ctrl+Alt+X", "선택 마커의 구간 / 모든 마커의 구간 / 모든 마커의 전체 움직임을 부드럽게"),
-        ("Ctrl+S", "현재 편집 저장"),
+    ("Edit Markers", &[
+        ("List Ctrl+click / Shift+click / Ctrl+A", "Add or drop a row / pick rows in between / pick all."),
+        ("Ctrl+Shift+click in Tracks", "Add the rows in between to your picks."),
+        ("D / Q", "Switch between QuickLabel Mode and Select Mode / go to Select Mode."),
+        ("S / A", "Go to the next / previous label."),
+        ("Shift+D", "Remove labels from the markers you picked."),
+        ("Delete", "Delete points or Comments, or close files. It depends on where you last clicked."),
+        ("C / Shift+C", "Fill gaps using Cubic / Pattern Based."),
+        ("X / Shift+X / Ctrl+Alt+X", "Smooth your picks in the range / all markers in the range / all markers in the file."),
+        ("Ctrl+S", "Save your edits."),
     ]),
     ("Comment", &[
-        ("M 짧게 / Comment 버튼", "고른 구간이나 현재 프레임에 Comment 만들기"),
-        ("M 누르고 있기", "프레임을 움직이다 놓으면 그동안 지난 구간에 Comment 만들기"),
-        ("유형 버튼 / T", "만든 직후 유형 고르기 / 선택한 Comment의 유형 차례로 바꾸기"),
-        ("재생 막대의 주황 칸 클릭 / 오른쪽 클릭", "Comment 첫 프레임으로 이동 / Comment 지우기"),
-        ("COMMENTS 행 클릭 / # 두 번 클릭", "Comment와 마커 선택 / 첫 프레임으로 이동"),
-        ("COMMENTS 칸 두 번 클릭 / Enter", "프레임·마커·글 고치기 / 저장. Type은 눌러서 고르기"),
-        ("Comment 저장 위치", "Comment는 .takm 파일 안에 저장해요."),
+        ("Tap M / Comment button", "Add a Comment to the picked range or this frame."),
+        ("Hold M", "Move through frames while you hold it. Let go to add a Comment to that range."),
+        ("Type button / T", "Pick a type after adding a Comment / go to the next type for the picked Comment."),
+        ("Click / right-click an orange block", "Go to the first frame of the Comment / delete it."),
+        ("Click a COMMENTS row / Double-click #", "Pick the Comment and markers / go to its first frame."),
+        ("Double-click a COMMENTS cell / Enter", "Edit frames, markers, or text / save. Click Type to pick a type."),
+        ("Where Comments are saved", "Comments are saved in the .takm file."),
     ]),
-    ("그 밖", &[
-        ("Esc", "진행 중인 입력·편집 먼저 취소. 그다음 선택이나 편집 구간 풀기"),
-        ("Ctrl+Z 또는 Ctrl+Alt+Z / Ctrl+Y", "되돌리기 / 다시 하기"),
-        ("Ctrl+B / Ctrl+J / Ctrl+Alt+B", "왼쪽 / 아래 / 오른쪽 패널 켜고 끄기"),
-        ("패널 제목 끌기", "패널 옮기기, 탭으로 합치기, 떠 있는 창으로 떼기"),
-        ("Ctrl+Shift+S", "지금 각도와 위·옆·앞의 화면 캡처 저장"),
+    ("Other Controls", &[
+        ("Esc", "Cancel what you are doing first. Then clear your picks or edit range."),
+        ("Ctrl+Z or Ctrl+Alt+Z / Ctrl+Y", "Undo / redo."),
+        ("Ctrl+B / Ctrl+J / Ctrl+Alt+B", "Show or hide the left / bottom / right panels."),
+        ("Drag a panel title", "Move a panel, group it with tabs, or pull it into its own window."),
+        ("Ctrl+Shift+S", "Save pictures from this angle and from the top, side, and front."),
     ]),
 ];
 

@@ -57,13 +57,25 @@ fn help_keys_match_readme_and_rows_are_unique() {
     for (_, rows) in SECTIONS {
         for &(input, _) in *rows {
             assert!(input_rows.insert(input), "duplicate help row: {input}");
-            let input = input.replace("클릭", "click").replace("드래그", "drag");
-            for key in tokens(&input).filter(|key| is_key(key)) {
+            for key in tokens(input).filter(|key| is_key(key)) {
                 assert!(
                     documented.contains(key),
                     "undocumented input {key} in {input}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn help_section_copy_uses_english_and_input_symbols() {
+    for (heading, rows) in SECTIONS {
+        let texts = std::iter::once(*heading).chain(rows.iter().flat_map(|&(input, action)| [input, action]));
+        for text in texts {
+            assert!(
+                text.chars().all(|c| c.is_ascii() || "→←↑↓×".contains(c)),
+                "unexpected character in help text: {text}"
+            );
         }
     }
 }
@@ -137,7 +149,7 @@ fn wheel_reaches_last_help_row_and_keeps_title_visible() {
     draw(&ctx, scroll);
     let (after_rect, after) = draw(&ctx, input(size));
     assert_eq!(rect, after_rect);
-    assert!(visible_text(&after.shapes, "조작키"));
+    assert!(visible_text(&after.shapes, "Controls"));
     assert!(visible_text(&after.shapes, last_row));
 }
 

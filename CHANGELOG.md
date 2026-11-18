@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.62.2 — 2026-11-18
+
+- Call the help window `Controls`. Use short English for headings, shortcuts, and tips. Open it from `도움말 → 조작키`.
+
 ## v0.62.0 — 2026-11-18
 
 - Raise the viewer-wide limit from 12 to 30 distinct sources across tabs. Count overlays and pending reads. Repeated views share one source count.

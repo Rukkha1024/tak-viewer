@@ -46,7 +46,7 @@ Windows의 EXPLORER에서 SSH 연결을 설정해 서버 파일을 읽을 수 �
 
 ## Controls
 
-`도움말 → 조작키` shows grouped shortcuts. Move or resize the window. Scroll its body for more.
+`도움말 → 조작키` opens `Controls`, with grouped shortcuts in short English. Move or resize the window. Scroll its body for more.
 
 Exact modifiers required; focused text/popup/edit/held-M/capture priority → input rules.
 
