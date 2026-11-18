@@ -54,6 +54,13 @@ pub struct LabelsState {
     pub filter: String,
     pub collapsed: HashSet<usize>,
     pub scroll_to: Option<usize>,
+    pub linked_pick: LinkedLabelPick,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkedLabelPick {
+    pub asset: Option<tak_core::tak::Uid>,
+    pub track: Option<tak_core::tak::Uid>,
 }
 
 /// The two marker lists share selected tracks, but each owns its range anchor.
@@ -220,6 +227,7 @@ impl LabelsState {
         self.collapsed.clear();
         self.filter.clear();
         self.scroll_to = None;
+        self.linked_pick = LinkedLabelPick::default();
         self.list_selection = Default::default();
         for (gi, g) in data.groups.iter().enumerate() {
             if g.kind == GroupKind::Unlabeled {

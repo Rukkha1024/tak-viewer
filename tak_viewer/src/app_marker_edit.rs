@@ -1,5 +1,6 @@
 //! Viewer-side state and dispatch for the two marker-editing panels.
 use super::*;
+use crate::label_increment::IncrementMode;
 use crate::ui::edit_tools::{self, EditToolsAction, EditToolsState, TrackChoice};
 use crate::ui::labeling::{
     self, AssetChoice, LabelGroup, LabelRow, LabelingAction, LabelingMode, LabelingState,
@@ -76,7 +77,6 @@ impl MarkerUi {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum PanelSetting {
     Mode(LabelingMode),
-    Increment(bool),
     Backward(bool),
     Forward(bool),
     Asset(Option<Uid>),
@@ -378,10 +378,28 @@ fn visible_labels(state: &LabelingState) -> Vec<LabelKey> {
     labeling::visible_labels(state)
 }
 
-fn increment_order(state: &LabelingState, target: LabelKey) -> Vec<LabelKey> {
+fn increment_order(state: &LabelingState, target: LabelKey, moving_at_frame: Option<Uid>) -> Vec<LabelKey> {
+    if state.increment == IncrementMode::Stay { return Vec::new(); }
     let mut order = visible_labels(state);
     if !order.contains(&target) { order.insert(0, target); }
+    if state.increment == IncrementMode::NextMissing {
+        let present: HashSet<_> = state.groups.iter().flat_map(|group| &group.labels)
+            .filter(|row| row.present && row.track_uid != moving_at_frame)
+            .filter_map(|row| row.key).collect();
+        order.retain(|key| *key == target || !present.contains(key));
+    }
     order
+}
+
+fn label_marker_source(view: &View) -> Result<Uid, &'static str> {
+    if view.selected.len() != 1 {
+        return Err("3D에서 점을 하나만 선택해 주세요.");
+    }
+    view.data.as_ref()
+        .and_then(|data| data.markers.get(*view.selected.first()?))
+        .filter(|marker| (view.shown[0] || view.overlay.is_none()) && marker.present(view.pb.frame))
+        .map(|marker| marker.uid)
+        .ok_or("현재 프레임의 3D 화면에서 점을 선택해 주세요.")
 }
 
 impl TakViewerApp {
@@ -446,7 +464,6 @@ impl TakViewerApp {
         let ui = &self.marker_ui[slot];
         match value {
             PanelSetting::Mode(_) => PanelSetting::Mode(ui.labeling.mode),
-            PanelSetting::Increment(_) => PanelSetting::Increment(ui.labeling.increment),
             PanelSetting::Backward(_) => PanelSetting::Backward(ui.labeling.backward),
             PanelSetting::Forward(_) => PanelSetting::Forward(ui.labeling.forward),
             PanelSetting::Asset(_) => PanelSetting::Asset(ui.labeling.asset_filter),
@@ -465,7 +482,6 @@ impl TakViewerApp {
         let ui = &mut self.marker_ui[slot];
         match value {
             PanelSetting::Mode(v) => ui.labeling.mode = *v,
-            PanelSetting::Increment(v) => ui.labeling.increment = *v,
             PanelSetting::Backward(v) => ui.labeling.backward = *v,
             PanelSetting::Forward(v) => ui.labeling.forward = *v,
             PanelSetting::Asset(v) => ui.labeling.asset_filter = *v,
@@ -1790,12 +1806,20 @@ impl TakViewerApp {
             });
         }
         ui.labeling.view_slot = slot;
+        ui.labeling.increment = self.settings.labeling_increment;
+        ui.labeling.link_to_3d = self.settings.labeling_link;
+        ui.labeling.linked_pick = view.labels.linked_pick;
         ui.labeling.assets = assets;
         ui.labeling.filter = view.labels.filter.clone();
         ui.labeling.groups = groups;
         ui.labeling.unlabeled = unlabeled;
         ui.labeling.armed = view.armed_label;
         ui.labeling.selected_labeled_count = selected_labeled_count;
+        ui.labeling.label_marker_reason = label_marker_source(view).err().or_else(|| {
+            (busy || self.dirty_prompt.is_some() || self.hold.is_some() || self.comment_edit.is_some()
+                || view.edit_refresh.is_some() || view.loading.is_some() || data.analog_pending)
+                .then_some("지금은 마커를 편집할 수 없어요.")
+        });
         ui.labeling.blocked_reason = if self.dirty_prompt.is_some()
             || busy
             || view.edit_refresh.is_some()
@@ -1880,6 +1904,34 @@ impl TakViewerApp {
 
     pub(super) fn labeling_action(&mut self, ctx: &egui::Context, slot: usize, action: LabelingAction) {
         match &action {
+            LabelingAction::SetIncrement(mode) => {
+                self.observe(true);
+                self.settings.labeling_increment = *mode;
+                self.observe(true);
+                return;
+            }
+            LabelingAction::SetLinkTo3d(link) => {
+                self.observe(true);
+                self.settings.labeling_link = *link;
+                self.observe(true);
+                return;
+            }
+            LabelingAction::LabelMarker(target) => {
+                match label_marker_source(&self.views[slot]) {
+                    Ok(source) => self.assign_label_to_point(ctx, slot, source, *target),
+                    Err(reason) => self.takm_note = Some((reason.into(), ctx.input(|i| i.time))),
+                }
+                return;
+            }
+            LabelingAction::EditContextTrack { uid, unlabel } => {
+                let view = &mut self.views[slot];
+                if let Some(index) = view.data.as_ref().and_then(|data| data.markers.iter().position(|m| m.uid == *uid)) {
+                    view.select(index, false);
+                    if *unlabel { self.unlabel_selected(ctx, slot); }
+                    else { self.delete_selected(ctx, slot); }
+                }
+                return;
+            }
             LabelingAction::SelectTracks { list, uid, gesture } => {
                 self.select_labeling_tracks(slot, *list, *uid, *gesture);
                 return;
@@ -1919,7 +1971,6 @@ impl TakViewerApp {
         }
         let setting = match &action {
             LabelingAction::SetMode(v) => Some(PanelSetting::Mode(*v)),
-            LabelingAction::SetIncrement(v) => Some(PanelSetting::Increment(*v)),
             LabelingAction::SetBackward(v) if *v || self.marker_ui[slot].labeling.forward => {
                 Some(PanelSetting::Backward(*v))
             }
@@ -1927,6 +1978,7 @@ impl TakViewerApp {
                 Some(PanelSetting::Forward(*v))
             }
             LabelingAction::SetBackward(_) | LabelingAction::SetForward(_) => return,
+            LabelingAction::SetAssetFilter(_) if self.settings.labeling_link => return,
             LabelingAction::SetAssetFilter(v) => Some(PanelSetting::Asset(*v)),
             _ => None,
         };
@@ -1939,6 +1991,9 @@ impl TakViewerApp {
         match action {
             LabelingAction::SetMode(_)
             | LabelingAction::SetIncrement(_)
+            | LabelingAction::SetLinkTo3d(_)
+            | LabelingAction::LabelMarker(_)
+            | LabelingAction::EditContextTrack { .. }
             | LabelingAction::SetBackward(_)
             | LabelingAction::SetForward(_)
             | LabelingAction::SetAssetFilter(_) => unreachable!(),
@@ -2088,17 +2143,17 @@ impl TakViewerApp {
         let Ok(current_frame) = u32::try_from(view.pb.frame) else {
             return;
         };
+        let range = self.marker_ui[slot].tools.range;
+        let moving_at_frame = range.is_none_or(|(first, last)| (first..=last).contains(&current_frame)).then_some(source);
         let request = LabelRequest {
             source,
             target,
             current_frame,
-            scope: LabelScope::SelectedOrAll {
-                range: self.marker_ui[slot].tools.range,
-            },
+            scope: LabelScope::SelectedOrAll { range },
             backward: ui.backward,
             forward: ui.forward,
-            increment: ui.increment && !keep_armed,
-            visible_labels: if keep_armed { Vec::new() } else { increment_order(ui, target) },
+            increment: ui.increment != IncrementMode::Stay && !keep_armed,
+            visible_labels: if keep_armed { Vec::new() } else { increment_order(ui, target, moving_at_frame) },
             selection: view.edit_selection_state(),
         };
         self.start_marker_command(ctx, slot, MarkerCommand::Label { request, keep_armed });
@@ -2225,11 +2280,15 @@ impl TakViewerApp {
 }
 
 #[cfg(test)]
+#[path = "app_labeling_additions_tests.rs"]
+mod labeling_additions_tests;
+
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn step(ctx: &egui::Context, app: &mut TakViewerApp, elapsed: f64) {
+    pub(super) fn step(ctx: &egui::Context, app: &mut TakViewerApp, elapsed: f64) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -2242,7 +2301,7 @@ mod integration_tests {
         let _ = ctx.run(input, |ctx| app.frame(ctx));
     }
 
-    fn wait_for(
+    pub(super) fn wait_for(
         ctx: &egui::Context,
         app: &mut TakViewerApp,
         predicate: impl Fn(&TakViewerApp) -> bool,
@@ -2259,7 +2318,7 @@ mod integration_tests {
         }
     }
 
-    fn settled(app: &TakViewerApp) -> bool {
+    pub(super) fn settled(app: &TakViewerApp) -> bool {
         app.marker_ui[0].job.is_none() && app.views[0].edit_refresh.is_none()
     }
 
@@ -3099,10 +3158,10 @@ mod integration_tests {
         let ui = &mut app.marker_ui[0].labeling;
         ui.asset_filter = None;
         ui.filter = "B".into();
-        assert_eq!(increment_order(ui, hidden), [hidden, keys[1]]);
-        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden), hidden).unwrap(), Some(keys[1]));
+        assert_eq!(increment_order(ui, hidden, None), [hidden, keys[1]]);
+        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden, None), hidden).unwrap(), Some(keys[1]));
         ui.filter = "no match".into();
-        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden), hidden).unwrap(), None);
+        assert_eq!(tak_core::edit::label::next_label_in_order(&increment_order(ui, hidden, None), hidden).unwrap(), None);
     }
 
     #[test]
@@ -3218,7 +3277,6 @@ mod integration_tests {
         app.observe(false);
         let changes = [
             PanelSetting::Mode(LabelingMode::Select),
-            PanelSetting::Increment(false),
             PanelSetting::Backward(false),
             PanelSetting::Forward(false),
             PanelSetting::Asset(Some([3; 16])),

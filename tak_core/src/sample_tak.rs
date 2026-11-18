@@ -268,6 +268,11 @@ pub fn sample_tak_for_label_assignments() -> Vec<u8> {
 /// Deterministic synthetic recording with a force plate and an embedded skeleton.
 /// This is fabricated test data, not a captured Motive compatibility reference.
 pub fn sample_tak_with_devices() -> Vec<u8> {
+    sample_tak_with_unlabeled_frames(50..60)
+}
+
+/// The device fixture with the unnamed track sampled in a caller-selected range.
+pub fn sample_tak_with_unlabeled_frames(frames: std::ops::Range<u32>) -> Vec<u8> {
     let text = |out: &mut Vec<u8>, value: &str| {
         out.extend((value.encode_utf16().count() as u16).to_le_bytes());
         out.extend(utf16(value));
@@ -357,7 +362,7 @@ pub fn sample_tak_with_devices() -> Vec<u8> {
     recs.extend([
         translation(1, 0..300),
         translation(2, (0..300).filter(|f| !(100..140).contains(f))),
-        translation(3, 50..60),
+        translation(3, frames),
     ]);
     let mut channels = CHANNELS_HEADER.to_vec();
     channels.extend((recs.len() as u32).to_le_bytes());

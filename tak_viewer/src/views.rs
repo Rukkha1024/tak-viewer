@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tak_core::comments::{self, Comments};
 use tak_core::geom::{v3, Vec3};
 use tak_core::playback::Playback;
+use tak_core::tak::MarkerKind;
 use tak_core::view_data::{AnalogPart, ViewData};
 use tak_core::edit::{DocumentId, DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
 
@@ -181,6 +182,7 @@ pub struct Selection {
     pub comments: crate::comment_selection::CommentSelection,
     pub list_anchors: [panels::ListSelectionState; 2],
     pub armed_label: Option<LabelKey>,
+    pub linked_pick: panels::LinkedLabelPick,
 }
 
 /// A frame range of a view's band strip (`View::range`).
@@ -427,6 +429,7 @@ pub struct View {
     pub restore_picked: Option<Option<u64>>,
     pub restore_comment_selection: Option<crate::comment_selection::CommentSelection>,
     pub restore_list_anchors: Option<[panels::ListSelectionState; 2]>,
+    pub restore_linked_pick: Option<panels::LinkedLabelPick>,
     /// Latest desired marker revision; older worker results must not be published.
     pub edit_refresh: Option<Revision>,
     pub edit_selection: Option<EditSelection>,
@@ -549,6 +552,7 @@ impl Default for View {
             restore_picked: None,
             restore_comment_selection: None,
             restore_list_anchors: None,
+            restore_linked_pick: None,
             edit_refresh: None,
             edit_selection: None,
             armed_label: None,
@@ -1240,6 +1244,7 @@ impl View {
         self.restore_picked = None;
         self.restore_comment_selection = None;
         self.restore_list_anchors = None;
+        self.restore_linked_pick = None;
         let (tx, rx) = channel();
         let (comments_tx, comments_rx) = channel();
         let (lazy_tx, lazy_rx) = channel();
@@ -1354,6 +1359,7 @@ impl View {
         self.restore_picked = None;
         self.restore_comment_selection = None;
         self.restore_list_anchors = None;
+        self.restore_linked_pick = None;
         self.remote_loading = None;
         drop_later(self.loading.take());
         drop_later(self.analog_rx.take());
@@ -1454,6 +1460,7 @@ impl View {
         drop_later(Some(std::mem::take(&mut self.plate_lanes)));
         self.labels.reset(&data, file_id);
         if let Some(anchors) = self.restore_list_anchors.take() { self.labels.list_selection = anchors; }
+        if let Some(pick) = self.restore_linked_pick.take() { self.labels.linked_pick = pick; }
         let old = self.data.replace(data);
         match self.restore.take() {
             Some(spot) => self.apply_spot(&spot, now),
@@ -1878,6 +1885,7 @@ impl View {
             return;
         }
         let filter = self.labels.filter.clone();
+        let linked_pick = self.labels.linked_pick;
         let folds = self.data.as_ref().map(|old| panels::fold_keys(old, &self.labels.collapsed)).unwrap_or_default();
         let old_groups: std::collections::HashSet<_> = self.data.as_ref().map(|old| (0..old.groups.len())
             .map(|i| panels::FoldKey::group(old, i)).collect()).unwrap_or_default();
@@ -1887,6 +1895,7 @@ impl View {
         self.labels.reset(&data, self.file_id);
         self.labels.list_selection = anchors;
         self.labels.filter = filter;
+        self.labels.linked_pick = linked_pick;
         let new_defaults: Vec<_> = self.labels.collapsed.iter().copied()
             .filter(|&i| !old_groups.contains(&panels::FoldKey::group(&data, i))).collect();
         self.labels.collapsed = panels::fold_indices(&data, &folds);
@@ -1979,6 +1988,22 @@ impl View {
         }
     }
 
+    pub(crate) fn link_labeling_to_scene(&mut self, enabled: bool) {
+        if !enabled { return; }
+        self.labels.linked_pick = panels::LinkedLabelPick::default();
+        let Some(index) = self.primary else { return };
+        let Some(data) = self.data.as_ref() else { return };
+        let Some(marker) = data.markers.get(index) else { return };
+        let asset = marker.parent.filter(|uid| {
+            !matches!(marker.kind, MarkerKind::Unlabeled | MarkerKind::Unknown)
+                && (data.take.assets.iter().any(|a| a.uid == *uid)
+                    || data.take.label_groups.iter().any(|a| a.uid == *uid))
+        });
+        self.labels.linked_pick = panels::LinkedLabelPick { asset, track: Some(marker.uid) };
+        self.labels.collapsed.remove(&marker.group);
+        self.labels.scroll_to = Some(index);
+    }
+
     pub fn clear_selection(&mut self) {
         for selection in &mut self.labels.list_selection { selection.end_range(); }
         self.clear_comment_selection();
@@ -1990,7 +2015,7 @@ impl View {
 
     /// The selection now (markers and the selected comment).
     pub fn selection(&self) -> Selection {
-        Selection { selected: self.selected.clone(), order: self.ordered_selection(), primary: self.primary, comment: self.picked, comments: self.comment_selection.clone(), list_anchors: self.labels.list_selection.clone(), armed_label: self.armed_label }
+        Selection { selected: self.selected.clone(), order: self.ordered_selection(), primary: self.primary, comment: self.picked, comments: self.comment_selection.clone(), list_anchors: self.labels.list_selection.clone(), armed_label: self.armed_label, linked_pick: self.labels.linked_pick }
     }
 
     /// Put a selection back (undo / redo) the way a click leaves it: Labels scrolls to the
@@ -2004,6 +2029,7 @@ impl View {
         self.comment_selection = s.comments;
         self.labels.list_selection = s.list_anchors;
         self.armed_label = s.armed_label;
+        self.labels.linked_pick = s.linked_pick;
         self.normalize_selection();
         self.labels.scroll_to = self.primary;
     }

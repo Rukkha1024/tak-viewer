@@ -31,6 +31,7 @@ pub struct AutoShot {
     pub edit_tools: bool,
     pub edit_pattern: bool,
     pub edit_layout: u8,
+    pub labeling_link: bool,
     /// `--comments`: the COMMENTS pane in front.
     pub comments: bool,
     /// `--pick-comment <id>`: that comment selected in every view.
@@ -96,6 +97,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let mut edit_tools = false;
     let mut edit_pattern = false;
     let mut edit_layout = 0;
+    let mut labeling_link = false;
     let mut comments = false;
     let mut pick_comment = None;
     let mut edit_comment = None;
@@ -116,6 +118,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                     edit_tools: false,
                     edit_pattern: false,
                     edit_layout: 0,
+                    labeling_link: false,
                     comments: false,
                     pick_comment: None,
                     edit_comment: None,
@@ -170,6 +173,10 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                 edit_tools = true;
                 i += 1;
             }
+            "--labeling-link" => {
+                labeling_link = true;
+                i += 1;
+            }
             "--edit-pattern" => {
                 edit_tools = true;
                 edit_pattern = true;
@@ -219,6 +226,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         s.edit_tools = edit_tools;
         s.edit_pattern = edit_pattern;
         s.edit_layout = edit_layout;
+        s.labeling_link = labeling_link;
         s.comments = comments;
         s.pick_comment = edit_comment.map(|e| e.0).or(pick_comment);
         s.edit_comment = edit_comment;

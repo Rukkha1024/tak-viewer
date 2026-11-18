@@ -1,7 +1,8 @@
 //! Independent Labeling pane. Rows carry stable identities, not just display names.
 
-use super::panels::{gaps_text, label_cell, label_columns, label_row_pairs};
+use super::panels::{label_cell, label_columns, label_row_pairs, LinkedLabelPick};
 use super::theme;
+use crate::label_increment::IncrementMode;
 pub use super::panels::{MarkerList, SelectionGesture};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Ui};
 use tak_core::edit::LabelKey;
@@ -66,7 +67,9 @@ pub struct LabelingState {
     /// View-only search; the owning view keeps it alongside the shared group folds.
     pub filter: String,
     pub mode: LabelingMode,
-    pub increment: bool,
+    pub(crate) increment: IncrementMode,
+    pub link_to_3d: bool,
+    pub linked_pick: LinkedLabelPick,
     pub backward: bool,
     pub forward: bool,
     pub asset_filter: Option<Uid>,
@@ -79,6 +82,7 @@ pub struct LabelingState {
     /// Existing trajectories, including extra and unlabeled markers without a LabelKey.
     pub scroll_to_track: Option<Uid>,
     pub selected_labeled_count: usize,
+    pub label_marker_reason: Option<&'static str>,
     /// A caller-provided reason, e.g. a read-only document or a pending edit.
     pub blocked_reason: Option<String>,
 }
@@ -89,7 +93,9 @@ impl Default for LabelingState {
             view_slot: 0,
             filter: String::new(),
             mode: LabelingMode::QuickLabel,
-            increment: true,
+            increment: IncrementMode::default(),
+            link_to_3d: false,
+            linked_pick: LinkedLabelPick::default(),
             backward: true,
             forward: true,
             asset_filter: None,
@@ -100,6 +106,7 @@ impl Default for LabelingState {
             scroll_to: None,
             scroll_to_track: None,
             selected_labeled_count: 0,
+            label_marker_reason: Some("3D에서 점을 하나만 선택해 주세요."),
             blocked_reason: None,
         }
     }
@@ -109,7 +116,8 @@ impl Default for LabelingState {
 pub enum LabelingAction {
     SetFilter(String),
     SetMode(LabelingMode),
-    SetIncrement(bool),
+    SetIncrement(IncrementMode),
+    SetLinkTo3d(bool),
     SetBackward(bool),
     SetForward(bool),
     SetAssetFilter(Option<Uid>),
@@ -128,11 +136,22 @@ pub enum LabelingAction {
     },
     /// Selection only: never arms or applies a QuickLabel target.
     SelectTracks { list: MarkerList, uid: Option<Uid>, gesture: SelectionGesture },
+    LabelMarker(LabelKey),
+    EditContextTrack { uid: Uid, unlabel: bool },
     Unlabel,
     RemoveMarker,
 }
 
 impl LabelingState {
+    fn shown_asset(&self) -> Option<Uid> {
+        if self.link_to_3d { self.linked_pick.asset } else { self.asset_filter }
+    }
+
+    fn matches_row(&self, track: Option<Uid>, name: &str, needle: &str) -> bool {
+        needle.is_empty() || name.to_lowercase().contains(needle)
+            || (self.link_to_3d && track.is_some() && track == self.linked_pick.track)
+    }
+
     pub(crate) fn track_order(&self, list: MarkerList) -> Vec<Uid> {
         match list {
             MarkerList::Named => self.groups.iter().flat_map(|group| &group.labels)
@@ -152,7 +171,7 @@ impl LabelingState {
             }
         }
         let needle = self.filter.trim().to_lowercase();
-        visible.extend(self.unlabeled.iter().filter(|row| needle.is_empty() || row.name.to_lowercase().contains(&needle)).map(|row| row.uid));
+        visible.extend(self.unlabeled.iter().filter(|row| self.matches_row(Some(row.uid), &row.name, &needle)).map(|row| row.uid));
         let hidden = selected.difference(&visible).count();
         let target = self.groups.iter().flat_map(|g| &g.labels).find(|row| row.primary && row.selected)
             .map(|row| row.name.as_str())
@@ -196,13 +215,13 @@ fn list_rows(state: &LabelingState, count: usize) -> Vec<ListRow> {
     let needle = state.filter.trim().to_lowercase();
     for (gi, group) in state.groups.iter().enumerate() {
         if state
-            .asset_filter
+            .shown_asset()
             .is_some_and(|asset| Some(asset) != group.asset_uid)
         {
             continue;
         }
         let labels: Vec<_> = group.labels.iter().enumerate()
-            .filter(|(_, row)| needle.is_empty() || row.name.to_lowercase().contains(&needle))
+            .filter(|(_, row)| state.matches_row(row.track_uid, &row.name, &needle))
             .map(|(index, _)| index).collect();
         if !needle.is_empty() && labels.is_empty() {
             continue;
@@ -226,6 +245,7 @@ pub(crate) fn visible_labels(state: &LabelingState) -> Vec<LabelKey> {
 }
 
 fn label_scroll_offset(rows: &[ListRow], state: &LabelingState, pitch: f32) -> Option<f32> {
+    if state.scroll_to.is_none() && state.scroll_to_track.is_none() { return None; }
     rows.iter().position(|row| match *row {
         ListRow::Labels(group, left, right) => [Some(left), right].into_iter().flatten().any(|i| {
             let row = &state.groups[group].labels[i];
@@ -234,6 +254,26 @@ fn label_scroll_offset(rows: &[ListRow], state: &LabelingState, pitch: f32) -> O
         }),
         ListRow::Group(_) => false,
     }).map(|index| ((index as f32 - 3.0) * pitch).max(0.0))
+}
+
+fn coverage_text(fill_pct: f32) -> String {
+    if fill_pct > 0.0 && fill_pct <= 0.5 {
+        "<1%".into()
+    } else if fill_pct >= 99.5 && fill_pct < 100.0 {
+        ">99%".into()
+    } else {
+        format!("{fill_pct:.0}%")
+    }
+}
+
+fn context_track_action(row: &LabelRow, unlabel: bool) -> LabelingAction {
+    if let Some(uid) = row.track_uid.filter(|_| !row.selected) {
+        LabelingAction::EditContextTrack { uid, unlabel }
+    } else if unlabel {
+        LabelingAction::Unlabel
+    } else {
+        LabelingAction::RemoveMarker
+    }
 }
 
 fn paint_row(
@@ -271,10 +311,10 @@ fn paint_row(
     } else {
         theme::LABEL_ABSENT
     };
-    let gaps = p.layout_no_wrap(gaps_text(fill_pct), FontId::proportional(12.5), theme::TEXT);
+    let percent = p.layout_no_wrap(coverage_text(fill_pct), FontId::proportional(12.5), theme::TEXT);
     let left = rect.left() + 24.0;
-    let gaps_r = rect.right() - 8.0;
-    let name_width = (gaps_r - 44.0_f32.max(gaps.size().x + 6.0) - left).max(0.0);
+    let percent_r = rect.right() - 8.0;
+    let name_width = (percent_r - 44.0_f32.max(percent.size().x + 6.0) - left).max(0.0);
     let mut job = egui::text::LayoutJob::simple_singleline(
         name.to_owned(),
         FontId::proportional(13.0),
@@ -293,10 +333,10 @@ fn paint_row(
     );
     p.galley(
         pos2(
-            gaps_r - gaps.size().x,
-            rect.center().y - gaps.size().y * 0.5,
+            percent_r - percent.size().x,
+            rect.center().y - percent.size().y * 0.5,
         ),
-        gaps,
+        percent,
         theme::TEXT,
     );
 }
@@ -315,7 +355,7 @@ fn draw_headers(ui: &Ui, rect: Rect, count: usize) {
         p.text(
             pos2(r.right() - 8.0, r.center().y),
             Align2::RIGHT_CENTER,
-            "Gaps",
+            "%",
             FontId::proportional(12.5),
             theme::TEXT_DIM,
         );
@@ -379,12 +419,19 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                 {
                     action = Some(LabelingAction::Unlabel);
                 }
-                if ui
-                    .selectable_label(state.increment, RichText::new("+1").size(11.0))
-                    .clicked()
-                {
-                    action = Some(LabelingAction::SetIncrement(!state.increment));
-                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Increment");
+                egui::ComboBox::from_id_salt("labeling_increment")
+                    .width(188.0)
+                    .selected_text(state.increment.caption())
+                    .show_ui(ui, |ui| {
+                        for mode in IncrementMode::ALL {
+                            if ui.selectable_label(state.increment == mode, mode.caption()).clicked() {
+                                action = Some(LabelingAction::SetIncrement(mode));
+                            }
+                        }
+                    });
                 if ui
                     .add_enabled(
                         !state.backward || state.forward,
@@ -422,11 +469,11 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Selected");
                 let selected = state
-                    .asset_filter
+                    .shown_asset()
                     .and_then(|id| state.assets.iter().find(|a| a.uid == id))
                     .map(|asset| asset_name(asset, &state.assets))
                     .unwrap_or_else(|| "All".to_owned());
-                egui::ComboBox::from_id_salt("labeling_asset")
+                ui.add_enabled_ui(!state.link_to_3d, |ui| egui::ComboBox::from_id_salt("labeling_asset")
                     .selected_text(selected)
                     .width(160.0)
                     .show_ui(ui, |ui| {
@@ -447,7 +494,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                 action = Some(LabelingAction::SetAssetFilter(Some(asset.uid)));
                             }
                         }
-                    });
+                    }));
                 if ui.small_button("A Prev").clicked() {
                     action = Some(LabelingAction::StepLabel { forward: false });
                 }
@@ -455,6 +502,10 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                     action = Some(LabelingAction::StepLabel { forward: true });
                 }
             });
+            let mut link_to_3d = state.link_to_3d;
+            if ui.checkbox(&mut link_to_3d, "Link to 3D Selection").changed() {
+                action = Some(LabelingAction::SetLinkTo3d(link_to_3d));
+            }
 
             ui.horizontal(|ui| {
                 let total = state.groups.iter().flat_map(|g| &g.labels).filter(|row| row.track_uid.is_some()).count();
@@ -480,7 +531,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                 ("White", theme::LABEL_TRACKED),
                 (" = present at current frame · ", theme::TEXT_DIM),
                 ("Red", theme::LABEL_ABSENT),
-                (" = absent · Gaps = missing frames (blank when complete). Gap count and longest gap: select a marker in the Selected Marker panel.", theme::TEXT_DIM),
+                (" = absent · % = share of take frames with a point. Gap count and longest gap in Selected Marker.", theme::TEXT_DIM),
             ] {
                 legend.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
             }
@@ -488,7 +539,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             let legend = ui.painter().layout_job(legend);
             let needle = state.filter.trim().to_lowercase();
             let unlabeled: Vec<_> = state.unlabeled.iter().enumerate()
-                .filter(|(_, row)| needle.is_empty() || row.name.to_lowercase().contains(&needle))
+                .filter(|(_, row)| state.matches_row(Some(row.uid), &row.name, &needle))
                 .map(|(index, _)| index).collect();
             let pitch = ROW_H + ui.spacing().item_spacing.y;
             let unlabeled_height = (unlabeled.len() as f32 * pitch).min(120.0);
@@ -558,7 +609,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                     (first + offset) % 2 == 1,
                                 );
                                 let gesture = ui.input(|i| modifier_gesture(i.modifiers));
-                                if resp.clicked() || (resp.secondary_clicked() && !row.selected) {
+                                if resp.clicked() {
                                     action = Some(if let Some(gesture) = gesture {
                                         LabelingAction::SelectTracks { list: MarkerList::Named, uid: row.track_uid, gesture }
                                     } else {
@@ -566,14 +617,30 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                     });
                                 }
                                 if gesture.is_none() { resp.context_menu(|ui| {
+                                    let label_reason = if row.key.is_none() {
+                                        Some("이 행에 지정할 수 있는 이름이 없어요.")
+                                    } else {
+                                        state.label_marker_reason
+                                    };
+                                    let assign = ui.add_enabled(label_reason.is_none(), egui::Button::new("Label Marker"));
+                                    if let Some(reason) = label_reason {
+                                        assign.on_disabled_hover_text(reason);
+                                    } else if assign.clicked() {
+                                        action = row.key.map(LabelingAction::LabelMarker);
+                                        ui.close_menu();
+                                    }
                                     if ui.add_enabled(row.track_uid.is_some() && state.blocked_reason.is_none(), egui::Button::new("Remove Marker")).clicked() {
-                                        action = Some(LabelingAction::RemoveMarker);
+                                        action = Some(context_track_action(row, false));
                                         ui.close_menu();
                                     }
                                     let why = if row.track_uid.is_none() {
                                         Some("This label has no marker track.")
-                                    } else {
+                                    } else if row.selected {
                                         state.unlabel_reason()
+                                    } else if row.key.is_none() {
+                                        Some("This marker has no known label.")
+                                    } else {
+                                        state.blocked_reason.as_deref()
                                     };
                                     if ui
                                         .add_enabled(
@@ -582,7 +649,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                         )
                                         .clicked()
                                     {
-                                        action = Some(LabelingAction::Unlabel);
+                                        action = Some(context_track_action(row, true));
                                         ui.close_menu();
                                     }
                                     if let Some(why) = why {
@@ -617,7 +684,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Unlabeled Markers").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("Gaps").color(theme::TEXT_DIM));
+                    ui.label(RichText::new("%").color(theme::TEXT_DIM));
                 });
             });
             let mut unlabeled_scroll = egui::ScrollArea::vertical()
@@ -1039,11 +1106,8 @@ mod tests {
         );
         assert_eq!(
             click(&ctx, &st, "L03", Modifiers::NONE, PointerButton::Secondary),
-            Some(LabelingAction::SelectLabel {
-                key: st.groups[0].labels[3].key,
-                track_uid: Some([3; 16]),
-                additive: false
-            })
+            None,
+            "opening the menu keeps the 3D source selected"
         );
         st.forward = false;
         let (out, _) = draw(&ctx, &st, 440.0, vec![]);

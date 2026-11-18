@@ -195,6 +195,8 @@ pub struct Settings {
     pub plate_channels: Vec<LaneSet>,
     pub device_layouts: Vec<crate::device_grid::Layout>,
     pub channel_names: crate::device_grid::ChannelNames,
+    pub(crate) labeling_increment: crate::label_increment::IncrementMode,
+    pub(crate) labeling_link: bool,
 }
 
 impl Default for Settings {
@@ -225,6 +227,8 @@ impl Default for Settings {
             plate_channels: vec![LaneSet::default(); MAX_VIEWS],
             device_layouts: Vec::new(),
             channel_names: Default::default(),
+            labeling_increment: Default::default(),
+            labeling_link: false,
         }
     }
 }
@@ -1348,6 +1352,7 @@ impl TakViewerApp {
                     // `--select A,B,C` (v0.27.0, agent pictures): several markers, the last one
                     // found the primary (as Ctrl+click one after another).
                     window_command::select_markers(v, auto.select.as_deref());
+                    v.link_labeling_to_scene(auto.labeling_link);
                     if let Some(want) = &auto.plate {
                         if let Some(p) = v.data.as_ref().and_then(|d| shot::find_plate(&d.plates, want)) {
                             v.plate = Some(p);
@@ -1373,6 +1378,10 @@ impl TakViewerApp {
                     self.show_pane(Pane::Comments);
                 }
                 if auto.edit_tools { self.show_pane(Pane::EditTools); }
+                if auto.labeling_link {
+                    self.settings.labeling_link = true;
+                    self.show_pane(Pane::Labeling);
+                }
                 if auto.edit_pattern { self.select_pattern_for_capture(self.active); }
                 if auto.edit_layout != 0 {
                     dock::hide(&mut self.dock, Pane::Selected);
@@ -3156,6 +3165,11 @@ impl TakViewerApp {
         let quick_edit = quick && (out.clicked.flatten().is_some() || out.double_clicked.is_some())
             && ui.input(|input| input.modifiers == Modifiers::NONE) && !key_focus::keys_blocked(ui.ctx());
         let quick_click = out.clicked.flatten().filter(|_| quick_edit);
+        let scene_selection = (out.context_clicked.is_some() && self.scene_marker_menu.is_open())
+            || (out.clicked.is_some() && out.plate.is_none() && quick_click.is_none()
+                && (out.clicked != Some(None) || !out.ctrl))
+            || out.box_selected.is_some()
+            || (out.double_clicked.is_some() && !quick_edit);
         if let Some(index) = quick_click.filter(|_| out.double_clicked.is_none()) {
             if let Some(marker) = v.data.as_ref().and_then(|data| data.markers.get(index)) { self.marker_click = Some((slot, marker.uid)); }
         }
@@ -3172,6 +3186,9 @@ impl TakViewerApp {
         if let Some(m) = out.double_clicked.filter(|_| !quick_edit) {
             v.select(m, false);
             v.focus_selected();
+        }
+        if scene_selection && !editing && self.hold.is_none() {
+            v.link_labeling_to_scene(self.settings.labeling_link);
         }
         if quick {
             if let (Some(key), Some(pointer)) = (v.armed_label, ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p))) {
@@ -4381,7 +4398,7 @@ mod tests {
 
     #[test]
     fn command_line_runs_leave_the_settings_file_alone() {
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&egui::Context::default(), None, vec![], Some(shot), None);
         let mut st = FileLike::default();
         app.save(&mut st);
@@ -5453,7 +5470,7 @@ mod tests {
     #[test]
     fn screenshot_plate_argument_chooses_that_plate_in_every_view() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         for (k, name) in [(0, "a.tak"), (1, "b.tak")] {
@@ -9773,7 +9790,7 @@ mod tests {
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         // A screenshot run is a command run too.
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
     }
 
@@ -10125,7 +10142,7 @@ mod tests {
     #[test]
     fn command_line_runs_do_not_use_or_fill_the_memory() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         app.settings.file_memory = vec![views::Spot {
             path: "a.tak".into(),
@@ -11201,7 +11218,7 @@ mod tests {
         let _dir_guard = comment_dir("overlay_shot");
         let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
-        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, stage: 0 };
+        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);

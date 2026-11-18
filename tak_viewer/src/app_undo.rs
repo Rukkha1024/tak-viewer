@@ -25,6 +25,7 @@ struct FileBase {
     comments: crate::comment_selection::CommentSelection,
     list_anchors: [panels::ListSelectionState; 2],
     armed_label: Option<LabelKey>,
+    linked_pick: panels::LinkedLabelPick,
     range: Range,
     plate: Option<usize>,
     speed: f64,
@@ -47,6 +48,7 @@ impl FileBase {
             comments: v.comment_selection.clone(),
             list_anchors: v.labels.list_selection.clone(),
             armed_label: v.armed_label,
+            linked_pick: v.labels.linked_pick,
             range: v.range,
             plate: v.plate,
             speed: v.pb.speed,
@@ -74,6 +76,7 @@ pub(super) struct LayoutSnap {
     picked: [Option<u64>; MAX_VIEWS],
     comments: [crate::comment_selection::CommentSelection; MAX_VIEWS],
     list_anchors: [[panels::ListSelectionState; 2]; MAX_VIEWS],
+    linked_picks: [panels::LinkedLabelPick; MAX_VIEWS],
     /// Keep editable state across reversible layout changes without sharing ViewData.
     documents: [Option<crate::views::EditSession>; MAX_VIEWS],
     /// Kept with the document even after heavy close-history runtimes are evicted.
@@ -178,6 +181,8 @@ pub(super) struct Options {
     plate_channels: Vec<LaneSet>,
     device_layouts: Vec<crate::device_grid::Layout>,
     channel_names: crate::device_grid::ChannelNames,
+    labeling_increment: crate::label_increment::IncrementMode,
+    labeling_link: bool,
 }
 
 impl Options {
@@ -191,6 +196,8 @@ impl Options {
             plate_channels: s.plate_channels.clone(),
             device_layouts: s.device_layouts.clone(),
             channel_names: s.channel_names.clone(),
+            labeling_increment: s.labeling_increment,
+            labeling_link: s.labeling_link,
         }
     }
 
@@ -203,6 +210,8 @@ impl Options {
             && self.plate_channels == s.plate_channels
             && self.device_layouts == s.device_layouts
             && self.channel_names == s.channel_names
+            && self.labeling_increment == s.labeling_increment
+            && self.labeling_link == s.labeling_link
     }
 
     /// Status bar word for going from `self` to `to`.
@@ -211,6 +220,8 @@ impl Options {
             "Channel names".into()
         } else if self.device_layouts != to.device_layouts {
             "Saved layouts".into()
+        } else if self.labeling_increment != to.labeling_increment || self.labeling_link != to.labeling_link {
+            "Labeling".into()
         } else if self.scene != to.scene {
             "Display".into()
         } else if self.opacity != to.opacity {
@@ -652,6 +663,7 @@ impl TakViewerApp {
             picked: std::array::from_fn(|k| if pending_view(&self.views[k]) { self.views[k].restore_picked.unwrap_or(None) } else { self.views[k].picked }),
             comments: std::array::from_fn(|k| self.views[k].restore_comment_selection.clone().unwrap_or_else(|| self.views[k].comment_selection.clone())),
             list_anchors: std::array::from_fn(|k| self.views[k].restore_list_anchors.clone().unwrap_or_else(|| self.views[k].labels.list_selection.clone())),
+            linked_picks: std::array::from_fn(|k| self.views[k].restore_linked_pick.unwrap_or(self.views[k].labels.linked_pick)),
             documents: std::array::from_fn(|k| layout_document(&self.views[k])),
             source_stamps: std::array::from_fn(|k| layout_source_stamp(&self.views[k])),
             edit_selections: std::array::from_fn(|k| layout_edit_selection(&self.views[k])),
@@ -813,6 +825,7 @@ impl TakViewerApp {
                     wanted.layout.picked[slot] = original.layout.picked[old];
                     wanted.layout.comments[slot] = original.layout.comments[old].clone();
                     wanted.layout.list_anchors[slot] = original.layout.list_anchors[old].clone();
+                    wanted.layout.linked_picks[slot] = original.layout.linked_picks[old];
                     wanted.layout.documents[slot] = original.layout.documents[old].clone();
                     wanted.layout.source_stamps[slot] = original.layout.source_stamps[old].clone();
                     wanted.layout.edit_selections[slot] = original.layout.edit_selections[old].clone();
@@ -916,6 +929,7 @@ impl TakViewerApp {
             base.layout.picked[slot] = if pending_view(v) { v.restore_picked.unwrap_or(None) } else { v.picked };
             base.layout.comments[slot] = v.restore_comment_selection.clone().unwrap_or_else(|| v.comment_selection.clone());
             base.layout.list_anchors[slot] = v.restore_list_anchors.clone().unwrap_or_else(|| v.labels.list_selection.clone());
+            base.layout.linked_picks[slot] = v.restore_linked_pick.unwrap_or(v.labels.linked_pick);
             base.layout.documents[slot] = layout_document(v);
             base.layout.source_stamps[slot] = layout_source_stamp(v);
             base.layout.edit_selections[slot] = layout_edit_selection(v);
@@ -1037,13 +1051,14 @@ impl TakViewerApp {
             // (one action with the comment) or Esc (put back), so it is not compared meanwhile.
             let drafting = marker_edit == Some((k, v.file_id));
             let order = v.ordered_selection();
-            if !drafting && (v.selected != b.selected || order != b.order || v.primary != b.primary || v.picked != b.picked || v.comment_selection != b.comments || v.labels.list_selection != b.list_anchors || v.armed_label != b.armed_label) {
-                let before = Selection { selected: std::mem::replace(&mut b.selected, v.selected.clone()), order: std::mem::replace(&mut b.order, order), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label };
+            if !drafting && (v.selected != b.selected || order != b.order || v.primary != b.primary || v.picked != b.picked || v.comment_selection != b.comments || v.labels.list_selection != b.list_anchors || v.armed_label != b.armed_label || v.labels.linked_pick != b.linked_pick) {
+                let before = Selection { selected: std::mem::replace(&mut b.selected, v.selected.clone()), order: std::mem::replace(&mut b.order, order), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label, linked_pick: b.linked_pick };
                 b.primary = v.primary;
                 b.picked = v.picked;
                 b.comments = v.comment_selection.clone();
                 b.list_anchors = v.labels.list_selection.clone();
                 b.armed_label = v.armed_label;
+                b.linked_pick = v.labels.linked_pick;
                 parts.push(Part::Selection { file: b.file.clone(), before, after: v.selection() });
                 if base.layout.files[k].as_deref() == v.path() { base.layout.edit_selections[k] = Some(v.edit_selection_state()); }
             }
@@ -1159,11 +1174,12 @@ impl TakViewerApp {
                 parts.push(Part::Frame { file: file.clone(), before: b.frame, after: v.pb.frame });
                 b.frame = v.pb.frame;
             }
-            let before = Selection { selected: b.selected.clone(), order: b.order.clone(), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label };
+            let before = Selection { selected: b.selected.clone(), order: b.order.clone(), primary: b.primary, comment: b.picked, comments: b.comments.clone(), list_anchors: b.list_anchors.clone(), armed_label: b.armed_label, linked_pick: b.linked_pick };
             if before != now {
                 (b.selected, b.order, b.primary, b.picked, b.armed_label) = (now.selected.clone(), now.order.clone(), now.primary, now.comment, now.armed_label);
                 b.comments = now.comments.clone();
                 b.list_anchors = now.list_anchors.clone();
+                b.linked_pick = now.linked_pick;
                 parts.push(Part::Selection { file, before, after: now });
             }
         }
@@ -1241,6 +1257,7 @@ impl TakViewerApp {
                 (b.selected, b.order, b.primary, b.picked, b.armed_label) = (before.selected.clone(), before.order.clone(), before.primary, before.comment, before.armed_label);
                 b.comments = before.comments.clone();
                 b.list_anchors = before.list_anchors.clone();
+                b.linked_pick = before.linked_pick;
             }
         }
     }
@@ -1622,6 +1639,8 @@ impl TakViewerApp {
                 let (from, to) = if redo { (before, after) } else { (after, before) };
                 let s = &mut self.settings;
                 if from.channel_names != to.channel_names { s.channel_names = to.channel_names.clone(); }
+                if from.labeling_increment != to.labeling_increment { s.labeling_increment = to.labeling_increment; }
+                if from.labeling_link != to.labeling_link { s.labeling_link = to.labeling_link; }
                 if from.device_layouts != to.device_layouts { s.device_layouts = to.device_layouts.clone(); }
                 if from.scene != to.scene { s.scene = to.scene.clone(); }
                 if from.graph_float != to.graph_float { s.graph_float = to.graph_float; }
@@ -1660,7 +1679,9 @@ impl TakViewerApp {
                 let v = &mut self.views[k];
                 v.set_selection(if redo { after } else { before }.clone());
                 // Only the selected comment changed (v0.17.1).
-                if (&before.selected, &before.order, before.primary) == (&after.selected, &after.order, after.primary) {
+                if before.linked_pick != after.linked_pick {
+                    v.selection_words()
+                } else if (&before.selected, &before.order, before.primary) == (&after.selected, &after.order, after.primary) {
                     v.picked_words()
                 } else {
                     v.selection_words()
@@ -1854,6 +1875,7 @@ impl TakViewerApp {
                         view.picked = snap.picked[k];
                         view.comment_selection = snap.comments[k].clone();
                         view.labels.list_selection = snap.list_anchors[k].clone();
+                        view.labels.linked_pick = snap.linked_picks[k];
                         if let (Some(selection), Some(data)) = (&snap.edit_selections[k], &view.data) {
                             let find = |uid: &[u8; 16]| data.markers.iter().position(|marker| marker.uid == *uid);
                             let visible = Selection {
@@ -1864,6 +1886,7 @@ impl TakViewerApp {
                                 comments: snap.comments[k].clone(),
                                 list_anchors: snap.list_anchors[k].clone(),
                                 armed_label: selection.armed_label,
+                                linked_pick: snap.linked_picks[k],
                             };
                             view.set_selection(visible);
                             view.edit_selection = Some(selection.clone());
@@ -1875,12 +1898,14 @@ impl TakViewerApp {
                         view.restore_picked = None;
                         view.restore_comment_selection = None;
                         view.restore_list_anchors = None;
+                        view.restore_linked_pick = None;
                     } else {
                         self.views[k].restore = snap.spots[k].clone().or_else(|| self.views[k].restore.take());
                         self.views[k].restore_range = Some(snap.ranges[k]);
                         self.views[k].restore_picked = Some(snap.picked[k]);
                         self.views[k].restore_comment_selection = Some(snap.comments[k].clone());
                         self.views[k].restore_list_anchors = Some(snap.list_anchors[k].clone());
+                        self.views[k].restore_linked_pick = Some(snap.linked_picks[k]);
                     }
                 }
             }

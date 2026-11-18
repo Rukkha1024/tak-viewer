@@ -78,6 +78,39 @@ mod scene_marker_menu {
     }
 
     #[test]
+    fn both_label_menus_preserve_collision_samples_with_next_missing_enabled() {
+        for scene in [false, true] {
+            let ctx = egui::Context::default();
+            let (dir, mut app) = fixture(&ctx);
+            app.settings.graph_float = false;
+            app.settings.labeling_increment = crate::label_increment::IncrementMode::NextMissing;
+            app.views[0].select(1, false);
+            app.views[0].armed_label = None;
+            frame_with(&ctx, &mut app, vec![]);
+            app.quiet();
+            let count = steps(&app, 0).0;
+            let original = read_saved(dir.join("labels.takm"));
+
+            if scene {
+                let point = marker_on_screen(&app, 1);
+                let output = open(&ctx, &mut app, point);
+                let submenu = hover(&ctx, &mut app, menu_item(&output, "Label Marker").center());
+                click_at(&ctx, &mut app, menu_item(&submenu, "A").center());
+            } else {
+                app.labeling_action(&ctx, 0, crate::ui::labeling::LabelingAction::LabelMarker(KEY_A));
+            }
+
+            wait(&ctx, &mut app, |app| !app.marker_job_running(0));
+            assert_eq!(steps(&app, 0).0, count + 1, "{:?}", app.takm_note);
+            assert_eq!(app.views[0].armed_label, (!scene).then_some(KEY_B));
+            let edited = snapshot(&app);
+            let displaced = edited.tracks().find(|track| track.label.is_none()).unwrap();
+            assert_eq!(sample(edited.track(&A).unwrap(), 5), sample(original.track(&B).unwrap(), 5));
+            assert_eq!(sample(displaced, 5), sample(original.track(&A).unwrap(), 5));
+        }
+    }
+
+    #[test]
     fn marker_menu_label_matches_quicklabel_bytes_and_keeps_the_armed_label() {
         let ctx = egui::Context::default();
         let (dir, mut app) = fixture(&ctx);

@@ -196,7 +196,7 @@
     }
 
     #[test]
-    fn at_380pt_each_row_has_the_column_major_names_and_right_aligned_gaps_only() {
+    fn at_380pt_each_row_has_the_column_major_names_and_right_aligned_coverage() {
         let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
         for (i, m) in p.data.markers.iter_mut().enumerate() {
             m.fill_pct = if i == 2 { 100.0 } else { 90.0 - i as f32 * 10.0 };
@@ -205,7 +205,7 @@
         }
         let painted = texts(&p.idle());
         assert_eq!(painted.iter().filter(|t| t.text == "Labels").count(), 2);
-        let mut headers: Vec<_> = painted.iter().filter(|t| t.text == "Gaps" && (t.rect.center().y - at(&painted, "Labels").rect.center().y).abs() < 0.5).collect();
+        let mut headers: Vec<_> = painted.iter().filter(|t| t.text == "%" && (t.rect.center().y - at(&painted, "Labels").rect.center().y).abs() < 0.5).collect();
         headers.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
         assert_eq!(headers.len(), 2);
         for (left, right) in [("M0", "M3"), ("M1", "M4")] {
@@ -214,11 +214,11 @@
         }
         assert!(at(&painted, "M0").rect.top() < at(&painted, "M1").rect.top());
         assert!(at(&painted, "M1").rect.top() < at(&painted, "M2").rect.top());
-        for (value, col) in [("10%", 0), ("20%", 0), ("40%", 1), ("50%", 1)] {
+        for (value, col) in [("90%", 0), ("80%", 0), ("100%", 0), ("60%", 1), ("50%", 1)] {
             assert!((at(&painted, value).rect.right() - headers[col].rect.right()).abs() < 0.5, "{value} right-aligned to its header");
         }
         assert!(!painted.iter().any(|t| ["빈구간", "최대", "123", "2", "0%"].contains(&t.text.as_str())), "old header/cell numbers are gone");
-        assert!(painted.iter().any(|t| t.text.contains("Gap count and longest gap: select a marker in the Selected Marker panel.")), "the legend tells where the other numbers are");
+        assert!(painted.iter().any(|t| t.text.contains("Gap count and longest gap in Selected Marker.")), "the legend tells where the other numbers are");
     }
 
     #[test]
@@ -278,14 +278,14 @@
     }
 
     #[test]
-    fn long_names_in_both_cells_are_font_elided_and_the_gaps_stay_visible() {
+    fn long_names_in_both_cells_are_font_elided_and_the_coverage_stays_visible() {
         let left = "A_very_long_marker_name_abcdefghijklmnopqrstuvwxyz";
         let right = "B_very_long_marker_name_abcdefghijklmnopqrstuvwxyz";
         let mut p = PaneTest::new(&[&[left, right]]);
         p.data.markers[0].fill_pct = 83.0;
         p.data.markers[1].fill_pct = 57.0;
         let painted = texts(&p.idle());
-        for (name, value) in [(left, "17%"), (right, "43%")] {
+        for (name, value) in [(left, "83%"), (right, "57%")] {
             let (name, value) = (at(&painted, name), at(&painted, value));
             assert!(name.elided);
             assert!(name.glyphs.ends_with('…'), "inspect painted glyphs, not the original LayoutJob text");
@@ -302,7 +302,7 @@
         let mut p = PaneTest::new(&[&["M0", "M1", "M2", "M3", "M4"]]);
         p.width = 259.0;
         let painted = texts(&p.idle());
-        assert_eq!(painted.iter().filter(|t| t.text == "Gaps").count(), 2);
+        assert_eq!(painted.iter().filter(|t| t.text == "%").count(), 2);
         assert_eq!(painted.iter().filter(|t| t.text == "Labels").count(), 1);
         for i in 1..5 {
             let (a, b) = (at(&painted, &format!("M{}", i - 1)), at(&painted, &format!("M{i}")));
@@ -311,7 +311,7 @@
         }
         p.width = 260.0;
         let painted = texts(&p.idle());
-        assert_eq!(painted.iter().filter(|t| t.text == "Gaps").count(), 3);
+        assert_eq!(painted.iter().filter(|t| t.text == "%").count(), 3);
         assert!((at(&painted, "M0").rect.top() - at(&painted, "M3").rect.top()).abs() < 0.1);
     }
 

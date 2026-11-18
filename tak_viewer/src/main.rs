@@ -33,6 +33,7 @@ mod capture;
 mod headless;
 mod instances;
 mod shot;
+mod label_increment;
 mod ssh;
 mod ssh_probe;
 mod soft_render;
@@ -226,6 +227,7 @@ fn usage() -> String {
         capture::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
+        "Headless Labeling link: --labeling-link with --select NAME",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

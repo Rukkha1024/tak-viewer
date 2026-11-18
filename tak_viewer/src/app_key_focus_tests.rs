@@ -113,7 +113,7 @@ fn delete_focus_view_tab_ssh_and_labeling_legend_block_marker_delete() {
                 .find(|r| r.center().y < app.views[0].scene_rect.top() + dock::TAB_H).expect("view name tag").center(),
             "ssh" => text_rects(&out, "SSH (0)").first().expect("SSH section").center(),
             _ => {
-                let text = "White = present at current frame · Red = absent · Gaps = missing frames (blank when complete). Gap count and longest gap: select a marker in the Selected Marker panel.";
+                let text = "White = present at current frame · Red = absent · % = share of take frames with a point. Gap count and longest gap in Selected Marker.";
                 text_rects(&out, text).first().expect("Labeling legend").center()
             }
         };

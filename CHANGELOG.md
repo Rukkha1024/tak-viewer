@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.52.0 — 2026-11-18
+
+- Labeling adds a saved 3D selection link, three increment choices, and row-menu Label Marker. Named and Unlabeled lists show point coverage across the take.
+
 ## v0.51.0 — 2026-11-18
 
 - 3D right-click menu shows selection count and current marker coordinates. Assign or clear labels from the same menu. Keep the armed QuickLabel target. One undo per edit.
