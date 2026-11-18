@@ -334,7 +334,7 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
     {
         return Err("TAK · TAKM 경로에는 출력할 수 없어요.".into());
     }
-    let (auto, leftovers) = shot::parse(&rest);
+    let (auto, leftovers) = shot::parse_command(&rest)?;
     if !leftovers.is_empty()
         || (!list_only && auto.is_none())
         || (list_only && (auto.is_some() || dump.is_some() || cancel_after.is_some() || stall_after.is_some()))

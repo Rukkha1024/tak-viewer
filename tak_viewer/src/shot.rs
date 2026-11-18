@@ -21,6 +21,7 @@ pub fn parse_edit(s: &str) -> Option<(u64, Field)> {
 #[derive(Clone, Debug)]
 pub struct AutoShot {
     pub out: PathBuf,
+    pub output: crate::shot_output::Options,
     pub frame: Option<i64>,
     pub select: Option<ShotSelection>,
     /// `--plate`: plate name or number (from 0).
@@ -94,8 +95,17 @@ pub fn parse_range(s: &str) -> Option<(i64, i64)> {
     Some((num(a)?, num(b)?))
 }
 
-/// Parse `--screenshot`, `--frame`, `--select`, `--plate`, `--range`; returns (shot, remaining
-/// positional args). A bad `--range` value is warned about and dropped (never taken for a file).
+/// Parse screenshot output options and the existing frame/layout options.
+pub fn parse_command(args: &[String]) -> Result<(Option<AutoShot>, Vec<String>), String> {
+    let (output, args) = crate::shot_output::parse(args)?;
+    let (mut shot, rest) = parse(&args);
+    if let Some(shot) = &mut shot {
+        shot.output = output;
+    }
+    Ok((shot, rest))
+}
+
+/// Parse frame/layout options. Warn and drop a bad `--range`.
 pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let (overlays, args) = take_overlays(args);
     let args = args.as_slice();
@@ -125,7 +135,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         match args[i].as_str() {
             "--screenshot" if i + 1 < args.len() => {
                 shot = Some(AutoShot {
-                    out: PathBuf::from(&args[i + 1]),
+                    out: crate::workspace::resolve_path(&args[i + 1]),
+                    output: Default::default(),
                     frame: None,
                     select: None,
                     plate: None,

@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.63.0 — 2026-11-18
+
+- Screenshot. Accept WSL and Windows output paths and `--size WxH`. Read the PNG back and print both paths. Add `--crop`, `--crop-panel`, `--scale`, `--crop-only` and `--regions`. Capture exits 1 on a missing or bad picture.
+- Add `checks/compare_png.py`: changed pixel count, bounds, footer or rectangle masks, diff PNG.
+
 ## v0.62.3 — 2026-11-18
 
 - Take a click or drag in a graph from the first frame its box shows. Curves still loading → the click still moves the frame. Before, that click was lost.

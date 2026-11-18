@@ -483,8 +483,10 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
                         let px = [(size[0] * ppp).round() as usize, (size[1] * ppp).round() as usize];
                         let prims = ctx.tessellate(out.shapes.clone(), ppp);
                         let img = soft_render::paint(&prims, &textures, px, ppp, CLEAR);
-                        let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
-                        if let Err(e) = crate::shot::save_png(&auto.out, px[0], px[1], &rgba) { eprintln!("screenshot: {e}"); code = 1; }
+                        if let Err(e) = crate::shot_output::write(&auto, &img, ppp, Default::default()) {
+                            eprintln!("screenshot: {e}");
+                            code = 1;
+                        }
                     }
                     app.ssh_probe_disconnect(&p.alias);
                     let deadline = Instant::now() + Duration::from_secs(10);

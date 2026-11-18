@@ -36,6 +36,7 @@ mod help_shot;
 mod instances;
 mod merge_keys;
 mod shot;
+mod shot_output;
 mod label_increment;
 mod ssh;
 mod ssh_probe;
@@ -56,7 +57,10 @@ const MAX_OPEN_FILES: usize = 30;
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
-    if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
+    if matches!(args.get(1).map(String::as_str), Some("--help" | "-h"))
+        || (args.iter().any(|arg| arg == "--screenshot")
+            && args.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")))
+    {
         println!("{}", usage());
         std::process::exit(0);
     }
@@ -225,7 +229,14 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let (auto, rest) = if capture.is_some() { (None, vec![]) } else { shot::parse(&args[1..]) };
+    let (auto, rest) = if capture.is_some() {
+        (None, vec![])
+    } else {
+        shot::parse_command(&args[1..]).unwrap_or_else(|error| {
+            eprintln!("{error}\n\n{}", shot_output::USAGE);
+            std::process::exit(2);
+        })
+    };
     let initial: Vec<PathBuf> = match &capture {
         Some(c) => vec![c.tak.clone()],
         None => rest.iter().map(PathBuf::from).collect(),
@@ -239,7 +250,9 @@ fn main() -> eframe::Result<()> {
         eprintln!("--shot-label requires one local take and --screenshot");
         std::process::exit(2);
     }
-    let size = capture.as_ref().map_or([1600.0, 960.0], |c| c.size);
+    let size = capture.as_ref().map(|c| c.size)
+        .or_else(|| auto.as_ref().and_then(|shot| shot.output.size))
+        .unwrap_or([1600.0, 960.0]);
     let command_run = capture.is_some() || auto.is_some();
     if no_desktop {
         if !command_run {
@@ -252,7 +265,7 @@ fn main() -> eframe::Result<()> {
         if capture.is_none() && auto.is_none() {
             eprintln!("--headless는 --capture나 --screenshot과 함께 써요.
 
-{}", capture::USAGE);
+{}\n{}", capture::USAGE, shot_output::USAGE);
             std::process::exit(2);
         }
         std::process::exit(headless::run(initial, auto, capture, size, tab_shot));
@@ -264,6 +277,7 @@ fn main() -> eframe::Result<()> {
 fn usage() -> String {
     [
         capture::USAGE,
+        shot_output::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         help_shot::USAGE,
@@ -312,11 +326,15 @@ fn run_window(
     });
     if only && registration.is_none() { cli_exit(1, "뷰어 창 목록 폴더를 찾을 수 없어요."); }
     let others_at_start = registration.as_ref().is_some_and(|r| r.others_alive());
+    let min_size = auto.as_ref().and_then(|shot| shot.output.size)
+        .map_or([900.0, 600.0], |[w, h]| [w.min(900.0), h.min(600.0)]);
+    let command_result = command_run.then(|| std::rc::Rc::new(std::cell::Cell::new(None)));
+    let app_result = command_result.clone();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(version::window_title(None))
             .with_inner_size(size)
-            .with_min_inner_size([900.0, 600.0])
+            .with_min_inner_size(min_size)
             .with_drag_and_drop(true),
         persistence_path: data.map(|dir| dir.join("app.ron")),
         persist_window: !command_run && !only,
@@ -327,6 +345,7 @@ fn run_window(
         options,
         Box::new(move |cc| {
             let mut app = app::TakViewerApp::new(cc, initial, auto, capture, startup);
+            app.native_command_result = app_result;
             app.set_registration(registration, others_at_start);
             // WORKSPACE follows the disk in the user's window only; command runs
             // (`--screenshot`, `--capture`) never start the folder watcher.
@@ -338,5 +357,13 @@ fn run_window(
             }
             Ok(Box::new(app))
         }),
-    )
+    )?;
+    if let Some(result) = command_result {
+        match result.get() {
+            Some(true) => {}
+            Some(false) => std::process::exit(1),
+            None => cli_exit(1, "그림 저장을 마치기 전에 창이 닫혔어요."),
+        }
+    }
+    Ok(())
 }

@@ -464,6 +464,8 @@ pub struct TakViewerApp {
     /// A view's floating graph asked for the GRAPH pane this frame (applied after drawing).
     graph_to_panel: bool,
     auto: Option<AutoShot>,
+    shot_regions: Option<crate::shot_output::Regions>,
+    command_output: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     label_shot: label_shot::Progress,
     workspace: Workspace,
     ssh: crate::ssh::SshManager,
@@ -555,6 +557,7 @@ pub struct TakViewerApp {
     hold_loads: bool,
     /// A command line run failed (load, capture or PNG save); `--headless` exits with 1.
     pub failed: bool,
+    pub(crate) native_command_result: Option<std::rc::Rc<std::cell::Cell<Option<bool>>>>,
     /// v0.27.0 speed fix: graph work was put off to later frames in the frame before
     /// (`graph::start_frame`), so a graph on screen is not complete yet; `--screenshot` waits.
     pub graph_put_off: bool,
@@ -697,6 +700,8 @@ impl TakViewerApp {
             show_settings: false,
             graph_to_panel: false,
             auto,
+            shot_regions: None,
+            command_output: None,
             label_shot: label_shot::Progress::default(),
             workspace: Workspace::new(ctx.clone()),
             ssh: { let mut ssh = crate::ssh::SshManager::new(ctx, settings_ssh); ssh.python_settings = settings_python; ssh },
@@ -751,6 +756,7 @@ impl TakViewerApp {
             #[cfg(test)]
             hold_loads: false,
             failed: false,
+            native_command_result: None,
             graph_put_off: false,
             registration: None,
             registry_checked: None,
@@ -1303,8 +1309,7 @@ impl TakViewerApp {
         let Some(auto) = self.auto.clone() else { return };
         if let Some(e) = &self.error {
             eprintln!("screenshot: load failed: {e}");
-            self.failed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.finish_command(ctx, false);
             return;
         }
         let shot_image = ctx.input(|i| {
@@ -1314,16 +1319,11 @@ impl TakViewerApp {
             })
         });
         if let (Some(img), true) = (shot_image, auto.stage >= 7) {
-            let [w, h] = img.size;
-            let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
-            match shot::save_png(&auto.out, w, h, &rgba) {
-                Ok(()) => println!("screenshot saved: {} ({w}x{h})", auto.out.display()),
-                Err(e) => {
-                    eprintln!("screenshot: save failed: {e}");
-                    self.failed = true;
-                }
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let regions = self.shot_regions.take().unwrap_or_default();
+            let ppp = ctx.pixels_per_point();
+            self.command_output = Some(crate::shot_output::spawn(ctx, move || {
+                crate::shot_output::write(&auto, &img, ppp, regions)
+            }));
             return;
         }
         // Pictures are taken with every view's file and force plates loaded, and every graph
@@ -1480,6 +1480,9 @@ impl TakViewerApp {
             6 if self.drive_label_shot(ctx) => {}
             6 if self.wait_for_scene_menu_shot(ctx) => {}
             6 => {
+                if auto.output.needs_regions() || auto.output.size.is_some() {
+                    self.shot_regions = Some(crate::shot_output::Regions::begin(ctx.pixels_per_point()));
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
                 next.stage = 7;
             }
@@ -1515,11 +1518,34 @@ impl TakViewerApp {
         }));
     }
 
+    fn finish_command(&mut self, ctx: &egui::Context, success: bool) {
+        self.failed = !success;
+        if let Some(result) = &self.native_command_result {
+            result.set(Some(success));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn poll_command_output(&mut self, ctx: &egui::Context) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some(worker) = &self.command_output else { return false };
+        let result = match worker.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => Err("그림 저장 작업이 멈췄어요.".into()),
+        };
+        if let Err(error) = &result {
+            eprintln!("{error}");
+        }
+        self.command_output = None;
+        self.finish_command(ctx, result.is_ok());
+        true
+    }
+
     fn fail_capture(&mut self, ctx: &egui::Context, run: &CaptureRun, msg: String) {
         if run.plan.exit_when_done {
             eprintln!("capture: {msg}");
-            self.failed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.finish_command(ctx, false);
         } else {
             self.error = Some(format!("캡처하지 못했어요.\n\n{msg}"));
         }
@@ -1528,6 +1554,19 @@ impl TakViewerApp {
     /// `--capture` / menu capture, one shot per (frame, view); see `capture.rs`.
     fn drive_capture(&mut self, ctx: &egui::Context, now: f64) {
         let Some(mut run) = self.capture.take() else { return };
+        if let Some(pending) = run.pending_image.take() {
+            use std::sync::mpsc::TryRecvError;
+            let result = match pending.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    run.pending_image = Some(pending);
+                    self.capture = Some(run);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => Err("캡처 그림 저장 작업이 멈췄어요.".into()),
+            };
+            run.image_result(result, pending.record);
+        }
         if run.plan.exit_when_done {
             if let Some(e) = self.error.clone() {
                 self.fail_capture(ctx, &run, format!("load failed: {e}"));
@@ -1554,9 +1593,13 @@ impl TakViewerApp {
             })
         });
         if let (Some(img), 5) = (shot_image, run.stage) {
-            self.store_capture_shot(ctx, &mut run, &img);
+            self.store_capture_shot(ctx, &mut run, img);
             run.index += 1;
             run.stage = 0;
+            if run.pending_image.is_some() {
+                self.capture = Some(run);
+                return;
+            }
         }
         if !run.started {
             if let Err(msg) = self.start_capture(&mut run) {
@@ -1689,44 +1732,56 @@ impl TakViewerApp {
         }
     }
 
-    fn store_capture_shot(&mut self, ctx: &egui::Context, run: &mut CaptureRun, img: &egui::ColorImage) {
+    fn store_capture_shot(&mut self, ctx: &egui::Context, run: &mut CaptureRun, img: std::sync::Arc<egui::ColorImage>) {
         let [w, h] = img.size;
-        let mut image = capture::Image { w, h, rgba: img.pixels.iter().flat_map(|p| p.to_array()).collect() };
-        if !run.plan.full_ui {
+        let crop = (!run.plan.full_ui).then(|| {
             // Keep the 3D view only.
             let ppp = ctx.pixels_per_point();
             let r = self.view().scene_rect;
             let px = |v: f32| (v * ppp).round().max(0.0) as usize;
-            image = image.crop(px(r.min.x), px(r.min.y), px(r.width()), px(r.height()));
-        }
+            [px(r.min.x), px(r.min.y), px(r.width()), px(r.height())]
+        });
         let (Some((frame, view)), Some(out)) = (run.shots.get(run.index).copied(), run.out_dir.clone()) else { return };
         let name = run.file_name(frame, view);
-        match capture::save_png(&out.join(&name), &image) {
-            Ok(()) => {
-                let v = self.view();
-                if let Some(d) = &v.data {
-                    run.records.push(capture::shot_record(d, frame, view, &name, &v.cam, &run.selected));
-                }
-                run.cells.push(image.shrink(capture::SHEET_CELL_W));
+        let v = self.view();
+        let record = v.data.as_ref().map(|d| capture::shot_record(d, frame, view, &name, &v.cam, &run.selected));
+        let command = run.plan.exit_when_done;
+        let save = move || {
+            let mut image = capture::Image { w, h, rgba: img.pixels.iter().flat_map(|p| p.to_array()).collect() };
+            if let Some([x, y, w, h]) = crop {
+                image = image.crop(x, y, w, h);
             }
-            Err(e) => run.notes.push(format!("{name} 저장 실패: {e}")),
+            capture::save_image(&out.join(name), &image, command)?;
+            Ok(image.shrink(capture::SHEET_CELL_W))
+        };
+        if command {
+            run.pending_image = Some(capture::PendingImage { record, result: crate::shot_output::spawn(ctx, save) });
+        } else {
+            run.image_result(save(), record);
         }
     }
 
     fn finish_capture(&mut self, ctx: &egui::Context, mut run: CaptureRun, now: f64) {
         // Frames and camera come back to where they were: no action.
         self.history.quiet_all = true;
-        let lines = match &self.view().data {
-            Some(d) => run.finish(d, workspace::to_wsl_path(&capture::absolute(&d.take.path))),
-            None => vec![],
-        };
+        let data = self.view().data.clone();
         if run.plan.exit_when_done {
-            for l in &lines {
-                println!("{l}");
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.command_output = Some(crate::shot_output::spawn(ctx, move || {
+                let d = data.ok_or("캡처한 파일을 찾지 못했어요.")?;
+                for line in run.finish(&d, workspace::to_wsl_path(&capture::absolute(&d.take.path))) {
+                    println!("{line}");
+                }
+                if run.output_failed || run.records.len() != run.shots.len() {
+                    return Err("캡처 파일을 모두 저장하지 못했어요.".into());
+                }
+                Ok(())
+            }));
             return;
         }
+        let lines = match data {
+            Some(d) => run.finish(&d, workspace::to_wsl_path(&capture::absolute(&d.take.path))),
+            None => vec![],
+        };
         let v = self.view_mut();
         if let Some(c) = run.restore_cam {
             v.cam = c;
@@ -2939,7 +2994,7 @@ impl TakViewerApp {
         let frame = egui::Frame::none().fill(theme::STATUS_BG).inner_margin(egui::Margin::symmetric(10.0, 0.0));
         let mut show_warnings = false;
         let mut open_comments = false;
-        egui::TopBottomPanel::bottom("status").exact_height(STATUS_H).frame(frame).show(ctx, |ui| {
+        let footer = egui::TopBottomPanel::bottom("status").exact_height(STATUS_H).frame(frame).show(ctx, |ui| {
             if self.dirty_prompt.is_some() { ui.disable(); }
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
@@ -3015,6 +3070,9 @@ impl TakViewerApp {
                 });
             });
         });
+        if let Some(regions) = &mut self.shot_regions {
+            regions.record("footer", footer.response.rect);
+        }
         open_comments |= ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("ssh_open_comments"))).unwrap_or(false);
         if open_comments {
             self.show_pane(Pane::Comments);
@@ -3122,6 +3180,13 @@ impl TakViewerApp {
         // The 3D on screen. It takes the mouse below the tab row (`input`) and in the row right
         // of the name tag (`row`); on the name tag the tab under it keeps the mouse.
         let rect = egui::Rect::from_min_max(egui::pos2(body.left(), top), egui::pos2(body.right(), deck_top));
+        if let Some(regions) = &mut self.shot_regions {
+            regions.record(format!("3D view {}", slot + 1), rect);
+            regions.record(format!("timeline {}", slot + 1), deck_rect);
+            if slot == self.active {
+                regions.record("timeline", deck_rect);
+            }
+        }
         let input = egui::Rect::from_min_max(body.min, rect.max);
         let name_tag = tag.as_ref().map_or(egui::Rect::NOTHING, |t| t.rect);
         let row = tag.as_ref().map_or(egui::Rect::NOTHING, |t| egui::Rect::from_min_max(egui::pos2(t.rect.right(), rect.top()), egui::pos2(rect.right(), body.top())));
@@ -3454,6 +3519,12 @@ impl egui_dock::TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         let app = &mut *self.app;
+        if let Some(regions) = &mut app.shot_regions {
+            if Pane::PANELS.contains(tab) {
+                let name = if *tab == Pane::Selected { "Selected Marker" } else { tab.title() };
+                regions.record(name, ui.available_rect_before_wrap().intersect(ui.clip_rect()));
+            }
+        }
         let _span=crate::bench_timing::span_view(tab.title(),Some(if let Pane::View(k)=*tab{usize::from(k)}else{app.active}));
         if app.dirty_prompt.is_some() { ui.disable(); }
         let key_target = match *tab {
@@ -3772,8 +3843,10 @@ impl TakViewerApp {
         self.poll_exit_wait(ctx);
 
         self.apply_ssh_demo(ctx);
-        self.drive_auto_shot(ctx, now);
-        self.drive_capture(ctx, now);
+        if !self.poll_command_output(ctx) {
+            self.drive_auto_shot(ctx, now);
+            self.drive_capture(ctx, now);
+        }
         self.explorer.progress.begin_frame();
         // A cell edit of the COMMENTS pane first (its Enter / Esc), then `M` held (comment while
         // watching): its Esc and its key-up come before the rest.
@@ -3852,6 +3925,9 @@ impl TakViewerApp {
         self.dock = dock_state;
         self.dock_area = area;
         if let Some(rect) = dock::layout_strip_rect(&self.dock).filter(|_| self.capture.is_none()) {
+            if let Some(regions) = &mut self.shot_regions {
+                regions.record("Layout Tabs", rect);
+            }
             let actions = egui::Area::new(egui::Id::new("whole_layout_strip"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(rect.min)
@@ -3864,6 +3940,9 @@ impl TakViewerApp {
             for action in actions { self.layout_strip_action(ctx, action); }
         } else {
             self.layout_strip.wheel.clear_region();
+        }
+        if let Some(regions) = &mut self.shot_regions {
+            regions.freeze();
         }
         // A click on a view's tab or inside a view makes it the active one.
         let focused = self.dock.find_active_focused().map(|(_, t)| *t);
@@ -4428,7 +4507,7 @@ mod tests {
 
     #[test]
     fn command_line_runs_leave_the_settings_file_alone() {
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&egui::Context::default(), None, vec![], Some(shot), None);
         let mut st = FileLike::default();
         app.save(&mut st);
@@ -5509,7 +5588,7 @@ mod tests {
     #[test]
     fn screenshot_plate_argument_chooses_that_plate_in_every_view() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: Some("P2".into()), range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         for (k, name) in [(0, "a.tak"), (1, "b.tak")] {
@@ -9829,7 +9908,7 @@ mod tests {
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         // A screenshot run is a command run too.
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
     }
 
@@ -10182,7 +10261,7 @@ mod tests {
     #[test]
     fn command_line_runs_do_not_use_or_fill_the_memory() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         app.settings.file_memory = vec![views::Spot {
             path: "a.tak".into(),
@@ -11265,7 +11344,7 @@ mod tests {
         let _dir_guard = comment_dir("overlay_shot");
         let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
-        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: dir.join("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);

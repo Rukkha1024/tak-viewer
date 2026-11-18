@@ -228,6 +228,16 @@ pub fn shot_file_name(frame: i64, view: ViewPreset) -> String {
     format!("f{frame:06}_{}.png", view.key())
 }
 
+pub fn parse_size(value: &str) -> Result<[f32; 2], String> {
+    let (w, h) = value.split_once(['x', 'X']).ok_or("--size에는 1400x860처럼 폭x높이를 써 주세요.")?;
+    let w = w.trim().parse::<f32>().map_err(|_| "--size의 폭을 숫자로 써 주세요.")?;
+    let h = h.trim().parse::<f32>().map_err(|_| "--size의 높이를 숫자로 써 주세요.")?;
+    if !(400.0..=8000.0).contains(&w) || !(300.0..=8000.0).contains(&h) {
+        return Err("--size는 400x300 ~ 8000x8000 포인트예요.".into());
+    }
+    Ok([w, h])
+}
+
 /// `Ok(None)` when `--capture` is absent. `Err` carries a message for the user (print USAGE too).
 pub fn parse(args: &[String]) -> Result<Option<CapturePlan>, String> {
     if !args.iter().any(|a| a == "--capture") {
@@ -289,13 +299,7 @@ pub fn parse(args: &[String]) -> Result<Option<CapturePlan>, String> {
             "--ui" => plan.full_ui = true,
             "--no-sheet" => plan.sheet = false,
             "--size" => {
-                let v = value(i, a)?;
-                let (w, h) = v.split_once(['x', 'X']).ok_or_else(|| format!("--size 형식: 1600x1000 ({v})"))?;
-                let (w, h): (f32, f32) = (w.trim().parse().map_err(|_| "--size 폭".to_owned())?, h.trim().parse().map_err(|_| "--size 높이".to_owned())?);
-                if !(400.0..=8000.0).contains(&w) || !(300.0..=8000.0).contains(&h) {
-                    return Err("--size는 400x300 ~ 8000x8000".into());
-                }
-                plan.size = [w, h];
+                plan.size = parse_size(&value(i, a)?)?;
                 i += 1;
             }
             "--out" => {
@@ -322,17 +326,28 @@ pub fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Check both the requested destination and an existing link's target.
+pub fn check_output_path(path: &Path) -> std::io::Result<()> {
+    use tak_core::{tak, takm};
+    let target = takm::canonical_target(path)?;
+    if [path, &target].iter().any(|p| tak::is_take_path(p) || takm::is_takm_path(p)) {
+        return Err(std::io::Error::other("TAK나 TAKM 경로에는 저장하지 않아요."));
+    }
+    if takm::in_input(path) {
+        return Err(std::io::Error::other("input/ 폴더 안에는 저장하지 않아요."));
+    }
+    Ok(())
+}
+
 /// Refuse output folders inside the repository's `input/` (originals are read-only; the same
 /// rule as the comment files, `tak_core::tak::in_repo_input`).
 pub fn check_out_dir(out: &Path, tak: &Path) -> Result<(), String> {
+    check_output_path(out).map_err(|e| format!("{} ({e})", out.display()))?;
     let roots = [repo_root(tak), out.ancestors().find(|a| a.exists()).and_then(repo_root)];
     for root in roots.into_iter().flatten() {
         if tak_core::tak::in_repo_input(out, &root) {
             return Err(format!("input/ 안에는 저장하지 않아요: {}", out.display()));
         }
-    }
-    if tak_core::tak::is_take_path(out) {
-        return Err("출력 폴더 이름이 .tak으로 끝나요".into());
     }
     Ok(())
 }
@@ -584,19 +599,14 @@ pub fn sheet(cells: &[Image], cols: usize, gap: usize) -> Option<Image> {
     Some(Image { w, h, rgba })
 }
 
-/// Compressed PNG (RGB, alpha dropped: screenshots are opaque). Refuses `.tak` paths.
-pub fn save_png(path: &Path, img: &Image) -> std::io::Result<()> {
-    if tak_core::tak::is_take_path(path) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing to write a .tak path"));
-    }
-    let rgb: Vec<u8> = img.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+pub fn write_png(path: &Path, [w, h]: [usize; 2], color: png::ColorType, pixels: &[u8]) -> std::io::Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, img.w as u32, img.h as u32);
-    enc.set_color(png::ColorType::Rgb);
+    let mut enc = png::Encoder::new(file, w as u32, h as u32);
+    enc.set_color(color);
     enc.set_depth(png::BitDepth::Eight);
     let to_io = |e: png::EncodingError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
     let mut writer = enc.write_header().map_err(to_io)?;
-    writer.write_image_data(&rgb).map_err(to_io)?;
+    writer.write_image_data(pixels).map_err(to_io)?;
     writer.finish().map_err(to_io)
 }
 
@@ -618,10 +628,17 @@ pub struct CaptureRun {
     pub cells: Vec<Image>,
     pub records: Vec<Value>,
     pub notes: Vec<String>,
+    pub output_failed: bool,
+    pub pending_image: Option<PendingImage>,
     pub tak_before: Option<(u64, std::time::SystemTime)>,
     /// Menu capture: camera to restore afterwards.
     pub restore_cam: Option<Camera>,
     pub restore_frame: Option<i64>,
+}
+
+pub struct PendingImage {
+    pub record: Option<Value>,
+    pub result: std::sync::mpsc::Receiver<Result<Image, String>>,
 }
 
 impl CaptureRun {
@@ -637,6 +654,8 @@ impl CaptureRun {
             cells: vec![],
             records: vec![],
             notes: vec![],
+            output_failed: false,
+            pending_image: None,
             tak_before: None,
             restore_cam: None,
             restore_frame: None,
@@ -660,6 +679,19 @@ impl CaptureRun {
         shot_file_name(frame, view)
     }
 
+    pub fn image_result(&mut self, result: Result<Image, String>, record: Option<Value>) {
+        match result {
+            Ok(cell) => {
+                self.records.extend(record);
+                self.cells.push(cell);
+            }
+            Err(error) => {
+                self.output_failed = true;
+                self.notes.push(error);
+            }
+        }
+    }
+
     /// Write sheet.png and captures.json; returns the lines to print.
     pub fn finish(&mut self, data: &ViewData, wsl_path: Option<String>) -> Vec<String> {
         let Some(out) = self.out_dir.clone() else { return vec![] };
@@ -669,9 +701,12 @@ impl CaptureRun {
             let cols = self.plan.views.len().clamp(1, 6);
             if let Some(img) = sheet(&self.cells, cols, 6) {
                 let p = out.join("sheet.png");
-                match save_png(&p, &img) {
+                match save_image(&p, &img, self.plan.exit_when_done) {
                     Ok(()) => sheet_name = json!("sheet.png"),
-                    Err(e) => self.notes.push(format!("sheet.png 저장 실패: {e}")),
+                    Err(error) => {
+                        self.output_failed = true;
+                        self.notes.push(error);
+                    }
                 }
             }
         }
@@ -694,9 +729,23 @@ impl CaptureRun {
             "shots": self.records,
         });
         let json_path = out.join("captures.json");
-        match std::fs::write(&json_path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+        let write_json = || {
+            let json = serde_json::to_vec_pretty(&doc)?;
+            if self.plan.exit_when_done {
+                check_output_path(&json_path)?;
+            }
+            std::fs::write(&json_path, &json)?;
+            if self.plan.exit_when_done && std::fs::metadata(&json_path)?.len() != json.len() as u64 {
+                return Err(std::io::Error::other("captures.json 크기가 달라요."));
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        match write_json() {
             Ok(()) => {}
-            Err(e) => lines.push(format!("captures.json 저장 실패: {e}")),
+            Err(e) => {
+                self.output_failed = true;
+                lines.push(format!("captures.json 저장 실패: {e}"));
+            }
         }
         lines.push(format!("capture: {} shots -> {}", self.records.len(), out.display()));
         if let Some(w) = crate::workspace::to_wsl_path(&out) {
@@ -708,6 +757,23 @@ impl CaptureRun {
         }
         lines
     }
+}
+
+/// CLI output gets read back on the worker. Menu capture keeps its existing write path.
+pub fn save_image(path: &Path, img: &Image, verify: bool) -> Result<(), String> {
+    let work = || {
+        if verify {
+            check_output_path(path)?;
+        }
+        let rgb: Vec<u8> = img.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let size = [img.w, img.h];
+        write_png(path, size, png::ColorType::Rgb, &rgb)?;
+        if verify {
+            crate::shot_output::verify_png(path, size)?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    work().map_err(|e| format!("{} 저장 실패: {e}", path.display()))
 }
 
 #[cfg(test)]

@@ -780,7 +780,7 @@ pub fn to_wsl_path(p: &Path) -> Option<String> {
     let s = s.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}")).unwrap_or(s);
     let s = s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s);
     for host in [r"\\wsl.localhost\", r"\\wsl$\"] {
-        if s.len() > host.len() && s[..host.len()].eq_ignore_ascii_case(host) {
+        if s.get(..host.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(host)) {
             let rest = &s[host.len()..];
             let tail = rest.split_once('\\').map(|(_, t)| t).unwrap_or("");
             return Some(format!("/{}", tail.replace('\\', "/")));
