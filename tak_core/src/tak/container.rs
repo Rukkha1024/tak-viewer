@@ -3,6 +3,10 @@
 //! Also holds the small little-endian / text helpers shared by the other reader modules.
 
 use super::{err, Result, TakError};
+use std::borrow::Cow;
+use std::fs::File;
+
+use super::fast_read::{read_exact_at, StreamMap};
 
 pub const MAGIC: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 pub const END: u32 = 0xFFFF_FFFE;
@@ -181,6 +185,7 @@ pub struct DirEntry {
 
 pub struct Container<'a> {
     data: &'a [u8],
+    file_len: u64,
     pub sector_size: usize,
     pub mini_size: usize,
     pub cutoff: u32,
@@ -195,11 +200,11 @@ fn words(raw: &[u8]) -> Vec<u32> {
 }
 
 /// `TakContainer.read_chain`.
-fn read_chain<'r>(
+fn read_chain<B: AsRef<[u8]>>(
     start: u32,
     table: &[u32],
     unit: usize,
-    reader: impl Fn(u32) -> Result<&'r [u8]>,
+    mut reader: impl FnMut(u32) -> Result<B>,
     size: Option<u64>,
 ) -> Result<Vec<u8>> {
     if size == Some(0) {
@@ -216,6 +221,7 @@ fn read_chain<'r>(
         }
         seen[idx] = true;
         let chunk = reader(current)?;
+        let chunk = chunk.as_ref();
         let expected: i128 = match size {
             None => unit as i128,
             Some(s) => (unit as i128).min(s as i128 - nchunks as i128 * unit as i128),
@@ -237,12 +243,26 @@ fn read_chain<'r>(
 
 impl<'a> Container<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 8 || data[..8] != MAGIC {
+        let mut container = Self::parse_index(data, data.len() as u64, |offset, size| {
+            Ok(Cow::Borrowed(&data[offset as usize..offset as usize + size]))
+        })?;
+        container.data = data;
+        let root = &container.entries[0];
+        container.mini_stream = read_chain(root.start, &container.fat, container.sector_size, |i| container.sector(i), Some(root.size))?;
+        Ok(container)
+    }
+
+    fn parse_index(
+        head: &[u8],
+        file_len: u64,
+        mut read: impl FnMut(u64, usize) -> Result<Cow<'a, [u8]>>,
+    ) -> Result<Self> {
+        if head.len() < 8 || head[..8] != MAGIC {
             return err("Not the observed compound container");
         }
-        let sector_shift = u16_at(data, 30)? as u32;
-        let mini_shift = u16_at(data, 32)? as u32;
-        let cutoff = u32_at(data, 56)?;
+        let sector_shift = u16_at(head, 30)? as u32;
+        let mini_shift = u16_at(head, 32)? as u32;
+        let cutoff = u32_at(head, 56)?;
         let sector_size: usize = match sector_shift {
             9 => 512,
             12 => 4096,
@@ -254,27 +274,26 @@ impl<'a> Container<'a> {
             return err("Unsupported sector geometry");
         }
         let mini_size = 1usize << mini_shift;
-        if u32_at(data, 72)? != 0 {
+        if u32_at(head, 72)? != 0 {
             return err("Extended DIFAT not implemented");
         }
-        let count = u32_at(data, 44)?;
+        let count = u32_at(head, 44)?;
         if count > 109 {
             return err("Too many FAT sectors");
         }
-        let sector = |index: u32| -> Result<&'a [u8]> {
+        let mut sector = |index: u32| {
             let offset = (index as u64 + 1) * sector_size as u64;
-            if offset >= data.len() as u64 {
+            if offset >= file_len {
                 return err("Sector outside file");
             }
-            let o = offset as usize;
-            Ok(slice_clamped(data, o, o + sector_size))
+            read(offset, (file_len - offset).min(sector_size as u64) as usize)
         };
         let mut fat = Vec::new();
         for i in 0..count as usize {
-            let s = sector(u32_at(data, 76 + i * 4)?)?;
-            fat.extend(words(s));
+            let s = sector(u32_at(head, 76 + i * 4)?)?;
+            fat.extend(words(&s));
         }
-        let raw = read_chain(u32_at(data, 48)?, &fat, sector_size, sector, None)?;
+        let raw = read_chain(u32_at(head, 48)?, &fat, sector_size, &mut sector, None)?;
         let mut entries = Vec::with_capacity(raw.len() / 128);
         for entry in raw.chunks(128) {
             if entry.len() != 128 {
@@ -296,15 +315,34 @@ impl<'a> Container<'a> {
                 size: u64_at(entry, 120)?,
             });
         }
-        let root = match entries.first() {
-            Some(r) => r.clone(),
-            None => return err("Missing root directory entry"),
-        };
-        let mini_stream = read_chain(root.start, &fat, sector_size, sector, Some(root.size))?;
-        let mini_fat_size = u32_at(data, 64)? as u64 * sector_size as u64;
-        let mini_fat_raw = read_chain(u32_at(data, 60)?, &fat, sector_size, sector, Some(mini_fat_size))?;
+        if entries.is_empty() {
+            return err("Missing root directory entry");
+        }
+        let mini_fat_size = u32_at(head, 64)? as u64 * sector_size as u64;
+        let mini_fat_raw = read_chain(u32_at(head, 60)?, &fat, sector_size, sector, Some(mini_fat_size))?;
         let mini_fat = words(&mini_fat_raw);
-        Ok(Container { data, sector_size, mini_size, cutoff, fat, entries, mini_stream, mini_fat })
+        Ok(Container { data: &[], file_len, sector_size, mini_size, cutoff, fat, entries, mini_stream: Vec::new(), mini_fat })
+    }
+
+    /// Read only CFB allocation and directory data. Stream maps keep the same original order
+    /// as the in-memory reader, including duplicate names and mini streams.
+    pub(crate) fn file_streams(file: &File, len: u64) -> Result<Vec<(String, StreamMap)>> {
+        let mut head = [0; 512];
+        read_exact_at(file, &mut head, 0)?;
+        let container = Self::parse_index(&head, len, |offset, size| {
+            let mut sector = vec![0; size];
+            read_exact_at(file, &mut sector, offset)?;
+            Ok(Cow::Owned(sector))
+        })?;
+        let roots = container.regular_chain(&container.entries[0])?;
+        container.streams()?.into_iter().map(|(name, index)| {
+            let len = container.entries[index].size;
+            let (sector, offsets) = container.stream_sectors(index, &roots)?;
+            let chain = offsets.into_iter().map(|off| {
+                u32::try_from(off / sector - 1).map_err(|_| TakError("Sector index outside supported range".into()))
+            }).collect::<Result<_>>()?;
+            Ok((name, StreamMap { sector, chain, len, flat: None }))
+        }).collect()
     }
 
     fn sector(&self, index: u32) -> Result<&'a [u8]> {
@@ -377,6 +415,13 @@ impl<'a> Container<'a> {
         if entry.size < self.cutoff as u64 {
             return err("Stream is in the mini stream");
         }
+        self.regular_chain(entry)
+    }
+
+    fn regular_chain(&self, entry: &DirEntry) -> Result<Vec<u32>> {
+        if entry.size == 0 {
+            return Ok(Vec::new());
+        }
         let unit = self.sector_size as u64;
         let mut out = Vec::new();
         let mut seen = vec![false; self.fat.len()];
@@ -388,11 +433,11 @@ impl<'a> Container<'a> {
             }
             seen[idx] = true;
             let offset = (current as u64 + 1) * unit;
-            if offset >= self.data.len() as u64 {
+            if offset >= self.file_len {
                 return err("Sector outside file");
             }
             let done = out.len() as u64 * unit;
-            if done >= entry.size || (self.data.len() as u64 - offset).min(unit) < unit.min(entry.size - done) {
+            if done >= entry.size || (self.file_len - offset).min(unit) < unit.min(entry.size - done) {
                 return err("Stream size and sector chain disagree");
             }
             out.push(current);
@@ -407,34 +452,40 @@ impl<'a> Container<'a> {
     /// Physical sector starts without reading stream payloads, including mini streams.
     /// The sparse index used by edit preparation intentionally contains no mini payload.
     pub(crate) fn physical_sectors(&self, index: usize) -> Result<(u64, Vec<u64>)> {
+        let roots = if self.entries[index].size < self.cutoff as u64 {
+            self.regular_chain(&self.entries[0])?
+        } else {
+            Vec::new()
+        };
+        self.stream_sectors(index, &roots)
+    }
+
+    fn stream_sectors(&self, index: usize, roots: &[u32]) -> Result<(u64, Vec<u64>)> {
         let entry = &self.entries[index];
         let small = entry.size < self.cutoff as u64;
         let (unit, fat) = if small { (self.mini_size as u64, &self.mini_fat) }
                           else { (self.sector_size as u64, &self.fat) };
         let root = &self.entries[0];
-        let mut roots = Vec::new();
-        if small {
-            let mut cur = root.start;
-            let mut seen = std::collections::HashSet::new();
-            while cur != END {
-                if !seen.insert(cur) || cur as usize >= self.fat.len() { return err("invalid mini root chain"); }
-                roots.push((cur as u64 + 1) * self.sector_size as u64);
-                cur = self.fat[cur as usize];
-            }
+        if entry.size == 0 {
+            return Ok((unit, Vec::new()));
         }
         let mut out = Vec::new();
         let mut current = entry.start;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = vec![false; fat.len()];
         while current != END {
-            if current as usize >= fat.len() || !seen.insert(current) { return err("invalid stream chain"); }
+            if current as usize >= fat.len() || seen[current as usize] { return err("invalid stream chain"); }
+            seen[current as usize] = true;
+            let done = out.len() as u64 * unit;
+            if done >= entry.size { return err("stream extent exceeds declared size"); }
+            let size = unit.min(entry.size - done);
             let off = if small {
                 let logical = current as u64 * unit;
-                if logical >= root.size { return err("mini sector outside root"); }
-                *roots.get((logical / self.sector_size as u64) as usize).ok_or_else(|| super::TakError("short mini root".into()))?
-                    + logical % self.sector_size as u64
+                let ss = self.sector_size as u64;
+                if logical + size > root.size { return err("mini sector outside root"); }
+                let sector = roots.get((logical / ss) as usize).ok_or_else(|| TakError("short mini root".into()))?;
+                (u64::from(*sector) + 1) * ss + logical % ss
             } else { (current as u64 + 1) * unit };
-            let done = out.len() as u64 * unit;
-            if done >= entry.size || off.checked_add(unit.min(entry.size - done)).is_none_or(|end| end > self.data.len() as u64) {
+            if off.checked_add(size).is_none_or(|end| end > self.file_len) {
                 return err("stream extent outside file");
             }
             out.push(off);

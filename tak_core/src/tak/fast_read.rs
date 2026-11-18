@@ -766,6 +766,20 @@ pub(crate) struct StreamMap {
 }
 
 impl StreamMap {
+    /// Visit a stream in logical byte order using caller-owned scratch space.
+    pub(crate) fn visit(&self, file: &File, buf: &mut [u8], mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        for (mut offset, mut remaining) in self.pieces(0, self.len) {
+            while remaining > 0 {
+                let n = remaining.min(buf.len());
+                read_exact_at(file, &mut buf[..n], offset)?;
+                consume(&buf[..n])?;
+                offset += n as u64;
+                remaining -= n;
+            }
+        }
+        Ok(())
+    }
+
     /// Stream bytes [a, b) as file pieces (file offset, length): consecutive sectors merged,
     /// pieces at most `CHUNK` long.
     pub(crate) fn pieces(&self, a: u64, b: u64) -> Vec<(u64, usize)> {

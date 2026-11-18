@@ -30,6 +30,9 @@ use crate::tak::container::{sha256_hex, Container};
 use crate::tak::fast_read::read_exact_at;
 use crate::tak::{err, in_repo_input, is_take_path, repo_root, Result, Take, TakError};
 
+#[path = "takm_verify.rs"]
+pub mod verify;
+
 /// First 8 bytes. The first `.takm` (markers only, removed in v0.4.0) began `TAKM\r\n\x1a\n`.
 pub const MAGIC: [u8; 8] = *b"TAKM-2\r\n";
 const OLD_MAGIC: [u8; 8] = *b"TAKM\r\n\x1a\n";
@@ -43,6 +46,7 @@ pub const CAMERA_STREAM: &str = "DeviceData/Track 0.trk";
 const EOL: &str = "\r\n";
 /// Largest stream table accepted when reading (a real one is under 1 KB).
 const MAX_TABLE: u64 = 16 << 20;
+const IO_CHUNK: usize = 2 << 20;
 
 /// `.takm` extension (any case).
 pub fn is_takm_path(path: &Path) -> bool {
@@ -138,6 +142,10 @@ fn parse_header(head: &[u8], file_len: u64) -> Result<(u64, u64, u64)> {
     if layout != LAYOUT {
         return err(format!("이 뷰어가 모르는 .takm 모양(번호 {layout})이에요. 더 새 뷰어로 여세요."));
     }
+    header_bounds(head, file_len)
+}
+
+fn header_bounds(head: &[u8], file_len: u64) -> Result<(u64, u64, u64)> {
     let (table_off, table_len, fixed_len) = (u64_le(head, 16), u64_le(head, 24), u64_le(head, 32));
     let ok = table_off >= HEADER_LEN
         && table_len <= MAX_TABLE
@@ -150,15 +158,15 @@ fn parse_header(head: &[u8], file_len: u64) -> Result<(u64, u64, u64)> {
 }
 
 /// The stream table (JSON) -> `Index`, every stream inside [64, table offset).
-fn parse_table(table: &[u8], table_off: u64, fixed_len: u64) -> Result<Index> {
+fn decode_table(v: &Value, table_off: u64, fixed_len: u64) -> Result<Index> {
     let bad = |what: &str| TakError(format!(".takm 표가 맞지 않아요({what})."));
-    let v: Value = serde_json::from_slice(table).map_err(|_| bad("JSON"))?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| bad(k));
     let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).ok_or_else(|| bad(k));
     let list = |k: &str| v.get(k).and_then(Value::as_array).ok_or_else(|| bad(k));
     let mut streams = Vec::new();
     for s in list("streams")? {
-        let st = Stream { name: text(s, "name")?, index: num(s, "index")? as usize, offset: num(s, "offset")?, size: num(s, "size")? };
+        let index = usize::try_from(num(s, "index")?).map_err(|_| bad("index"))?;
+        let st = Stream { name: text(s, "name")?, index, offset: num(s, "offset")?, size: num(s, "size")? };
         if st.offset < HEADER_LEN || st.offset.checked_add(st.size).is_none_or(|e| e > table_off) {
             return Err(bad(&format!("{} 자리", st.name)));
         }
@@ -166,7 +174,8 @@ fn parse_table(table: &[u8], table_off: u64, fixed_len: u64) -> Result<Index> {
     }
     let mut dropped = Vec::new();
     for d in list("dropped")? {
-        dropped.push(Dropped { name: text(d, "name")?, index: num(d, "index")? as usize, size: num(d, "size")?, sha256: text(d, "sha256")? });
+        let index = usize::try_from(num(d, "index")?).map_err(|_| bad("index"))?;
+        dropped.push(Dropped { name: text(d, "name")?, index, size: num(d, "size")?, sha256: text(d, "sha256")? });
     }
     let src = v.get("source").ok_or_else(|| bad("source"))?;
     Ok(Index {
@@ -174,9 +183,15 @@ fn parse_table(table: &[u8], table_off: u64, fixed_len: u64) -> Result<Index> {
         streams,
         dropped,
         source: Source { name: text(src, "name")?, size: num(src, "size")?, sha256: text(src, "sha256")? },
-        made_by: text(&v, "made_by")?,
-        made_at: text(&v, "made_at")?,
+        made_by: text(v, "made_by")?,
+        made_at: text(v, "made_at")?,
     })
+}
+
+fn read_table(file: &File, table_off: u64, table_len: u64) -> Result<Value> {
+    let mut table = vec![0u8; table_len as usize];
+    read_exact_at(file, &mut table, table_off)?;
+    serde_json::from_slice(&table).map_err(|_| TakError(".takm 표가 맞지 않아요(JSON).".into()))
 }
 
 /// Header and stream table of an open `.takm` of `file_len` bytes (two positional reads).
@@ -184,9 +199,7 @@ pub fn read_index(file: &File, file_len: u64) -> Result<Index> {
     let mut head = vec![0u8; HEADER_LEN.min(file_len) as usize];
     read_exact_at(file, &mut head, 0)?;
     let (table_off, table_len, fixed_len) = parse_header(&head, file_len)?;
-    let mut table = vec![0u8; table_len as usize];
-    read_exact_at(file, &mut table, table_off)?;
-    parse_table(&table, table_off, fixed_len)
+    decode_table(&read_table(file, table_off, table_len)?, table_off, fixed_len)
 }
 
 /// `read_index` of a path.
@@ -238,30 +251,42 @@ impl<W: Write> Sealing<W> {
 pub fn write(w: &mut impl Write, tak: &[u8], source_name: &str, made_at: &str) -> Result<u64> {
     let c = Container::parse(tak)?;
     let list = c.streams()?;
+    let source = Source { name: source_name.into(), size: tak.len() as u64, sha256: sha256_hex(tak) };
+    write_streams(w, list.iter().map(|(name, entry)| (name.as_str(), c.entries[*entry].size)), &source, made_at,
+        |i, consume| consume(&c.read_stream(list[i].1)?))
+}
+
+fn write_streams<'a>(
+    w: &mut impl Write,
+    list: impl Iterator<Item = (&'a str, u64)>,
+    source: &Source,
+    made_at: &str,
+    mut visit: impl FnMut(usize, &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
+) -> Result<u64> {
     // Dropped streams first: their SHA-256 goes into the table.
     let mut dropped = Vec::new();
-    let mut kept: Vec<(usize, &String, usize, u64)> = Vec::new();
+    let mut kept = Vec::new();
     let mut offset = HEADER_LEN;
-    for (i, (name, idx)) in list.iter().enumerate() {
+    for (i, (name, size)) in list.enumerate() {
         if name == CAMERA_STREAM {
-            let raw = c.read_stream(*idx)?;
-            dropped.push(json!({"name": name, "index": i, "size": raw.len(), "sha256": sha256_hex(&raw)}));
+            let mut hash = Sha256::new();
+            visit(i, &mut |chunk| { hash.update(chunk); Ok(()) })?;
+            dropped.push(json!({"name": name, "index": i, "size": size, "sha256": format!("{:x}", hash.finalize())}));
         } else {
-            let size = c.entries[*idx].size;
-            kept.push((i, name, *idx, offset));
-            offset += size;
+            kept.push((i, name, offset, size));
+            offset = offset.checked_add(size).ok_or_else(|| TakError("TAKM 크기가 너무 커요.".into()))?;
         }
     }
     let streams: Vec<Value> = kept
         .iter()
-        .map(|&(i, name, idx, off)| json!({"name": name, "index": i, "offset": off, "size": c.entries[idx].size}))
+        .map(|&(i, name, off, size)| json!({"name": name, "index": i, "offset": off, "size": size}))
         .collect();
     let table = serde_json::to_vec(&json!({
         "format": "takm",
         "layout": LAYOUT,
         "made_by": format!("tak_viewer {}", env!("CARGO_PKG_VERSION")),
         "made_at": made_at,
-        "source": {"name": source_name, "size": tak.len(), "sha256": sha256_hex(tak)},
+        "source": {"name": source.name, "size": source.size, "sha256": source.sha256},
         "streams": streams,
         "dropped": dropped,
     }))
@@ -276,12 +301,11 @@ pub fn write(w: &mut impl Write, tak: &[u8], source_name: &str, made_at: &str) -
     head[32..40].copy_from_slice(&fixed_len.to_le_bytes());
     let mut s = Sealing { w, hash: Sha256::new(), written: 0 };
     s.put(&head)?;
-    for &(_, _, idx, off) in &kept {
-        let raw = c.read_stream(idx)?;
-        if s.written != off || raw.len() as u64 != c.entries[idx].size {
+    for &(idx, _, off, size) in &kept {
+        visit(idx, &mut |chunk| Ok(s.put(chunk)?))?;
+        if s.written != off + size {
             return err("stream size changed while writing");
         }
-        s.put(&raw)?;
     }
     s.put(&table)?;
     if s.written != fixed_len {
@@ -473,8 +497,12 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
         .map_err(|e| format!("저장 잠금을 얻지 못했어요: {e}"))?;
     check_out(&out, tak)?;
     let old = comments::read(&csv).map_err(|e| format!("옆의 Comment 파일을 읽지 못했어요: {} ({e})", csv.display()))?;
-    let bytes = std::fs::read(tak).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
+    let input = File::open(tak).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
+    let list = Container::file_streams(&input, before.0).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
+    let mut buf = vec![0; IO_CHUNK];
+    let digest = hash_file_prefix(&input, before.0, &mut buf).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
     let name = tak.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let source = Source { name, size: before.0, sha256: format!("{digest:x}") };
     let tmp = out.with_file_name(format!(".{}.{}.part", out.file_name().map(|s| s.to_string_lossy()).unwrap_or_default(), std::process::id()));
     let made_at = {
         let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -483,7 +511,9 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
     let written = (|| -> std::result::Result<u64, String> {
         let file = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| format!("임시 파일을 만들지 못했어요: {e}"))?;
         let mut w = BufWriter::with_capacity(4 << 20, file);
-        let mut n = write(&mut w, &bytes, &name, &made_at).map_err(|e| format!("TAK를 읽지 못했어요: {e}"))?;
+        let mut n = write_streams(&mut w, list.iter().map(|(name, map)| (name.as_str(), map.len)), &source, &made_at,
+            |i, consume| list[i].1.visit(&input, &mut buf, consume))
+            .map_err(|e| format!("TAKM을 만들지 못했어요: {e}"))?;
         for e in old.iter().flat_map(|p| &p.events) {
             let line = comments::encode(e);
             w.write_all(line.as_bytes()).map_err(|e| format!("쓰지 못했어요: {e}"))?;
@@ -491,7 +521,7 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
         }
         let file = w.into_inner().map_err(|e| format!("쓰지 못했어요: {e}"))?;
         file.sync_all().map_err(|e| format!("쓰지 못했어요: {e}"))?;
-        if stat(tak).ok() != Some(before) || bytes.len() as u64 != before.0 {
+        if stat(tak).ok() != Some(before) {
             return Err("읽는 동안 TAK가 바뀌었어요".into());
         }
         Ok(n)
@@ -504,11 +534,7 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
             return Err(e);
         }
     };
-    let dropped = Container::parse(&bytes)
-        .and_then(|c| {
-            Ok(c.streams()?.into_iter().filter(|(n, _)| n == CAMERA_STREAM).map(|(n, i)| (n, c.entries[i].size)).collect())
-        })
-        .unwrap_or_default();
+    let dropped = list.into_iter().filter(|(name, _)| name == CAMERA_STREAM).map(|(name, map)| (name, map.len)).collect();
     Ok(Converted {
         out,
         tak_size: before.0,
@@ -522,20 +548,25 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
 }
 
 /// Usage line of `--to-takm`.
-pub const USAGE: &str = "사용법: tak_viewer --to-takm <a.tak> [<b.tak> …] [--out-dir <폴더>]";
+pub const USAGE: &str = "사용법: tak_viewer --to-takm <a.tak> [<b.tak> …] [--out-dir <폴더>] [--verify]";
 
-/// `--to-takm` options after the flag: (TAK files, `--out-dir`).
-pub fn parse_args(args: &[String]) -> std::result::Result<(Vec<PathBuf>, Option<PathBuf>), String> {
+/// `--to-takm` options after the flag: (TAK files, `--out-dir`, `--verify`).
+pub fn parse_args(args: &[String]) -> std::result::Result<(Vec<PathBuf>, Option<PathBuf>, bool), String> {
     let mut files = Vec::new();
     let mut out_dir = None;
+    let mut verify = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out-dir" => {
-                let Some(d) = it.next() else { return Err("--out-dir 뒤에 폴더가 없어요".into()) };
+                let Some(d) = it.next().filter(|s| !s.is_empty() && !s.starts_with("--")) else { return Err("--out-dir 뒤에 폴더가 없어요".into()) };
                 if out_dir.replace(PathBuf::from(d)).is_some() {
                     return Err("--out-dir은 한 번만 써요".into());
                 }
+            }
+            "--verify" => {
+                if verify { return Err("--verify는 한 번만 써요".into()); }
+                verify = true;
             }
             s if s.starts_with("--") => return Err(format!("모르는 옵션: {s}")),
             s => files.push(PathBuf::from(s)),
@@ -544,7 +575,7 @@ pub fn parse_args(args: &[String]) -> std::result::Result<(Vec<PathBuf>, Option<
     if files.is_empty() {
         return Err("TAK 파일이 없어요".into());
     }
-    Ok((files, out_dir))
+    Ok((files, out_dir, verify))
 }
 
 fn mb(n: u64) -> String {
@@ -577,7 +608,7 @@ pub fn report_line(tak: &Path, c: &Converted) -> String {
 /// `args` = `["--to-takm", files…, "--out-dir", dir]`. One line per file; exit code 0 = all
 /// made, 1 = some failed, 2 = bad options.
 pub fn run(args: &[String]) -> i32 {
-    let (files, out_dir) = match parse_args(args.get(1..).unwrap_or(&[])) {
+    let (files, out_dir, verify) = match parse_args(args.get(1..).unwrap_or(&[])) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("{e}\n{USAGE}");
@@ -587,7 +618,19 @@ pub fn run(args: &[String]) -> i32 {
     let mut failed = 0;
     for tak in &files {
         match convert(tak, out_dir.as_deref()) {
-            Ok(c) => println!("{}", report_line(tak, &c)),
+            Ok(c) => {
+                let line = report_line(tak, &c);
+                if verify {
+                    let result = verify::verify(&c.out, Some(tak));
+                    println!("{line} · 확인 {}", result.verdict.as_str());
+                    if result.verdict == verify::Verdict::Failed {
+                        failed += 1;
+                        eprintln!("{}: {}", c.out.display(), result.failure_details());
+                    }
+                } else {
+                    println!("{line}");
+                }
+            }
             Err(e) => {
                 failed += 1;
                 eprintln!("{}: 만들지 못했어요: {e}", tak.display());
@@ -633,7 +676,30 @@ pub fn read_tail(path: &Path) -> Result<Tail> {
 /// The tail read as a comment file (`comments::parse`: header, cut-off last line and bad lines
 /// skipped).
 pub fn read_comments(path: &Path) -> Result<comments::Parsed> {
-    Ok(comments::parse(&read_tail_text(path)?))
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let index = read_index(&file, len)?;
+    read_comments_at(&file, len, index.tail_start()).map(|(parsed, _)| parsed)
+}
+
+fn read_comments_at(file: &File, len: u64, start: u64) -> Result<(comments::Parsed, Option<&'static str>)> {
+    let size = usize::try_from(len - start).map_err(|_| TakError("Comment 영역이 너무 커요.".into()))?;
+    let mut tail = Vec::new();
+    tail.try_reserve_exact(size).map_err(|_| TakError("Comment 영역을 읽을 메모리가 부족해요.".into()))?;
+    tail.resize(size, 0);
+    read_exact_at(file, &mut tail, start)?;
+    let text = String::from_utf8_lossy(&tail);
+    let has_header = text.split_once('\n').is_some_and(|(line, _)| {
+        line.strip_suffix('\r').unwrap_or(line) == comments::header_line().trim_end()
+    });
+    let damage = if !has_header {
+        Some("Comment 머리글이 없거나 맞지 않아요.")
+    } else if matches!(text, std::borrow::Cow::Owned(_)) {
+        Some("Comment 꼬리에 잘못된 UTF-8 글자가 있어요.")
+    } else {
+        None
+    };
+    Ok((comments::parse(&text), damage))
 }
 
 /// Append lines (each without a line break; CRLF is added) to the tail. Only appends: the
@@ -768,7 +834,7 @@ pub(crate) fn append_events_locked(target: &Path, events: &[comments::Event], ca
     Ok((None, Some(CommentWriteStamp { before, after })))
 }
 
-/// Check the fixed part against its SHA-256 (reads the whole fixed part).
+/// Check the fixed part against its SHA-256 in bounded chunks.
 pub fn verify_fixed(path: &Path) -> Result<()> {
     verify_fixed_seal(path).map(|_| ())
 }
@@ -787,19 +853,23 @@ pub(crate) fn fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> 
 pub(crate) fn verify_fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> {
     let file = File::open(path)?;
     let (fixed_len, seal) = read_seal(&file)?;
-    let mut hash = Sha256::new();
-    let mut buf = vec![0u8; 4 << 20];
-    let mut pos = 0u64;
-    while pos < fixed_len {
-        let n = (fixed_len - pos).min(buf.len() as u64) as usize;
-        read_exact_at(&file, &mut buf[..n], pos)?;
-        hash.update(&buf[..n]);
-        pos += n as u64;
-    }
-    if hash.finalize().as_slice() != seal {
+    let mut buf = vec![0; IO_CHUNK];
+    if hash_file_prefix(&file, fixed_len, &mut buf)?.as_slice() != seal {
         return err(".takm 고정 부분이 바뀌었어요(SHA-256이 달라요).");
     }
     Ok((fixed_len, seal))
+}
+
+fn hash_file_prefix(file: &File, len: u64, buf: &mut [u8]) -> Result<sha2::digest::Output<Sha256>> {
+    let mut hash = Sha256::new();
+    let mut pos = 0u64;
+    while pos < len {
+        let n = (len - pos).min(buf.len() as u64) as usize;
+        read_exact_at(file, &mut buf[..n], pos)?;
+        hash.update(&buf[..n]);
+        pos += n as u64;
+    }
+    Ok(hash.finalize())
 }
 
 #[cfg(test)]
@@ -1221,14 +1291,16 @@ mod tests {
     #[test]
     fn options_and_paths() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_args(&s(&["a.tak"])).unwrap(), (vec![PathBuf::from("a.tak")], None));
+        assert_eq!(parse_args(&s(&["a.tak"])).unwrap(), (vec![PathBuf::from("a.tak")], None, false));
         assert_eq!(
-            parse_args(&s(&["a.tak", "--out-dir", "o", "b.tak"])).unwrap(),
-            (vec![PathBuf::from("a.tak"), PathBuf::from("b.tak")], Some(PathBuf::from("o")))
+            parse_args(&s(&["a.tak", "--out-dir", "o", "b.tak", "--verify"])).unwrap(),
+            (vec![PathBuf::from("a.tak"), PathBuf::from("b.tak")], Some(PathBuf::from("o")), true)
         );
         assert!(parse_args(&s(&[])).is_err());
         assert!(parse_args(&s(&["--out-dir", "o"])).is_err());
         assert!(parse_args(&s(&["a.tak", "--out-dir"])).is_err());
+        assert!(parse_args(&s(&["a.tak", "--out-dir", "--verify"])).is_err());
+        assert!(parse_args(&s(&["a.tak", "--verify", "--verify"])).is_err());
         assert!(parse_args(&s(&["a.tak", "--out-dir", "o", "--out-dir", "p"])).is_err());
         assert!(parse_args(&s(&["a.tak", "--force"])).is_err());
         assert_eq!(run(&s(&["--to-takm"])), 2);

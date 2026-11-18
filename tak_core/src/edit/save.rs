@@ -641,6 +641,12 @@ mod tests {
         let outcome = TakmSave.save(f.request(&f.tak, &out)).unwrap();
         assert_eq!(outcome.written_revision, written.revision());
         assert_eq!(std::fs::read(&f.tak).unwrap(), original);
+        let verified = takm::verify::verify(&out, Some(&f.tak));
+        assert_eq!(verified.verdict, takm::verify::Verdict::Edited);
+        assert_eq!(verified.source_unchanged, Some(true));
+        assert_eq!(verified.checks.retained_streams.pass, Some(true));
+        let changes: Vec<_> = verified.changed_streams.iter().map(|s| (s.index, s.name.as_str())).collect();
+        assert_eq!(changes, [(3, "Channels.dat")]);
         let before = source_data(&f.tak).unwrap();
         let after = source_data(&out).unwrap();
         assert_eq!(before.streams.len(), after.streams.len());
@@ -679,6 +685,10 @@ mod tests {
         let out = f.dir.join("added.takm");
         let first = TakmSave.save(f.request(&f.tak, &out)).unwrap();
         assert_eq!(takm::read_take(&out).unwrap().trajectories.len(), 4);
+        let verified = takm::verify::verify(&out, Some(&f.tak));
+        assert_eq!(verified.verdict, takm::verify::Verdict::Edited);
+        let changes: Vec<_> = verified.changed_streams.iter().map(|s| (s.index, s.name.as_str())).collect();
+        assert_eq!(changes, [(0, "Nodes.dat"), (3, "Channels.dat")]);
         f.doc.mark_saved(&f.doc.snapshot(), out.clone()).unwrap();
         f.doc.apply(&patch, false).unwrap();
         assert!(f.doc.is_dirty());
@@ -686,6 +696,7 @@ mod tests {
             expected_source: first.version.clone(), expected_destination: first.version };
         TakmSave.save(req).unwrap();
         assert_eq!(takm::read_take(&out).unwrap().trajectories.len(), 3);
+        assert_eq!(takm::verify::verify(&out, Some(&f.tak)).verdict, takm::verify::Verdict::Identical);
     }
 
     #[test]

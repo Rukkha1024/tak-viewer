@@ -1,5 +1,12 @@
 # 변경 사항
 
+## v0.41.0 — 2026-11-18
+
+- **TAKM verification:** `--verify-takm <file.takm> [--source <file.tak>] [out.json]` proves a TAKM against its source TAK: source size/SHA-256, every retained stream byte-equal at its original stream index (never by name), the one dropped camera record by index/size/SHA-256, fixed seal and table. Verdict `identical` / `edited` (lists `changed_streams`; only marker streams an edited save may replace) / `no_source` / `failed`. Comment tail health reported separately. `source_unchanged` from before/after size + mtime.
+- **Convert and verify:** `--to-takm … --verify` appends the verdict per file; exit 1 if any fails; failed output kept for inspection.
+- **Memory:** positional reads with bounded buffers; 128 MB take verified in 1.4 s at about 11 MiB peak.
+- Old per-task verifier scripts and the Python fallback converter are no longer needed: conversion passes from WSL and Windows sources to WSL and Windows folders.
+
 ## v0.40.0 — 2026-11-18
 
 - **Take summary:** `--summary <file> [<file2> …] [--markers A,B] [--frames a:b] [--top N] [--json [out.json]]` prints a short Korean text (or JSON) per TAK/TAKM: Progress, frame range/rate/duration, marker counts by structural kind, marker-set coverage (min/median present, frames with all present, missing cells), markers with gaps (count, total, longest with range), devices, and for TAKM seal + live Comment count + source name. No window.

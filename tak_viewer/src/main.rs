@@ -69,6 +69,9 @@ fn main() -> eframe::Result<()> {
         }
         None => {}
     }
+    if args.get(1).map(String::as_str) == Some("--verify-takm") {
+        std::process::exit(tak_core::takm::verify::run(&args[2..], workspace::resolve_path));
+    }
     if matches!(args.get(1).map(String::as_str), Some("--add-comments" | "--list-comments")) {
         std::process::exit(comment_command::run(&args[1..], workspace::resolve_path, capture::local_iso_time));
     }
@@ -207,7 +210,7 @@ fn main() -> eframe::Result<()> {
 
 /// Usage of every command, one place (each new command adds its text here).
 fn usage() -> String {
-    [capture::USAGE, comment_command::USAGE, window_command::USAGE, summary_command::USAGE].join("\n\n")
+    [capture::USAGE, comment_command::USAGE, window_command::USAGE, summary_command::USAGE, tak_core::takm::USAGE, tak_core::takm::verify::USAGE].join("\n\n")
 }
 
 fn cli_exit(code: i32, message: &str) -> ! {

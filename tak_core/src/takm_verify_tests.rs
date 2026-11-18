@@ -1,0 +1,322 @@
+use super::*;
+use crate::sample_tak::{cfb, sample_tak};
+use crate::takm;
+use crate::test_support::TempDir;
+
+fn converted(tag: &str) -> (TempDir, PathBuf, PathBuf) {
+    let dir = TempDir::new(tag);
+    let source = dir.join("walk.tak");
+    std::fs::write(&source, sample_tak()).unwrap();
+    let result = convert(&source, None).unwrap();
+    (dir, source, result.out)
+}
+
+fn reseal(bytes: &mut [u8]) {
+    let fixed = u64_le(bytes, 32) as usize;
+    let digest = Sha256::digest(&bytes[..fixed]);
+    bytes[fixed..fixed + 32].copy_from_slice(&digest);
+}
+
+fn edit_table(path: &Path, change: impl FnOnce(&mut Value)) {
+    let mut raw = std::fs::read(path).unwrap();
+    let table_off = u64_le(&raw, 16) as usize;
+    let previous_fixed = u64_le(&raw, 32) as usize;
+    let mut table: Value = serde_json::from_slice(&raw[table_off..previous_fixed]).unwrap();
+    change(&mut table);
+    let table = serde_json::to_vec(&table).unwrap();
+    let fixed = table_off + table.len();
+    let tail = raw.split_off(previous_fixed + SEAL_LEN as usize);
+    raw.truncate(table_off);
+    raw[24..32].copy_from_slice(&(table.len() as u64).to_le_bytes());
+    raw[32..40].copy_from_slice(&(fixed as u64).to_le_bytes());
+    raw.extend_from_slice(&table);
+    raw.resize(fixed + SEAL_LEN as usize, 0);
+    reseal(&mut raw);
+    raw.extend_from_slice(&tail);
+    std::fs::write(path, raw).unwrap();
+}
+
+#[test]
+fn verifies_identical_conversion_and_reports_source_selection() {
+    let (_dir, source, path) = converted("verify_identical");
+    let auto = verify(&path, None);
+    assert_eq!(auto.verdict, Verdict::Identical);
+    assert_eq!(auto.source_selection, "sibling");
+    assert_eq!(auto.source.as_deref(), Some(source.as_path()));
+    assert_eq!(auto.source_unchanged, Some(true));
+    assert_eq!(auto.source_before, auto.source_after);
+    assert!(auto.required_checks().iter().all(|c| c.pass == Some(true)));
+    assert_eq!(auto.comments.live_count, Some(0));
+
+    let explicit = verify(&path, Some(&source));
+    assert_eq!(explicit.verdict, Verdict::Identical);
+    assert_eq!(explicit.source_selection, "explicit");
+
+    std::fs::remove_file(&source).unwrap();
+    let absent = verify(&path, None);
+    assert_eq!(absent.verdict, Verdict::NoSource);
+    assert_eq!(absent.source_selection, "none");
+    assert_eq!(absent.source_unchanged, None);
+    assert_eq!(absent.checks.retained_streams.pass, None);
+    assert_eq!(verify(&path, Some(&source)).verdict, Verdict::Failed);
+}
+
+#[test]
+fn swapping_equal_length_duplicate_names_fails_at_each_original_index() {
+    let dir = TempDir::new("verify_duplicates");
+    let source = dir.join("duplicate.tak");
+    let mut raw = cfb(&[
+        ("Nodes.dat", vec![1; 71]),
+        ("NodeX.dat", vec![2; 71]),
+        (CAMERA_STREAM, vec![3; 5000]),
+    ]);
+    let encoded = |name: &str| {
+        name.encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    let from = encoded("NodeX.dat");
+    let at = raw.windows(from.len()).position(|b| b == from).unwrap();
+    raw[at..at + from.len()].copy_from_slice(&encoded("Nodes.dat"));
+    std::fs::write(&source, raw).unwrap();
+    let path = convert(&source, None).unwrap().out;
+    assert_eq!(verify(&path, None).verdict, Verdict::Identical);
+    let index = read_index_path(&path).unwrap();
+    assert_eq!(index.streams.len(), 2);
+    let mut raw = std::fs::read(&path).unwrap();
+    let a = index.streams[0].offset as usize;
+    let b = index.streams[1].offset as usize;
+    for i in 0..71 {
+        raw.swap(a + i, b + i);
+    }
+    reseal(&mut raw);
+    std::fs::write(&path, raw).unwrap();
+
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.fixed_seal.pass, Some(true));
+    assert_eq!(result.checks.retained_streams.pass, Some(false));
+    assert!(result.checks.retained_streams.detail.contains("Nodes.dat"));
+    assert_eq!(
+        result
+            .changed_streams
+            .iter()
+            .map(|s| s.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn flipped_retained_byte_fails_and_names_stream_even_when_seal_fails() {
+    let (_dir, _source, path) = converted("verify_flipped");
+    let index = read_index_path(&path).unwrap();
+    let stream = index.unique("Calibration.dat").unwrap();
+    let mut raw = std::fs::read(&path).unwrap();
+    raw[stream.offset as usize] ^= 1;
+    std::fs::write(&path, raw).unwrap();
+
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.fixed_seal.pass, Some(false));
+    assert_eq!(result.checks.retained_streams.pass, Some(false));
+    assert!(result
+        .checks
+        .retained_streams
+        .detail
+        .contains("Calibration.dat"));
+    assert_eq!(result.changed_streams[0].index, stream.index);
+}
+
+#[test]
+fn wrong_source_fails_even_if_its_container_streams_match() {
+    let (dir, source, path) = converted("verify_wrong_source");
+    let other = dir.join("mismatch").join("walk.tak");
+    std::fs::create_dir(other.parent().unwrap()).unwrap();
+    let mut raw = std::fs::read(&source).unwrap();
+    raw[15] ^= 1; // Unused CFB header byte. All payloads still match.
+    std::fs::write(&other, raw).unwrap();
+    let result = verify(&path, Some(&other));
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.source_sha256.pass, Some(false));
+    assert_eq!(result.checks.source_name.pass, Some(true));
+    assert_eq!(result.checks.source_size.pass, Some(true));
+    assert_eq!(result.checks.retained_streams.pass, Some(true));
+    assert_eq!(result.source_unchanged, Some(true));
+
+    let renamed = dir.join("renamed.tak");
+    std::fs::copy(&source, &renamed).unwrap();
+    let result = verify(&path, Some(&renamed));
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.source_name.pass, Some(false));
+    assert_eq!(result.checks.source_sha256.pass, Some(true));
+}
+
+#[test]
+fn checks_structure_layout_camera_hash_and_seal_independently() {
+    let (_dir, _source, path) = converted("verify_fixed");
+    let original = std::fs::read(&path).unwrap();
+    let fixed = u64_le(&original, 32) as usize;
+    let mut damaged = original.clone();
+    damaged[fixed] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.header_table.pass, Some(true));
+    assert_eq!(result.checks.retained_streams.pass, Some(true));
+    assert_eq!(result.checks.fixed_seal.pass, Some(false));
+
+    std::fs::write(&path, &original).unwrap();
+    edit_table(&path, |table| table["layout"] = json!(2));
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.layout_version.pass, Some(false));
+    assert_eq!(result.checks.fixed_seal.pass, Some(true));
+
+    std::fs::write(&path, &original).unwrap();
+    edit_table(&path, |table| table["streams"][1]["index"] = json!(0));
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.header_table.pass, Some(false));
+    assert_eq!(result.checks.layout_version.pass, Some(true));
+    assert_eq!(result.checks.fixed_seal.pass, Some(true));
+
+    std::fs::write(&path, &original).unwrap();
+    edit_table(&path, |table| {
+        table["dropped"][0]["sha256"] = json!("0".repeat(64))
+    });
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert_eq!(result.checks.dropped_streams.pass, Some(false));
+    assert_eq!(result.checks.retained_streams.pass, Some(true));
+
+    std::fs::write(&path, &original).unwrap();
+    edit_table(&path, |table| table["dropped"][0]["size"] = json!(1));
+    assert_eq!(verify(&path, None).checks.dropped_streams.pass, Some(false));
+
+    std::fs::write(&path, original).unwrap();
+    edit_table(&path, |table| {
+        table["dropped"][0]["name"] = json!("MetaData.dat")
+    });
+    assert_eq!(verify(&path, None).checks.header_table.pass, Some(false));
+}
+
+#[test]
+fn live_comments_and_tail_damage_do_not_change_fixed_verdict() {
+    let (_dir, _source, path) = converted("verify_tail");
+    let event = "t,add,1,,0,0,,note,1,,walk.tak|1,\r\n";
+    let tail = format!("{event}bad\r\nt,add,2");
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(tail.as_bytes())
+        .unwrap();
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Identical);
+    assert_eq!(result.comments.status.pass, Some(false));
+    assert_eq!(result.comments.live_count, Some(1));
+    assert_eq!(result.comments.malformed_lines, Some(1));
+    assert_eq!(result.comments.skipped_lines, Some(2));
+    assert_eq!(result.comments.cut_tail, Some(true));
+
+    let mut raw = std::fs::read(&path).unwrap();
+    let note = raw.windows(4).rposition(|b| b == b"note").unwrap();
+    raw[note] = 0xff;
+    std::fs::write(&path, raw).unwrap();
+    let result = verify(&path, None);
+    assert_eq!(result.verdict, Verdict::Identical);
+    assert_eq!(result.comments.status.pass, Some(false));
+    assert!(result.comments.status.detail.contains("UTF-8"));
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).into()).collect()
+}
+
+#[test]
+fn conversion_flag_verifies_each_result_and_propagates_failure() {
+    let dir = TempDir::new("convert_verify");
+    let source = dir.join("good.tak");
+    std::fs::write(&source, sample_tak()).unwrap();
+    let rc = takm::run(&strings(&[
+        "--to-takm",
+        "--verify",
+        source.to_str().unwrap(),
+    ]));
+    assert_eq!(rc, 0);
+    assert_eq!(
+        verify(&source.with_extension("takm"), None).verdict,
+        Verdict::Identical
+    );
+
+    let no_camera = dir.join("no_camera.tak");
+    std::fs::write(&no_camera, cfb(&[("Data", vec![5; 12])])).unwrap();
+    let another = dir.join("also_good.tak");
+    std::fs::copy(source, &another).unwrap();
+    let rc = takm::run(&strings(&[
+        "--to-takm",
+        "--verify",
+        no_camera.to_str().unwrap(),
+        another.to_str().unwrap(),
+    ]));
+    assert_eq!(rc, 1);
+    assert!(no_camera.with_extension("takm").exists());
+    assert_eq!(
+        verify(&another.with_extension("takm"), None).verdict,
+        Verdict::Identical
+    );
+}
+
+#[test]
+fn cli_exit_codes_output_and_refusals() {
+    let (dir, source, path) = converted("verify_output");
+    let run = |args: &[&str]| super::run(&strings(args), |s| PathBuf::from(s));
+    let input = path.to_str().unwrap();
+    assert_eq!(run(&[]), 2);
+    assert_eq!(run(&["bad.tak"]), 2);
+    assert_eq!(run(&[input, "--source"]), 2);
+    assert_eq!(run(&[input, "--source", "--unknown"]), 2);
+    assert_eq!(run(&[input, "--source", "bad.takm"]), 2);
+    assert_eq!(run(&[input, "--source", "a.tak", "--source", "b.tak"]), 2);
+    assert_eq!(run(&[input, "a.json", "b.json"]), 2);
+
+    let tak_bytes = std::fs::read(&source).unwrap();
+    let takm_bytes = std::fs::read(&path).unwrap();
+    assert_eq!(run(&[input, source.to_str().unwrap()]), 2);
+    assert_eq!(run(&[input, input]), 2);
+    assert_eq!(std::fs::read(&source).unwrap(), tak_bytes);
+    assert_eq!(std::fs::read(&path).unwrap(), takm_bytes);
+
+    std::fs::create_dir(dir.join("apps")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "").unwrap();
+    std::fs::write(dir.join("apps/AGENTS.md"), "").unwrap();
+    std::fs::create_dir(dir.join("input")).unwrap();
+    let protected = dir.join("input").join("report.json");
+    assert_eq!(run(&[input, protected.to_str().unwrap()]), 2);
+    assert!(!protected.exists());
+
+    let output = dir.join("report.json");
+    assert_eq!(run(&[input, output.to_str().unwrap()]), 0);
+    let report_bytes = std::fs::read(&output).unwrap();
+    let report: Value = serde_json::from_slice(&report_bytes).unwrap();
+    assert_eq!(report["source_unchanged"], true);
+    assert_eq!(report["verdict"], "identical");
+    assert_eq!(run(&[input, output.to_str().unwrap()]), 2);
+    assert_eq!(std::fs::read(&output).unwrap(), report_bytes);
+
+    let alias = dir.join("alias.json");
+    if std::fs::hard_link(&source, &alias).is_ok() {
+        assert_eq!(run(&[input, alias.to_str().unwrap()]), 2);
+        assert_eq!(std::fs::read(&source).unwrap(), tak_bytes);
+    }
+
+    let failed = dir.join("failed.json");
+    assert_eq!(
+        run(&[input, "--source", "missing.tak", failed.to_str().unwrap()]),
+        1
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(failed).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "failed");
+    assert_eq!(report["source_unchanged"], false);
+}

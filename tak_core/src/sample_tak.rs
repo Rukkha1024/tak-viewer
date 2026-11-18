@@ -28,7 +28,7 @@ fn words(w: &[u32], unit: usize) -> Vec<u8> {
 }
 
 /// Compound file holding `streams` (`Folder/Name` paths), siblings in the given order.
-fn cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     const SS: usize = 512;
     struct E {
         name: String,
