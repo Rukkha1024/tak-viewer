@@ -1,10 +1,11 @@
 fn multi_drain(ctx: &egui::Context, app: &mut TakViewerApp) {
-    for _ in 0..2000 {
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    while app.comment_outstanding > 0 {
         app.poll_comment_writes(ctx);
-        if app.comment_outstanding == 0 { return; }
-        std::thread::sleep(Duration::from_millis(2));
+        if app.comment_outstanding == 0 { break; }
+        watchdog.pause(|| format!("Comment writer did not finish. Outstanding={}, queued={}, registration={}, error={:?}",
+            app.comment_outstanding, app.comment_waiting.len(), app.comment_registration.is_some(), app.comment_registration_error));
     }
-    panic!("Comment writer did not finish");
 }
 fn multi_frame(ctx: &egui::Context, app: &mut TakViewerApp, modifiers: Modifiers, events: Vec<egui::Event>) -> egui::FullOutput {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 960.0));

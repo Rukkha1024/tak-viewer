@@ -511,7 +511,8 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
         } else {
             crate::app::key_focus::region(ui, hover_rect.intersect(clip), crate::app::key_focus::Target::Markers(slot));
         }
-        let lane_h = (rect.height() - graph::NAV_H) / g.lanes.len().max(1) as f32;
+        let plot_height = rect.height() - graph::NAV_H;
+        let lane_h = plot_height / g.lanes.len().max(1) as f32;
         let alpha = (f32::from(opacity.min(100)) * 2.55).round() as u8;
         let look = Look {
             bg: Color32::from_rgba_unmultiplied(14, 14, 14, alpha),
@@ -521,6 +522,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
             values: lane_h >= 40.0 && rect.width() >= 260.0,
             tag_w: TAG_PAD + if hot { full_w } else { plain_w },
             keep_out: view_tag,
+            pending_plot_height: plot_height,
             selection: g.selection,
         };
         let Graph { lanes, drawn, gaps, plot_id, first, last, frame, spans, .. } = g;

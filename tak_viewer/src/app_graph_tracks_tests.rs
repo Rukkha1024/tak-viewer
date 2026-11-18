@@ -116,7 +116,7 @@ fn tracks_row_drag_is_live_preserves_selection_and_shares_one_range() {
     assert_eq!((app.view().range, app.view().pb.frame), (Some((2, 7)), 5));
 
     app.settings.graph_layout = graph::tracks::Layout::Channels;
-    wait_marker_graphs(&ctx, &mut app);
+    wait_marker_graph(&ctx, &mut app, 0);
     let out = frame_with(&ctx, &mut app, vec![]);
     let yellow = graph_selection_fill_rects(&out, theme::RANGE.gamma_multiply(0.12));
     assert_eq!(yellow.len(), 1, "Channels paints the Tracks range");

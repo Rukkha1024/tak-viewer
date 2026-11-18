@@ -1151,9 +1151,13 @@ mod tests {
         let mut ws = listed(&root);
         ws.start_watch_every(Duration::from_millis(20));
         ws.watch(&[root.clone()]);
-        // Idle: rounds go on, nothing is sent, no repaint is asked for.
-        std::thread::sleep(Duration::from_millis(300));
-        let (rounds, wakes, _) = ws.watch_counts();
+        // Let the idle watcher finish three real rounds before inspecting its output.
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        let (rounds, wakes, _) = loop {
+            let counts = ws.watch_counts();
+            if counts.0 >= 3 { break counts; }
+            watchdog.pause(|| format!("idle watcher for {root:?} has finished {} rounds", counts.0));
+        };
         assert!(rounds >= 3, "rounds keep running ({rounds})");
         assert_eq!(wakes, 0, "an idle window is never woken by the watcher");
         assert!(!ws.poll());
@@ -1162,6 +1166,11 @@ mod tests {
         assert!(poll_until(&mut ws), "the change arrives by itself");
         assert_eq!(ws.siblings(&root.join("new.takm")).unwrap().len(), 1, "PageUp / PageDown see it");
         assert_eq!(ws.loaded_files().len(), 1, "the search box sees it");
+        // The watcher sends the listing before it records the wake for that round.
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        while ws.watch_counts().1 == 0 {
+            watchdog.pause(|| format!("watcher published the listing for {root:?}, but no wake yet"));
+        }
         assert_eq!(ws.watch_counts().1, 1, "one repaint for one change");
         let _ = std::fs::remove_dir_all(&root);
     }

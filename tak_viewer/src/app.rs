@@ -4555,16 +4555,26 @@ mod tests {
         assert_eq!(app.views[0].graph_rect, None, "no marker selected: no graph");
         let whole = app.views[0].scene_rect;
         assert!(whole.bottom() > 850.0, "nothing below the 3D but its playback bar: {whole:?}");
+        let release = app.views[0].lanes.hold_marker_topology();
         app.views[0].select(0, false);
         frame_with(&ctx, &mut app, vec![]);
         let g = app.views[0].graph_rect.expect("a selected marker's graph floats over the 3D");
         assert!(app.views[0].scene_rect == whole && whole.contains_rect(g), "the 3D keeps its size, the graph is inside it: {g:?} in {whole:?}");
         assert!((g.bottom() - (whole.bottom() - 6.0)).abs() < 0.5 && (g.width() - (whole.width() - 12.0)).abs() < 0.5, "first place: along the bottom, as wide as the view");
+        assert!(app.views[0].lanes.marker_topology_pending());
         // A click inside the graph goes to that frame; the 3D under it does not get the click
         // (a click on empty 3D would clear the selection).
         click_at(&ctx, &mut app, egui::pos2(g.right() - 12.0, g.center().y - 10.0));
         assert_eq!(app.views[0].pb.frame, 9, "click near the right end of the graph: last frame");
         assert_eq!(app.views[0].primary, Some(0), "the selection is kept");
+        assert!(app.views[0].lanes.marker_topology_pending(), "the click sought before topology arrived");
+        release.send(()).unwrap();
+        wait_marker_graph(&ctx, &mut app, 0);
+        idle(&ctx, &mut app);
+        app.views[0].pb.set_frame(0, 0.0);
+        click_at(&ctx, &mut app, egui::pos2(g.right() - 12.0, g.center().y - 10.0));
+        assert_eq!(app.views[0].pb.frame, 9, "the same click seeks to the same frame after topology");
+        assert_eq!(app.views[0].primary, Some(0));
         // Folded: only the name tag is left, the graph itself is gone.
         app.settings.graph_boxes[0].collapsed = true;
         frame_with(&ctx, &mut app, vec![]);
@@ -4595,8 +4605,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.views[0].show(views::sample_data("a.tak", &["M"]), rx, 10, 1.0, 0.0);
         app.views[0].select(0, false);
-        frame_with(&ctx, &mut app, vec![]);
-        frame_with(&ctx, &mut app, vec![]);
+        wait_marker_graph(&ctx, &mut app, 0);
         // The graph lives in the whole 3D as drawn (the view is alone: no tab row).
         let area = app.views[0].scene_rect;
         let view_tag = view_tab(&ctx, &app, 0);
@@ -6333,10 +6342,12 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         app.close_editor(0);
         app.retry_comments_and_transition(&ctx, 0);
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        while app.views[0].data.is_some() {
             frame_with(&ctx, &mut app, vec![]);
             if app.views[0].data.is_none() { break; }
-            std::thread::sleep(Duration::from_millis(2));
+            watchdog.pause(|| format!("Comment retry did not close the view. Outstanding={}, failed={}, prompt={}, note={:?}",
+                app.comment_outstanding, app.comment_failed.len(), app.dirty_prompt.is_some(), app.takm_note));
         }
         assert!(app.views[0].data.is_none(), "successful retry closes the view");
         assert!(app.comment_failed.is_empty());
@@ -6485,10 +6496,11 @@ mod tests {
         let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
         app.ensure_comment_writer(&ctx);
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        while app.comment_registration.is_some() {
             app.poll_comment_writes(&ctx);
             if app.comment_registration.is_none() { break; }
-            std::thread::sleep(Duration::from_millis(2));
+            watchdog.pause(|| format!("Comment writer registration pending. Error: {:?}", app.comment_registration_error));
         }
         assert!(app.comment_registration.is_none());
         let path = dir.join("a.takm");
@@ -6520,11 +6532,7 @@ mod tests {
         click_at(&ctx, &mut app, discard);
         assert!(app.exit_approved, "exit must not wait for the held lock; prompt={} pending={}", app.dirty_prompt.is_some(), app.views[0].comments.pending);
         drop(lock);
-        for _ in 0..2000 {
-            app.poll_comment_writes(&ctx);
-            if app.comment_outstanding == 0 { break; }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        multi_drain(&ctx, &mut app);
         assert_eq!(app.comment_outstanding, 0);
         assert!(tak_core::takm::read_comments(&path).unwrap().events.is_empty());
     }
@@ -7890,10 +7898,11 @@ mod tests {
         if app.views[k].loading.is_none() && app.views[k].waiting_shared_path().is_none() && app.views[k].data.is_some() {
             // Conversion switches as soon as markers arrive. Its real Comment reader
             // may still be running, so visible data alone does not complete this fixture.
-            for _ in 0..2000 {
+            let watchdog = crate::work_queue::TestWatchdog::new();
+            while app.views[k].comments_rx.is_some() {
                 frame_with(ctx, app, vec![]);
                 if app.views[k].comments_rx.is_none() { break; }
-                std::thread::sleep(Duration::from_millis(2));
+                watchdog.pause(|| format!("Comment reader still pending for view {k}: {:?}", app.views[k].path()));
             }
             assert!(app.views[k].comments_rx.is_none(), "the shown file's Comments did not arrive");
             if !app.no_persist && matches!(app.views[k].comments.target, Some(Ok(_))) {
@@ -9963,15 +9972,15 @@ mod tests {
 
     /// Frames until the Explorer has read its folders (the listing runs on its own thread).
     fn until_listed(ctx: &egui::Context, app: &mut TakViewerApp) {
-        for _ in 0..500 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
             frame_with(ctx, app, vec![]);
             if !app.workspace.is_loading() {
                 frame_with(ctx, app, vec![]);
                 return;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            watchdog.pause(|| format!("folder not listed. Roots: {:?}", app.workspace.roots()));
         }
-        panic!("folder not listed");
     }
 
     #[test]
@@ -11304,13 +11313,18 @@ mod tests {
         (app, f)
     }
 
-    fn wait_marker_graphs(ctx: &egui::Context, app: &mut TakViewerApp) {
-        for _ in 0..200 {
-            frame_with(ctx, app, vec![]);
-            if app.open_views().iter().all(|&slot| !app.views[slot].lanes.preparing()) { return; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    fn wait_marker_graph(ctx: &egui::Context, app: &mut TakViewerApp, slot: usize) -> egui::FullOutput {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
+            let out = frame_with(ctx, app, vec![]);
+            let pass = ctx.cumulative_pass_nr() - 1;
+            let view = &app.views[slot];
+            if view.lanes.painted_marker_graph(pass) {
+                return out;
+            }
+            watchdog.pause(|| format!("view {slot} (float={}, selected={:?}, pass={pass}) marker graph: {}",
+                app.settings.graph_float, view.selected, view.lanes.marker_graph_state()));
         }
-        panic!("marker graphs did not become ready");
     }
 
     fn marker_index(app: &TakViewerApp, name: &str) -> usize {
@@ -11325,11 +11339,10 @@ mod tests {
         let (mut app, f) = pair_app(&ctx, &dir);
         let n = marker_index(&app, "N");
         app.views[0].select(n, false);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
         assert!(app.views[0].graph_rect.is_some(), "the graph floats");
+        // Compare the cached redraws after installing each configuration.
+        frame_with(&ctx, &mut app, vec![]);
         // Without an overlay: solid lines only, no legend.
         let alone = app.views[0].lanes.drew().clone();
         assert_eq!((alone.solid, alone.dashed, alone.legend), (3, 0, false));
@@ -11339,8 +11352,7 @@ mod tests {
         // b.tak laid over: N of b dashed in the same lanes, one range over both.
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive_as(&ctx, &mut app, 0, pair_take(&f[1], &["M", "N", "U"], true));
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
         let pair = app.views[0].lanes.pair_now().expect("a second file");
         assert_eq!(pair.lanes.len(), 3);
         let frames = |run: &Vec<[f64; 2]>| (run[0][0], run.last().unwrap()[0]);
@@ -11356,8 +11368,7 @@ mod tests {
         // Key 2 hides the dashed line, key 1 the solid one; the range never moves.
         for (key, shown, solid, dashed) in [(Key::Num2, [true, false], 3, 0), (Key::Num1, [false, false], 0, 0), (Key::Num2, [false, true], 0, 6), (Key::Num1, [true, true], 3, 6)] {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, key)]);
-            frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+            wait_marker_graph(&ctx, &mut app, 0);
             let d = app.views[0].lanes.drew().clone();
             assert_eq!((app.views[0].shown, d.solid, d.dashed, d.legend), (shown, solid, dashed, true), "{key:?}");
             assert_eq!(d.ranges, both.ranges, "same scale shown or hidden ({shown:?})");
@@ -11366,43 +11377,32 @@ mod tests {
 
         // The GRAPH pane draws the same.
         app.set_graph_float(false);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
         let pane = app.views[0].lanes.drew().clone();
         assert!(dock::has(&app.dock, Pane::Graph) && app.views[0].graph_rect.is_none());
         assert_eq!((pane.solid, pane.dashed, pane.legend, pane.ranges), (3, 6, true, both.ranges.clone()));
         app.set_graph_float(true);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
 
         // M is the same in both files: dashed under the solid line.
         app.views[0].select(marker_index(&app, "M"), false);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
         let m = app.views[0].lanes.drew().clone();
         assert_eq!((m.solid, m.dashed, m.legend, m.ranges[0]), (3, 3, true, (0.0, 0.0)), "x of M = 0 in both");
         // Q is not in b, U is unlabeled: nothing extra, the graph as without an overlay.
         for name in ["Q", "U"] {
             app.views[0].select(marker_index(&app, name), false);
-            frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+            wait_marker_graph(&ctx, &mut app, 0);
             let d = app.views[0].lanes.drew().clone();
             assert!(app.views[0].lanes.pair_now().is_some_and(|p| p.lanes.is_empty()), "{name}");
             assert_eq!((d.solid, d.dashed, d.legend), (3, 0, false), "{name}");
         }
         // Taken off: N's graph exactly as before the overlay.
         app.views[0].select(n, false);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
+        wait_marker_graph(&ctx, &mut app, 0);
         app.overlay_off(0);
+        wait_marker_graph(&ctx, &mut app, 0);
         frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
-        frame_with(&ctx, &mut app, vec![]);
-        wait_marker_graphs(&ctx, &mut app);
         assert!(app.views[0].lanes.pair_now().is_none());
         assert_eq!(*app.views[0].lanes.drew(), alone);
     }
@@ -11677,15 +11677,14 @@ mod tests {
         app.hold_loads = true;
         app.open_workspace(dir.clone());
         // The folder is listed (background), then the file's row is right-clicked.
-        let mut row = None;
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        let row = loop {
             let out = frame_with(&ctx, &mut app, vec![]);
             if let Some(r) = text_rects(&out, "b.tak").first() {
-                row = Some(*r);
-                break;
+                break Some(*r);
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+            watchdog.pause(|| format!("file row missing for {tak:?}. Listing pending: {}", app.workspace.is_loading()));
+        };
         let out = right_click_at(&ctx, &mut app, row.expect("the file row").center());
         click_at(&ctx, &mut app, text_rects(&out, ".takm으로 저장")[0].center());
         until_converted(&ctx, &mut app);
@@ -11749,20 +11748,20 @@ mod tests {
         let (mut app, f) = pair_app_named(&ctx, &dir, "a.takm");
         wait_comment_ids(&ctx, &mut app, 0);
         let (m, n, q) = (marker_index(&app, "M"), marker_index(&app, "N"), marker_index(&app, "Q"));
-        let two_frames = |app: &mut TakViewerApp| {
+        let drawn_graph = |app: &mut TakViewerApp| {
+            wait_marker_graph(&ctx, app, 0);
             frame_with(&ctx, app, vec![]);
-            wait_marker_graphs(&ctx, app);
             app.views[0].lanes.drew().clone()
         };
         // One marker: X red, Y green, Z blue, as before.
         app.views[0].select(n, false);
-        let one = two_frames(&mut app);
+        let one = drawn_graph(&mut app);
         assert_eq!((one.solid, one.colors.clone()), (3, vec![vec![theme::AXIS_X], vec![theme::AXIS_Y], vec![theme::AXIS_Z]]));
         // Ctrl+click Q, then M: three curves in every lane (LABELS order M, N, Q whatever the
         // clicks), all in the lane's colour; one range over all (x of M, N, Q = 0, 100, 300 mm).
         app.views[0].select(q, true);
         app.views[0].select(m, true);
-        let three = two_frames(&mut app);
+        let three = drawn_graph(&mut app);
         assert!(app.views[0].graph_rect.is_some(), "the graph floats");
         assert_eq!(three.colors, lane_colors(3));
         assert_eq!((three.solid, three.dashed, three.legend), (9, 0, false));
@@ -11776,9 +11775,9 @@ mod tests {
         assert_eq!((app.views[0].lanes.builds, app.views[0].comments.spans.builds), builds, "nothing built again frame by frame");
         // Taking M away keeps N and Q's lanes; back to N alone: exactly as before.
         app.views[0].select(m, true);
-        assert_eq!(two_frames(&mut app).colors, lane_colors(2));
+        assert_eq!(drawn_graph(&mut app).colors, lane_colors(2));
         app.views[0].select(n, false);
-        assert_eq!(two_frames(&mut app), one);
+        assert_eq!(drawn_graph(&mut app), one);
 
         // Comment bands: one for each Comment naming any graphed marker, once each.
         app.views[0].select(m, false);
@@ -11787,19 +11786,19 @@ mod tests {
         app.add_comment(&ctx, 0, vec!["N".into(), "Q".into()], 2, 4);
         app.add_comment(&ctx, 0, vec!["U".into()], 5, 6);
         app.add_comment(&ctx, 0, vec!["M".into()], 7, 7);
-        assert_eq!(two_frames(&mut app).bands, 2, "N+Q once, M once, U is not graphed");
+        assert_eq!(drawn_graph(&mut app).bands, 2, "N+Q once, M once, U is not graphed");
 
         // b.tak laid over: M and N of b dashed in the lanes' colours (Q is not in b); keys 1 / 2.
         lay_over(&ctx, &mut app, &f[1]);
         overlay_arrive_as(&ctx, &mut app, 0, pair_take(&f[1], &["M", "N", "U"], true));
-        let both = two_frames(&mut app);
+        let both = drawn_graph(&mut app);
         assert_eq!(both.dash_colors, lane_colors(2));
         assert_eq!(both.colors, three.colors);
         assert!(both.legend && both.dashed > 0);
         assert!(near(both.ranges[0], (0.0, 300.0)), "x of N in b (150 mm) is inside: {:?}", both.ranges[0]);
         for (key, shown) in [(Key::Num2, [true, false]), (Key::Num1, [false, false]), (Key::Num2, [false, true]), (Key::Num1, [true, true])] {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, key)]);
-            let d = two_frames(&mut app);
+            let d = drawn_graph(&mut app);
             assert_eq!(app.views[0].shown, shown);
             assert_eq!((d.colors.iter().all(Vec::is_empty), d.dash_colors.iter().all(Vec::is_empty)), (!shown[0], !shown[1]), "{key:?}");
             assert_eq!(d.ranges, both.ranges, "the range does not jump ({shown:?})");
@@ -11807,7 +11806,7 @@ mod tests {
 
         // The GRAPH pane draws the same.
         app.set_graph_float(false);
-        let pane = two_frames(&mut app);
+        let pane = drawn_graph(&mut app);
         assert!(dock::has(&app.dock, Pane::Graph) && app.views[0].graph_rect.is_none());
         assert_eq!((pane.colors, pane.dash_colors, pane.ranges, pane.bands), (both.colors, both.dash_colors, both.ranges, 2));
 
@@ -11817,22 +11816,22 @@ mod tests {
         let x_of_n = 100.0;
         for float in [false, true] {
             app.set_graph_float(float);
-            let before = two_frames(&mut app);
+            let before = drawn_graph(&mut app);
             let (undo, frame, selected) = (app.history.undo.len(), app.views[0].pb.frame, app.views[0].selected.clone());
             let f = app.views[0].pb.frame as f64 + 0.3;
             let p = before.point(0, f, x_of_n).expect("lane X drawn");
             frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(p)]);
-            let h = two_frames(&mut app);
+            let h = drawn_graph(&mut app);
             assert_eq!((h.hovered, h.hover_lanes), (Some(graph::Curve { marker: 1, laid_over: false }), 3), "float {float}");
             assert_eq!(h.hover_text.map(|t| t.0).as_deref(), Some("N"), "float {float}");
             assert_eq!((h.colors, h.ranges), (before.colors.clone(), before.ranges.clone()), "nothing else changes");
             assert_eq!((app.history.undo.len(), app.views[0].pb.frame, &app.views[0].selected), (undo, frame, &selected), "float {float}");
             frame_with(&ctx, &mut app, vec![egui::Event::PointerGone]);
-            assert_eq!(two_frames(&mut app).hovered, None);
+            assert_eq!(drawn_graph(&mut app).hovered, None);
         }
         // `--hover N` / `--bench-hover` (agent only): the same without a mouse.
         app.views[0].lanes.hover_at = Some(1);
-        let h = two_frames(&mut app);
+        let h = drawn_graph(&mut app);
         assert_eq!((h.hovered.map(|c| c.marker), h.hover_text.map(|t| t.0)), (Some(1), Some("N".to_string())));
         app.views[0].lanes.hover_at = None;
         // `--bench-hover`: another curve (or none) every second frame, M, N, Q, none, M …
@@ -11863,7 +11862,7 @@ mod tests {
         app.views[0].select_many((0..12).collect(), Some(11), false);
         for float in [true, false] {
             app.set_graph_float(float);
-            wait_marker_graphs(&ctx, &mut app);
+            wait_marker_graph(&ctx, &mut app, 0);
             let d = app.views[0].lanes.drew().clone();
             assert_eq!(d.colors, vec![vec![theme::AXIS_X; 8], vec![theme::AXIS_Y; 8], vec![theme::AXIS_Z; 8]], "float {float}");
             let (lo, hi) = d.ranges[0];

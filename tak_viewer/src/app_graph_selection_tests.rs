@@ -13,7 +13,7 @@ fn graph_selection_setup(ctx: &egui::Context, detached: bool) -> TakViewerApp {
             .set_position(egui::pos2(300.0, 150.0))
             .set_size(egui::vec2(800.0, 400.0));
     }
-    wait_marker_graphs(ctx, &mut app);
+    wait_marker_graph(ctx, &mut app, 0);
     app.quiet();
     app.history.undo.clear();
     app.history.redo.clear();
@@ -122,7 +122,7 @@ fn graph_selection_keeps_3d_overlay_drag_as_frame_scrubbing() {
     let (mut app, _) = one_view_with_graph(&ctx);
     app.views[0].range = Some((1, 3));
     app.views[0].pb.set_frame(5, 0.0);
-    wait_marker_graphs(&ctx, &mut app);
+    wait_marker_graph(&ctx, &mut app, 0);
     app.quiet();
     app.history.undo.clear();
     app.history.redo.clear();
@@ -132,4 +132,108 @@ fn graph_selection_keeps_3d_overlay_drag_as_frame_scrubbing() {
     assert_eq!(app.history.kinds(), vec!["Frame"]);
     undo_key(&ctx, &mut app);
     assert_eq!((app.views[0].range, app.views[0].pb.frame), (Some((1, 3)), 5));
+}
+
+#[test]
+fn graph_selection_floating_plot_scrubs_live_while_topology_is_held() {
+    let ctx = egui::Context::default();
+    let mut app = one_view(&ctx);
+    let release = app.views[0].lanes.hold_marker_topology();
+    app.views[0].select(0, false);
+    frame_with(&ctx, &mut app, vec![]);
+    let rect = app.views[0].graph_rect.unwrap();
+    assert!(app.views[0].lanes.marker_topology_pending());
+    let x = |frame| tracks_frame_x(rect, 0, 9, frame);
+    let at = |frame| egui::pos2(x(frame), rect.center().y);
+    let from = at(2);
+    frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(from), graph_selection_primary(from, true)]);
+    for frame in [6, 8] {
+        frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(at(frame))]);
+        assert_eq!(app.views[0].pb.frame, frame, "scrub while the mouse is still held");
+        assert_eq!(app.views[0].range, None);
+        assert_eq!(app.views[0].primary, Some(0));
+    }
+    frame_with(&ctx, &mut app, vec![graph_selection_primary(at(8), false)]);
+
+    // The navigation strip still paints at the top while the lanes are absent.
+    click_at(&ctx, &mut app, egui::pos2(x(4), rect.top() + graph::NAV_H * 0.5));
+    assert_eq!(app.views[0].pb.frame, 4);
+    idle(&ctx, &mut app);
+
+    let area = app.views[0].scene_rect;
+    let view_tag = view_tab(&ctx, &app, 0);
+    let name_w = marker_name_w(&ctx);
+    let points = |app: &TakViewerApp| graph_float::test_points(
+        Kind::Marker, &app.settings.graph_boxes[0], area, view_tag, name_w,
+    );
+    let tag = points(&app)[0];
+    click_at(&ctx, &mut app, tag);
+    assert_eq!(app.views[0].pb.frame, 4, "the tag keeps its click");
+    assert_eq!(app.views[0].graph_rect, Some(rect));
+    idle(&ctx, &mut app);
+    drag(&ctx, &mut app, tag, tag + egui::vec2(0.0, -50.0));
+    let moved = app.views[0].graph_rect.unwrap();
+    assert!((moved.min - rect.min - egui::vec2(0.0, -50.0)).length() < 0.5);
+    assert_eq!(app.views[0].pb.frame, 4, "moving the tag doesn't scrub");
+    let fold = points(&app)[2];
+    click_at(&ctx, &mut app, fold);
+    assert!(app.settings.graph_boxes[0].collapsed && app.views[0].graph_rect.is_none());
+    idle(&ctx, &mut app);
+    let unfold = points(&app)[2];
+    click_at(&ctx, &mut app, unfold);
+    assert!(app.views[0].graph_rect.is_some());
+    let to_panel = points(&app)[1];
+    click_at(&ctx, &mut app, to_panel);
+    assert!(!app.settings.graph_float && dock::has(&app.dock, Pane::Graph));
+    assert_eq!((app.views[0].pb.frame, app.views[0].primary), (4, Some(0)));
+    assert!(app.views[0].lanes.marker_topology_pending());
+    release.send(()).unwrap();
+}
+
+#[test]
+fn graph_selection_panel_input_works_while_topology_is_held() {
+    use graph::tracks::Layout;
+    for detached in [false, true] {
+        for layout in [Layout::Channels, Layout::Combined] {
+            let ctx = egui::Context::default();
+            let mut app = one_view(&ctx);
+            app.set_graph_float(false);
+            app.settings.graph_layout = layout;
+            if detached {
+                dock::hide(&mut app.dock, Pane::Graph);
+                let window = app.dock.add_window(vec![Pane::Graph]);
+                app.dock.get_window_state_mut(window).unwrap()
+                    .set_position(egui::pos2(300.0, 150.0))
+                    .set_size(egui::vec2(800.0, 400.0));
+            }
+            // Register the panel before the selection that opens the plot.
+            frame_with(&ctx, &mut app, vec![]);
+            let release = app.views[0].lanes.hold_marker_topology();
+            app.views[0].select(0, false);
+            let out = frame_with(&ctx, &mut app, vec![]);
+            assert!(app.views[0].lanes.marker_topology_pending());
+            let nav = graph_selection_fill_rects(&out, theme::NAV_BG).into_iter()
+                .find(|rect| (rect.height() - graph::NAV_H).abs() < 0.01)
+                .expect("the pending GRAPH navigation strip is painted");
+            let footer = text_rects(&out, "· Drag = range · Right-drag = value zoom · Wheel = time zoom")[0];
+            let x = |frame| tracks_frame_x(nav, 0, 9, frame);
+            let point = |frame| egui::pos2(x(frame), footer.bottom() + 12.0);
+            let click = point(9);
+
+            frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(click), graph_selection_primary(click, true)]);
+            frame_with(&ctx, &mut app, vec![graph_selection_primary(click, false)]);
+            assert_eq!((app.views[0].pb.frame, app.views[0].primary), (9, Some(0)), "{layout:?}, detached={detached}");
+            drag(&ctx, &mut app, egui::pos2(x(3), nav.center().y), egui::pos2(x(5), nav.center().y));
+            assert_eq!((app.views[0].pb.frame, app.views[0].range), (5, None));
+            click_at(&ctx, &mut app, footer.center());
+            assert_eq!(app.views[0].pb.frame, 5, "the visible footer keeps its click");
+            drag(&ctx, &mut app, point(2), point(7));
+            assert_eq!((app.views[0].range, app.views[0].pb.frame), (Some((2, 7)), 5));
+            assert!(app.views[0].lanes.marker_topology_pending());
+            release.send(()).unwrap();
+            wait_marker_graph(&ctx, &mut app, 0);
+            click_at(&ctx, &mut app, click);
+            assert_eq!((app.views[0].pb.frame, app.views[0].primary), (9, Some(0)));
+        }
+    }
 }

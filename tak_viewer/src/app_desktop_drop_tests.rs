@@ -155,8 +155,10 @@ fn desktop_center_dirty_last_reference_cancel_preserves_edits_and_file() {
     let mut app=TakViewerApp::build(&ctx,None,vec![],None,None);
     app.open(&ctx,source.clone());
     close_wait_until(&ctx,&mut app,|a| a.views[0].data.is_some() && !a.views[0].busy());
-    app.views[0].select(0,false); app.views[0].pb.frame=10; app.delete_selected(&ctx,0);
-    close_wait_until(&ctx,&mut app,|a| !a.marker_job_running(0) && a.views[0].edit_refresh.is_none());
+    app.views[0].select(0,false); app.views[0].pb.frame=10;
+    let before=app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
+    app.delete_selected(&ctx,0);
+    wait_for_close_edit(&ctx,&mut app,before);
     assert!(app.views[0].marker_dirty());
     let p=app.views[0].scene_rect.center(); let destination=_dir.join("replacement.takm"); let pushed=app.history.pushed;
     os_drop_input(&ctx,&mut app,Some(p),&[destination],true);

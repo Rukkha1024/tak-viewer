@@ -14,6 +14,10 @@ const POLL: Duration = Duration::from_millis(10);
 const BOOTSTRAP: &str = "import json,os,sys; m=__import__('msvcrt') if os.name=='nt' else None; m.setmode(sys.stdin.fileno(),os.O_BINARY) if m else None; m.setmode(sys.stdout.fileno(),os.O_BINARY) if m else None; p=json.loads(sys.stdin.buffer.readline()); exec(p['helper_source'].lstrip(chr(65279)))";
 type Frame = (Value, Vec<Vec<u8>>);
 
+#[cfg(test)]
+// Observe logical response poll intervals. A test can signal expiration of its fake clock.
+type ResponsePoll = Box<dyn FnMut(Duration) -> Option<Instant> + Send>;
+
 /// Keep session decoding testable without a network or a subprocess.
 pub(super) trait Connection: Send {
     fn request(&mut self, request: Value, cancel: &CancelToken) -> Result<Frame, String>;
@@ -50,6 +54,8 @@ pub(super) struct Transport {
     reads: Option<mpsc::SyncSender<PayloadLimit>>,
     closed: bool,
     received: Arc<AtomicU64>,
+    #[cfg(test)]
+    response_poll: Option<ResponsePoll>,
 }
 
 impl Transport {
@@ -201,6 +207,8 @@ impl Transport {
             reads: Some(reads),
             closed: false,
             received,
+            #[cfg(test)]
+            response_poll: None,
         };
         let bootstrap = json!({"helper_source": helper_source});
         if let Err(error) = transport.send(bootstrap, cancel, Some(connect_deadline)) {
@@ -229,7 +237,10 @@ impl Transport {
         let result = self.reads.as_ref().ok_or("SSH transport is closed".to_string())
             .and_then(|reads| reads.try_send(limit).map_err(|_| "SSH response reader unavailable".to_string()))
             .and_then(|()| self.send(request, cancel, deadline))
-            .and_then(|()| wait(self.frames.as_ref().unwrap(), cancel, deadline, &mut self.child)?);
+            .and_then(|()| wait(self.frames.as_ref().unwrap(), cancel, deadline, &mut self.child,
+                #[cfg(test)]
+                self.response_poll.as_mut(),
+            )?);
         match result {
             Ok((header, buffers)) => {
                 if header["ok"] == false {
@@ -264,7 +275,10 @@ impl Transport {
             Ok(()) => (),
             Err(_) => return Err("SSH request writer unavailable".into()),
         }
-        wait(&self.written, cancel, deadline, &mut self.child)?
+        wait(&self.written, cancel, deadline, &mut self.child,
+            #[cfg(test)]
+            None,
+        )?
     }
 
     fn fail(&mut self, error: String) -> String {
@@ -344,12 +358,21 @@ fn wait<T>(
     cancel: &CancelToken,
     deadline: Option<Instant>,
     child: &mut Child,
+    #[cfg(test)] mut response_poll: Option<&mut ResponsePoll>,
 ) -> Result<T, String> {
+    #[cfg(test)]
+    let mut deadline = deadline;
     loop {
         check_wait(cancel, deadline)?;
-        match receiver.recv_timeout(deadline.map_or(POLL, |d| POLL.min(d.saturating_duration_since(Instant::now())))) {
+        let interval = deadline.map_or(POLL, |d| POLL.min(d.saturating_duration_since(Instant::now())));
+        match receiver.recv_timeout(interval) {
             Ok(value) => return Ok(value),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(test)]
+                if let Some(expire) = response_poll.as_mut().and_then(|poll| poll(interval)) {
+                    assert!(deadline.is_some(), "the request did not install its expected deadline");
+                    deadline = Some(expire);
+                }
                 // SSH keepalive exits with failure even if a descendant retains a pipe.
                 if matches!(child.try_wait(), Ok(Some(status)) if !status.success()) {
                     return Err("SSH transport closed unexpectedly".into());
@@ -537,58 +560,110 @@ mod tests {
 
     #[test]
     fn slow_stream_survives_scaled_old_total_and_idle_deadlines_with_live_counter() {
-        // 50 ms stands for the removed 120 s rule. Both the pause and total
-        // response exceed that scale; connection setup has already completed.
-        let source = "import sys,time\nsys.stdin.buffer.readline()\nsys.stdout.write('{\"ok\":true,\"lengths\":[8]}\\n');sys.stdout.flush()\nfor i in range(8):\n sys.stdout.buffer.write(b'x');sys.stdout.buffer.flush();time.sleep(0.08)";
-        let mut transport = Transport::local_python(crate::remote::test_python(), source, Duration::from_secs(5), 8).unwrap();
+        const WATCHDOG: Duration = Duration::from_secs(60);
+        const HEADER: &str = "{\"ok\":true,\"lengths\":[8]}\n";
+        let source = format!("import sys\nsys.stdin.buffer.readline()\nsys.stdout.write({HEADER:?}+'x');sys.stdout.flush()\nif sys.stdin.buffer.readline() == b'progress\\n':\n sys.stdout.buffer.write(b'x');sys.stdout.flush()\nif sys.stdin.buffer.readline() == b'finish\\n':\n sys.stdout.buffer.write(b'xxxxxx');sys.stdout.flush()");
+        let mut transport = Transport::local_python(
+            crate::remote::test_python(), &source, Duration::from_secs(30), 8,
+        ).unwrap();
+        transport.connect_deadline = Instant::now() - Duration::from_millis(50);
+        let writes = transport.writes.clone().unwrap();
         let counter = transport.received.clone();
-        transport.connect_deadline = Instant::now() + Duration::from_millis(50);
+        let (tick_tx, tick_rx) = mpsc::sync_channel(2);
+        let mut elapsed = Duration::ZERO;
+        transport.response_poll = Some(Box::new(move |interval| {
+            let previous = elapsed;
+            elapsed += interval;
+            for milestone in [Duration::from_millis(200), Duration::from_millis(500)] {
+                if previous < milestone && elapsed >= milestone {
+                    tick_tx.send(elapsed).unwrap();
+                }
+            }
+            None
+        }));
         let (tx, rx) = mpsc::channel();
-        let start = Instant::now();
         let worker = thread::spawn(move || {
             let result = transport.request(json!({}), &CancelToken::default());
             tx.send(result).unwrap();
         });
-        while counter.load(Ordering::Relaxed) == 0 {
-            assert!(start.elapsed() < Duration::from_secs(5));
-            thread::sleep(POLL);
-        }
-        let partial = counter.load(Ordering::Relaxed);
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let wait_for_bytes = |minimum| {
+            let start = Instant::now();
+            loop {
+                let received = counter.load(Ordering::Relaxed);
+                if received >= minimum { return received; }
+                assert!(start.elapsed() < WATCHDOG,
+                    "fake stream delivered {received} of {minimum} expected bytes. Result: {:?}", rx.try_recv());
+                thread::sleep(POLL);
+            }
+        };
+        let partial = wait_for_bytes(HEADER.len() as u64 + 1);
+        tick_rx.recv_timeout(WATCHDOG).expect("response did not survive its first 200 ms of polling");
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        writes.try_send(b"progress\n".to_vec()).expect("release next byte");
+        wait_for_bytes(partial + 1);
         assert!(counter.load(Ordering::Relaxed) > partial);
-        let (_, blocks) = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let elapsed = tick_rx.recv_timeout(WATCHDOG).expect("response did not survive its first 500 ms of polling");
+        writes.try_send(b"finish\n".to_vec()).expect("release final bytes");
+        let (_, blocks) = rx.recv_timeout(WATCHDOG).expect("final response did not finish").unwrap();
         assert_eq!(blocks, vec![b"xxxxxxxx".to_vec()]);
-        assert!(start.elapsed() >= Duration::from_millis(500));
+        assert!(elapsed >= Duration::from_millis(500));
         worker.join().unwrap();
     }
 
     #[test]
     fn silent_stream_waits_until_cancel_or_fake_keepalive_closes_transport() {
+        const WATCHDOG: Duration = Duration::from_secs(60);
+        const SILENCE: Duration = Duration::from_millis(300);
+        let source = "import sys\nsys.stdin.buffer.readline()\nif sys.stdin.buffer.readline() == b'close\\n':\n sys.stderr.write('fake keepalive failure\\n');sys.stderr.flush()\n sys.exit(255)";
         for close in [false, true] {
-            let source = if close {
-                "import sys,time\nsys.stdin.buffer.readline()\ntime.sleep(0.6)\nsys.stderr.write('fake keepalive failure\\n');sys.stderr.flush()\nsys.exit(255)"
-            } else {
-                "import time;time.sleep(30)"
-            };
-            let mut transport = Transport::local_python(crate::remote::test_python(), source, Duration::from_secs(5), 10).unwrap();
+            let mut transport = Transport::local_python(
+                crate::remote::test_python(), source, Duration::from_secs(30), 10,
+            ).unwrap();
+            // An application request has no deadline even after the connect clock expired.
+            transport.connect_deadline = Instant::now() - Duration::from_millis(50);
+            let writes = transport.writes.clone().unwrap();
             let cancel = CancelToken::default();
             let trigger = cancel.clone();
-            let (tx, rx) = mpsc::channel();
+            let (silence_tx, silence_rx) = mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let ticks = Arc::new(AtomicU64::new(0));
+            let clock = ticks.clone();
+            transport.response_poll = Some(Box::new(move |interval| {
+                let interval_ms = interval.as_millis() as u64;
+                let previous_ms = clock.fetch_add(interval_ms, Ordering::Relaxed);
+                let elapsed_ms = previous_ms + interval_ms;
+                let silence_ms = SILENCE.as_millis() as u64;
+                if previous_ms < silence_ms && elapsed_ms >= silence_ms {
+                    silence_tx.send(elapsed_ms).unwrap();
+                    resume_rx.recv_timeout(WATCHDOG).expect("silent response poll was never released");
+                }
+                None
+            }));
             let worker = thread::spawn(move || {
                 let error = transport.request(json!({}), &cancel).unwrap_err();
-                tx.send((error, transport.child.try_wait().unwrap().is_some())).unwrap();
+                result_tx.send((error, transport.child.try_wait().unwrap().is_some())).unwrap();
             });
-            // No bytes for several times the scaled old limit must not end a request.
-            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
-            let start = Instant::now();
-            if !close { trigger.cancel(); }
-            let (error, reaped) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let silent_at = silence_rx.recv_timeout(WATCHDOG).unwrap_or_else(|reason|
+                panic!("response did not reach the silent window ({reason}). Result: {:?}", result_rx.try_recv()));
+            assert!(matches!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            if close {
+                writes.try_send(b"close\n".to_vec()).expect("send fake keepalive close");
+            } else {
+                trigger.cancel();
+            }
+            resume_tx.send(()).unwrap();
+            let (error, reaped) = result_rx.recv_timeout(WATCHDOG).unwrap_or_else(|reason|
+                panic!("silent transport did not finish after close={close} ({reason}). Poll clock: {} ms",
+                    ticks.load(Ordering::Relaxed)));
             assert!(!error.contains("timed out"), "{error}");
             assert!(reaped);
-            if close { assert!(error.contains("fake keepalive failure"), "{error}"); }
-            else {
+            if close {
+                assert!(error.contains("fake keepalive failure"), "{error}");
+            } else {
                 assert!(error.contains("cancelled"), "{error}");
-                assert!(start.elapsed() < Duration::from_millis(500));
+                let after_cancel = ticks.load(Ordering::Relaxed) - silent_at;
+                assert!(Duration::from_millis(after_cancel) < Duration::from_millis(500));
             }
             worker.join().unwrap();
         }
@@ -687,17 +762,25 @@ mod tests {
         {
             let mut transport = Transport::local_python(
                 crate::remote::test_python(),
-                "import time; time.sleep(30)",
-                Duration::from_millis(100),
+                "import sys\nfor line in sys.stdin.buffer: pass",
+                Duration::from_secs(60),
                 10,
             )
             .unwrap();
-            let started = Instant::now();
+            let elapsed_ms = Arc::new(AtomicU64::new(0));
+            let clock = elapsed_ms.clone();
+            transport.response_poll = Some(Box::new(move |interval| {
+                let total = clock.fetch_add(interval.as_millis() as u64, Ordering::Relaxed)
+                    + interval.as_millis() as u64;
+                (total >= 100).then(Instant::now)
+            }));
             let error = transport
                 .hello(&CancelToken::default())
                 .unwrap_err();
             assert!(error.contains("timed out"), "{error}");
-            assert!(started.elapsed() < Duration::from_secs(2));
+            let elapsed = Duration::from_millis(elapsed_ms.load(Ordering::Relaxed));
+            assert!(elapsed >= Duration::from_millis(100), "the deadline must expire while waiting for hello");
+            assert!(elapsed < Duration::from_secs(2));
             assert!(transport.child.try_wait().unwrap().is_some());
             assert!(transport
                 .request(json!({}), &CancelToken::default())

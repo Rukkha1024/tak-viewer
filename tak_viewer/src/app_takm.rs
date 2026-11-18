@@ -28,6 +28,22 @@ pub(super) struct Job {
     waiting: Option<Location>,
 }
 
+#[cfg(test)]
+impl Job {
+    pub(super) fn pending_state(&self) -> String {
+        let phase = match &self.phase {
+            Phase::Prepare => "preflight",
+            Phase::Convert(_) => "conversion worker",
+            Phase::Read { view: None, .. } => "destination preflight",
+            Phase::Read { view: Some(view), .. } if view.data.is_none() => "staged marker read",
+            Phase::Read { .. } => "publish staged result",
+        };
+        let output = match &self.phase { Phase::Read { out, .. } => Some(out), _ => None };
+        format!("{:?}: {phase}, output={output:?}, identities worker={}, waiting on occurrence={:?}",
+            self.tak, self.resolving.is_some(), self.waiting)
+    }
+}
+
 type Identities = HashMap<PathBuf, PathBuf>;
 
 enum Phase {
@@ -37,6 +53,7 @@ enum Phase {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(test, derive(Debug))]
 pub(super) struct Location { tab: Option<layout_tabs::TabId>, slot: usize }
 
 struct Occurrence {

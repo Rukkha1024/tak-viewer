@@ -50,6 +50,7 @@ fn delete_focus_clicked_blocked_panel_keeps_delete_when_pointer_moves_to_graph()
 fn delete_focus_clicked_graph_keeps_delete_when_pointer_moves_to_workspace() {
     let ctx = egui::Context::default();
     let mut app = delete_focus_app(&ctx);
+    wait_marker_graph(&ctx, &mut app, 0);
     let graph = app.views[0].graph_rect.unwrap().center();
     frame_with(&ctx, &mut app, delete_focus_click(graph));
     let clicked = key_focus::target(&ctx);
@@ -94,7 +95,7 @@ fn delete_focus_graph_panel_and_detached_graph_window_allow_marker_delete() {
             app.dock.get_window_state_mut(surface).unwrap()
                 .set_position(egui::pos2(410.0, 180.0)).set_size(egui::vec2(500.0, 400.0));
         } else { dock::show(&mut app.dock, Pane::Graph); }
-        for _ in 0..3 { frame_with(&ctx, &mut app, vec![]); }
+        wait_marker_graph(&ctx, &mut app, 0);
         let (surface, node, _) = app.dock.find_tab(&Pane::Graph).unwrap();
         let at = app.dock[surface][node].rect().unwrap().center();
         let mut events = delete_focus_click(at);
@@ -226,8 +227,7 @@ fn delete_focus_graph_name_tag_footer_and_overlay_legends_block_marker_delete() 
                 ));
                 app.views[0].shown = [true, true];
             }
-            wait_marker_graphs(&ctx, &mut app);
-            let out = frame_with(&ctx, &mut app, vec![]);
+            let out = wait_marker_graph(&ctx, &mut app, 0);
             let bounds = if floating { app.views[0].graph_rect.unwrap() }
                 else { place_of(&app, Pane::Graph) };
             let at = if overlay_legend {

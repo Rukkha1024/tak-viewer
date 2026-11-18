@@ -20,12 +20,12 @@ fn app(ctx: &egui::Context, source: &Path) -> TakViewerApp {
 }
 
 fn finish(ctx: &egui::Context, app: &mut TakViewerApp) {
-    for _ in 0..2000 {
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    while app.takm_job.is_some() {
         app.poll_takm(ctx);
-        if app.takm_job.is_none() { return; }
-        std::thread::sleep(Duration::from_millis(1));
+        let Some(job) = &app.takm_job else { break };
+        watchdog.pause(|| format!("TAKM stage did not complete. {}. Note: {:?}", job.pending_state(), app.takm_note));
     }
-    panic!("TAKM stage did not complete");
 }
 
 fn dirtify(view: &mut View) {
@@ -361,11 +361,13 @@ fn selected_plate_waits_for_pending_destination_then_clamps_a_known_missing_plat
     finish(&ctx, &mut app);
     assert_eq!(app.views[0].plate, Some(1), "the destination has not resolved its plates yet");
     drop(tx);
-    for _ in 0..1000 {
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    loop {
         app.views[1].poll_analog();
         app.views[0].sync_shared();
         if !app.views[0].data.as_ref().unwrap().analog_pending { break; }
-        std::thread::sleep(Duration::from_millis(1));
+        watchdog.pause(|| format!("analog completion did not reach the shared destination: owner work={}, target={:?}",
+            app.views[1].analog_work_pending(), app.views[1].path()));
     }
     assert!(!app.views[0].data.as_ref().unwrap().analog_pending);
     assert_eq!(app.views[0].plate, None, "a known missing destination plate is no longer selected");
@@ -412,10 +414,11 @@ fn deferred_emg_owner_survives_conversion_undo_redo_in_an_unchanged_original_ove
     owner.devices.request_emg = true;
     owner.request_emg(&ctx);
     assert!(owner.emg_requested);
-    for _ in 0..5000 {
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    loop {
         owner.poll_analog();
         if !owner.data.as_ref().unwrap().emg_pending { break; }
-        std::thread::sleep(Duration::from_millis(1));
+        watchdog.pause(|| format!("deferred EMG for {:?}, requested={}", owner.path(), owner.emg_requested));
     }
     assert!(!owner.data.as_ref().unwrap().emg_pending);
     assert!(owner.data.as_ref().unwrap().devices.iter().enumerate().any(|(index, device)| device.plate.is_none()

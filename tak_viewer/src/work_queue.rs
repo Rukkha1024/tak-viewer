@@ -26,3 +26,20 @@ pub fn retire<T: Send + 'static>(value: T) {
         .get_or_init(|| queue(1))
         .send(Box::new(move || drop(value)));
 }
+
+/// Bounds a test's wait for a specific worker result. Report the last state on timeout.
+#[cfg(test)]
+pub(crate) struct TestWatchdog(std::time::Instant);
+
+#[cfg(test)]
+impl TestWatchdog {
+    pub(crate) fn new() -> Self { Self(std::time::Instant::now()) }
+
+    pub(crate) fn pause(&self, pending: impl FnOnce() -> String) {
+        let elapsed = self.0.elapsed();
+        if elapsed >= std::time::Duration::from_secs(60) {
+            panic!("still waiting after {elapsed:?}: {}", pending());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}

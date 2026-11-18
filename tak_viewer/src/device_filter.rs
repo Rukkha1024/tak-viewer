@@ -778,14 +778,19 @@ mod tests {
         Arc::new(ViewData::build(take))
     }
     fn wait(device: &mut Device, data: &Arc<ViewData>, ctx: &egui::Context) {
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        let key = (data.analog_generation(), device.settings.steps.clone());
+        loop {
             device.update(data, 0, ctx);
-            if !device.pending() {
+            let installed = device.cache.iter().any(|(cached, output)| {
+                cached == &key && device.ready.as_ref().is_some_and(|ready| Arc::ptr_eq(ready, output))
+            });
+            if installed && !device.pending() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            watchdog.pause(|| format!("device filter worker did not finish. Generation={}, pending={}, requested={:?}, wanted={:?}, error={:?}",
+                device.generation.load(Ordering::Relaxed), device.pending(), device.requested, device.settings.steps, device.error));
         }
-        panic!("worker did not finish")
     }
     #[test]
     fn supersedes_old_settings_bypasses_and_reuses_cached_output() {

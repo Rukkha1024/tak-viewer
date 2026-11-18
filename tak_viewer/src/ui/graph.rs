@@ -125,6 +125,8 @@ pub struct Look {
     /// view's own name tag over a floating graph): the graph does not take it there.
     /// `Rect::NOTHING` = none.
     pub keep_out: Rect,
+    /// Plot height for pointer input while marker topology is pending. Paint stays unchanged.
+    pub pending_plot_height: f32,
     /// Inclusive edit range shared with the timeline; absent for other graph types.
     pub selection: Option<(i64, i64)>,
 }
@@ -132,7 +134,7 @@ pub struct Look {
 impl Look {
     /// In a pane (GRAPH, devices): Motive Graph View colors.
     pub fn pane() -> Look {
-        Look { bg: theme::GRAPH_BG, nav_bg: theme::NAV_BG, watermark: theme::GRAPH_WATERMARK, values: true, tag_w: 0.0, keep_out: Rect::NOTHING, selection: None }
+        Look { bg: theme::GRAPH_BG, nav_bg: theme::NAV_BG, watermark: theme::GRAPH_WATERMARK, values: true, tag_w: 0.0, keep_out: Rect::NOTHING, pending_plot_height: 0.0, selection: None }
     }
 }
 
@@ -747,6 +749,8 @@ pub struct Drawn {
     /// Tests: what the last `show` painted.
     #[cfg(test)]
     pub drew: Drew,
+    #[cfg(test)]
+    pub(crate) complete_pass: Option<u64>,
     /// v0.27.0: the other markers of a graph of several (after the one whose lanes are passed to
     /// `show`), each its lanes (X, Y, Z; in the lanes' colours since v0.29.0) (`set_more`).
     /// Empty = one marker.
@@ -1022,6 +1026,14 @@ impl Drawn {
     #[cfg(test)]
     pub fn pending(&self) -> bool {
         self.more_lanes.iter().chain(&self.more_pair_lanes).any(|t| t.key != self.key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_state(&self) -> String {
+        let job = self.background_rx.as_ref().map(|(key, generation, _)| (key, generation));
+        format!("thinning generation={}, job={job:?}, installed={:?}, mesh jobs={}, painted pass={:?}",
+            self.background_generation, self.key,
+            self.mesh_rx.iter().filter(|job| job.is_some()).count(), self.complete_pass)
     }
 }
 
@@ -1380,8 +1392,11 @@ fn show_inner(
     let mut vr = ViewRange::load(ui, id, full);
     let height = lanes.len() as f32 * lane_h + NAV_H;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    // The mouse: the whole graph, or around what is drawn over its corner (`Look::keep_out`).
-    let [main, below] = around(rect, look.keep_out);
+    // Register the full hit area in the same pass that displays the pending graph.
+    let hit_rect = if lanes.is_empty() {
+        Rect::from_min_max(rect.min, rect.max + vec2(0.0, look.pending_plot_height))
+    } else { rect };
+    let [main, below] = around(hit_rect, look.keep_out);
     let mut resp = ui.interact(main, id.with("plot"), Sense::click_and_drag());
     if below.is_positive() {
         resp = resp.union(ui.interact(below, id.with("plot_below"), Sense::click_and_drag()));
@@ -1409,7 +1424,11 @@ fn show_inner(
         }
     }
     let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
-        select_drag(ui, &resp, id, plot, RangeDragAxis::Any, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
+        // The empty panel still paints its navigation strip at the top. That strip scrubs.
+        let input_plot = if lanes.is_empty() {
+            Rect::from_min_max(rect.left_bottom(), hit_rect.right_bottom() - vec2(0.0, NAV_H))
+        } else { plot };
+        select_drag(ui, &resp, id, input_plot, RangeDragAxis::Any, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
     });
     if !selecting && resp.double_clicked() {
         vr = full;
@@ -1739,6 +1758,10 @@ fn show_inner(
         drew.hovered = hovered;
         drew.maps = maps;
         drawn.drew = drew;
+        drawn.complete_pass = (!lanes.is_empty() && drawn.key == Some(key)
+            && !drawn.pending() && drawn.background_rx.is_none()
+            && drawn.mesh_rx.iter().all(Option::is_none))
+            .then(|| ui.ctx().cumulative_pass_nr());
     }
     goto
 }
@@ -1921,19 +1944,20 @@ mod tests {
         let mut worker = promotion_graph(true);
         worker.drawn.force_worker_mesh = true;
         worker.pass = 1_000_000;
-        let mut ready = false;
-        for _ in 0..100 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        let (a, b) = loop {
             let a = reference.render(vec![]);
             let b = worker.render(vec![]);
-            if worker.drawn.shapes.iter().filter(|s|s.is_some()).count() == 3
-                && worker.drawn.mesh_rx.iter().all(Option::is_none) {
-                assert_eq!(a.0,b.0,"worker tessellation preserves every vertex and index");
-                assert_eq!(a.1.pixels,b.1.pixels,"queued owned copies preserve exact pixels");
-                ready=true;break;
+            if worker.drawn.complete_pass == Some(worker.ctx.cumulative_pass_nr() - 1) {
+                break (a, b);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(ready,"worker must publish every lane");
+            watchdog.pause(|| format!("worker must publish every lane. {}", worker.drawn.background_state()));
+        };
+        assert_eq!(a.0,b.0,"worker tessellation preserves every vertex and index");
+        assert_eq!(a.1.pixels,b.1.pixels,"queued owned copies preserve exact pixels");
+        let ready = worker.drawn.shapes.iter().filter(|s| s.is_some()).count() == 3
+            && worker.drawn.mesh_rx.iter().all(Option::is_none);
+        assert!(ready, "worker must publish every lane");
         for _ in 0..5 {
             let a=reference.render(vec![]);let b=worker.render(vec![]);
             assert_eq!(a.0,b.0);assert_eq!(a.1.pixels,b.1.pixels);
@@ -2717,8 +2741,8 @@ mod tests {
         drawn.push_more(lanes.clone()); // Raw maximum / processed overlay.
         drawn.push_more_pair(lanes.clone());
         let ctx = egui::Context::default();
-        let mut complete = false;
-        for iteration in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        for iteration in 0.. {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0))),
                 time: Some(iteration as f64 / 100.0), ..Default::default()
@@ -2735,9 +2759,10 @@ mod tests {
                 });
                 end_frame();
             });
-            if !drawn.background_pending() { complete = true; break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if drawn.complete_pass == Some(ctx.cumulative_pass_nr() - 1) { break; }
+            watchdog.pause(|| format!("background graph did not complete. {}", drawn.background_state()));
         }
+        let complete = drawn.complete_pass == Some(ctx.cumulative_pass_nr() - 1);
         assert!(complete, "background graph did not complete");
         let key = drawn.key.unwrap();
         let vr = ViewRange { lo: f64::from_bits(key.0), hi: f64::from_bits(key.1) };
@@ -2772,10 +2797,11 @@ mod tests {
             more_lanes: Vec::new(), more_pair_lanes: Vec::new() }).is_ok());
         drawn.prepare_background(&lanes, range, 200, key, &ctx);
         assert!(drawn.key.is_none(), "a matching range must not accept an obsolete source generation");
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
             drawn.prepare_background(&lanes, range, 200, key, &ctx);
-            if !drawn.background_pending() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if drawn.key == Some(key) { break; }
+            watchdog.pause(|| format!("thinning did not install {:?}. {}", key, drawn.background_state()));
         }
         assert_eq!(drawn.key, Some(key));
         assert_eq!(drawn.more_lanes.len(), 1);
@@ -2784,10 +2810,11 @@ mod tests {
         let zoom_key = (zoom.lo.to_bits(), zoom.hi.to_bits(), 300);
         drawn.prepare_background(&lanes, zoom, 300, zoom_key, &ctx);
         assert_eq!(drawn.lanes[0].runs, previous, "keep the previous curve until the zoom worker finishes");
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
             drawn.prepare_background(&lanes, zoom, 300, zoom_key, &ctx);
-            if !drawn.background_pending() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if drawn.key == Some(zoom_key) { break; }
+            watchdog.pause(|| format!("thinning did not install {:?}. {}", zoom_key, drawn.background_state()));
         }
         assert_eq!(drawn.key, Some(zoom_key));
         let expected = thin(&source, &zoom, 300);
@@ -2810,10 +2837,11 @@ mod tests {
         let mut drawn = Drawn::background();
         drawn.push_more(vec![lane(Color32::GREEN, 1.0)]);
         drawn.push_more(vec![lane(Color32::YELLOW, 2.0)]);
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
             drawn.prepare_background(&old, range, 200, key, &ctx);
-            if !drawn.background_pending() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if drawn.key == Some(key) { break; }
+            watchdog.pause(|| format!("thinning did not install {:?}. {}", key, drawn.background_state()));
         }
         assert_eq!(drawn.key, Some(key));
         let previous = drawn.lanes[0].runs.clone();
@@ -2840,10 +2868,11 @@ mod tests {
         assert_eq!(drawn.drew.colors[0], vec![Color32::RED, Color32::GREEN, Color32::YELLOW],
             "new faint-primary input must not recolor or hide the previous complete graph");
         drop(hold);
-        for _ in 0..2000 {
+        let watchdog = crate::work_queue::TestWatchdog::new();
+        loop {
             drawn.prepare_background(&new, range, 200, key, &ctx);
-            if !drawn.background_pending() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if drawn.key == Some(key) { break; }
+            watchdog.pause(|| format!("thinning did not install {:?}. {}", key, drawn.background_state()));
         }
         assert_eq!(drawn.key, Some(key));
         assert!(drawn.background_sources.is_none());

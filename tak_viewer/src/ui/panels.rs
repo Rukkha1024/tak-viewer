@@ -285,6 +285,8 @@ pub struct LaneCache {
     /// How many times the second file's lanes were built (tests).
     #[cfg(test)]
     pub pair_builds: usize,
+    #[cfg(test)]
+    topology_gate: Option<std::sync::mpsc::Receiver<()>>,
     async_mode: bool,
     async_key: Option<MarkerJobKey>,
     async_job: Option<MarkerJob>,
@@ -396,7 +398,13 @@ impl LaneCache {
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let cancelled = cancel.clone();
             let (tx, rx) = std::sync::mpsc::channel();
+            #[cfg(test)]
+            let gate = self.topology_gate.take();
             std::thread::spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    if gate.recv().is_err() { return; }
+                }
                 let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::Relaxed);
                 let mut lanes = Vec::new();
                 let mut more = Vec::new();
@@ -525,6 +533,32 @@ impl LaneCache {
     }
 
     pub fn preparing(&self) -> bool { self.pending_arc() }
+
+    #[cfg(test)]
+    pub(crate) fn hold_marker_topology(&mut self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        assert!(self.topology_gate.replace(gate).is_none());
+        release
+    }
+
+    #[cfg(test)]
+    pub(crate) fn marker_topology_pending(&self) -> bool {
+        self.async_job.is_some() && self.lanes.is_empty()
+    }
+
+    /// A visible, retained pass must paint the installed topology and thinning together.
+    #[cfg(test)]
+    pub(crate) fn painted_marker_graph(&self, pass: u64) -> bool {
+        self.async_mode
+            && self.async_key.as_ref().is_some_and(|key| self.built == key.markers.len())
+            && self.drawn.complete_pass == Some(pass)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn marker_graph_state(&self) -> String {
+        format!("topology={:?}, worker={}, installed markers={}, {}",
+            self.async_key, self.async_job.is_some(), self.built, self.drawn.background_state())
+    }
 
     /// Plan step 9: with a file laid over the view (`over` = its path and data), its marker of the
     /// same name goes into the lanes of each graphed marker (`markers`, `graphed`; the first
@@ -988,12 +1022,17 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
     let m = &data.markers[mi];
     let (lanes, gaps, drawn) = cache.get(data, file_id, markers);
     const HINT_H: f32 = 22.0;
-    let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lanes.len().max(1) as f32).clamp(34.0, if combined { 420.0 } else { 140.0 });
-    let look = Look::pane();
+    let pending = lanes.is_empty();
+    let lane_count = if pending { if combined { 1 } else { 3 } } else { lanes.len() };
+    let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lane_count as f32).clamp(34.0, if combined { 420.0 } else { 140.0 });
+    let mut look = Look::pane();
+    if pending {
+        look.pending_plot_height = lane_h * lane_count as f32;
+    }
     let goto = graph::show_select(ui, graph::tracks::graph_id(file_id), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection, zoom);
     let mut over = false;
     let keys = graph_keys(data, markers, frame);
-    let footer = ui.horizontal(|ui| {
+    let draw_footer = |ui: &mut Ui| {
         over = over_3d_button(ui);
         if combined {
             graph::conveniences::axis_legend(ui);
@@ -1013,7 +1052,18 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
             ui.label(RichText::new(left_out_text(markers.len(), total)).small().color(theme::TEXT));
         }
         ui.label(RichText::new("· Drag = range · Right-drag = value zoom · Wheel = time zoom").small().color(theme::TEXT_DIM));
-    });
+    };
+    let footer = if pending {
+        // The footer still paints next to the empty strip, inside the reserved hit area.
+        // Its background owns input behind the buttons until the plot pushes it down.
+        let size = vec2(ui.available_width(), ui.spacing().interact_size.y);
+        ui.scope_builder(egui::UiBuilder::new()
+            .max_rect(Rect::from_min_size(ui.next_widget_position(), size))
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .sense(Sense::click_and_drag()), draw_footer)
+    } else {
+        ui.horizontal(draw_footer)
+    };
     crate::app::key_focus::region(ui, footer.response.rect, crate::app::key_focus::Target::Blocked);
     if over {
         return Some(Action::GraphOver3d);
@@ -2196,10 +2246,9 @@ mod deck_tests {
         let mut actual = LaneCache::default();
         actual.prepare_arc(&data, 7, &order[..1], Some((path, &other)), [true, true], &ctx, false);
         actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx, false);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let watchdog = crate::work_queue::TestWatchdog::new();
         while actual.built() != (3, 3) {
-            assert!(std::time::Instant::now() < deadline, "marker worker must publish");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            watchdog.pause(|| format!("marker worker must publish. {}", actual.marker_graph_state()));
             actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx, false);
         }
         let (lanes, gaps, drawn) = actual.get(&data, 7, &order);

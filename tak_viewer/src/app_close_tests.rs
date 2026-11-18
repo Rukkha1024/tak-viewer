@@ -381,12 +381,23 @@ fn last_close_dirty_dialog_cancel_and_discard_work_for_all_three_entry_points() 
 }
 
 fn close_wait_until(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
-    let began = Instant::now();
+    let watchdog = crate::work_queue::TestWatchdog::new();
     while !ready(app) {
-        assert!(began.elapsed() < Duration::from_secs(10), "close test timed out: {:?}", app.takm_note);
         frame_with(ctx, app, vec![]);
-        std::thread::sleep(Duration::from_millis(2));
+        if ready(app) { break; }
+        watchdog.pause(|| format!("close test: path={:?}, loading={}, edit job={}, refresh={:?}, saving={}, prompt={}, note={:?}, error={:?}",
+            app.views[0].path(), app.views[0].busy(), app.marker_job_running(0), app.views[0].edit_refresh,
+            app.marker_saving(0), app.dirty_prompt.is_some(), app.takm_note, app.error));
     }
+}
+
+fn wait_for_close_edit(ctx: &egui::Context, app: &mut TakViewerApp, before: tak_core::edit::Revision) {
+    close_wait_until(ctx, app, |app| {
+        let view = &app.views[0];
+        let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
+        revision != before && view.data.as_ref().unwrap().edit_revision == Some(revision)
+            && !app.marker_job_running(0) && view.edit_refresh.is_none()
+    });
 }
 
 #[test]
@@ -402,8 +413,9 @@ fn last_close_save_button_saves_marker_edits_and_failed_save_keeps_the_view_open
         close_wait_until(&ctx, &mut app, |app| app.views[0].data.is_some() && !app.views[0].busy());
         app.views[0].select(0, false);
         app.views[0].pb.frame = 10;
+        let before = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
         app.delete_selected(&ctx, 0);
-        close_wait_until(&ctx, &mut app, |app| !app.marker_job_running(0) && app.views[0].edit_refresh.is_none());
+        wait_for_close_edit(&ctx, &mut app, before);
         assert!(app.views[0].marker_dirty(), "Delete made a real unsaved edit: {:?}", app.takm_note);
         run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
         assert!(app.dirty_prompt.is_some());
