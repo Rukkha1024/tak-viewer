@@ -6,8 +6,8 @@ use super::*;
 pub(crate) enum Target {
     #[default]
     Blocked,
-    Markers(usize),
     Scene(usize),
+    Markers(usize),
     NamedMarkers(usize),
     UnlabeledMarkers(usize),
     Comments,

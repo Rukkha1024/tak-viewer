@@ -202,3 +202,22 @@ fn alt_inspects_a_marker_without_gesture_side_effects() {
     assert_eq!(app.views[0].selection(), before);
     assert_eq!(steps(&app, 0), history);
 }
+
+#[test]
+fn orthographic_picks_draw_distance_and_angle() {
+    let ctx = egui::Context::default();
+    let mut app = scene_selection_app(&ctx);
+    app.views[0].cam.preset = crate::camera::Preset::Top;
+    frame_with(&ctx, &mut app, vec![]);
+    let [a, vertex, b] = [0, 1, 2].map(|index| marker_on_screen(&app, index));
+    let shift = Modifiers { shift: true, ..Modifiers::NONE };
+    click_at(&ctx, &mut app, a);
+    click_with(&ctx, &mut app, vertex, shift);
+    let distance = frame_with(&ctx, &mut app, vec![]);
+    assert_eq!(text_rects(&distance, "100.00 mm").len(), 2);
+
+    click_with(&ctx, &mut app, b, shift);
+    assert_eq!(app.views[0].ordered_selection(), [0, 1, 2]);
+    let angle = frame_with(&ctx, &mut app, vec![]);
+    assert_eq!(text_rects(&angle, "180.00°").len(), 2);
+}

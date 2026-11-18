@@ -8,7 +8,7 @@
 //! it is opened again.
 //! Layout of the views (which slots are on screen, where) is in `ui/dock.rs`.
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Preset};
 use crate::ui::panels::{self, BlockCache, DevicesState, HeatCache, LabelsState, LaneCache, PlateCache};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ use tak_core::playback::Playback;
 use tak_core::tak::MarkerKind;
 use tak_core::view_data::{AnalogPart, ViewData};
 use tak_core::edit::{DocumentId, DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
+
+mod follow;
 
 /// One editable document per local file, shared by its views and layout history.
 pub type EditSession = Arc<Mutex<EditDocument>>;
@@ -257,6 +259,9 @@ pub struct Spot {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y: f32,
+    /// Live layout history only. Recent-file opens and persisted settings reset the mode.
+    #[serde(skip)]
+    pub camera_mode: (Preset, bool),
     /// Selected marker names in selection order; `primary` = the one picked last.
     /// Older settings store Labels order; restoring them puts their primary last.
     pub selected: Vec<String>,
@@ -268,7 +273,8 @@ pub struct Spot {
 }
 
 /// Keep `spot` as the newest entry of its file, at most `MAX_SPOTS` files.
-pub fn remember(list: &mut Vec<Spot>, spot: Spot) {
+pub fn remember(list: &mut Vec<Spot>, mut spot: Spot) {
+    spot.camera_mode = Default::default();
     list.retain(|s| s.path != spot.path);
     list.insert(0, spot);
     list.truncate(MAX_SPOTS);
@@ -447,6 +453,7 @@ pub struct View {
     /// Unique for each file shown in this app (egui ids, Labels reset, graph cache).
     pub file_id: usize,
     pub cam: Camera,
+    pub follow_target: Option<Vec3>,
     pub pb: Playback,
     pub selected: BTreeSet<usize>,
     /// Selection order, oldest first. Kept separate from the set used for drawing.
@@ -565,6 +572,7 @@ impl Default for View {
             remote_loading: None,
             file_id: 0,
             cam: Camera::default(),
+            follow_target: None,
             pb: Playback::new(0, 0, 100.0),
             selected: BTreeSet::new(),
             selection_order: Vec::new(),
@@ -1429,6 +1437,9 @@ impl View {
         let mut pb = Playback::new(data.start_frame, data.end_frame, data.take.frame_rate);
         pb.speed = speed;
         self.pb = pb;
+        self.cam.preset = Preset::Perspective;
+        self.cam.follow = false;
+        self.follow_target = None;
         self.selected.clear();
         self.selection_order.clear();
         self.primary = None;
@@ -1675,14 +1686,16 @@ impl View {
     pub fn spot(&self) -> Option<Spot> {
         let d = self.data.as_ref()?;
         let name = |m: usize| d.markers.get(m).map(|m| m.name.clone());
+        let pivot = self.follow_target.filter(|_| self.cam.follow).unwrap_or(self.cam.pivot);
         Some(Spot {
             path: d.take.path.to_string_lossy().into_owned(),
             frame: self.pb.frame,
-            pivot: [self.cam.pivot.x, self.cam.pivot.y, self.cam.pivot.z],
+            pivot: [pivot.x, pivot.y, pivot.z],
             yaw: self.cam.yaw,
             pitch: self.cam.pitch,
             distance: self.cam.distance,
             fov_y: self.cam.fov_y,
+            camera_mode: (self.cam.preset, self.cam.follow),
             selected: self.ordered_selection().into_iter().filter_map(name).collect(),
             primary: self.primary.and_then(name),
             plate: self.plate.and_then(|p| d.plates.get(p)).map(|p| p.name.clone()),
@@ -1694,7 +1707,11 @@ impl View {
     /// A camera that does not make sense (old or damaged settings) is replaced by framing.
     pub fn apply_spot(&mut self, spot: &Spot, now: f64) {
         self.pb.set_frame(spot.frame, now);
+        self.follow_target = None;
+        let (preset, follow) = spot.camera_mode;
         let cam = Camera {
+            preset,
+            follow,
             pivot: Vec3::from_arr(spot.pivot),
             yaw: spot.yaw,
             pitch: spot.pitch,
@@ -3077,6 +3094,7 @@ mod tests {
             pitch: 0.3,
             distance: 4.0,
             fov_y: 0.8,
+            camera_mode: Default::default(),
             selected: vec!["LKNE".into(), "RKNE".into()],
             primary: Some("RKNE".into()),
             plate: None,

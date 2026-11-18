@@ -435,6 +435,7 @@ impl TakViewerApp {
             });
             let old = self.takm_view_mut(location).expect("preflighted occurrence");
             incoming.cam = old.cam;
+            incoming.follow_target = old.follow_target;
             incoming.pb.speed = old.pb.speed;
             incoming.pb.set_frame(old.pb.frame, now);
             incoming.pb.playing = old.pb.playing;

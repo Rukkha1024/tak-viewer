@@ -8,7 +8,7 @@
 
 use super::theme;
 use super::scene_measurement::Measurement;
-use crate::camera::{Camera, View};
+use crate::camera::{Camera, Preset, View};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -21,6 +21,7 @@ pub const MARKER_RADIUS_M: f32 = 0.007;
 pub const PICK_MIN_PX: f32 = 7.0;
 /// Settings default History Length 250 frames.
 pub const HISTORY_FRAMES: i64 = 250;
+const TRAIL_MARKER_LIMIT: usize = 8;
 /// Height of the strip along the bottom of the 3D where the HUD is (axis, frame, marker count).
 const HUD_BAND: f32 = 64.0;
 
@@ -249,6 +250,14 @@ pub fn pick_plate(quads: &[PlateQuad], pointer: Pos2) -> Option<usize> {
         // Convex quad: the point is on the same side of all four edges.
         let side = |k: usize| (c[(k + 1) % 4] - c[k]).x * (pointer - c[k]).y - (c[(k + 1) % 4] - c[k]).y * (pointer - c[k]).x;
         let s = [side(0), side(1), side(2), side(3)];
+        // Two triangles give the signed area. An edge-on plate has no interior.
+        let area = |a: Pos2, b: Pos2| {
+            let (a, b) = (a - c[0], b - c[0]);
+            a.x * b.y - a.y * b.x
+        };
+        if area(c[1], c[2]) + area(c[2], c[3]) == 0.0 {
+            return false;
+        }
         s.iter().all(|&v| v >= 0.0) || s.iter().all(|&v| v <= 0.0)
     };
     quads.iter().find(|q| inside(&q.corners)).map(|q| q.plate)
@@ -384,6 +393,14 @@ pub const OVERLAY_RING_W: f32 = 1.5;
 /// or asset tags either) and the laid-over file's markers at its frame, drawn as white rings
 /// (display only, never clicked); plan step 8 adds its sticks (thin white, under this file's).
 #[allow(clippy::too_many_arguments)]
+fn trail_markers(selected: &BTreeSet<usize>) -> impl Iterator<Item = usize> + '_ {
+    selected.iter().copied().take(TRAIL_MARKER_LIMIT)
+}
+
+fn show_marker_name(names: bool, selected: bool, labeled: bool, hovered: bool) -> bool {
+    hovered || (names && (selected || labeled))
+}
+
 pub fn show(
     ui: &mut Ui,
     rect: Rect,
@@ -398,7 +415,9 @@ pub fn show(
     primary: Option<usize>,
     measurement: Option<Measurement>,
     plate: Option<usize>,
-    hud_label: &str,
+    capture_label: Option<&str>,
+    legacy_capture: bool,
+    follow_target: Option<Vec3>,
     layers: Layers,
 ) -> SceneOutput {
     let (_, mut response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -413,7 +432,7 @@ pub fn show(
     // Mouse (Motive): left click / left drag box = select markers, right drag = orbit
     // around the pivot, middle drag = pan, wheel = zoom.
     let delta = response.drag_delta();
-    if response.dragged_by(PointerButton::Secondary) {
+    if response.dragged_by(PointerButton::Secondary) && delta != egui::Vec2::ZERO {
         cam.orbit(delta.x, delta.y);
     }
     let box_id = response.id.with("box_select");
@@ -432,7 +451,7 @@ pub fn show(
     if box_done || !box_active {
         ui.data_mut(|d| d.remove::<Option<Pos2>>(box_id));
     }
-    if response.dragged_by(PointerButton::Middle) {
+    if response.dragged_by(PointerButton::Middle) && follow_target.is_none() {
         cam.pan(delta.x, delta.y, rect);
     }
     if response.hovered() {
@@ -446,7 +465,9 @@ pub fn show(
     let mut painter = ui.painter().clone();
     painter.set_clip_rect(rect);
     painter.rect_filled(rect, 0.0, theme::VIEW_BG);
-    let view = cam.view(rect);
+    let mut display_camera = *cam;
+    display_camera.pivot = follow_target.unwrap_or(cam.pivot);
+    let view = display_camera.view(rect);
     if opts.grid {
         grid(&painter, &view, data.and_then(|d| d.bounds));
     }
@@ -456,7 +477,12 @@ pub fn show(
     // "Perspective" right of the name tag; notes below it.
     let (hud_x, note_y) = if tag.x > 0.0 { (tag.x + 10.0, tag.y + 4.0) } else { (10.0, 26.0) };
     let hud_y = if tag.y > 0.0 { (tag.y - 13.0) / 2.0 } else { 8.0 };
+    let hud_label = capture_label.unwrap_or_else(|| cam.preset.label());
     painter.text(rect.left_top() + vec2(hud_x, hud_y), Align2::LEFT_TOP, hud_label, FontId::proportional(13.0), theme::HUD_TEXT);
+    let show_follow = cam.follow && capture_label.is_none();
+    if show_follow {
+        painter.text(rect.left_top() + vec2(10.0, note_y), Align2::LEFT_TOP, "Follow Selected", FontId::proportional(12.0), theme::ACCENT);
+    }
 
     let Some(data) = data else {
         painter.text(
@@ -482,7 +508,7 @@ pub fn show(
         sticks(&painter, &view, data, frame, opts.standard_sticks);
         if opts.standard_sticks && data.sticks.iter().any(|s| s.standard) {
             painter.text(
-                rect.left_top() + vec2(10.0, note_y),
+                rect.left_top() + vec2(10.0, note_y + if show_follow { 16.0 } else { 0.0 }),
                 Align2::LEFT_TOP,
                 "선: 파일에 없어 표준 선(Conventional Full Body 39)으로 표시",
                 FontId::proportional(12.0),
@@ -491,7 +517,11 @@ pub fn show(
         }
     }
     if own && opts.history {
-        if opts.trail_all {
+        if !legacy_capture {
+            for m in trail_markers(selected) {
+                history(&painter, &view, data, m, frame, HISTORY_FRAMES);
+            }
+        } else if opts.trail_all {
             for &m in selected {
                 history(&painter, &view, data, m, frame, opts.trail_frames);
             }
@@ -526,20 +556,31 @@ pub fn show(
                 continue;
             }
             let Some(ai) = g.asset else { continue };
-            if let Some((c, top)) = data.asset_anchor(gi, frame) {
-                if let Some((pos, _)) = view.project(v3(c.x, top + 0.22, c.z)) {
-                    asset_pill(&painter, pos, &data.take.assets[ai].name);
-                }
+            let anchor = if matches!(cam.preset, Preset::Top | Preset::Bottom) {
+                // World Y projects into depth here. Put the pill above the points on screen.
+                let bounds = g.members.iter().filter_map(|&m| {
+                    view.project(data.markers[m].position(frame)?).map(|(pos, _)| pos)
+                }).fold(Rect::NOTHING, |bounds, pos| bounds.union(Rect::from_min_max(pos, pos)));
+                (bounds.min.x <= bounds.max.x).then(|| pos2(bounds.center().x, bounds.top() - 18.0))
+            } else {
+                data.asset_anchor(gi, frame).and_then(|(c, top)| {
+                    view.project(v3(c.x, top + 0.22, c.z)).map(|(pos, _)| pos)
+                })
+            };
+            if let Some(pos) = anchor {
+                asset_pill(&painter, pos, &data.take.assets[ai].name);
             }
         }
     }
 
-    let hover = response.hover_pos().and_then(|h| pick(&projected, h));
+    let hover = response.hover_pos()
+        .filter(|p| legacy_capture || !covers.iter().any(|cover| cover.contains(*p)))
+        .and_then(|p| pick(&projected, p));
     for p in &projected {
         let m = &data.markers[p.marker];
         let labeled = !matches!(data.groups[m.group].kind, GroupKind::Unlabeled);
         let sel = selected.contains(&p.marker);
-        if sel || Some(p.marker) == hover || (opts.names && labeled) {
+        if show_marker_name(opts.names, sel, labeled, Some(p.marker) == hover) || (legacy_capture && sel) {
             let color = if Some(p.marker) == primary {
                 theme::SELECT_PRIMARY
             } else if sel {
@@ -642,6 +683,9 @@ pub fn show(
 }
 
 #[cfg(test)]
+mod mode_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -723,7 +767,7 @@ mod tests {
                     state.1 = ui.max_rect();
                     let rect = state.1;
                     state.2 = show(ui, rect, Rect::NOTHING, vec2(0.0, 0.0), &[], Some(&data), 0, &mut state.0,
-                        &SceneOptions::default(), &selected, Some(0), None, None, "Perspective", Layers { own: true, overlay: None });
+                        &SceneOptions::default(), &selected, Some(0), None, None, None, false, None, Layers { own: true, overlay: None });
                 });
             })
         };

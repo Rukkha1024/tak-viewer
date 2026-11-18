@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.54.0 — 2026-11-18
+
+- 3D Follow Selected (G), per view. Seven direction choices in 보기, including six orthographic views.
+- Selected trails up to eight. L off hides 3D marker names except pointer hover. Existing command capture output preserved.
+
 ## v0.53.0 — 2026-11-18
 
 - Add 3D Shift+click and visible-marker Ctrl+A. Keep click order and restore selection with undo/redo.

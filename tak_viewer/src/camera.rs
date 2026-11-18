@@ -5,6 +5,9 @@
 use eframe::egui::{pos2, Pos2, Rect};
 use tak_core::geom::{v3, Vec3};
 
+mod preset;
+pub use preset::Preset;
+
 pub const WORLD_UP: Vec3 = v3(0.0, 1.0, 0.0);
 pub const NEAR: f32 = 0.02;
 const MIN_DISTANCE: f32 = 0.05;
@@ -16,6 +19,8 @@ pub const ZOOM_SPEED: f32 = 0.002; // per scroll point
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
     pub pivot: Vec3,
+    pub preset: Preset,
+    pub follow: bool,
     /// Rotation around world Y; 0 = camera on +Z looking toward -Z.
     pub yaw: f32,
     /// Elevation; positive = camera above the pivot.
@@ -29,6 +34,8 @@ impl Default for Camera {
     fn default() -> Self {
         Camera {
             pivot: v3(0.0, 0.9, 0.0),
+            preset: Preset::Perspective,
+            follow: false,
             yaw: 35f32.to_radians(),
             pitch: 22f32.to_radians(),
             distance: 6.0,
@@ -46,6 +53,7 @@ pub struct View {
     pub up: Vec3,
     pub focal_px: f32,
     pub center: Pos2,
+    ortho_distance: Option<f32>,
 }
 
 impl Camera {
@@ -56,16 +64,22 @@ impl Camera {
     }
 
     pub fn view(&self, rect: Rect) -> View {
+        let focal_px = (rect.height() * 0.5) / (self.fov_y * 0.5).tan();
+        let center = rect.center();
+        if let Some((forward, right, up)) = self.preset.basis() {
+            // Parallel projection has no near clip. Depth is relative to the pivot.
+            return View { eye: self.pivot, forward, right, up, focal_px, center, ortho_distance: Some(self.distance) };
+        }
         let eye = self.eye();
         let forward = (self.pivot - eye).normalized();
         let right = forward.cross(WORLD_UP).normalized();
         let up = right.cross(forward);
-        let focal_px = (rect.height() * 0.5) / (self.fov_y * 0.5).tan();
-        View { eye, forward, right, up, focal_px, center: rect.center() }
+        View { eye, forward, right, up, focal_px, center, ortho_distance: None }
     }
 
     /// Right drag: orbit around the pivot (pivot stays fixed).
     pub fn orbit(&mut self, dx: f32, dy: f32) {
+        self.preset = Preset::Perspective;
         self.yaw -= dx * ORBIT_SPEED;
         self.pitch = (self.pitch + dy * ORBIT_SPEED).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
@@ -89,9 +103,11 @@ impl Camera {
         if !(min.is_finite() && max.is_finite()) || !(aspect > 0.0) {
             return;
         }
-        let ext = max - min;
-        self.yaw = if ext.x >= ext.z { 20f32.to_radians() } else { 110f32.to_radians() };
-        self.pitch = 18f32.to_radians();
+        if self.preset == Preset::Perspective {
+            let ext = max - min;
+            self.yaw = if ext.x >= ext.z { 20f32.to_radians() } else { 110f32.to_radians() };
+            self.pitch = 18f32.to_radians();
+        }
         self.fit_box(min, max, aspect);
     }
 
@@ -106,6 +122,14 @@ impl Camera {
             .collect();
         let tan_v = (self.fov_y * 0.5).tan();
         let tan_h = tan_v * aspect;
+        if let Some((_, right, up)) = self.preset.basis() {
+            let distance = corners.into_iter().map(|point| {
+                let offset = point - self.pivot;
+                (offset.dot(right) / tan_h).abs().max((offset.dot(up) / tan_v).abs())
+            }).fold(0.0, f32::max);
+            self.distance = (distance / 0.92).clamp(1.0, MAX_DISTANCE);
+            return;
+        }
         let fits = |cam: &Camera| {
             let eye = cam.eye();
             let forward = (cam.pivot - eye).normalized();
@@ -139,13 +163,14 @@ impl View {
     }
 
     pub fn camera_to_screen(&self, c: Vec3) -> Pos2 {
-        pos2(self.center.x + c.x * self.focal_px / c.z, self.center.y - c.y * self.focal_px / c.z)
+        let depth = self.ortho_distance.unwrap_or(c.z);
+        pos2(self.center.x + c.x * self.focal_px / depth, self.center.y - c.y * self.focal_px / depth)
     }
 
     /// Screen position and depth; None when behind the near plane.
     pub fn project(&self, p: Vec3) -> Option<(Pos2, f32)> {
         let c = self.to_camera(p);
-        if c.z < NEAR || !c.is_finite() {
+        if !c.is_finite() || (self.ortho_distance.is_none() && c.z < NEAR) {
             return None;
         }
         Some((self.camera_to_screen(c), c.z))
@@ -155,7 +180,13 @@ impl View {
     pub fn project_segment(&self, a: Vec3, b: Vec3) -> Option<(Pos2, Pos2)> {
         let mut ca = self.to_camera(a);
         let mut cb = self.to_camera(b);
-        if !(ca.is_finite() && cb.is_finite()) || (ca.z < NEAR && cb.z < NEAR) {
+        if !(ca.is_finite() && cb.is_finite()) {
+            return None;
+        }
+        if self.ortho_distance.is_some() {
+            return Some((self.camera_to_screen(ca), self.camera_to_screen(cb)));
+        }
+        if ca.z < NEAR && cb.z < NEAR {
             return None;
         }
         if ca.z < NEAR {
@@ -170,7 +201,7 @@ impl View {
 
     /// Screen radius of a sphere of world radius `r` at depth `z`.
     pub fn radius_px(&self, r: f32, z: f32) -> f32 {
-        r * self.focal_px / z
+        r * self.focal_px / self.ortho_distance.unwrap_or(z)
     }
 
     /// Direction-only projection for the orientation gizmo (x right, y down).
@@ -178,6 +209,9 @@ impl View {
         (d.dot(self.right), -d.dot(self.up), d.dot(self.forward))
     }
 }
+
+#[cfg(test)]
+mod mode_tests;
 
 #[cfg(test)]
 mod tests {

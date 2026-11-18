@@ -1,6 +1,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use crate::camera::Preset;
 use crate::ui::comment_list::Field;
 use tak_core::view_data::PlateView;
 
@@ -48,6 +49,8 @@ pub struct AutoShot {
     /// `--hover <NAME>` (v0.29.0): the marker graph drawn as if the mouse were on that graphed
     /// marker's curve (`panels::LaneCache::hover_at`).
     pub hover: Option<String>,
+    pub scene_view: Option<Preset>,
+    pub scene_follow: bool,
     pub stage: u32,
 }
 
@@ -110,6 +113,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let mut edit_comment = None;
     let mut type_strip = None;
     let mut hover = None;
+    let mut scene_view = None;
+    let mut scene_follow = false;
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -133,6 +138,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                     overlays: Vec::new(),
                     hide: Vec::new(),
                     hover: None,
+                    scene_view: None,
+                    scene_follow: false,
                     stage: 0,
                 });
                 i += 2;
@@ -152,6 +159,17 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
             "--hover" if i + 1 < args.len() => {
                 hover = Some(args[i + 1].trim().to_owned());
                 i += 2;
+            }
+            "--scene-view" if i + 1 < args.len() => {
+                scene_view = Preset::parse(&args[i + 1]);
+                if scene_view.is_none() {
+                    eprintln!("--scene-view: '{}'은 보는 방향에 없어요.", args[i + 1]);
+                }
+                i += 2;
+            }
+            "--scene-follow" => {
+                scene_follow = true;
+                i += 1;
             }
             "--select" if i + 1 < args.len() => {
                 select = Some(ShotSelection::Names(args[i + 1].clone()));
@@ -245,6 +263,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         s.overlays = overlays;
         s.hide = hide;
         s.hover = hover;
+        s.scene_view = scene_view;
+        s.scene_follow = scene_follow;
     }
     (shot, rest)
 }

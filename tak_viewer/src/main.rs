@@ -229,6 +229,7 @@ fn usage() -> String {
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         "Headless Labeling link: --labeling-link with --select NAME",
         "Headless 3D selection: --select-visible or --select A,B[,C]",
+        "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,
