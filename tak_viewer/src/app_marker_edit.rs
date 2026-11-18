@@ -94,7 +94,7 @@ pub(super) struct PreparedSession {
 
 #[derive(Clone)]
 enum MarkerCommand {
-    Label(LabelRequest),
+    Label { request: LabelRequest, keep_armed: bool },
     Unlabel(UnlabelRequest),
     Delete(DeleteRequest),
     Fill {
@@ -115,7 +115,7 @@ enum MarkerCommand {
 impl MarkerCommand {
     fn selection(&self) -> &EditSelection {
         match self {
-            Self::Label(r) => &r.selection,
+            Self::Label { request, .. } => &request.selection,
             Self::Unlabel(r) => &r.selection,
             Self::Delete(r) => &r.selection,
             Self::Fill { selection, .. } | Self::Smooth { selection, .. } => selection,
@@ -254,8 +254,8 @@ fn run_marker_command(
             let outcome = delete_samples(snapshot, &request).map_err(edit_error)?;
             Ok((outcome.patch, outcome.result.message))
         }
-        MarkerCommand::Label(request) => {
-            let outcome = LabelEditor::with_creation_streams(&session.creation)
+        MarkerCommand::Label { request, keep_armed } => {
+            let mut outcome = LabelEditor::with_creation_streams(&session.creation)
                 .label_with_outcome(snapshot, &request)
                 .map_err(|error| match error {
                     EditError::AmbiguousLabel => "마커가 여러 개여서 라벨을 붙일 수 없어요.".into(),
@@ -264,6 +264,9 @@ fn run_marker_command(
                     EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
                     other => edit_error(other),
                 })?;
+            if let Some(patch) = outcome.patch.as_mut().filter(|_| keep_armed) {
+                patch.selection_after.armed_label = patch.selection_before.armed_label;
+            }
             let message = outcome
                 .patch
                 .as_ref()
@@ -1280,7 +1283,7 @@ impl TakViewerApp {
         self.views[slot].sync_shared();
         let now = ctx.input(|i| i.time);
         let view = &self.views[slot];
-        let local_label_shot = matches!(&command, MarkerCommand::Label(_)) && self.label_shot_in_progress(slot);
+        let local_label_shot = matches!(&command, MarkerCommand::Label { .. }) && self.label_shot_in_progress(slot);
         if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !local_label_shot)
             || self.dirty_prompt.is_some()
             || self.hold.is_some()
@@ -1615,7 +1618,7 @@ impl TakViewerApp {
         });
     }
 
-    fn refresh_marker_ui(&mut self, slot: usize) {
+    pub(super) fn refresh_marker_ui(&mut self, slot: usize) {
         self.views[slot].sync_shared();
         let busy = self.marker_job_running(slot) || self.marker_saving(slot);
         let view = &self.views[slot];
@@ -1673,11 +1676,7 @@ impl TakViewerApp {
                     });
                     continue;
                 }
-                let key = m
-                    .parent
-                    .filter(|p| *p != [0; 16])
-                    .zip(m.slot)
-                    .map(|(parent, slot)| LabelKey { parent, slot });
+                let key = super::scene_marker_menu::label_key(m, group.kind);
                 if let Some(key) = key {
                     parents.insert(key.parent);
                     seen.insert(key);
@@ -2072,6 +2071,10 @@ impl TakViewerApp {
     }
 
     pub(super) fn assign_label_to_point(&mut self, ctx: &egui::Context, slot: usize, source: Uid, target: LabelKey) {
+        self.assign_point_label(ctx, slot, source, target, false);
+    }
+
+    pub(super) fn assign_point_label(&mut self, ctx: &egui::Context, slot: usize, source: Uid, target: LabelKey, keep_armed: bool) {
         self.refresh_marker_ui(slot);
         let view = &self.views[slot];
         let ui = &self.marker_ui[slot].labeling;
@@ -2094,11 +2097,11 @@ impl TakViewerApp {
             },
             backward: ui.backward,
             forward: ui.forward,
-            increment: ui.increment,
-            visible_labels: increment_order(ui, target),
+            increment: ui.increment && !keep_armed,
+            visible_labels: if keep_armed { Vec::new() } else { increment_order(ui, target) },
             selection: view.edit_selection_state(),
         };
-        self.start_marker_command(ctx, slot, MarkerCommand::Label(request));
+        self.start_marker_command(ctx, slot, MarkerCommand::Label { request, keep_armed });
     }
 
     fn fill_markers(

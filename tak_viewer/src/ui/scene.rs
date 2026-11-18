@@ -76,7 +76,7 @@ pub struct SceneOutput {
     pub double_clicked: Option<usize>,
     /// Right-click point: select it only if it is not already selected.
     pub context_clicked: Option<usize>,
-    pub remove_marker: bool,
+    pub marker_menu: Option<egui::Response>,
     /// Left click without Ctrl on no marker but inside this force plate (as drawn): choose or
     /// un-choose it. `clicked` is then `Some(None)`; the marker selection stays.
     pub plate: Option<usize>,
@@ -559,21 +559,10 @@ pub fn show(
             out.double_clicked = pick(&projected, pointer);
         }
     }
-    let context_id = response.id.with("marker_context_target");
     if response.secondary_clicked() {
-        let target = response.interact_pointer_pos().and_then(|p| pick(&projected, p));
-        ui.data_mut(|data| data.insert_temp(context_id, target));
-        out.context_clicked = target;
+        out.context_clicked = response.interact_pointer_pos().and_then(|p| pick(&projected, p));
     }
-    let context_target = ui.data(|data| data.get_temp::<Option<usize>>(context_id)).flatten();
-    if context_target.is_some() {
-        response.context_menu(|ui| {
-            if ui.button("Remove Marker").clicked() {
-                out.remove_marker = true;
-                ui.close_menu();
-            }
-        });
-    }
+    out.marker_menu = own.then_some(response);
 
     // HUD: axis triad (lower-left), marker details (lower-right), frame readout (bottom center).
     // An item between x0 and x1 sits on the bottom edge, or just above the floating graphs
@@ -690,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn right_click_point_opens_remove_marker() {
+    fn right_click_point_passes_the_context_target_to_the_app() {
         use eframe::egui::{Event, Modifiers, RawInput};
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -715,19 +704,6 @@ mod tests {
         render(vec![event(true)]);
         render(vec![event(false)]);
         assert_eq!(state.borrow().2.context_clicked, Some(0));
-        let output = render(vec![]);
-        fn menu_rect(shape: &egui::Shape) -> Option<Rect> {
-            match shape {
-                egui::Shape::Text(text) if text.galley.text() == "Remove Marker" => Some(Rect::from_min_size(text.pos, text.galley.size())),
-                egui::Shape::Vec(items) => items.iter().find_map(menu_rect),
-                _ => None,
-            }
-        }
-        let menu = output.shapes.iter().find_map(|shape| menu_rect(&shape.shape)).unwrap().center();
-        let click = |pressed| Event::PointerButton { pos: menu, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        render(vec![Event::PointerMoved(menu)]);
-        render(vec![click(true)]);
-        render(vec![click(false)]);
-        assert!(state.borrow().2.remove_marker);
+        assert!(state.borrow().2.marker_menu.as_ref().unwrap().secondary_clicked());
     }
 }

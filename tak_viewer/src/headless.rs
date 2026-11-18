@@ -362,6 +362,7 @@ fn run_with_probe(initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Op
         let mut raw = frame_input(screen, start, std::mem::take(&mut events));
         crate::desktop_drop::inject_preview(&mut raw);
         let out = ctx.run(raw, |ctx| app.frame(ctx));
+        events.extend(app.scene_menu_shot_hover().map(Event::PointerMoved));
         if let Some(p) = &mut probe {
             match p.tick(&mut app, &ctx) {
                 crate::ssh_probe::Step::Escape => events.push(Event::Key { key:egui::Key::Escape, physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }),

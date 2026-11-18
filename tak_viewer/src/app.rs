@@ -42,6 +42,8 @@ mod remote_ui;
 mod marker_edit;
 #[path = "app_label_shot.rs"]
 pub(super) mod label_shot;
+#[path = "app_scene_marker_menu.rs"]
+pub(crate) mod scene_marker_menu;
 #[path = "app_tabs.rs"]
 mod layout_tabs;
 #[path = "app_layout_tabs.rs"]
@@ -414,7 +416,7 @@ pub struct TakViewerApp {
     identity_candidate: std::cell::RefCell<Option<(PathBuf, PathBuf)>>,
     marker_sessions: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::PreparedSession>,
     marker_click: Option<(usize, tak_core::tak::Uid)>,
-    marker_delete: Option<usize>,
+    scene_marker_menu: scene_marker_menu::Menu,
     dirty_prompt: Option<marker_edit::DirtyPrompt>,
     overlay_dirty: Option<overlay_dirty::OverlayDirty>,
     overlay_marker_ui: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::MarkerUi>,
@@ -650,7 +652,7 @@ impl TakViewerApp {
             identity_candidate: Default::default(),
             marker_sessions: Default::default(),
             marker_click: None,
-            marker_delete: None,
+            scene_marker_menu: scene_marker_menu::Menu::default(),
             dirty_prompt: None,
             overlay_dirty: None,
             overlay_marker_ui: Default::default(),
@@ -1427,6 +1429,7 @@ impl TakViewerApp {
             // Verification of the menu capture: wait until it has finished.
             6 if self.capture.is_some() => {}
             6 if self.drive_label_shot(ctx) => {}
+            6 if self.wait_for_scene_menu_shot(ctx) => {}
             6 => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
                 next.stage = 7;
@@ -2546,7 +2549,7 @@ impl TakViewerApp {
 
     /// Keys act on the active view.
     fn handle_keys(&mut self, ctx: &egui::Context, now: f64) {
-        if self.typing(ctx) || self.dirty_prompt.is_some() || ctx.memory(|m| m.any_popup_open()) {
+        if self.typing(ctx) || self.dirty_prompt.is_some() || self.scene_marker_menu.is_open() || ctx.memory(|m| m.any_popup_open()) {
             return;
         }
         // Ctrl+Z / Ctrl+Y work on the whole app (v0.16.0), also with no file in the active view.
@@ -3116,9 +3119,9 @@ impl TakViewerApp {
         let scene_opts = &self.settings.scene;
         // The selected marker's graph and the chosen plate's graph float over this 3D (not in
         // pictures), anywhere in the 3D as drawn (tab row too, under the name tag).
-        let gbox = &mut self.settings.graph_boxes[slot];
-        let pbox = &mut self.settings.plate_boxes[slot];
-        let pset = &mut self.settings.plate_channels[slot];
+        let gbox = &self.settings.graph_boxes[slot];
+        let pbox = &self.settings.plate_boxes[slot];
+        let pset = &self.settings.plate_channels[slot];
         let float = self.settings.graph_float && !capturing;
         let graph_marker = v.data.as_ref().and_then(|d| v.primary.filter(|m| float && *m < d.markers.len()));
         // No plate graph (and no note) while the forces are still loading. Its lanes: those
@@ -3146,10 +3149,10 @@ impl TakViewerApp {
             })
             .inner;
         let quick = quick_available && self.marker_ui[slot].labeling.mode == crate::ui::labeling::LabelingMode::QuickLabel && v.armed_label.is_some();
-        if let Some(index) = out.context_clicked {
-            if !v.selected.contains(&index) { v.select(index, false); }
+        if let Some(response) = out.marker_menu {
+            self.draw_scene_marker_menu(slot, &response, out.context_clicked);
         }
-        if out.remove_marker { self.marker_delete = Some(slot); }
+        let v = &mut self.views[slot];
         let quick_edit = quick && (out.clicked.flatten().is_some() || out.double_clicked.is_some())
             && ui.input(|input| input.modifiers == Modifiers::NONE) && !key_focus::keys_blocked(ui.ctx());
         let quick_click = out.clicked.flatten().filter(|_| quick_edit);
@@ -3215,6 +3218,9 @@ impl TakViewerApp {
         // plate graph after the marker graph: on top where they overlap). Own child ui each,
         // whose clip rect holds the tab row (egui clips the mouse to the clip rect).
         let opacity = self.settings.graph_opacity;
+        let gbox = &mut self.settings.graph_boxes[slot];
+        let pbox = &mut self.settings.plate_boxes[slot];
+        let pset = &mut self.settings.plate_channels[slot];
         let frame = v.pb.frame;
         let mut goto = None;
         if let (Some(mi), Some(d)) = (graph_marker, v.data.as_ref()) {
@@ -3603,7 +3609,8 @@ impl TakViewerApp {
             _ => key_focus::Target::Blocked,
         };
         key_focus::begin_frame(ctx, self.capture.is_some() || self.dirty_prompt.is_some()
-            || self.hold.is_some() || self.comment_edit.is_some() || self.layout_strip.is_renaming(), initial_focus);
+            || self.hold.is_some() || self.comment_edit.is_some() || self.layout_strip.is_renaming()
+            || self.scene_marker_menu.is_open(), initial_focus);
         let now = ctx.input(|i| i.time);
         self.layout_time = now;
         if !self.no_persist && !self.exit_approved && ctx.input(|i| i.viewport().close_requested()) {
@@ -3626,7 +3633,7 @@ impl TakViewerApp {
             self.read_desktop_drop(ctx);
         }
         let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none()
-            && self.capture.is_none()
+            && self.capture.is_none() && !self.scene_marker_menu.is_open()
             && !ctx.input(|input| input.key_down(Key::M)) && !ctx.memory(|m| m.any_popup_open());
         if global_keys && exact_key(ctx, Key::O, true, true, false) {
             self.pick_folder();
@@ -3817,7 +3824,7 @@ impl TakViewerApp {
         }
         self.apply(action, now);
         if let Some((slot, uid)) = self.marker_click.take().filter(|_| self.dirty_prompt.is_none()) { self.label_sample(ctx, slot, uid); }
-        if let Some(slot) = self.marker_delete.take().filter(|_| self.dirty_prompt.is_none()) { self.delete_selected(ctx, slot); }
+        self.apply_scene_marker_menu(ctx);
         if let Some(a) = ws_action {
             self.explorer_action(ctx, a);
         }

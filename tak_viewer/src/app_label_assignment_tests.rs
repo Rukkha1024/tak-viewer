@@ -16,6 +16,8 @@ mod label_assignment {
         slot: 2,
     };
 
+    include!("app_scene_marker_menu_tests.rs");
+
     fn wait(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
         let start = Instant::now();
         while !ready(app) {

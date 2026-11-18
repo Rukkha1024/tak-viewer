@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.51.0 — 2026-11-18
+
+- 3D right-click menu shows selection count and current marker coordinates. Assign or clear labels from the same menu. Keep the armed QuickLabel target. One undo per edit.
+
 ## v0.50.0 — 2026-11-18
 
 - QuickLabel reassigns named and Unlabeled points. Preserve old samples in a new Unlabeled track on overlapping frames. One undo per click. Status shows both frame counts.

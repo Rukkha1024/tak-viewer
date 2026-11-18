@@ -174,6 +174,10 @@ fn main() -> eframe::Result<()> {
         eprintln!("{error}");
         std::process::exit(2);
     }
+    if let Err(error) = app::scene_marker_menu::take_probe(&mut args, headless) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     let no_desktop = !headless && instances::no_desktop();
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
@@ -221,6 +225,7 @@ fn usage() -> String {
     [
         capture::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
+        "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,
