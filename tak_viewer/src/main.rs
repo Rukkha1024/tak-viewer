@@ -30,6 +30,7 @@ mod desktop_drop;
 mod device_grid;
 mod comment_selection;
 mod capture;
+mod check_command;
 mod headless;
 mod instances;
 mod merge_keys;
@@ -80,6 +81,9 @@ fn main() -> eframe::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("--summary") {
         std::process::exit(summary_command::run(&args[2..], workspace::resolve_path));
+    }
+    if args.get(1).map(String::as_str) == Some("--check") {
+        std::process::exit(check_command::run(&args[2..]));
     }
     if let Err(error) = desktop_drop::take_preview(&mut args) { eprintln!("{error}"); std::process::exit(2); }
     if args.get(1).map(String::as_str)==Some("--dump-device-signal") {
@@ -263,6 +267,7 @@ fn usage() -> String {
         summary_command::USAGE,
         tak_core::takm::USAGE,
         tak_core::takm::verify::USAGE,
+        check_command::USAGE,
     ]
     .join("\n\n")
 }

@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.60.0 — 2026-11-18
+
+- **One-command check:** `--check <trusted file> [<file2> … up to 4] --out <dir> [--roles copy,agent,raw] [--frames <spec>|auto[:N]] [--views …] [--select A,B] [--top N] [--no-pictures]`. Per file: `--summary` facts + the normal headless capture set (same frames, views, selection for every file) under `<out>/<role>_<stem>/`; all facts in `<out>/check.json`; short Korean text on stdout. No window, no settings.
+- **Comparison against the first file:** marker-set markers paired by structure (same skeleton template, same slot; never by name) → frames present in one file only, distance max with frame, mean, counts above 1 mm / 20 mm, top N. Second block pairs the same stored trajectories by UID and flags name/parent/slot changes. Different template → slot block skipped with reason.
+- **Frames:** default `auto:12` picks gap edges, largest slot distances, presence-change stretches, then even controls; reasons recorded.
+- **Completeness:** every expected PNG, `sheet.png`, empty capture notes, source size/mtime checked; anything missing → listed, exit 1. Differences are not failures (exit 0). `--out` must be new or empty; refuses input/ and .tak/.takm paths.
+- `checks/check_compare.py` re-derives the comparison numbers independently.
+
 ## v0.59.0 — 2026-11-18
 
 - GRAPH. Right-drag to zoom a lane’s values. `Auto Extents` resets the scale. `Zoom Fit` or `F` fits the yellow range. `Shift+F` fits the whole take.

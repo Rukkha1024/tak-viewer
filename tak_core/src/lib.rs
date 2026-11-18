@@ -15,6 +15,7 @@
 //! - [`edit`]: revision-checked marker documents and atomic patches, separate from view data.
 pub mod comment_command;
 pub mod comments;
+pub mod comparison;
 pub mod dump;
 pub mod edit;
 pub mod geom;

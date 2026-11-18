@@ -3253,6 +3253,7 @@ mod integration_tests {
             uid: [7; 16], name: "Asset".into(), markerset_name: None,
             model: Some(tak_core::tak::SkeletonModel { serialization_version: 1, template_code: 1, joints: vec![],
                 constraints: vec![tak_core::tak::Constraint { joint_id: 0, slot_raw: 1, slot: 1, name: "Primary".into(), local: [0.0; 3], enabled: true, primary: true }] }),
+            slot_comparison_model: None,
             sticks: vec![], marker_colors: vec![],
         });
         let track = &mut take.trajectories[0];

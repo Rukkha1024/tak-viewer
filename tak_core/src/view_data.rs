@@ -345,7 +345,7 @@ pub fn gaps(frames: &[u32], first: i64, last: i64) -> Vec<(i64, i64)> {
     out
 }
 
-fn detect_unit_scale(take: &Take) -> f32 {
+pub(crate) fn detect_unit_scale(take: &Take) -> f32 {
     let mut values: Vec<f32> = take
         .trajectories
         .iter()
@@ -373,7 +373,7 @@ impl MarkerView {
             return None;
         }
         let p = self.dense[(frame - s) as usize];
-        if p[0].is_nan() {
+        if !display_sample_present(&p) {
             None
         } else {
             Some(Vec3::from_arr(p))
@@ -383,6 +383,10 @@ impl MarkerView {
     pub fn present(&self, frame: i64) -> bool {
         self.position(frame).is_some()
     }
+}
+
+pub(crate) fn display_sample_present(xyz: &[f32; 3]) -> bool {
+    !xyz[0].is_nan()
 }
 
 /// Per-trajectory display tables (independent of the other trajectories).

@@ -145,6 +145,8 @@ pub struct SkeletonAsset {
     pub markerset_name: Option<String>,
     /// None when SKL profile unsupported or parse failed (reason pushed to `Take::warnings`).
     pub model: Option<SkeletonModel>,
+    /// Validated SKL when the normal model rejects duplicate recorded slots. Used only by slot comparison.
+    pub slot_comparison_model: Option<SkeletonModel>,
     /// Empty when the file has zero sticks or they could not be read.
     pub sticks: Vec<MarkerStick>,
     /// Per-marker display colors after the stick table, keyed by signed slot, only when the

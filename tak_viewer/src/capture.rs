@@ -174,15 +174,16 @@ impl FrameSpec {
                 if a > b {
                     vec![]
                 } else {
-                    (a..=b).step_by((*step).max(1) as usize).collect()
+                    (a..=b).step_by((*step).max(1) as usize).take(MAX_FRAMES).collect()
                 }
             }
             Self::Even(n) => {
                 let n = (*n).max(1) as i64;
+                let (first, last) = (i128::from(first), i128::from(last));
                 if n == 1 {
-                    vec![(first + last) / 2]
+                    vec![((first + last) / 2) as i64]
                 } else {
-                    (0..n).map(|i| first + (last - first) * i / (n - 1)).collect()
+                    (0..n).map(|i| (first + (last - first) * i128::from(i) / i128::from(n - 1)) as i64).collect()
                 }
             }
         };
@@ -211,6 +212,21 @@ pub struct CapturePlan {
 }
 
 pub const DEFAULT_VIEWS: [ViewPreset; 4] = [ViewPreset::Persp, ViewPreset::Top, ViewPreset::Side, ViewPreset::Front];
+
+pub fn parse_views(value: &str) -> Result<Vec<ViewPreset>, String> {
+    if value.trim().eq_ignore_ascii_case("all") {
+        return Ok(vec![ViewPreset::Persp, ViewPreset::Top, ViewPreset::Side, ViewPreset::Front, ViewPreset::Bottom]);
+    }
+    value.split(',').map(|s| ViewPreset::parse(s).ok_or_else(|| format!("모르는 각도: {s}"))).collect()
+}
+
+pub fn parse_selection(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
+pub fn shot_file_name(frame: i64, view: ViewPreset) -> String {
+    format!("f{frame:06}_{}.png", view.key())
+}
 
 /// `Ok(None)` when `--capture` is absent. `Err` carries a message for the user (print USAGE too).
 pub fn parse(args: &[String]) -> Result<Option<CapturePlan>, String> {
@@ -248,19 +264,11 @@ pub fn parse(args: &[String]) -> Result<Option<CapturePlan>, String> {
                 i += 1;
             }
             "--views" | "--view" => {
-                let v = value(i, a)?;
-                plan.views = if v.trim().eq_ignore_ascii_case("all") {
-                    vec![ViewPreset::Persp, ViewPreset::Top, ViewPreset::Side, ViewPreset::Front, ViewPreset::Bottom]
-                } else {
-                    v.split(',').map(|s| ViewPreset::parse(s).ok_or_else(|| format!("모르는 각도: {s}"))).collect::<Result<_, _>>()?
-                };
-                if plan.views.is_empty() {
-                    return Err("--views가 비어 있어요".into());
-                }
+                plan.views = parse_views(&value(i, a)?)?;
                 i += 1;
             }
             "--select" => {
-                plan.select = value(i, a)?.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+                plan.select = parse_selection(&value(i, a)?);
                 i += 1;
             }
             "--trail" => {
@@ -649,7 +657,7 @@ impl CaptureRun {
     }
 
     pub fn file_name(&self, frame: i64, view: ViewPreset) -> String {
-        format!("f{frame:06}_{}.png", view.key())
+        shot_file_name(frame, view)
     }
 
     /// Write sheet.png and captures.json; returns the lines to print.

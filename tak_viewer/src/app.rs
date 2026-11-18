@@ -11074,6 +11074,7 @@ mod tests {
             name: "S".into(),
             markerset_name: None,
             model: None,
+            slot_comparison_model: None,
             sticks: vec![MarkerStick { slot_a: 1, slot_b: 2, rgb: STICK_RGB }, MarkerStick { slot_a: 2, slot_b: 3, rgb: STICK_RGB }],
             marker_colors: vec![],
         }];

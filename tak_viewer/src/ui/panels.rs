@@ -2173,7 +2173,7 @@ mod deck_tests {
         use tak_core::tak::{MarkerKind, SkeletonAsset};
         let asset = [9u8; 16];
         let mut t = crate::views::sample_take("g.tak", names);
-        t.assets = vec![SkeletonAsset { uid: asset, name: "S".into(), markerset_name: None, model: None, sticks: vec![], marker_colors: vec![] }];
+        t.assets = vec![SkeletonAsset { uid: asset, name: "S".into(), markerset_name: None, model: None, slot_comparison_model: None, sticks: vec![], marker_colors: vec![] }];
         for (k, tr) in t.trajectories.iter_mut().enumerate() {
             (tr.kind, tr.parent_uid, tr.asset_uid, tr.slot) = (MarkerKind::Template, Some(asset), Some(asset), Some(k as i32 + 1));
         }

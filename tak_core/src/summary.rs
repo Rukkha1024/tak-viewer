@@ -194,6 +194,14 @@ pub struct AnalogChannelSummary {
 /// Reads analog headers on the fast path. TAKM also verifies its fixed part and reads
 /// the live Comment count. No files, settings, or coordination state are written.
 pub fn read_summary(path: &Path, options: &SummaryOptions) -> Result<TakeSummary, SummaryError> {
+    read_summary_with_take(path, options).map(|(_, summary)| summary)
+}
+
+/// Reuse the same decoded samples for summary and comparison.
+pub fn read_summary_with_take(
+    path: &Path,
+    options: &SummaryOptions,
+) -> Result<(Take, TakeSummary), SummaryError> {
     let is_takm = takm::is_takm_path(path);
     if !is_takm && !tak::is_take_path(path) {
         return Err(SummaryError::Argument(
@@ -252,7 +260,7 @@ pub fn read_summary(path: &Path, options: &SummaryOptions) -> Result<TakeSummary
             source_name: index.source.name,
         });
     }
-    Ok(summary)
+    Ok((take, summary))
 }
 
 fn summarize(take: &Take, options: &SummaryOptions) -> Result<TakeSummary, SummaryError> {
@@ -629,6 +637,7 @@ mod tests {
                 name: "asset".into(),
                 markerset_name: Some("recorded set".into()),
                 model: None,
+                slot_comparison_model: None,
                 sticks: vec![],
                 marker_colors: vec![],
             }],

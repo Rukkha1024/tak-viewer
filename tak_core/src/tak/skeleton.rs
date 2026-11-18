@@ -166,6 +166,15 @@ fn validate_hierarchy(joints: &[Joint]) -> Result<()> {
     Ok(())
 }
 
+fn duplicate_track_slot(trajectories: &[Trajectory], asset: Uid) -> Option<i32> {
+    let mut seen_uids = HashSet::new();
+    let mut track_slots = HashSet::new();
+    trajectories.iter()
+        .filter(|t| t.parent_uid == Some(asset) && seen_uids.insert(t.uid))
+        .filter_map(|t| t.slot)
+        .find(|&slot| !track_slots.insert(slot))
+}
+
 /// One asset of `_embedded_skeletons(take, infer_coordinates=False)`.
 fn parse_model(raw: &[u8], header: &Header, trajectories: &[Trajectory]) -> Result<Parsed> {
     let asset = header.uid;
@@ -221,16 +230,8 @@ fn parse_model(raw: &[u8], header: &Header, trajectories: &[Trajectory]) -> Resu
         return err("Invalid skeleton segment count");
     }
     // `tracks`: one trajectory per (asset UID, signed slot); TakeEditor keys markers by UID.
-    let mut seen_uids = HashSet::new();
-    let mut track_slots = HashSet::new();
-    for t in trajectories {
-        if t.parent_uid == Some(asset) && seen_uids.insert(t.uid) {
-            if let Some(slot) = t.slot {
-                if !track_slots.insert(slot) {
-                    return err(format!("Two trajectories share asset slot {slot}"));
-                }
-            }
-        }
+    if let Some(slot) = duplicate_track_slot(trajectories, asset) {
+        return err(format!("Two trajectories share asset slot {slot}"));
     }
     let mut joints = Vec::new();
     let mut constraints = Vec::new();
@@ -404,11 +405,19 @@ pub fn read_assets(raw: &[u8], trajectories: &[Trajectory], warnings: &mut Vec<S
             name,
             markerset_name,
             model: None,
+            slot_comparison_model: None,
             sticks: Vec::new(),
             marker_colors: Vec::new(),
         };
         match parse_model(raw, h, trajectories) {
-            Err(e) => warnings.push(format!("{label}: model not loaded: {}", e.0)),
+            Err(e) => {
+                // Preserve the normal reader result. Compare unaffected slots if the
+                // independent SKL definition still validates without the recorded tracks.
+                if duplicate_track_slot(trajectories, h.uid).is_some() {
+                    asset.slot_comparison_model = parse_model(raw, h, &[]).ok().map(|p| p.model);
+                }
+                warnings.push(format!("{label}: model not loaded: {}", e.0));
+            }
             Ok(parsed) => {
                 match marker_sticks(raw, &h.uid, &parsed) {
                     Ok(sticks) => asset.sticks = sticks,
@@ -447,6 +456,22 @@ mod tests {
         assert!(candidate_template_count(&props("Body (16) x")).is_err());
         assert!(candidate_template_count(&props("Body (0)")).is_err());
         assert!(candidate_template_count(&Props::new()).is_err());
+    }
+
+    #[test]
+    fn repeated_recorded_slot_keeps_the_valid_definition_for_comparison_only() {
+        let raw = crate::sample_tak::sample_tak_with_devices();
+        let take = crate::tak::decode(std::path::Path::new("fixture.tak"), &raw).unwrap();
+        assert!(take.assets[0].model.is_some());
+        let mut trajectories = take.trajectories;
+        trajectories[1].slot = trajectories[0].slot;
+        let container = crate::tak::container::Container::parse(&raw).unwrap();
+        let nodes = container.read_named(&["Nodes.dat"]).unwrap();
+        let mut warnings = Vec::new();
+        let result = read_assets(&nodes[0].1, &trajectories, &mut warnings);
+        assert!(result[0].model.is_none());
+        assert!(result[0].slot_comparison_model.is_some());
+        assert!(warnings[0].contains("Two trajectories share asset slot 1"));
     }
 
     #[test]
