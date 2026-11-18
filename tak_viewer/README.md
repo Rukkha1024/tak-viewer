@@ -66,15 +66,16 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | Reverse | Toggle reverse direction at same speed; Space plays/stops chosen direction |
 | →/←, ↑/↓, Home/End | ±1, ±10, first/last frame |
 | D / Q | QuickLabel↔Select mode / 3D selection tool |
-| QuickLabel plain 3D click | Assign armed label to named or Unlabeled point. Move colliding points to Unlabeled. Same label shows status only |
+| QuickLabel plain 3D click | Assign armed label to named or Unlabeled point. Move colliding points to Unlabeled. Same label with points in scope shows `already set` and follows Increment |
 | S / A | Next/previous visible label |
 | Unlabel / Shift+D | Remove label over configured scope |
 | Delete / Remove Marker | Remove selected samples in edit range/current frame; focused list may own Delete |
 | C / Shift+C | Cubic / Pattern Based fill |
 | X / Shift+X / Ctrl+Alt+X | Smooth selected-range / all-markers-range / all-markers-full-take |
 | Z / Shift+Z | Selected markers' next-gap start / previous-gap end |
-| V or [ / B or ] | Range start / end |
-| Shift+B / Shift+V | Clear range / full range |
+| V / B | Set yellow edit range start / end at this frame |
+| Shift+B / Shift+V | Clear edit range / use the whole file |
+| `[` / `]` | Set green working range start / end at this frame |
 | Shift+[ / Shift+] / `Reset` | Reset working range to full file |
 | G / `보기 → Follow Selected (G)` | Toggle tracking in focused scene / active view |
 | `보기 → View Direction` | Perspective / Front / Back / Left / Right / Top / Bottom |
@@ -179,12 +180,13 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --scale N | Enlarge crop by positive integer N, nearest neighbor. Limit 64 million output pixels |
 | --crop-only | Save only the crop. Without it, also save the full-size screenshot |
 | --regions | Save full-image pixel rectangles to `<stem>.regions.json` |
+| `--progress-menu NAME` | Open the matching file row’s progress menu in a headless screenshot. Add `--ssh-demo progress` for fake SSH rows with the local views still visible. Read only |
 | --select-visible | Select current visible markers as 3D Ctrl+A does. Use `--select A,B` for distance or `--select A,B,C` for angle, with B as vertex. |
 | --plate index/name | Zero-based plate, exact name preferred |
 | --scene-view perspective\|front\|back\|left\|right\|top\|bottom | Set direction in all screenshot views |
 | --scene-follow | Enable Follow Selected in all screenshot views |
 | --range a-b | Clamp/sort endpoints; malformed warns, never filename |
-| --shot-label SOURCE=TARGET | Headless screenshot only. Repeat in order, one local file. Exact unique names. Apply assignments in memory at --frame/--range, then show status and Labeling |
+| --shot-label SOURCE=TARGET | Headless screenshot only. Repeat in order, one local file. Exact unique names. Apply QuickLabel in memory at --frame/--range. NAME=NAME confirms and advances. =TARGET arms the row for a before shot |
 | --shot-marker-menu menu\|info\|label | Headless screenshot only. Use --select and --frame to pick visible points in the active view. Open the 3D marker menu alone or with Marker Info / Label Marker expanded. Label submenu needs one selected point. Read/write no settings or take data |
 | --shot-help | Use with `--headless --screenshot out.png`, without a take. Open `Controls`. Default 1600×960 px at 100%. Optional `--shot-help-size 1920x1080@1.5` sets pixel size and scale. Add `--shot-help-bottom` to capture the last rows |
 | --comments | Bring COMMENTS forward |
@@ -308,12 +310,14 @@ Existing TAKM outside repo input for adds. WSL and Windows paths work. No window
 
 ```json
 [
-  {"markers": ["LTHI", "LKNE"], "start": 1073, "end": 1073, "type": "Needs visual check", "text": "한 줄 설명"},
+  {"markers": ["LTHI", "LKNE"], "start": 1073, "end": 1073, "type": "Visual check", "text": "한 줄 설명"},
   {"markers": [], "start": 1080, "end": 1090, "text": ""}
 ]
 ```
 
 Frames inclusive, in the viewer's numbering. `type` optional. Text may be empty. Without a positional file, supply a JSON object mapping each TAKM path to its row array. Relative paths start at the working directory. Validate every file and row before appending to any file.
+
+Current types in order: `Jitter`, `Jump`, `Visual check`, `File bad`, `Agree`, `No problem`, `Keep this only`. `Needs visual check` and `Marker swap` are retired, still accepted. Add stores the matching name. List returns the stored type, including retired and unknown values. `--by` filters by writer.
 
 `--dry-run` validates and plans without reserving IDs or writing. `--allow-unknown-markers` skips exact labeled-name validation. `--allow-duplicates` appends matching rows again. Without it, live matches and in-batch repeats are skipped after comparing marker lists without regard to order. Type names match without regard to case. Text stays one line, with tabs replaced by spaces.
 
@@ -357,12 +361,14 @@ Stages = `demean`, `rect`, `rms:50`, `lp:6:4`, `hp:20:4`, `bp:20:450:4`, `bs:59:
 tak_viewer.exe --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]
 tak_viewer.exe --headless --ssh-open ALIAS --ssh-path FILE --screenshot out.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]
 tak_viewer.exe --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot out.png [--ssh-platform linux|windows] [--ssh-workspace-expand] [--ssh-python COMMAND]
+tak_viewer.exe --headless --ssh-test-progress ALIAS FOLDER [1|3] --ssh-platform linux|windows --ssh-python "COMMAND"
 ~~~
 
 - Default platform is `linux`, including macOS hosts. Omit `--ssh-python` for discovery. Pass empty `--ssh-path` to list top-level drives or `/`. Open requires a file and screenshot, lists its parent, then attaches marker and analog results.
 - For open, `--ssh-cancel-after-ms N` sends Escape after N ms from open. `--ssh-stall-cancel-after-ms N` tests no-byte cancellation. `--ssh-dump OUT.json` exports the loaded data. `--ssh-markers-only` keeps received markers and ends deferred analog reads. Use it without timed cancellation.
 - Open edit hooks `--ssh-comment TEXT` and `--ssh-label unlabel` require `--ssh-save` and exercise the normal server write path. Workspace restart is in-memory. Add `--ssh-workspace-expand` for explicit real connect/list.
-- For local screenshot fixtures, `--ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux` uses fake state without SSH. Ready/top scene needs a local sample.
+- For local screenshot fixtures, `--ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress` uses fake state without SSH. Ready/top scene needs a local sample. The `progress` demo shows saved marks beside fake SSH rows.
+- The Progress test needs an SSH alias, `--ssh-platform` and `--ssh-python`. Use a top-level test folder such as `X:\tak_viewer_agent_test_demo` on Windows or `/tak_viewer_agent_test_demo` on Linux or macOS. Use only synthetic `sample.tak` and `sample.takm` files. Omit the number to read both marks. Pass `3` to change Recorded to Cleaned, or `1` to restore Recorded. For a write, use a Python command with write access limited to that folder. Check the seal and bytes before removing the test folder.
 
 [SSH outputs](../docs/cli-outputs.md#diagnostic-outputs)
 

@@ -17,7 +17,7 @@ struct RemoteOwner {
 #[derive(Clone)]
 pub(super) struct RemoteRead {
     owner: RemoteOwner,
-    location: RemoteLocation,
+    pub(super) location: RemoteLocation,
     file_id: Option<usize>,
     document: Option<tak_core::edit::DocumentId>,
 }
@@ -385,6 +385,7 @@ impl TakViewerApp {
 
     fn remote_action(&mut self, ctx: &egui::Context, action: SshAction) {
         match action {
+            SshAction::Progress(pick) => self.pick_progress(ctx, pick),
             SshAction::AddWorkspace { location, platform } => {
                 self.add_remote_workspace(ctx, location, platform);
             }
@@ -442,6 +443,10 @@ impl TakViewerApp {
     ) {
         let created = self.layout_tabs.active_id().is_none();
         let key = location.memory_key();
+        if self.progress_writing(&key) {
+            self.takm_note = Some(("진행 상태를 저장 중이에요. 저장이 끝난 뒤 열어 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         if !self.allow_open_file(&key, Some(slot)) { return; }
         let reload = self.views[slot].remote.as_ref() == Some(&location) && self.views[slot].remote_warning.is_some() && !cached;
         if self.views[slot].target() == Some(key.as_path()) && !reload { return; }
@@ -771,8 +776,8 @@ impl TakViewerApp {
             return true;
         }
         if let Some(data) = &v.data {
-            if let Some(number) = crate::take_progress::saved(&data.take) {
-                ui.label(text(crate::take_progress::label(number).into_owned()));
+            if let Some(state) = self.view().take_progress() {
+                ui.label(text(state.label().into_owned()));
             }
             ui.label(text(format!("{:.0} Hz", data.take.frame_rate)));
             let pending = self
@@ -1452,6 +1457,7 @@ impl TakViewerApp {
     }
     pub(super) fn save_remote(&mut self, ctx: &egui::Context, slot:usize, close_after:bool) {
         if (self.no_persist && !self.remote_write_probe) || self.remote_saving(slot) || self.marker_job_running(slot)
+            || self.views[slot].path().is_some_and(|path| self.progress_writing(path))
             || self.views[slot].edit_refresh.is_some() || self.views[slot].remote_loading.is_some()
             || self.comment_edit.is_some() || self.hold.is_some() {
             self.takm_note = Some(("진행 중인 작업이 끝나면 서버에 저장할 수 있어요.".into(),ctx.input(|i|i.time))); return;

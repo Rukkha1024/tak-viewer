@@ -33,9 +33,10 @@ impl SortKey {
     }
 }
 
-/// The items of the type list, top to bottom (↑ ↓ move along them): the three types in their
-/// one order (`comments::TYPES`: Jitter, Marker swap, Needs visual check), then no type.
-pub const TYPE_LIST: [&str; 4] = [comments::TYPES[0], comments::TYPES[1], comments::TYPES[2], ""];
+/// The items of the dropdown in order, with None last.
+pub fn type_choices() -> impl Iterator<Item = &'static str> {
+    comments::TYPES.iter().copied().chain([""])
+}
 
 /// What an item of the type list says: the full name, `None` for no type.
 pub fn item_name(value: &str) -> &str {
@@ -49,14 +50,14 @@ pub fn item_name(value: &str) -> &str {
 /// The item ↑ (`up`) or ↓ moves the list's highlight to from `now`. Nothing highlighted (a
 /// value the app does not know): ↓ = the first item, ↑ = the last. The ends stop.
 pub fn step_item(now: &str, up: bool) -> &'static str {
-    let last = TYPE_LIST.len() - 1;
-    let k = match (TYPE_LIST.iter().position(|v| *v == now), up) {
+    let last = comments::TYPES.len();
+    let k = match (type_choices().position(|v| v == now), up) {
         (Some(k), true) => k.saturating_sub(1),
         (Some(k), false) => (k + 1).min(last),
         (None, true) => last,
         (None, false) => 0,
     };
-    TYPE_LIST[k]
+    type_choices().nth(k).unwrap_or("")
 }
 
 /// How the list is sorted: a column, from the small end (▲) or reversed (▼). One for the app,
@@ -248,6 +249,8 @@ pub enum ListAction {
     /// the comment (no frame move, v0.27.3) and open its type list (a single click on the box of
     /// the list already open closes it).
     TypeBox(u64, bool),
+    /// Apply a visible type button to the representative Comment.
+    SetType(u64, &'static str),
     /// Save the edit going on (a click on an item of the type list: it is in the edit already).
     SaveEdit,
 }
@@ -334,23 +337,23 @@ struct Cols {
     id: Rect,
     markers: Rect,
     frames: Rect,
-    /// Type (step 5): the short form (`Swap` · `Jitter` · `Check`).
+    /// Stored type and dropdown arrow.
     ty: Rect,
     text: Rect,
     del: Rect,
 }
 
 /// Width of the Frames column: room for two number boxes of five-digit frames and a dash.
-const FRAMES_W: f32 = 104.0;
-/// Width of the Type column: a box with the short forms and a ▼ (type-combo: 52 → 64 pt).
-const TYPE_W: f32 = 64.0;
+const FRAMES_W: f32 = 94.0;
+pub const FRAME_FONT: f32 = 11.5;
+/// Fit the current names and arrow at normal width. Longer stored values can be inspected on hover.
+const TYPE_W: f32 = 106.0;
 
 fn cols(r: Rect) -> Cols {
     let w = r.width();
-    let id_w = 40.0;
-    let del_w = 24.0;
-    // Markers' share 19 % → 15 % (type-combo) so the note keeps 80 pt and more at 380 pt.
-    let markers_w = (w * 0.15).clamp(60.0, 170.0);
+    let id_w = 34.0;
+    let del_w = 20.0;
+    let markers_w = (w * 0.15).clamp(54.0, 170.0);
     let x = |a: f32, b: f32| Rect::from_min_max(pos2(a, r.top()), pos2(b, r.bottom()));
     let x0 = r.left();
     let (x1, x2, x3) = (x0 + id_w, x0 + id_w + markers_w, x0 + id_w + markers_w + FRAMES_W);
@@ -391,12 +394,14 @@ fn type_box(cell: Rect) -> Rect {
 }
 
 /// Room at the right end of a Type box for its ▼ (the text is clipped before it).
-const ARROW_ROOM: f32 = 15.0;
+const ARROW_ROOM: f32 = 13.0;
+const TYPE_TEXT_LEFT: f32 = 4.0;
+const MIN_TYPE_FONT: f32 = 9.0;
 
-/// A Type box: the short form (or a dim `—`) and a ▼ drawn as a shape (the font may lack it).
+/// A Type box: stored text (or a dim `—`) and a ▼ drawn as a shape.
 /// `live` = it acts as a box (dim outline and arrow when it does not: comments cannot be
 /// written here); `open` = its list is open.
-fn draw_type_box(ui: &Ui, r: Rect, text: &str, text_color: Color32, live: bool, open: bool) {
+fn draw_type_box(ui: &Ui, r: Rect, text: &str, text_color: Color32, live: bool, open: bool) -> bool {
     let p = ui.painter().with_clip_rect(r.expand(1.0).intersect(ui.clip_rect()));
     let edge = if open {
         theme::ACCENT
@@ -411,14 +416,24 @@ fn draw_type_box(ui: &Ui, r: Rect, text: &str, text_color: Color32, live: bool, 
     p.rect_stroke(r, 2.0, Stroke::new(1.0_f32, edge));
     let words = r.with_max_x(r.right() - ARROW_ROOM);
     let tp = p.with_clip_rect(words.intersect(ui.clip_rect()));
-    if text.is_empty() {
-        tp.text(pos2(r.left() + 5.0, r.center().y), Align2::LEFT_CENTER, "—", FontId::proportional(FONT), theme::TEXT_DIM);
+    let (label, color) = if text.is_empty() {
+        ("—", theme::TEXT_DIM)
     } else {
-        tp.text(pos2(r.left() + 5.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(FONT), text_color);
+        (text, text_color)
+    };
+    let left = r.left() + TYPE_TEXT_LEFT;
+    let available = words.right() - left;
+    let mut galley = tp.layout_no_wrap(label.to_owned(), FontId::proportional(FONT), color);
+    if galley.size().x > available {
+        let size = (FONT * (available - 2.0) / galley.size().x).max(MIN_TYPE_FONT);
+        galley = tp.layout_no_wrap(label.to_owned(), FontId::proportional(size), color);
     }
+    let clipped = galley.size().x > available;
+    tp.galley(pos2(left, r.center().y - galley.size().y / 2.0), galley, color);
     let arrow = if live { theme::TEXT } else { theme::TEXT_DIM.gamma_multiply(0.6) };
     let c = pos2(r.right() - 8.0, r.center().y + 1.0);
     p.add(egui::Shape::convex_polygon(vec![pos2(c.x - 3.5, c.y - 2.0), pos2(c.x + 3.5, c.y - 2.0), pos2(c.x, c.y + 2.5)], arrow, Stroke::NONE));
+    clipped
 }
 
 /// Height of an item of the type list, and the list's inner margin.
@@ -429,7 +444,7 @@ const CHECK_ROOM: f32 = 22.0;
 
 /// Size of the type list whose longest item name is `name_w` wide.
 pub fn list_size(name_w: f32) -> egui::Vec2 {
-    vec2((CHECK_ROOM + name_w + 14.0).ceil(), ITEM_H * TYPE_LIST.len() as f32 + 2.0 * LIST_PAD)
+    vec2((CHECK_ROOM + name_w + 14.0).ceil(), ITEM_H * (comments::TYPES.len() + 1) as f32 + 2.0 * LIST_PAD)
 }
 
 /// Where the type list of size `size` goes for a Type box `anchor` in the pane `room`: right
@@ -439,7 +454,8 @@ pub fn list_size(name_w: f32) -> egui::Vec2 {
 pub fn list_place(anchor: Rect, size: egui::Vec2, room: Rect) -> Rect {
     let below = room.bottom() - anchor.bottom();
     let above = anchor.top() - room.top();
-    let top = if size.y <= below || below >= above { anchor.bottom() } else { (anchor.top() - size.y).max(room.top()) };
+    let top = if size.y <= below || below >= above { anchor.bottom() } else { anchor.top() - size.y };
+    let top = top.clamp(room.top(), (room.bottom() - size.y).max(room.top()));
     let left = anchor.left().min(room.right() - size.x).max(room.left());
     Rect::from_min_size(pos2(left, top), size)
 }
@@ -465,7 +481,7 @@ fn type_list(ctx: &egui::Context, place: Rect, current: &str, choice: &mut Strin
             let p = ui.painter();
             p.rect_filled(r, 3.0, theme::MENU_BG);
             p.rect_stroke(r, 3.0, Stroke::new(1.0_f32, theme::GRAPH_GRID.gamma_multiply(1.6)));
-            for (k, value) in TYPE_LIST.into_iter().enumerate() {
+            for (k, value) in type_choices().enumerate() {
                 let item = Rect::from_min_size(pos2(r.left() + LIST_PAD, r.top() + LIST_PAD + k as f32 * ITEM_H), vec2(r.width() - 2.0 * LIST_PAD, ITEM_H));
                 let resp = ui.interact(item, ui.id().with(("type_item", k)), Sense::click());
                 let lit = *choice == value;
@@ -571,6 +587,17 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
         ui.add(egui::Label::new(RichText::new(line).size(LINE_FONT).color(color)).wrap());
     });
     }
+    let picked = input.picked.and_then(|id| input.list.get(id));
+    let enabled = writable && edit.is_none() && picked.is_some();
+    ui.horizontal_wrapped(|ui| {
+        for &kind in comments::TYPES {
+            let selected = picked.is_some_and(|c| c.comment_type == kind);
+            let button = ui.add_enabled(enabled, super::panels::type_button(kind, selected));
+            if let Some(c) = picked.filter(|_| button.clicked()) {
+                out.action = Some(ListAction::SetType(c.id, kind));
+            }
+        }
+    });
     // Column names: a click sorts by that column.
     let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     ui.painter().rect_filled(head, 0.0, theme::HEADER_BG);
@@ -647,7 +674,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             // comments cannot be written (a click is then a row click).
             let tbox = type_box(col.ty);
             let open = field == Some(Field::Type);
-            draw_type_box(ui, tbox, comments::type_short(&c.comment_type), text_color, writable, open);
+            let clipped_type = draw_type_box(ui, tbox, comments::type_short(&c.comment_type), text_color, writable, open);
             if open {
                 type_anchor = Some((c.id, tbox));
             }
@@ -665,7 +692,8 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
                     };
                     for (n, (s, r, which)) in boxes.into_iter().enumerate() {
                         let id = box_id(input.file_id, c.id, which);
-                        let te = egui::TextEdit::singleline(s).id(id).font(FontId::proportional(FONT)).margin(vec2(3.0, 1.0));
+                        let font = if which == 2 { FONT } else { FRAME_FONT };
+                        let te = egui::TextEdit::singleline(s).id(id).font(FontId::proportional(font)).margin(vec2(3.0, 1.0));
                         let layout = egui::Layout::centered_and_justified(egui::Direction::TopDown);
                         let shown = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r).layout(layout), |ui| te.show(ui)).inner;
                         if fresh && n == 0 {
@@ -732,13 +760,15 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             ui.painter().line_segment([x.left_top(), x.right_bottom()], stroke);
             ui.painter().line_segment([x.right_top(), x.left_bottom()], stroke);
             // The Type box over the row (only where comments can be written).
-            let tb = writable.then(|| ui.interact(tbox, ui.id().with(("comment_type_box", k)), Sense::click()));
+            let sense = if writable { Sense::click() } else { Sense::hover() };
+            let tb = ui.interact(tbox, ui.id().with(("comment_type_box", k)), sense);
+            let tb = if clipped_type && !open { tb.on_hover_text(&c.comment_type) } else { tb };
             let modifiers = ui.input(|i| i.modifiers);
-            if (modifiers.ctrl || modifiers.command || modifiers.shift) && (resp.clicked() || dr.clicked() || tb.as_ref().is_some_and(|t| t.clicked())) {
+            if (modifiers.ctrl || modifiers.command || modifiers.shift) && (resp.clicked() || dr.clicked() || tb.clicked()) {
                 out.action = Some(ListAction::MultiSelect { id: c.id, ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift });
             } else if dr.clicked() && writable {
                 out.action = Some(ListAction::Delete(c.id));
-            } else if let Some(tb) = tb.filter(|t| t.clicked()) {
+            } else if tb.clicked() {
                 out.action = Some(ListAction::TypeBox(c.id, tb.double_clicked()));
             } else if resp.double_clicked() {
                 // (Its first click was a single click: the comment is selected already.) On `#`
@@ -760,8 +790,14 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     if let Some(e) = edit.filter(|e| e.field == Field::Type) {
         match (type_anchor, input.list.get(e.id)) {
             (Some((id, anchor)), Some(c)) if id == e.id => {
-                let name_w = TYPE_LIST.iter().map(|v| ui.fonts(|f| f.layout_no_wrap(item_name(v).to_owned(), FontId::proportional(FONT), Color32::WHITE).size().x)).fold(0.0, f32::max);
-                let place = list_place(anchor, list_size(name_w), room);
+                let name_w = type_choices().map(|v| ui.fonts(|f| f.layout_no_wrap(item_name(v).to_owned(), FontId::proportional(FONT), Color32::WHITE).size().x)).fold(0.0, f32::max);
+                let size = list_size(name_w);
+                let fits_pane = (anchor.top() - room.top()).max(room.bottom() - anchor.bottom()) >= size.y;
+                let menu_room = if fits_pane { room } else {
+                    let screen = ui.ctx().screen_rect();
+                    Rect::from_min_max(pos2(room.left(), screen.top()), pos2(room.right(), screen.bottom()))
+                };
+                let place = list_place(anchor, size, menu_room);
                 if type_list(ui.ctx(), place, &c.comment_type, &mut e.choice, &mut out.items) {
                     out.action = Some(ListAction::SaveEdit);
                 }
@@ -814,30 +850,30 @@ mod tests {
     #[test]
     fn the_type_column_sorts_in_the_fixed_order_none_first_unknown_last_by_text() {
         let t = |id: u64, ty: &str| Comment { comment_type: ty.into(), ..c(id, &[], id as i64, id as i64, "") };
-        let list = vec![t(1, "Jitter"), t(2, ""), t(3, "zeta later"), t(4, "Needs visual check"), t(5, "Marker swap"), t(6, "Alpha later"), t(7, "Jitter"), t(8, "")];
+        let mut list = vec![t(1, "Jitter"), t(2, ""), t(3, "zeta later"), t(4, "Needs visual check"), t(5, "Marker swap"), t(6, "Alpha later"), t(7, "Jitter"), t(8, "")];
+        list.extend(comments::TYPES.iter().copied().enumerate().skip(1).rev().map(|(i, kind)| t(8 + i as u64, kind)));
         let ids = |sort: Sort| sorted(&list, sort).iter().map(|&i| list[i].id).collect::<Vec<_>>();
         let up = Sort { key: SortKey::Type, desc: false };
-        // One order everywhere (type-combo): none, Jitter, Marker swap, Needs visual check.
-        assert_eq!(ids(up), vec![2, 8, 1, 7, 5, 4, 6, 3], "none, Jitter, Marker swap, Needs visual check, then unknown by text; ties by id");
+        let expected = [2, 8, 1, 7].into_iter()
+            .chain((1..comments::TYPES.len() as u64).map(|i| 8 + i))
+            .chain([6, 5, 4, 3]).collect::<Vec<_>>();
+        assert_eq!(ids(up), expected, "none, current in order, then other values by text; ties by id");
         let mut back = ids(up);
         back.reverse();
         assert_eq!(ids(Sort { key: SortKey::Type, desc: true }), back);
         assert_eq!(SortKey::ALL.map(SortKey::name), ["#", "Markers", "Frames", "Type", "Comment"], "Type between Frames and Comment");
         assert_eq!(Sort::default().clicked(SortKey::Type).words(), "Sort Type ▲");
-        // Short forms in the boxes; the full names in the list, in the same order, None last.
-        assert_eq!(list.iter().map(|c| comments::type_short(&c.comment_type)).collect::<Vec<_>>(), ["Jitter", "", "zeta later", "Check", "Swap", "Alpha later", "Jitter", ""]);
-        assert_eq!(TYPE_LIST, ["Jitter", "Marker swap", "Needs visual check", ""]);
-        assert_eq!(TYPE_LIST.map(item_name), ["Jitter", "Marker swap", "Needs visual check", "None"]);
+        assert!(type_choices().map(item_name).eq(comments::TYPES.iter().copied().chain(["None"])));
     }
 
     #[test]
     fn up_and_down_move_the_highlight_and_stop_at_the_ends() {
-        assert_eq!(step_item("Jitter", false), "Marker swap");
-        assert_eq!(step_item("Marker swap", false), "Needs visual check");
-        assert_eq!(step_item("Needs visual check", false), "");
+        for (kind, next) in type_choices().zip(type_choices().skip(1)) {
+            assert_eq!(step_item(kind, false), next);
+            assert_eq!(step_item(next, true), kind);
+        }
         assert_eq!(step_item("", false), "", "stops at None");
         assert_eq!(step_item("Jitter", true), "Jitter", "stops at the top");
-        assert_eq!(step_item("", true), "Needs visual check");
         // Nothing highlighted (a value the app does not know): ↓ = the first, ↑ = the last.
         assert_eq!((step_item("Later kind", false), step_item("Later kind", true)), ("Jitter", ""));
     }
@@ -845,7 +881,7 @@ mod tests {
     #[test]
     fn the_type_list_opens_under_the_box_or_above_it_and_stays_inside_the_pane() {
         let size = list_size(112.0);
-        assert!(size.x >= 112.0 + 22.0 && size.y >= 4.0 * ITEM_H, "{size:?}");
+        assert!(size.x >= 112.0 + 22.0 && size.y >= type_choices().count() as f32 * ITEM_H, "{size:?}");
         for w in [380.0, 600.0, 900.0] {
             let room = Rect::from_min_size(pos2(1200.0, 300.0), vec2(w, 400.0));
             let row = |top: f32| Rect::from_min_size(pos2(room.left(), top), vec2(w, ROW_H));

@@ -206,8 +206,8 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     };
     assert!(assigned.is_loaded(), "{:?}", app.takm_note);
     check_assigned(&assigned);
-    assert_eq!(app.views[0].armed_label, Some(target));
-    assert!(app.takm_note.as_ref().is_some_and(|(note, _)| note.contains("No next label")));
+    assert_eq!(app.views[0].armed_label, expected_before_selection.armed_label);
+    assert!(app.takm_note.as_ref().is_some_and(|(note, _)| !note.contains("No next label")));
     assert_eq!(app.history.undo.len(), count + 1);
 
     app.undo_redo(&ctx, false);
@@ -220,7 +220,7 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     app.undo_redo(&ctx, true);
     wait_for(&ctx, &mut app, settled);
     check_assigned(&session.lock().unwrap().snapshot());
-    assert_eq!(app.views[0].armed_label, Some(target));
+    assert_eq!(app.views[0].armed_label, expected_before_selection.armed_label);
 
     app.save_markers(&ctx, 0, false, false);
     wait_for(&ctx, &mut app, |app| !app.marker_saving(0));

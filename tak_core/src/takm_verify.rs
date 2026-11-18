@@ -463,6 +463,20 @@ impl Verification {
             issues.push("원본과 표의 스트림 개수가 달라요.".into());
         }
         let mut other = vec![0; IO_CHUNK];
+        let progress_only = |stream: &Stream, map: &crate::tak::fast_read::StreamMap| -> Result<bool> {
+            const LIMIT: u64 = 256 * 1024;
+            if map.len > LIMIT || stream.size > LIMIT { return Ok(false); }
+            let original = map.read(source, 0, map.len)?;
+            let mut edited = vec![0; stream.size as usize];
+            read_exact_at(takm, &mut edited, stream.offset)?;
+            let value = |bytes: &[u8]| -> Result<Option<i64>> {
+                crate::tak::metadata::parse_properties(bytes)?.into_iter()
+                    .find(|(name, _)| name == "Progress").map(|(_, value)| crate::tak::metadata::python_int(&value)).transpose()
+            };
+            let before = value(&original)?;
+            let after = value(&edited)?;
+            Ok(crate::tak::metadata::patch_progress(&original, before, after)? == edited)
+        };
         let mut identical = 0;
         for stream in &index.streams {
             let label = format!("{} (원래 번호 {})", stream.name, stream.index);
@@ -496,10 +510,10 @@ impl Verification {
                     index: stream.index,
                     name: stream.name.clone(),
                 });
-                // Editor refuses ambiguous marker stream names.
-                if !matches!(name.as_str(), "Nodes.dat" | "Channels.dat")
-                    || streams.iter().filter(|(other, _)| other == name).count() != 1
-                {
+                let unique = streams.iter().filter(|(other, _)| other == name).count() == 1;
+                let allowed = unique && (matches!(name.as_str(), "Nodes.dat" | "Channels.dat")
+                    || (name == "MetaData.dat" && progress_only(stream, map).unwrap_or(false)));
+                if !allowed {
                     issues.push(format!("{label}의 바이트가 원본과 달라요."));
                 }
             }

@@ -97,7 +97,8 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("Home / End", "Go to the first / last frame."),
         ("Click or drag on the time ruler", "Go to that frame."),
         ("Drag or click the bar below the ruler", "Drag to pick a yellow edit range. Click an empty spot to clear it."),
-        ("[ or V / ] or B", "Set the edit range start / end to this frame."),
+        ("V / B", "Set the start / end of the yellow edit range to this frame."),
+        ("[ / ]", "Set the start / end of the green working range to this frame."),
         ("Shift+B / Shift+V", "Clear the edit range / select the whole file."),
         ("Green handles / Working Range", "Drag the handles or change Start and End to set where to play."),
         ("Shift+[ / Shift+] / Reset", "Set the play range back to the whole file."),
@@ -117,6 +118,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("1 / 2 or file tags", "Hide or show markers from the first / second file."),
         ("Click a 3D view / Click × on its tab", "Make it the active view for keys and panels / close that view."),
         ("Pencil or right-click on a saved folder", "Change the name shown in EXPLORER."),
+        ("Click a file's letter in EXPLORER", "Pick a saved state for a TAKM. The letter is on the left in OPEN EDITORS, WORKSPACE and SSH."),
     ]),
     ("Graphs", &[
         ("Channels / Tracks / Combined", "Separate lines for X, Y, Z / a bar per marker / all three lines in one graph."),
@@ -146,10 +148,10 @@ const SECTIONS: &[(&str, Rows)] = &[
     ("Comment", &[
         ("Tap M / Comment button", "Add a Comment to the picked range or this frame."),
         ("Hold M", "Move through frames while you hold it. Let go to add a Comment to that range."),
-        ("Type button / T", "Pick a type after adding a Comment / go to the next type for the picked Comment."),
+        ("Type button / T", "Click a type after adding or picking a Comment. Press T for the next type."),
         ("Click / right-click an orange block", "Go to the first frame of the Comment / delete it."),
         ("Click a COMMENTS row / Double-click #", "Pick the Comment and markers / go to its first frame."),
-        ("Double-click a COMMENTS cell / Enter", "Edit frames, markers, or text / save. Click Type to pick a type."),
+        ("Double-click a COMMENTS cell / Enter", "Edit frames, markers, or text / save. Open Type to see all choices and None."),
         ("Where Comments are saved", "Comments are saved in the .takm file."),
     ]),
     ("Other Controls", &[

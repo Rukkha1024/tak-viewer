@@ -33,7 +33,46 @@ pub struct RemoteWriteOutcome {
     pub verified: bool,
     pub imported_comments: u64,
 }
+#[derive(Clone, Debug)]
+pub struct RemoteProgress {
+    pub source: RemoteSource,
+    pub value: Option<i64>,
+}
+
 impl RemoteSession {
+    pub fn progress_batch(&mut self, paths: &[String], cancel: &CancelToken) -> Result<Vec<Option<RemoteProgress>>> {
+        if !(1..=16).contains(&paths.len()) || paths.iter().any(|path| path.len() > 32768) {
+            return Err("Invalid progress batch".into());
+        }
+        let (header, blocks) = self.transport.request(json!({"op":"progress_batch", "paths":paths}), cancel)?;
+        let rows = header["rows"].as_array().filter(|r| r.len() == paths.len() && blocks.is_empty())
+            .ok_or("Invalid progress batch response")?;
+        rows.iter().zip(paths).map(|(row, path)| {
+            if row.is_null() { return Ok(None); }
+            let value = match row.get("value") {
+                Some(Value::Null) => None,
+                Some(n) => Some(n.as_i64().ok_or("Invalid progress value")?),
+                None => return Err("Missing progress value".into()),
+            };
+            let source = RemoteSource { host: self.host.clone(), path: path.clone(), identity: source_identity(row)? };
+            Ok(Some(RemoteProgress { source, value }))
+        }).collect()
+    }
+
+    pub fn write_progress(&mut self, source: &RemoteSource, before: Option<i64>, after: Option<i64>,
+                          cancel: &CancelToken) -> Result<RemoteWriteOutcome> {
+        self.check_write_host(source)?;
+        if !crate::takm::is_takm_path(Path::new(&source.path)) {
+            return Err("진행 상태는 TAKM에서만 바꿀 수 있어요.".into());
+        }
+        let outcome = self.request_write(json!({"op":"takm_progress", "path":source.path,
+            "expected_identity":source.identity, "before":before, "after":after,
+            "max_bytes":self.config.maximum_payload_bytes}), cancel)?;
+        if outcome.existing || outcome.source_bytes != source.file_size() {
+            return Err("Invalid progress write response".into());
+        }
+        Ok(outcome)
+    }
     pub fn stat(&mut self, path: &str, cancel: &CancelToken) -> Result<RemoteSource> {
         let (header, blocks) = self.transport.request(json!({"op":"stat", "path":path,"max_bytes":self.config.maximum_payload_bytes}), cancel)?;
         if !blocks.is_empty() { return Err("Invalid remote stat response".into()); }
@@ -92,8 +131,11 @@ impl RemoteSession {
     }
     fn finish_write(&mut self, operation: &str, source: &RemoteSource, cancel: &CancelToken) -> Result<RemoteWriteOutcome> {
         self.check_write_host(source)?;
-        let (header, blocks) = self.transport.request(json!({"op":operation,"path":source.path,"expected_identity":source.identity,
-            "max_bytes":self.config.maximum_payload_bytes}), cancel)?;
+        self.request_write(json!({"op":operation,"path":source.path,"expected_identity":source.identity,
+            "max_bytes":self.config.maximum_payload_bytes}), cancel)
+    }
+    fn request_write(&mut self, request: Value, cancel: &CancelToken) -> Result<RemoteWriteOutcome> {
+        let (header, blocks) = self.transport.request(request, cancel)?;
         if !blocks.is_empty() || header["verified"] != true { return Err("Remote write was not verified".into()); }
         let number = |key: &str| header[key].as_u64().ok_or_else(||format!("Invalid remote write {key}"));
         let path = header["path"].as_str().ok_or("Invalid remote write path")?.to_owned();

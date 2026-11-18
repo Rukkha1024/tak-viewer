@@ -71,7 +71,9 @@ impl Row {
 
 fn known_type(text: &str) -> Option<&'static str> {
     comments::TYPES
-        .into_iter()
+        .iter()
+        .copied()
+        .chain(["Needs visual check", "Marker swap"])
         .find(|kind| kind.eq_ignore_ascii_case(text))
 }
 

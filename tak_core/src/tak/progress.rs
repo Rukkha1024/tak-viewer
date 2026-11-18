@@ -56,7 +56,7 @@ fn read_with(
     } else if magic == crate::takm::MAGIC {
         let index = crate::takm::read_index_at(size, MAX_METADATA, &mut bounded_read)?;
         let Some(entry) = index.unique(META) else {
-            return Ok((None, bytes));
+            return err("Missing or ambiguous metadata stream");
         };
         let mut meta = metadata_buffer(entry.size)?;
         bounded_read(&mut meta, entry.offset)?;
@@ -69,7 +69,9 @@ fn read_with(
     }
     let properties = parse_properties(&raw)?;
     let progress = properties.iter().find(|(key, _)| key == "Progress");
-    Ok((progress.and_then(|(_, value)| number(value)), bytes))
+    let value = progress.map(|(_, value)| number(value)
+        .ok_or_else(|| TakError("Invalid Progress value".into()))).transpose()?;
+    Ok((value, bytes))
 }
 
 fn metadata_buffer(size: u64) -> Result<Vec<u8>> {

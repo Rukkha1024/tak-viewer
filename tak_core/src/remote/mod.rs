@@ -3,7 +3,7 @@
 mod transport;
 mod command;
 mod write;
-pub use write::{RemoteEditStreams, RemoteWriteOutcome};
+pub use write::{RemoteEditStreams, RemoteProgress, RemoteWriteOutcome};
 pub use command::{python_tokens, PYTHON_NOT_FOUND};
 use crate::tak::Take;
 use serde_json::{json, Value};

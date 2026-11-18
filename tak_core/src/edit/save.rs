@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "save_stream.rs"]
 mod streaming;
+#[path = "save_progress.rs"]
+mod progress;
+pub use progress::{save_progress, ProgressSaved};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string()) }

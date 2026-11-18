@@ -145,27 +145,15 @@ impl Comment {
 
 // ───────────────────────────── Types (Comment plan step 5) ─────────────────────────────
 
-/// The comment types (user: `Marker swap` · `Jitter` · `Needs visual check`), in their one
-/// order everywhere (the type list of the COMMENTS pane, the strip of three buttons, `T`, the
-/// sort): Jitter → Marker swap → Needs visual check, the order of the user's sketch and of the
-/// chosen mockup (type-combo; v0.18.0 had Marker swap first). Written as these names in the
-/// `comment_type` column; empty = no type. Any other value (written by hand or by a later
-/// version) is kept as it is.
-pub const TYPES: [&str; 3] = ["Jitter", "Marker swap", "Needs visual check"];
+/// Current choices in UI, cycle and sort order. Names are also the stored values.
+pub const TYPES: &[&str] = &["Jitter", "Jump", "Visual check", "File bad", "Agree", "No problem", "Keep this only"];
 
-/// Short form of a type for a narrow column: `Swap` · `Jitter` · `Check`; no type = empty; a
-/// value the app does not know as it is.
+/// Type cell label, including retired and unknown stored text.
 pub fn type_short(t: &str) -> &str {
-    match t {
-        "Marker swap" => "Swap",
-        "Jitter" => "Jitter",
-        "Needs visual check" => "Check",
-        _ => t,
-    }
+    t
 }
 
-/// Place of a type in the sort order: no type 0, the known types 1..=3 in their one order,
-/// any other value 4 (those then go by text).
+/// Empty first, then current choices, then other values (sorted by text in the UI).
 pub fn type_rank(t: &str) -> usize {
     if t.is_empty() {
         0
@@ -174,17 +162,9 @@ pub fn type_rank(t: &str) -> usize {
     }
 }
 
-/// The type after `t` going round: none → Jitter → Marker swap → Needs visual check → none.
-/// (The key `T`.) A value the app does not know counts as standing before none (→ none).
+/// Cycle from None through the current choices. A retired or unknown value goes to None.
 pub fn step_type(t: &str) -> &'static str {
-    // Choices in order: "" then the three types.
-    let n = TYPES.len() + 1;
-    let choice = |k: usize| if k == 0 { "" } else { TYPES[k - 1] };
-    let at = if t.is_empty() { Some(0) } else { TYPES.iter().position(|k| *k == t).map(|k| k + 1) };
-    match at {
-        Some(k) => choice((k + 1) % n),
-        None => choice(0),
-    }
+    TYPES.get(type_rank(t)).copied().unwrap_or("")
 }
 
 /// The live comments of one take, folded from its events, in id order (a comment brought back
@@ -1768,19 +1748,24 @@ mod tests {
         let old = "2026-11-13T16:01:10+09:00,add,1,LKNE,300,1400,,,1,,a.tak|32663605,\r\n";
         let p = parse(&(header_line() + old));
         assert_eq!(p.comments().get(1).unwrap().comment_type, "");
-        // One order everywhere (type-combo): Jitter → Marker swap → Needs visual check.
-        // Short forms, sort places and the round of `T`.
-        assert_eq!(TYPES, ["Jitter", "Marker swap", "Needs visual check"]);
-        assert_eq!(TYPES.map(type_short), ["Jitter", "Swap", "Check"]);
-        assert_eq!((type_short(""), type_short("Ghost")), ("", "Ghost"));
-        assert_eq!(["", "Jitter", "Marker swap", "Needs visual check", "Ghost"].map(type_rank), [0, 1, 2, 3, 4]);
-        let mut t = "";
-        let mut seen = vec![];
-        for _ in 0..4 {
-            t = step_type(t);
-            seen.push(t);
+    }
+
+    #[test]
+    fn current_types_use_the_approved_order_for_labels_sort_and_cycle() {
+        assert_eq!(TYPES, ["Jitter", "Jump", "Visual check", "File bad", "Agree", "No problem", "Keep this only"]);
+        assert_eq!(type_rank(""), 0);
+        let mut now = "";
+        for (index, next) in TYPES.iter().copied().enumerate() {
+            assert_eq!(type_short(next), next);
+            assert_eq!(type_rank(next), index + 1);
+            now = step_type(now);
+            assert_eq!(now, next);
         }
-        assert_eq!(seen, ["Jitter", "Marker swap", "Needs visual check", ""]);
-        assert_eq!(step_type("Ghost"), "", "an unknown value goes to none");
+        assert_eq!(step_type(now), "");
+        for other in ["Needs visual check", "Marker swap", "Ghost"] {
+            assert_eq!(type_short(other), other);
+            assert_eq!(type_rank(other), TYPES.len() + 1);
+            assert_eq!(step_type(other), "");
+        }
     }
 }

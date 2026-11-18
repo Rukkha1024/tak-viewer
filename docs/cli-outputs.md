@@ -25,6 +25,7 @@ Syntax → [Agent commands](../tak_viewer/README.md#agent-commands).
 | `--bench-load` | Timing text and `bench-load-json:` line | 1 | 0 done, 1 load failure, 2 arguments |
 | `--bench-progress` | One progress timing line per readable file | — | 0 done, 1 read failure, 2 no files |
 | `--ssh-list`, `--ssh-open` | JSON stage lines to stdout. Open can save screenshot and `--ssh-dump` JSON | Unversioned stages. Dump 1 | 0 done, 1 failure, 2 arguments |
+| `--ssh-test-progress` | JSON stage lines to stdout for two test files and an optional saved mark | Unversioned | 0 done, 1 failure, 2 missing or invalid arguments before SSH |
 | `--ssh-workspace` | Restart screenshot PNG and JSON restart line | Unversioned | 0 saved, 1 failure, 2 missing/invalid required arguments |
 
 Fields required unless marked optional. `null` means the field exists without a value. Frames use viewer numbering and inclusive endpoints. Marker kinds (where present) = `template`, `skeleton_extra`, `other_parent`, `unlabeled`, `unknown`. UIDs = hex strings. Paths use host syntax unless a WSL field is supplied.
@@ -127,7 +128,7 @@ Conversion stdout carries output path, source and output size, dropped camera by
 | `verdict` | `identical`, `edited`, `no_source`, `failed`. A `failed` verdict makes the command exit 1. `no_source` covers structure and seal checks without a source |
 | `source_before`, `source_after`, `source_unchanged` | Nullable source stamps (`size` bytes, `mtime_ns` since Unix epoch) and comparison flag |
 | `checks` | `layout_version`, `header_table`, `fixed_seal`, `source_name`, `source_size`, `source_sha256`, `retained_streams`, `dropped_streams`. Each has `pass` (true, false or null if skipped) and `detail` |
-| `changed_streams[]` | Original zero-based `index` and `name`. Duplicate names keep separate rows |
+| `changed_streams[]` | Original zero-based `index` and `name`. Duplicate names keep separate rows. Marker edits may change unique Nodes/Channels streams. A Progress edit may change only the Progress property in unique MetaData |
 | `comments` | Independent tail `pass` and `detail`. Nullable `live_count`, `malformed_lines`, `skipped_lines`, `cut_tail` |
 
 ## Comments
@@ -135,7 +136,7 @@ Conversion stdout carries output path, source and output size, dropped camera by
 | Output | Fields |
 |---|---|
 | Single list | `file`, `comments`, `skipped_lines` (includes cut row), `malformed_lines`, `cut_tail` |
-| List row | Numeric `id`, `markers` (names), inclusive `start`/`end`, `type`, `text`, `time` (last effective event), `by` (`agent`, `viewer`, `legacy`) |
+| List row | Numeric `id`, `markers` (names), inclusive `start`/`end`, `type` (stored text, including retired and unknown values), `text`, `time` (last effective event), `by` (`agent`, `viewer`, `legacy`) |
 | Batch list | Single-list fields plus `live_count` (before filtering), `tail_note` (header/UTF-8 diagnostic or null), `error` (string or null). Unreadable file → empty `comments`, null counts/flags, error string. Positional order or sorted directory paths |
 | Add success | `file`, `added`, `skipped_existing`, `live_total`, `fixed_unchanged`, `dry_run`. Rows carry `markers`, `start`, `end`, `type`, `text`, plus nullable `id` (planned add or duplicate earlier in current batch). Skips add 1-based `row`. Dry-run total = current live count |
 | Batch add | Receipt array sorted by input path key. Validated targets have add-success shape when the batch runs. Validation failure returns one `{file,status,error}` per target, status `not_written`, error null for targets with no reported issue. Late append/I/O failure can leave earlier successful writes. Failing target has status `failed`, later targets have `not_written` |
@@ -164,6 +165,7 @@ Ready means marker data and requested startup controls are applied. Deferred ana
 | `--ssh-list`, `--ssh-open` | Stdout JSON lines by `stage`. Probe stages carry `elapsed_ms`, nullable `connect_ms`, `list_ms`, `markers_on_screen_ms` and `open_elapsed_ms`, `bytes_received` (helper JSON/framing/binary, excludes SSH encryption), `python_command`, `markers_kept`, `worker_running`, `note` and `diagnostic`. List stage `listing` carries path, count, truncated, drive source and named path entries. Edit stage `remote_edit_result` carries `result` | Unversioned. 0 done, 1 failure, 2 arguments |
 | `--ssh-dump` | Reader dump plus `marker_samples` (`frames`, `xyz_bits`) and `analog_samples` (`frames`, `value_bits`). Unsigned bit patterns of stored float32 values. Markers-only runs add `markers_only: true` and leave analog incomplete | Reader dump schema 1 with SSH fields. Exit follows SSH harness |
 | `tak_ssh` | List JSON, or read-stage lines with `stage`, `elapsed_ms`, `markers`, `frames`, `analog_devices`, `analog_pending` and optional `data`. `reference-stdin` emits a reader dump with the SSH sample fields | Unversioned stages. Nested dump schema 1. 0 done, 1 failure or bad arguments |
+| `--ssh-test-progress` | `listed_progress` has `rows[]` with `name` and nullable `progress`. A verified write adds `saved_progress` with `before`, `after` and `seal_verified`. Bad arguments print a reason and usage to stderr and produce no JSON | Unversioned |
 | `--ssh-workspace` | Screenshot of restart state. The `workspace_restart` JSON line carries `alias`, `path`, `platform`, `root_restored`, `not_connected`, `collapsed` and `no_startup_network` | Unversioned |
 | `--bench` text | Marker-on-screen and forceplate-ready time, open phase ms, memory, loading/playing frame time average and max, and graph completion after N playing frames. Includes any requested workspace, overlay and EMG measurements | No JSON without trace |
 | GRAPH gesture benchmarks | Gesture, layout, marker and frame counts, changed frames, mean and max ms. Final settle time and value/time extents. `--bench-trace` adds the same trace shape with phase `gesture` | Trace 1 when requested |

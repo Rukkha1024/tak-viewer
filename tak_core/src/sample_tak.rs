@@ -238,8 +238,33 @@ pub fn sample_tak() -> Vec<u8> {
 
 /// Two structurally labeled points with one gap in A and no preexisting Unlabeled donor.
 pub fn sample_tak_for_label_assignments() -> Vec<u8> {
-    let mut nodes = vec![2, 2, 0, 0, 0];
-    for (name, uid) in [("A", 1u8), ("B", 2)] {
+    sample_label_tracks(&[("A", 1, Some(6)), ("B", 2, Some(4))], None)
+}
+
+/// Six labels plus an Unlabeled point for stepping and collision tests.
+pub fn sample_tak_for_label_walk() -> Vec<u8> {
+    sample_label_tracks(
+        &[
+            ("A", 1, Some(6)),
+            ("B", 2, Some(4)),
+            ("C", 3, Some(8)),
+            ("D", 4, None),
+            ("E", 5, Some(5)),
+            ("F", 6, None),
+        ],
+        Some(("Unlabeled 001", 7)),
+    )
+}
+
+fn sample_label_tracks(labels: &[(&str, u8, Option<u32>)], unlabeled: Option<(&str, u8)>) -> Vec<u8> {
+    let count = (labels.len() + usize::from(unlabeled.is_some())) as u32;
+    let mut nodes = vec![2];
+    nodes.extend(count.to_le_bytes());
+    let mut channels = CHANNELS_HEADER.to_vec();
+    channels.extend(count.to_le_bytes());
+    for (name, uid, gap, labeled) in labels.iter().map(|&(name, uid, gap)| (name, uid, gap, true))
+        .chain(unlabeled.map(|(name, uid)| (name, uid, None, false)))
+    {
         let mut node = marker_node(name, uid);
         let words = u16::from_le_bytes([node[8], node[9]]) as usize;
         let property_end = 10 + 2 * words;
@@ -248,14 +273,13 @@ pub fn sample_tak_for_label_assignments() -> Vec<u8> {
         let updated_words = (words - 2 + suffix.encode_utf16().count()) as u16;
         node[8..10].copy_from_slice(&updated_words.to_le_bytes());
         let size = node.len();
-        node[size - 20..size - 4].fill(90);
-        node[size - 4..].copy_from_slice(&i32::from(uid).to_le_bytes());
+        if labeled {
+            node[size - 20..size - 4].fill(90);
+            node[size - 4..].copy_from_slice(&i32::from(uid).to_le_bytes());
+        }
         nodes.extend(node);
+        channels.extend(translation(uid, (0..=12).filter(|&frame| Some(frame) != gap)));
     }
-    let mut channels = CHANNELS_HEADER.to_vec();
-    channels.extend(2u32.to_le_bytes());
-    channels.extend(translation(1, (0..=12).filter(|&frame| frame != 6)));
-    channels.extend(translation(2, (0..=12).filter(|&frame| frame != 4)));
     let mut meta = vec![0; 6];
     meta.extend(utf16(
         "<properties><property><name>StartFrame</name><value>0</value></property>\

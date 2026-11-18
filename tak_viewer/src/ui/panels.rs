@@ -1304,44 +1304,53 @@ pub fn ordered_range(a: i64, b: i64, first: i64, last: i64) -> (i64, i64) {
     (a.min(b), a.max(b))
 }
 
-/// Height of the type strip (Comment plan step 5).
-pub const TYPE_STRIP_H: f32 = 26.0;
 const STRIP_FONT: f32 = 13.0;
+const STRIP_BUTTON_H: f32 = 20.0;
 const STRIP_PAD: f32 = 3.0;
 const STRIP_GAP: f32 = 4.0;
 
-/// The type strip's buttons for a bar at `deck` (one per type, full names), in a row over the
-/// bottom right of the 3D just above the bar, its right end at the `Comment` button's: floating,
-/// so nothing in the bar or the 3D moves.
-pub fn type_strip_rects(ctx: &egui::Context, deck: Rect) -> [Rect; 3] {
-    let widths = tak_core::comments::TYPES.map(|t| ctx.fonts(|f| f.layout_no_wrap(t.to_owned(), FontId::proportional(STRIP_FONT), egui::Color32::WHITE).size().x) + 14.0);
-    let h = TYPE_STRIP_H - 2.0 * STRIP_PAD;
-    let mut right = deck.right() - 6.0 - STRIP_PAD;
-    let top = deck.top() - 4.0 - TYPE_STRIP_H + STRIP_PAD;
-    let mut out = [Rect::NOTHING; 3];
-    for k in (0..3).rev() {
-        out[k] = Rect::from_min_size(pos2(right - widths[k], top), vec2(widths[k], h));
-        right -= widths[k] + STRIP_GAP;
+/// Wrap full-name buttons left to right, then anchor the group above the playback bar.
+pub fn type_strip_rects(ctx: &egui::Context, deck: Rect) -> Vec<Rect> {
+    let right = deck.right() - 6.0 - STRIP_PAD;
+    let available = (right - deck.left() - 6.0 - STRIP_PAD).max(1.0);
+    let mut buttons = Vec::with_capacity(tak_core::comments::TYPES.len());
+    let (mut x, mut y, mut width) = (0.0_f32, 0.0, 0.0_f32);
+    for &kind in tak_core::comments::TYPES {
+        let text_width = ctx.fonts(|f| f.layout_no_wrap(kind.to_owned(), FontId::proportional(STRIP_FONT), egui::Color32::WHITE).size().x);
+        let button_width = (text_width + 14.0).min(available);
+        if x > 0.0 && x + button_width > available {
+            x = 0.0;
+            y += STRIP_BUTTON_H + STRIP_GAP;
+        }
+        buttons.push(Rect::from_min_size(pos2(x, y), vec2(button_width, STRIP_BUTTON_H)));
+        width = width.max(x + button_width);
+        x += button_width + STRIP_GAP;
     }
-    out
+    let offset = vec2(right - width, deck.top() - 4.0 - STRIP_PAD - y - STRIP_BUTTON_H);
+    buttons.iter_mut().for_each(|button| *button = button.translate(offset));
+    buttons
 }
 
 /// The whole strip (its buttons and a small margin): clicks inside it do not close it.
-pub fn type_strip_rect(buttons: &[Rect; 3]) -> Rect {
-    buttons[0].union(buttons[2]).expand(STRIP_PAD)
+pub fn type_strip_rect(buttons: &[Rect]) -> Rect {
+    buttons.iter().copied().fold(Rect::NOTHING, Rect::union).expand(STRIP_PAD)
 }
 
-/// Draw the type strip: three text buttons, the comment's type now marked. Returns the type
-/// clicked. No hover texts.
-pub fn type_strip(ui: &mut Ui, buttons: &[Rect; 3], now: &str) -> Option<&'static str> {
+pub fn type_button(kind: &'static str, selected: bool) -> egui::Button<'static> {
+    let color = if selected { theme::TAB_TEXT_ACTIVE } else { theme::TEXT };
+    egui::Button::new(RichText::new(kind).size(STRIP_FONT).color(color))
+        .wrap_mode(egui::TextWrapMode::Extend)
+        .selected(selected)
+}
+
+/// Draw the strip and return the clicked type.
+pub fn type_strip(ui: &mut Ui, buttons: &[Rect], now: &str) -> Option<&'static str> {
     let whole = type_strip_rect(buttons);
     ui.painter().rect_filled(whole, 4.0, theme::PANEL_BG);
     ui.painter().rect_stroke(whole, 4.0, Stroke::new(1.0_f32, theme::COMMENT));
     let mut picked = None;
-    for (t, r) in tak_core::comments::TYPES.into_iter().zip(buttons) {
-        let on = now == t;
-        let color = if on { theme::TAB_TEXT_ACTIVE } else { theme::TEXT };
-        let b = egui::Button::new(RichText::new(t).size(STRIP_FONT).color(color)).wrap_mode(egui::TextWrapMode::Extend).selected(on).min_size(r.size());
+    for (&t, r) in tak_core::comments::TYPES.iter().zip(buttons) {
+        let b = type_button(t, now == t).min_size(r.size());
         if ui.put(*r, b).clicked() {
             picked = Some(t);
         }

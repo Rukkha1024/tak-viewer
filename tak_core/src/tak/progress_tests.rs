@@ -135,7 +135,7 @@ fn bad_or_missing_values_are_blank_and_structural_errors_refuse() {
         b"<properties><property name=\"Progress\" value=\"bad\"/></properties>",
         false,
     );
-    assert_eq!(read_traced(&raw, |_, _| true).unwrap().0, None);
+    assert!(read_traced(&raw, |_, _| true).is_err());
     let raw = compound(b"<properties></properties>", false);
     assert_eq!(read_traced(&raw, |_, _| true).unwrap().0, None);
     let mut cyclic = raw.clone();

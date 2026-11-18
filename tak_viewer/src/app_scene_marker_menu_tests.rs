@@ -102,11 +102,39 @@ mod scene_marker_menu {
 
             wait(&ctx, &mut app, |app| !app.marker_job_running(0));
             assert_eq!(steps(&app, 0).0, count + 1, "{:?}", app.takm_note);
-            assert_eq!(app.views[0].armed_label, (!scene).then_some(KEY_B));
+            assert_eq!(app.views[0].armed_label, None);
             let edited = snapshot(&app);
             let displaced = edited.tracks().find(|track| track.label.is_none()).unwrap();
             assert_eq!(sample(edited.track(&A).unwrap(), 5), sample(original.track(&B).unwrap(), 5));
             assert_eq!(sample(displaced, 5), sample(original.track(&A).unwrap(), 5));
+        }
+    }
+
+    #[test]
+    fn both_label_menus_keep_armed_label_on_same_label() {
+        for scene in [false, true] {
+            let ctx = egui::Context::default();
+            let (_dir, mut app) = fixture(&ctx);
+            app.settings.graph_float = false;
+            let revision = snapshot(&app).revision();
+            frame_with(&ctx, &mut app, vec![]);
+            app.quiet();
+            let history = steps(&app, 0);
+
+            if scene {
+                let point = marker_on_screen(&app, 0);
+                let output = open(&ctx, &mut app, point);
+                let submenu = hover(&ctx, &mut app, menu_item(&output, "Label Marker").center());
+                click_at(&ctx, &mut app, menu_item(&submenu, "A").center());
+            } else {
+                app.labeling_action(&ctx, 0, crate::ui::labeling::LabelingAction::LabelMarker(KEY_A));
+            }
+
+            assert_eq!(app.takm_note.as_ref().unwrap().0, "Already this label");
+            assert_eq!(app.views[0].armed_label, Some(KEY_A));
+            assert_eq!(steps(&app, 0), history);
+            assert_eq!(snapshot(&app).revision(), revision);
+            assert!(!app.views[0].marker_dirty());
         }
     }
 

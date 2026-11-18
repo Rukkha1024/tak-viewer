@@ -37,3 +37,137 @@ fn progress_worker_waits_for_explorer_and_foreground_open() {
     frame_with(&ctx, &mut app, vec![]);
     assert!(app.explorer.progress.worker_started());
 }
+
+#[test]
+fn picked_progress_writes_unopened_and_clean_open_takm_with_undo_redo() {
+    use crate::take_progress::{Pick, Stamp, State, Target};
+    let ctx = egui::Context::default();
+    let temp = comment_dir("progress_history");
+    let path = temp.join("progress.takm");
+    make_takm(&path);
+    let saved = || tak_core::tak::read_take(&path).unwrap().meta("Progress").map(str::to_owned);
+    let stamp = || Stamp::of(std::fs::metadata(&path).unwrap()).unwrap();
+    let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+    let pick = |before, after| Pick { target: Target::Local(path.clone()), before: State(before), after: State(after), stamp: Some(stamp()) };
+
+    app.pick_progress(&ctx, pick(None, Some(2)));
+    wait_for_progress(&ctx, &mut app);
+    assert_eq!(saved().as_deref(), Some("2"));
+    assert_eq!(app.history.kinds().last().map(String::as_str), Some("Progress"));
+    app.undo_redo(&ctx, false);
+    wait_for_progress(&ctx, &mut app);
+    assert_eq!(saved(), None);
+    app.undo_redo(&ctx, true);
+    wait_for_progress(&ctx, &mut app);
+    assert_eq!(saved().as_deref(), Some("2"));
+
+    app.open_in(&ctx, 0, path.clone());
+    wait_for_progress_view(&ctx, &mut app);
+    assert_eq!(app.views[0].take_progress(), Some(State(Some(2))));
+    let old = stamp();
+    app.pick_progress(&ctx, pick(Some(2), Some(5)));
+    wait_for_progress(&ctx, &mut app);
+    assert_eq!(saved().as_deref(), Some("5"));
+    assert_eq!(app.views[0].take_progress(), Some(State(Some(5))));
+    assert!(!app.views[0].marker_dirty());
+    assert_eq!(app.explorer.progress.visible_row(&path, old), Some((stamp(), State(Some(5)))));
+}
+
+fn wait_for_progress(ctx: &egui::Context, app: &mut TakViewerApp) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.progress_job.is_some() {
+        frame_with(ctx, app, vec![]);
+        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+fn wait_for_progress_view(ctx: &egui::Context, app: &mut TakViewerApp) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.views[0].data.is_none() || app.views[0].analog_work_pending() {
+        frame_with(ctx, app, vec![]);
+        assert!(Instant::now() < deadline, "{:?}", app.error);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+#[test]
+fn progress_updates_save_baseline_and_leaves_unsaved_marker_edit_pending() {
+    use crate::take_progress::{Pick, State, Target};
+    let ctx = egui::Context::default();
+    let temp = comment_dir("progress_dirty");
+    let path = temp.join("progress.takm");
+    make_takm(&path);
+    let disk_before = tak_core::tak::read_take(&path).unwrap();
+    let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+    app.open_in(&ctx, 0, path.clone());
+    wait_for_progress_view(&ctx, &mut app);
+    let marker = app.views[0].data.as_ref().unwrap().markers.iter()
+        .position(|marker| marker.name == "LKNE").unwrap();
+    let uid = app.views[0].data.as_ref().unwrap().markers[marker].uid;
+    app.views[0].select(marker, false);
+    app.views[0].range = Some((5, 10));
+    app.delete_selected(&ctx, 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.marker_job_running(0) || app.views[0].edit_refresh.is_some() {
+        frame_with(&ctx, &mut app, vec![]);
+        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(app.views[0].marker_dirty(), "{:?}", app.takm_note);
+    let expected = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
+    app.pick_progress(&ctx, Pick { target: Target::Local(path.clone()), before: State(None), after: State(Some(3)), stamp: None });
+    wait_for_progress(&ctx, &mut app);
+    let progress_only = tak_core::tak::read_take(&path).unwrap();
+    assert_eq!(progress_only.meta("Progress"), Some("3"), "{:?}", app.takm_note);
+    assert_eq!(progress_only.trajectories.iter().find(|row| row.uid == uid).unwrap().frames,
+               disk_before.trajectories.iter().find(|row| row.uid == uid).unwrap().frames);
+    assert!(app.views[0].marker_dirty());
+
+    app.save_markers(&ctx, 0, false, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.marker_saving(0) {
+        frame_with(&ctx, &mut app, vec![]);
+        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(!app.views[0].marker_dirty(), "{:?}", app.takm_note);
+    assert_eq!(tak_core::tak::read_take(&path).unwrap().meta("Progress"), Some("3"));
+    let (input, _) = tak_core::edit::PreparedInput::read_from_path(&path).unwrap();
+    let mut reopened = tak_core::edit::EditDocument::unloaded(path);
+    reopened.install_prepared(reopened.revision(), input).unwrap();
+    assert_eq!(reopened.snapshot().track(&uid).unwrap().samples, expected.track(&uid).unwrap().samples);
+}
+
+#[test]
+fn busy_or_failed_progress_write_keeps_state_and_history() {
+    use crate::take_progress::{Pick, State, Target};
+    let ctx = egui::Context::default();
+    let temp = comment_dir("progress_busy");
+    let path = temp.join("progress.takm");
+    make_takm(&path);
+    let original = std::fs::read(&path).unwrap();
+    let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+    let pick = |p| Pick { target: Target::Local(p), before: State(None), after: State(Some(4)), stamp: None };
+    app.hold_loads = true;
+    app.open_in(&ctx, 0, path.clone());
+    let count = app.history.undo.len();
+    app.pick_progress(&ctx, pick(path.clone()));
+    assert!(app.progress_job.is_none());
+    assert!(app.takm_note.as_ref().unwrap().0.contains("진행 중인"));
+    assert_eq!(app.history.undo.len(), count);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let gone = temp.join("missing.takm");
+    app.pick_progress(&ctx, pick(gone.clone()));
+    wait_for_progress(&ctx, &mut app);
+    assert!(!gone.exists());
+    assert!(app.takm_note.as_ref().unwrap().0.contains("저장할 수 없어요"));
+    assert!(!app.history.kinds().iter().any(|k| k == "Progress"));
+}
+
+#[test]
+fn progress_leaves_legacy_app_ron_settings_readable() {
+    let settings: Settings = ron::from_str(r#"(workspace_roots: ["old/takes"], workspace_open: ["old/takes"])"#).unwrap();
+    assert_eq!(settings.workspace_roots, ["old/takes"]);
+    assert_eq!(settings.workspace_open, ["old/takes"]);
+}

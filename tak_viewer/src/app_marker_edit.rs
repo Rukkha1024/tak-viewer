@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc};
 use tak_core::edit::delete::{delete_samples, DeleteRequest};
 use tak_core::edit::fill::{FillMethod, FillRequest, FillScope as CoreFillScope, NumericalFill};
 use tak_core::edit::label::{
-    CreationStreams, LabelEditor, LabelRequest, LabelScope, UnlabelRequest,
+    next_label_in_order, CreationStreams, LabelEditor, LabelRequest, LabelScope, UnlabelRequest,
 };
 use tak_core::edit::save::{self, FileVersion, SaveOutcome, SaveRequest, TakmSave};
 use tak_core::edit::smooth::{NumericalSmooth, SmoothRequest, SmoothScope as CoreSmoothScope};
@@ -88,7 +88,7 @@ pub(super) enum PanelSetting {
 #[derive(Clone)]
 pub(super) struct PreparedSession {
     _original_version: Option<FileVersion>,
-    current_version: Option<FileVersion>,
+    pub(super) current_version: Option<FileVersion>,
     creation: Arc<CreationStreams>,
 }
 
@@ -549,6 +549,10 @@ impl TakViewerApp {
     }
 
     pub(super) fn request_exit(&mut self, ctx: &egui::Context) {
+        if self.progress_job.is_some() {
+            self.takm_note = Some(("진행 상태를 저장 중이에요. 저장이 끝난 뒤 닫아 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         if self.dirty_prompt.is_some() { return; }
         for slot in self.open_views() {
             if self.guard_primary_dirty(slot, PendingTransition::Exit) { return; }
@@ -944,6 +948,7 @@ impl TakViewerApp {
         let view = &self.views[slot];
         if view.remote.is_some() { self.save_remote(ctx, slot, close_after); return; }
         if self.no_persist
+            || view.path().is_some_and(|path| self.progress_writing(path))
             || view.data.is_none()
             || view.waiting_shared_path().is_some()
             || view.edit_refresh.is_some()
@@ -1297,6 +1302,9 @@ impl TakViewerApp {
     }
 
     fn marker_command_block(&self, slot: usize, allow_capture: bool, legacy_notice: bool) -> Option<&'static str> {
+        if self.views[slot].path().is_some_and(|path| self.progress_writing(path)) {
+            return Some("진행 상태 저장이 끝난 뒤 편집해 주세요.");
+        }
         let view = &self.views[slot];
         if view.edit_document.is_none() || view.data.is_none() {
             return Some("Can't edit this file");
@@ -1939,7 +1947,7 @@ impl TakViewerApp {
             }
             LabelingAction::LabelMarker(target) => {
                 match label_marker_source(&self.views[slot]) {
-                    Ok(source) => self.assign_label_to_point(ctx, slot, source, *target),
+                    Ok(source) => self.assign_point_label(ctx, slot, source, *target, true),
                     Err(reason) => self.takm_note = Some((reason.into(), ctx.input(|i| i.time))),
                 }
                 return;
@@ -2154,17 +2162,47 @@ impl TakViewerApp {
         self.refresh_marker_ui(slot);
         let view = &self.views[slot];
         let ui = &self.marker_ui[slot].labeling;
-        if view.data.as_ref().is_some_and(|data| data.markers.iter().any(|marker| {
+        let range = self.marker_ui[slot].tools.range;
+        if let Some(marker) = view.data.as_ref().and_then(|data| data.markers.iter().find(|marker| {
             marker.uid == source && marker.parent == Some(target.parent) && marker.slot == Some(target.slot)
                 && marker.present(view.pb.frame)
         })) {
-            self.takm_note = Some(("Already this label".into(), ctx.input(|i| i.time)));
+            let now = ctx.input(|i| i.time);
+            if keep_armed {
+                self.takm_note = Some(("Already this label".into(), now));
+                return;
+            }
+            if !ui.backward && !ui.forward {
+                self.takm_note = Some(("앞이나 뒤 방향을 하나 이상 선택해 주세요.".into(), now));
+                return;
+            }
+            if let Some((first, last)) = range {
+                let (mut first, mut last) = (i64::from(first), i64::from(last));
+                if !ui.backward { first = first.max(view.pb.frame); }
+                if !ui.forward { last = last.min(view.pb.frame); }
+                let index = marker.segments.partition_point(|&(_, end)| end < first);
+                if first > last || marker.segments.get(index).is_none_or(|&(start, _)| start > last) {
+                    self.takm_note = Some(("No points to relabel in range".into(), now));
+                    return;
+                }
+            }
+            let mut message = format!("Label · {} · already set", marker.name);
+            if ui.increment != IncrementMode::Stay {
+                match next_label_in_order(&increment_order(ui, target, None), target) {
+                    Ok(Some(next)) => {
+                        self.views[slot].armed_label = Some(next);
+                        self.marker_ui[slot].labeling.scroll_to = Some(next);
+                    }
+                    Ok(None) => message.push_str(" · No next label"),
+                    Err(_) => message.push_str(" · 다음 라벨을 고를 수 없어요."),
+                }
+            }
+            self.takm_note = Some((message, now));
             return;
         }
         let Ok(current_frame) = u32::try_from(view.pb.frame) else {
             return;
         };
-        let range = self.marker_ui[slot].tools.range;
         let moving_at_frame = range.is_none_or(|(first, last)| (first..=last).contains(&current_frame)).then_some(source);
         let request = LabelRequest {
             source,

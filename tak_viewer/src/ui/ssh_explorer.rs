@@ -110,8 +110,7 @@ pub fn desired_height(manager: &SshManager) -> f32 {
             .hosts
             .iter()
             .map(|h| {
-                let children =
-                    h.expanded && matches!(h.state, HostState::Connected | HostState::Lost);
+                let children = h.shows_rows();
                 ROW_H
                     + if children {
                         ROW_H
@@ -186,7 +185,7 @@ pub fn show(
         for host in &mut manager.hosts {
             let platform = match manager.platform_overrides.get(&host.alias).map(String::as_str) { Some("windows") => "Windows", _ => "Linux" };
             let status = match host.state { HostState::Connected => format!("{platform} · 연결됨"), HostState::Connecting => "연결 중…".to_owned(), HostState::Lost => format!("{platform} · 끊김"), HostState::Off => platform.to_owned() };
-            ui.push_id(&host.alias, |ui| {
+            ui.push_id(host.alias.clone(), |ui| {
                 let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
                 if response.hovered() { ui.painter().rect_filled(rect, 0.0, HOVER_BG); }
                 chevron(ui.painter(), pos2(rect.left() + 18.0, rect.center().y), host.expanded, ICON_FG);
@@ -239,8 +238,12 @@ pub fn show(
                     });
                     if !enabled { ui.label(RichText::new("연결을 끊은 뒤 바꿀 수 있어요.").size(11.0).color(FG_DIM)); }
                 });
-                if !host.expanded { return; }
-                if host.state == HostState::Connecting { return; }
+                if !host.shows_rows() {
+                    if host.expanded {
+                        if let Some(note) = &host.note { ui.add(egui::Label::new(RichText::new(note).size(11.0).color(AMBER)).wrap()); }
+                    }
+                    return;
+                }
                 if let Some(note) = &host.note { ui.add(egui::Label::new(RichText::new(note).size(11.0).color(AMBER)).wrap()); }
                 if !matches!(host.state, HostState::Connected | HostState::Lost) { return; }
                 let connected = host.state == HostState::Connected;
@@ -261,7 +264,8 @@ pub fn show(
                 });
                 let tree_height = (host.rows.len() as f32 * ROW_H).min(220.0);
                 ScrollArea::vertical().id_salt("tree").max_height(tree_height.max(ROW_H)).auto_shrink([false, true]).show_rows(ui, ROW_H, host.rows.len(), |ui, range| {
-                    for row in &host.rows[range] {
+                    for index in range {
+                        let row = &host.rows[index];
                         let depth = match row { TreeRow::Dir { depth, .. } | TreeRow::File { depth, .. } | TreeRow::Note { depth, .. } => *depth };
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
                         let x = rect.left() + 26.0 + depth as f32 * 12.0;
@@ -281,11 +285,20 @@ pub fn show(
                                 });
                             }
                             TreeRow::File { path, name, .. } => {
-                                file_icon(ui.painter(), pos2(x + 8.0, rect.center().y), TAK_ICON);
-                                let avail = (rect.right() - x - 20.0).max(0.0);
+                                let icon_x = x + crate::take_progress::SLOT;
+                                file_icon(ui.painter(), pos2(icon_x + 8.0, rect.center().y), TAK_ICON);
+                                let avail = (rect.right() - icon_x - 20.0).max(0.0);
                                 let (text, _) = super::open_editors::fit(name, "", 0.0, avail, |s| ui.fonts(|f| f.layout_no_wrap(s.into(), FontId::proportional(12.0), FG).size().x));
-                                label(ui, &text, Rect::from_min_max(pos2(x + 20.0, rect.top()), rect.right_bottom()), FontId::proportional(12.0), FG);
+                                label(ui, &text, Rect::from_min_max(pos2(icon_x + 20.0, rect.top()), rect.right_bottom()), FontId::proportional(12.0), FG);
                                 let location = RemoteLocation { host: host.alias.clone(), path: path.clone() };
+                                if ui.is_rect_visible(rect) {
+                                    let state = host.visible_progress(&location.path);
+                                    let id = ui.id().with(("ssh-progress", &location.path));
+                                    if let Some(pick) = crate::take_progress::row_mark(ui, rect, x, id,
+                                        crate::take_progress::Target::Remote(location.clone()), state, None, connected) {
+                                        actions.push(SshAction::Progress(pick));
+                                    }
+                                }
                                 if response.clicked() {
                                     if connected { actions.push(SshAction::Open { location: location.clone(), side: ui.input(|i| i.modifiers.ctrl) }); }
                                     else { actions.push(SshAction::Notice("연결 버튼을 눌러 다시 연결한 뒤 열어 주세요.".into())); }

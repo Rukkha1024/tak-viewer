@@ -29,6 +29,7 @@ const TWISTIE: f32 = 16.0;
 pub struct FileDrag(pub PathBuf);
 
 pub enum WsAction {
+    Progress(crate::take_progress::Pick),
     /// Open in the active 3D view (click).
     Open(PathBuf),
     /// Open in a new 3D view next to the others (Ctrl+click, right-click menu).
@@ -383,7 +384,7 @@ fn mb(size: u64) -> String {
 /// `current` = file of the active 3D view (blue row), `others` = files of the other views and the
 /// files laid over views (grey rows). `overlaid` = the active view has a file laid over it (its
 /// right-click menu then offers to take it off).
-pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[PathBuf], overlaid: bool, st: &mut ExplorerState) -> Option<WsAction> {
+pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[PathBuf], overlaid: bool, st: &mut ExplorerState, ssh: &mut crate::ssh::SshManager) -> Option<WsAction> {
     let mut action = None;
     // The pane below the OPEN EDITORS section (drawn first, `open_editors.rs`).
     let full = ui.available_rect_before_wrap();
@@ -667,16 +668,11 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                 }
                 Row::File { file, folder, .. } => {
                     let remote = crate::workspace::is_remote_root_key(&file.path);
-                    file_icon(p, pos2(label_x + 6.0, rect.center().y), TAK_ICON);
+                    let icon_x = label_x + crate::take_progress::SLOT;
+                    file_icon(p, pos2(icon_x + 6.0, rect.center().y), TAK_ICON);
                     let color = if is_current || is_other { Color32::WHITE } else { FG };
-                    let name_left = label_x + 17.0;
-                    let progress = if !remote && ui.is_rect_visible(rect) {
-                        file.modified.and_then(|modified| {
-                            st.progress.visible_row(&file.path, crate::take_progress::Stamp { size: file.size, modified })
-                        })
-                    } else { None };
-                    let name_right = crate::take_progress::paint(ui, rect, name_left, rect.right() - 8.0, progress, FG_DIM);
-                    let clip = rect.with_max_x(if progress.is_some() { name_right } else { rect.right() });
+                    let name_left = icon_x + 17.0;
+                    let clip = rect;
                     let name_rect = p.with_clip_rect(clip).text(
                         pos2(name_left, rect.center().y),
                         Align2::LEFT_CENTER,
@@ -686,6 +682,23 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     );
                     if let Some(f) = folder {
                         p.with_clip_rect(clip).text(pos2(name_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, f, FontId::proportional(11.5), FG_DIM);
+                    }
+                    if ui.is_rect_visible(rect) {
+                        let (target, progress, stamp, connected) = if let Some((_, location)) = crate::workspace::remote_address(&file.path) {
+                            let connected = ssh.is_connected(&location.host);
+                            let progress = ssh.visible_progress(&location);
+                            (crate::take_progress::Target::Remote(location), progress, None, connected)
+                        } else {
+                            let cached = file.modified.and_then(|modified| st.progress.visible_row(
+                                &file.path, crate::take_progress::Stamp { size: file.size, modified }
+                            ));
+                            (crate::take_progress::Target::Local(file.path.clone()),
+                             cached.map(|(_, value)| value), cached.map(|(stamp, _)| stamp), true)
+                        };
+                        if let Some(pick) = crate::take_progress::row_mark(ui, rect, label_x, resp.id.with("progress"),
+                            target, progress, stamp, connected) {
+                            action = Some(WsAction::Progress(pick));
+                        }
                     }
                     let tip = if let Some((_, location)) = crate::workspace::remote_address(&file.path) {
                         format!("{}:{}\n\n클릭: 지금 화면에 열기 · Ctrl+클릭: 옆 화면에 열기\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
@@ -1041,7 +1054,7 @@ mod tests {
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 400.0));
         let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-                show(ui, ws, None, &[], false, st);
+                show(ui, ws, None, &[], false, st, &mut crate::ssh::SshManager::new(ctx, Default::default()));
             });
         });
         fn walk(shape: &Shape, found: &mut Vec<String>) {

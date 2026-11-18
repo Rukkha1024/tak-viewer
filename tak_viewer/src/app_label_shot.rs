@@ -1,4 +1,4 @@
-//! Headless screenshots of real in-memory label assignments.
+//! Headless screenshots of in-memory QuickLabel actions.
 use super::{egui, Pane, TakViewerApp};
 use crate::ui::labeling::LabelingAction;
 use std::sync::OnceLock;
@@ -21,7 +21,7 @@ pub(crate) fn take_probe(args: &mut Vec<String>, headless: bool) -> Result<(), &
         let (source, target) = args
             .get(index + 1)
             .and_then(|arg| arg.split_once('='))
-            .filter(|(source, target)| !source.is_empty() && !target.is_empty())
+            .filter(|(_, target)| !target.is_empty())
             .ok_or("--shot-label requires SOURCE=TARGET")?;
         steps.push(Step {
             source: source.into(),
@@ -55,6 +55,7 @@ pub(super) struct Progress {
 struct Pending {
     revision: Option<Revision>,
     marker_count: usize,
+    same_label: bool,
 }
 
 impl TakViewerApp {
@@ -83,10 +84,17 @@ impl TakViewerApp {
         if let Some(pending) = self.label_shot.pending.take() {
             let status = self.takm_note.as_ref().map_or("", |(text, _)| text);
             eprintln!("--shot-label: {status}");
-            if data.edit_revision == pending.revision {
+            let step = &steps[self.label_shot.next - 1];
+            if pending.same_label {
+                if data.edit_revision != pending.revision
+                    || !status.starts_with(&format!("Label · {} · already set", step.target))
+                {
+                    return self.fail_label_shot(ctx, step, "same-label confirmation failed");
+                }
+            } else if data.edit_revision == pending.revision {
                 return self.fail_label_shot(
                     ctx,
-                    &steps[self.label_shot.next - 1],
+                    step,
                     "assignment did not change the take",
                 );
             }
@@ -112,21 +120,23 @@ impl TakViewerApp {
         let Some(step) = steps.get(self.label_shot.next) else {
             return false;
         };
-        let mut sources = data
-            .markers
-            .iter()
-            .filter(|marker| marker.name == step.source);
-        let Some(source) = sources
-            .next()
-            .filter(|marker| marker.present(view.pb.frame))
-            .map(|marker| marker.uid)
-            .filter(|_| sources.next().is_none())
-        else {
-            return self.fail_label_shot(
-                ctx,
-                step,
-                "expected one source track with a point at this frame",
-            );
+        let source = if step.source.is_empty() {
+            None
+        } else {
+            let mut sources = data.markers.iter().filter(|marker| marker.name == step.source);
+            let Some(source) = sources
+                .next()
+                .filter(|marker| marker.present(view.pb.frame))
+                .map(|marker| marker.uid)
+                .filter(|_| sources.next().is_none())
+            else {
+                return self.fail_label_shot(
+                    ctx,
+                    step,
+                    "expected one source track with a point at this frame",
+                );
+            };
+            Some(source)
         };
         let mut targets = data
             .markers
@@ -143,9 +153,10 @@ impl TakViewerApp {
             return self.fail_label_shot(ctx, step, "expected one existing named target track");
         };
         self.label_shot.next += 1;
-        self.label_shot.pending = Some(Pending {
+        self.label_shot.pending = source.map(|source| Pending {
             revision: data.edit_revision,
             marker_count: data.markers.len(),
+            same_label: source == track_uid,
         });
         self.show_pane(Pane::Labeling);
         self.labeling_action(
@@ -157,7 +168,11 @@ impl TakViewerApp {
                 additive: false,
             },
         );
-        self.assign_label_to_point(ctx, slot, source, target);
+        if let Some(source) = source {
+            self.label_sample(ctx, slot, source);
+        } else {
+            self.label_shot.settle_frames = 5;
+        }
         true
     }
 

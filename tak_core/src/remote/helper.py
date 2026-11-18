@@ -11,9 +11,12 @@ import tempfile
 import datetime
 import json
 import os
+import re
 import stat
 import struct
 import sys
+import xml.etree.ElementTree as ET
+from xml.parsers import expat
 
 CHANNELS_HEADER = bytes.fromhex("f30a394c0200")
 DIMENSIONS = {"FloatChannel": 1, "Float16Channel": 16, "Vector3fChannel": 3,
@@ -68,7 +71,7 @@ class Stream:
 
 
 class Compound:
-    def __init__(self, reader):
+    def __init__(self, reader, metadata_only=False):
         head = reader.read(0, 512)
         if head[:8] != bytes.fromhex("d0cf11e0a1b11ae1"):
             raise Failure("unsupported_format", "Only uncompressed compound TAK is supported")
@@ -145,6 +148,9 @@ class Compound:
             if entry[1] == 1:
                 walk(entry[6], parents + [entry[0]], depth + 1)
             elif entry[1] == 2:
+                if metadata_only and name != "MetaData.dat":
+                    walk(entry[5], parents, depth + 1)
+                    return
                 first, length = entry[2:4]
                 if length == 0:
                     stream = Stream(reader, [], 0)
@@ -165,7 +171,7 @@ class Compound:
                 raise ValueError("Unexpected directory entry")
             walk(entry[5], parents, depth + 1)
         walk(roots[0][6], [])
-        if len(self.streams) != 3:
+        if not metadata_only and len(self.streams) != 3:
             raise ValueError("Missing selected stream")
 
 
@@ -273,7 +279,7 @@ def takm_index(reader):
 
 
 class Source:
-    def __init__(self, path, probe):
+    def __init__(self, path, probe, progress_only=False):
         self.path = path
         self.file = open(path, "rb")
         try:
@@ -292,7 +298,7 @@ class Source:
                 self.streams, self.all_streams, self.tail = compound.streams, compound.all_streams, self.reader.size
             else:
                 raise Failure("unsupported_format", "Unsupported TAK/TAKM container; no full-file fallback")
-            self.records = inventory(self.streams["Channels.dat"], probe)
+            self.records = [] if progress_only else inventory(self.streams["Channels.dat"], probe)
             self.nodes = None
             self.check()
         except Exception:
@@ -522,6 +528,15 @@ class Server:
         if op == "close":
             self.close()
             return dict(ok=True, lengths=[]), []
+        if op == "progress_batch":
+            return progress_batch(request)
+        if op == "takm_progress":
+            try:
+                return write_dispatch(self, request)
+            except Failure as error:
+                if error.code == "source_changed":
+                    raise Failure("progress_changed", str(error)) from error
+                raise
         if op in ("stat", "comment_ids", "takm_convert", "takm_append", "takm_save_patch", "patch_begin", "patch_chunk"):
             return write_dispatch(self, request)
         if op not in ("list", "open", "analog"):
@@ -625,6 +640,212 @@ class Server:
 COMMENT_HEADER = b"time,kind,comment_id,markers,frame_start,frame_end,comment_type,comment_text,shown_a,shown_b,file_a,file_b\r\n"
 CAMERA_STREAM = "DeviceData/Track 0.trk"
 COPY_CHUNK = 65536
+
+
+class ProgressReader(Reader):
+    def __init__(self, file, size):
+        super().__init__(file, size)
+        self.remaining = 1 << 20
+        self.calls = 128
+
+    def read(self, offset, length):
+        self.remaining -= length
+        self.calls -= 1
+        if self.remaining < 0 or self.calls < 0:
+            raise ValueError("Progress read exceeds budget")
+        return super().read(offset, length)
+
+
+def properties_xml(raw):
+    for encoding in ("utf-16le", "utf-8"):
+        opening = "<properties>".encode(encoding)
+        closing = "</properties>".encode(encoding)
+        start = raw.find(opening)
+        end = raw.find(closing, start + len(opening)) if start >= 0 else -1
+        if end >= 0:
+            end += len(closing)
+            return raw[start:end].decode(encoding).encode("utf-8"), start, end, encoding
+    raise ValueError("Metadata XML missing")
+
+
+def progress_properties(xml):
+    return [element for element in ET.fromstring(xml).findall("property")
+            if element.findtext("name", element.get("name")) == "Progress"]
+
+
+def progress_number(element):
+    value = int(element.findtext("value", element.get("value")))
+    if not -(1 << 63) <= value < (1 << 63):
+        raise ValueError("Progress outside integer range")
+    return value
+
+
+def progress_batch(request):
+    paths = request.get("paths")
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 16:
+        raise Failure("invalid_request", "Expected a bounded batch of paths")
+    rows = []
+    for requested in paths:
+        path = path_arg({"path": requested})
+        result = None
+        try:
+            if not path.lower().endswith((".tak", ".takm")) or not os.path.isfile(path):
+                raise ValueError("Progress requires a take")
+            with open(path, "rb") as file:
+                version = identity(file, path)
+                reader = ProgressReader(file, version[2])
+                streams = (takm_index(reader)[0] if reader.read(0, 8) == b"TAKM-2\r\n"
+                           else Compound(reader, metadata_only=True).streams)
+                stream = streams["MetaData.dat"]
+                if stream.length > 256 << 10:
+                    raise ValueError("Metadata exceeds progress budget")
+                props = progress_properties(properties_xml(stream.read(0, stream.length))[0])
+                value = progress_number(props[-1]) if props else None
+                if version == identity(file, path):
+                    result = dict(value=value, identity=version)
+        except (OSError, ValueError, KeyError, TypeError, Failure, ET.ParseError, struct.error):
+            pass
+        rows.append(result)
+    return dict(ok=True, lengths=[], rows=rows), []
+
+
+_XML_ATTR = re.compile(rb"""([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+
+
+def patch_progress(raw, before, after):
+    if any(n is not None and (type(n) is not int or not -(1 << 63) <= n < (1 << 63))
+           for n in (before, after)):
+        raise ValueError("Invalid progress value")
+    xml, start, end, encoding = properties_xml(raw)
+    props = progress_properties(xml)
+    if len(props) > 1 or (progress_number(props[0]) if props else None) != before:
+        raise Failure("source_changed", "Progress changed or is ambiguous")
+    if not props:
+        if after is None:
+            return raw
+        pos = len(xml) - len(b"</properties>")
+        replacement = f'<property name="Progress" value="{after}"/>'.encode()
+        patched = xml[:pos] + replacement + xml[pos:]
+    else:
+        # ElementTree identifies the property. Expat provides exact source byte positions
+        # so the rest of the XML (including comments and attribute formatting) survives.
+        root = ET.fromstring(xml)
+        property_index = next(i for i, child in enumerate(root)
+                              if child.tag == "property" and child.findtext("name", child.get("name")) == "Progress")
+        parser = expat.ParserCreate()
+        depth, ordinal, selected = 0, -1, False
+        spans = {}
+        def opening(name, attrs):
+            nonlocal depth, ordinal, selected
+            if depth == 1:
+                ordinal += 1
+                selected = ordinal == property_index
+                if selected:
+                    spans["property"] = parser.CurrentByteIndex
+            elif selected and depth == 2 and name == "value" and "value" not in spans:
+                spans["value"] = parser.CurrentByteIndex
+            depth += 1
+        def closing(name):
+            nonlocal depth, selected
+            depth -= 1
+            if selected and depth == 1:
+                spans["property_end"] = parser.CurrentByteIndex
+                selected = False
+            elif selected and depth == 2 and name == "value" and "value_end" not in spans:
+                spans["value_end"] = parser.CurrentByteIndex
+        parser.StartElementHandler, parser.EndElementHandler = opening, closing
+        parser.Parse(xml, True)
+        if after is None:
+            a, b = spans["property"], spans["property_end"]
+            tag = re.match(rb"""(?:[^>"']|"[^"]*"|'[^']*')*>""", xml[a:])
+            if tag is None:
+                raise ValueError("Invalid Progress tag")
+            if not tag[0].endswith(b"/>"):
+                b = xml.index(b">", b) + 1
+            replacement = b""
+        elif "value" in spans:
+            value = props[0].find("value")
+            a = xml.index(b">", spans["value"]) + 1
+            b = spans["value_end"]
+            if len(value) or b < a or b"<" in xml[a:b]:
+                raise ValueError("Unsupported Progress value")
+            replacement = str(after).encode()
+        else:
+            pos = spans["property"] + len(b"<property")
+            for match in _XML_ATTR.finditer(xml, pos):
+                if xml[pos:match.start()].strip() or match[1].startswith((b">", b"/>", b"<")):
+                    break
+                if match[1] == b"value":
+                    a, b = match.span(2 if match[2] is not None else 3)
+                    break
+                pos = match.end()
+            else:
+                raise ValueError("Missing Progress value")
+            if "a" not in locals():
+                raise ValueError("Missing Progress value")
+            replacement = str(after).encode()
+        if after is not None:
+            value = xml[a:b].decode("utf-8")
+            a += len(value[:len(value) - len(value.lstrip())].encode("utf-8"))
+            b -= len(value[len(value.rstrip()):].encode("utf-8"))
+        patched = xml[:a] + replacement + xml[b:]
+    return raw[:start] + patched.decode("utf-8").encode(encoding) + raw[end:]
+
+
+def write_progress(source, output, before, after):
+    if source.format != "takm":
+        raise Failure("invalid_request", "Progress needs an existing TAKM")
+    source_seal(source)
+    reader = source.reader
+    header = bytearray(reader.read(0, 64))
+    table_at, table_size, old_fixed = struct.unpack_from("<QQQ", header, 16)
+    meta = source.streams["MetaData.dat"]
+    if meta.length > 256 << 10:
+        raise ValueError("Metadata exceeds progress budget")
+    start = meta.mapping[0][0]
+    end = start + meta.length
+    patched = patch_progress(meta.read(0, meta.length), before, after)
+    shift = len(patched) - meta.length
+    previous, changed_table = 64, bool(shift)
+    for row in source.table["streams"]:
+        a = row["offset"]
+        if a < previous:
+            raise ValueError("Overlapping or unordered TAKM streams")
+        previous = a + row["size"]
+        if row["name"] == "MetaData.dat":
+            row["size"] = len(patched)
+            if "sha256" in row:
+                row["sha256"] = hashlib.sha256(patched).hexdigest()
+                changed_table = True
+        elif a >= end:
+            row["offset"] += shift
+    table = (json.dumps(source.table, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+             if changed_table else reader.read(table_at, table_size))
+    fixed = table_at + shift + len(table)
+    struct.pack_into("<QQQ", header, 16, table_at + shift, len(table), fixed)
+    digest = hashlib.sha256()
+    def put(block):
+        output.write(block)
+        digest.update(block)
+    def copy(a, b, write):
+        for offset in range(a, b, COPY_CHUNK):
+            write(reader.read(offset, min(COPY_CHUNK, b - offset)))
+    put(header)
+    copy(64, start, put)
+    put(patched)
+    copy(end, table_at, put)
+    put(table)
+    output.write(digest.digest())
+    copy(old_fixed + 32, reader.size, output.write)
+    output.flush()
+    os.fsync(output.fileno())
+    written = Reader(output, output.tell())
+    takm_index(written)
+    if hash_range(written, 0, fixed) != written.read(fixed, 32):
+        raise Failure("verification_failed", "Written TAKM seal does not match")
+    if hash_range(written, fixed + 32, reader.size - source.tail) != hash_range(reader, source.tail, reader.size - source.tail):
+        raise Failure("verification_failed", "Written Comment tail differs")
+    return fixed
 
 
 def expected_identity(request):
@@ -963,6 +1184,8 @@ def write_dispatch(server, request):
             return dict(ok=True, lengths=[], identity=source.identity, next_comment_id=next_id), []
         finally:
             source.file.close()
+    if op == "takm_progress" and not path.lower().endswith(".takm"):
+        raise Failure("invalid_request", "Progress needs an existing TAKM")
     destination = write_paths(request, path)
     if op == "patch_begin":
         lengths = request.get("part_lengths")
@@ -1015,7 +1238,7 @@ def write_dispatch(server, request):
                 finally:
                     source.file.close()
             return dict(ok=True, lengths=[], path=destination, identity=version, source_bytes=expected[2], output_bytes=version[2], fixed_len=fixed, existing=True, verified=True), []
-        source = Source(path, 2)
+        source = Source(path, 2, progress_only=op == "takm_progress")
         try:
             source.check(expected)
             if op == "takm_append":
@@ -1037,7 +1260,15 @@ def write_dispatch(server, request):
             else:
                 fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(destination) + ".", suffix=".part", dir=os.path.dirname(destination))
                 with os.fdopen(fd, "w+b") as output:
-                    fixed, imported, hashes = write_container(source, output, nodes, channels, events)
+                    if op == "takm_progress":
+                        mode = stat.S_IMODE(os.fstat(source.file.fileno()).st_mode)
+                        if not mode & 0o222:
+                            raise Failure("io_error", "Progress target is read-only")
+                        fixed = write_progress(source, output, request["before"], request["after"])
+                        os.chmod(temporary, mode)
+                        imported, hashes = 0, []
+                    else:
+                        fixed, imported, hashes = write_container(source, output, nodes, channels, events)
                 source.check(expected)
                 source.file.close()
                 server.close()  # Windows replacement needs the cached reader released too.
@@ -1088,7 +1319,7 @@ def main():
                 header, blocks = dict(ok=False, error=error.code, message=str(error)), []
             except OSError as error:
                 header, blocks = dict(ok=False, error="io_error", message=str(error)), []
-            except (ValueError, KeyError, IndexError, TypeError, struct.error, OverflowError, RecursionError) as error:
+            except (ValueError, KeyError, IndexError, TypeError, struct.error, OverflowError, RecursionError, ET.ParseError, expat.ExpatError) as error:
                 header, blocks = dict(ok=False, error="invalid_file", message=str(error)), []
             output.write(encoded(header))
             for block in blocks:

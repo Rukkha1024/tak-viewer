@@ -183,45 +183,49 @@ impl TakViewerApp {
             } else {
                 view.overlay_shared_target()
             };
-            let entry = |path: &Path, index: usize| Entry {
-                path: path.to_path_buf(),
-                host: if index == 0 {
-                    view.remote_loading
-                        .as_ref()
-                        .map(|(_, location, _)| location.host.clone())
-                        .or_else(|| view.remote.as_ref().map(|location| location.host.clone()))
-                } else {
-                    None
-                },
-                mark: over.as_ref().map(|_| index),
-                hidden: view.overlay.is_some() && !view.shown[index],
-                loading: if index == 0 {
-                    view.loading.is_some()
-                } else {
-                    view.overlay_load.is_some()
-                },
-                progress: {
-                    let owner = if index == 0 { Some(view) } else { view.overlay_owner() };
-                    owner.filter(|v| v.remote.is_none() && v.path() == Some(path))
-                        .and_then(|v| v.data.as_ref())
-                        .and_then(|data| crate::take_progress::saved(&data.take))
-                },
-                dirty: if index == 0 {
-                    view.marker_dirty() || (view.remote.is_some() && (view.comments.pending > 0 || view.comments.failed.is_some()))
-                } else {
-                    view.overlay_marker_dirty()
-                },
-                add_folder: if index == 0
-                    && (view.remote.is_some() || view.remote_loading.is_some())
-                {
-                    view.remote.as_ref().or_else(|| view.remote_loading.as_ref().map(|(_, l, _)| l)).and_then(|location| {
-                        let root = workspace::RemoteRoot { alias: location.host.clone(), path: crate::ssh::parent_path(&location.path), platform: self.ssh.platform(&location.host).to_owned() };
-                        let key = root.key();
-                        self.workspace.key_for_remote(location).is_none().then_some(key)
-                    })
-                } else {
-                    self.folder_outside_workspace(path)
-                },
+            let entry = |path: &Path, index: usize| {
+                let remote = (index == 0).then(|| view.remote_loading.as_ref().map(|(_, location, _)| location)
+                    .or(view.remote.as_ref()).filter(|location| location.memory_key() == path)).flatten();
+                Entry {
+                    path: path.to_path_buf(),
+                    host: if index == 0 {
+                        view.remote_loading
+                            .as_ref()
+                            .map(|(_, location, _)| location.host.clone())
+                            .or_else(|| view.remote.as_ref().map(|location| location.host.clone()))
+                    } else {
+                        None
+                    },
+                    mark: over.as_ref().map(|_| index),
+                    hidden: view.overlay.is_some() && !view.shown[index],
+                    loading: if index == 0 {
+                        view.loading.is_some()
+                    } else {
+                        view.overlay_load.is_some()
+                    },
+                    remote: remote.cloned(),
+                    connected: remote.is_none_or(|loc| self.ssh.is_connected(&loc.host)),
+                    progress: {
+                        let owner = if index == 0 { Some(view) } else { view.overlay_owner() };
+                        owner.filter(|v| v.path() == Some(path)).and_then(View::take_progress)
+                    },
+                    dirty: if index == 0 {
+                        view.marker_dirty() || (view.remote.is_some() && (view.comments.pending > 0 || view.comments.failed.is_some()))
+                    } else {
+                        view.overlay_marker_dirty()
+                    },
+                    add_folder: if index == 0
+                        && (view.remote.is_some() || view.remote_loading.is_some())
+                    {
+                        view.remote.as_ref().or_else(|| view.remote_loading.as_ref().map(|(_, l, _)| l)).and_then(|location| {
+                            let root = workspace::RemoteRoot { alias: location.host.clone(), path: crate::ssh::parent_path(&location.path), platform: self.ssh.platform(&location.host).to_owned() };
+                            let key = root.key();
+                            self.workspace.key_for_remote(location).is_none().then_some(key)
+                        })
+                    } else {
+                        self.folder_outside_workspace(path)
+                    },
+                }
             };
             let mut entries = vec![entry(&own, 0)];
             entries.extend(over.as_ref().map(|path| entry(path, 1)));
@@ -267,6 +271,7 @@ impl TakViewerApp {
             _ => {}
         }
         match a {
+            EditorAction::Progress(pick) => self.pick_progress(ctx, pick),
             EditorAction::Select { id, ctrl, shift } => {
                 let rows = self.editor_rows();
                 self.editor_selection.click(&rows, id, ctrl, shift);

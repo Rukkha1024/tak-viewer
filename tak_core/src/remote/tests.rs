@@ -49,6 +49,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_helper_batches_and_atomically_updates_progress_without_touching_tak() {
+        let takm = Fixture::new(true);
+        let tak = Fixture::new(false);
+        let mut session = session();
+        let cancel = CancelToken::default();
+        let editable = takm.0.to_string_lossy().into_owned();
+        let readonly = tak.0.to_string_lossy().into_owned();
+        let directory = takm.0.parent().unwrap().to_string_lossy();
+        let list_before = session.list(&directory, &cancel).unwrap();
+        let original = std::fs::read(&takm.0).unwrap();
+        let original_tak = std::fs::read(&tak.0).unwrap();
+        let request = [editable.clone(), readonly.clone(), format!("{editable}.missing.takm")];
+        let rows = session.progress_batch(&request, &cancel).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].as_ref().unwrap().value, None);
+        assert_eq!(rows[1].as_ref().unwrap().value, None);
+        assert!(rows[2].is_none());
+        assert_eq!(session.list(&directory, &cancel).unwrap(), list_before);
+        assert!(session.write_progress(&rows[1].as_ref().unwrap().source, None, Some(1), &cancel).is_err());
+
+        let saved = session.write_progress(&rows[0].as_ref().unwrap().source, None, Some(2), &cancel).unwrap();
+        assert!(saved.verified);
+        assert_eq!(crate::tak::read_take(&takm.0).unwrap().meta("Progress"), Some("2"));
+        crate::takm::verify_fixed(&takm.0).unwrap();
+        let reviewed = std::fs::read(&takm.0).unwrap();
+        let index = crate::takm::read_index_path(&takm.0).unwrap();
+        assert!(session.write_progress(&rows[0].as_ref().unwrap().source, None, Some(3), &cancel).is_err());
+        let cleaned = session.write_progress(&saved.source, Some(2), Some(3), &cancel).unwrap();
+        let edited = std::fs::read(&takm.0).unwrap();
+        let fixed = index.fixed_len as usize;
+        let changes: Vec<_> = reviewed[..fixed].iter().zip(&edited[..fixed])
+            .filter(|(a, b)| a != b).collect();
+        assert_eq!(changes, vec![(&b'2', &b'3')]);
+        assert_eq!(&reviewed[index.tail_start() as usize..], &edited[index.tail_start() as usize..]);
+        session.write_progress(&cleaned.source, Some(3), None, &cancel).unwrap();
+        let undone = crate::takm::read_take(&takm.0).unwrap();
+        assert_eq!(undone.meta("Progress"), None);
+        crate::takm::verify_fixed(&takm.0).unwrap();
+        assert_eq!(std::fs::read(&tak.0).unwrap(), original_tak);
+        assert_eq!(std::fs::read(&takm.0).unwrap(), original);
+    }
+
     fn helper_with_setup(setup: &str) -> transport::Transport {
         let source = HELPER.replace("if __name__ == \"__main__\":\n    main()", &format!("{setup}\nmain()"));
         transport::Transport::local_python(test_python(), &source, Duration::from_secs(10), 1 << 20).unwrap()
@@ -512,6 +555,33 @@ mod fake_tests {
     }
     fn identity() -> Value {
         json!([1, 2, 1000, 4, 5, 1, 2, 1000, 4, 5])
+    }
+
+    #[test]
+    fn fake_transport_keeps_listing_and_progress_separate_and_validates_response() {
+        let listed = json!({"entries": [{"path":"test.takm"}]});
+        let batch = json!({"rows": [{"value":7,"identity":identity()}, null]});
+        let written = json!({"path":"test.takm","identity":identity(),"source_bytes":1000,
+                            "output_bytes":1000,"fixed_len":950,"existing":false,"verified":true});
+        let (mut session, requests) = session(vec![
+            Ok((listed.clone(), vec![])), Ok((batch, vec![])), Ok((written, vec![]))
+        ]);
+        let cancel = CancelToken::default();
+        let start = std::time::Instant::now();
+        assert_eq!(session.list(".", &cancel).unwrap(), listed);
+        let list_us = start.elapsed().as_micros();
+        let rows = session.progress_batch(&["test.takm".into(), "missing.tak".into()], &cancel).unwrap();
+        assert_eq!(rows[0].as_ref().unwrap().value, Some(7));
+        assert!(rows[1].is_none());
+        session.write_progress(&rows[0].as_ref().unwrap().source, Some(7), Some(2), &cancel).unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["op"], "list");
+        assert!(!requests[0].as_object().unwrap().contains_key("progress"));
+        assert_eq!(requests[1]["op"], "progress_batch");
+        assert_eq!(requests[2]["op"], "takm_progress");
+        assert_eq!(requests[2]["before"], 7);
+        assert_eq!(requests[2]["after"], 2);
+        println!("Fake transport listing returned in {list_us} µs with one list request before progress");
     }
 
     #[test]

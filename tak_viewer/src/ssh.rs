@@ -32,6 +32,7 @@ pub fn demo_state() -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SshAction {
+    Progress(crate::take_progress::Pick),
     AddWorkspace { location: RemoteLocation, platform: String },
     Open {
         location: RemoteLocation,
@@ -165,6 +166,9 @@ pub struct Host {
     expanded_dirs: HashSet<String>,
     listings: HashMap<String, Listing>,
     worker: Option<WorkerHandle>,
+    progress: HashMap<String, Option<tak_core::remote::RemoteProgress>>,
+    progress_visible: Vec<String>,
+    demo_progress: HashMap<String, crate::take_progress::State>,
 }
 
 impl Host {
@@ -184,7 +188,36 @@ impl Host {
             expanded_dirs: HashSet::new(),
             listings: HashMap::new(),
             worker: None,
+            progress: HashMap::new(),
+            progress_visible: Vec::new(),
+            demo_progress: HashMap::new(),
         }
+    }
+
+    pub fn shows_rows(&self) -> bool {
+        self.expanded && (matches!(self.state, HostState::Connected | HostState::Lost)
+            || (self.state == HostState::Off && !self.rows.is_empty()))
+    }
+
+    pub fn visible_progress(&mut self, path: &str) -> Option<crate::take_progress::State> {
+        if let Some(value) = self.demo_progress.get(path) { return Some(*value); }
+        if let Some(value) = self.progress.get(path) {
+            return value.as_ref().map(|row| crate::take_progress::State(row.value));
+        }
+        if self.state == HostState::Connected && self.progress_visible.len() < 8
+            && !self.progress_visible.iter().any(|p| p == path) {
+            self.progress_visible.push(path.into());
+        }
+        None
+    }
+
+    fn cache_progress(&mut self, path: String, row: Option<tak_core::remote::RemoteProgress>) {
+        // Keep current visible results when the user scrolls through a long listing.
+        if self.progress.len() >= 1024 && !self.progress.contains_key(&path) {
+            let old = self.progress.keys().find(|p| !self.progress_visible.contains(p)).cloned();
+            if let Some(old) = old { self.progress.remove(&old); }
+        }
+        self.progress.insert(path, row);
     }
 
     fn rebuild_rows(&mut self) {
@@ -256,6 +289,8 @@ enum OperationKind {
     Connect,
     List,
     Open,
+    Progress,
+    ProgressWrite,
 }
 #[derive(Clone, Copy)]
 enum AnalogStage { Initial, Full, OnAccess }
@@ -285,6 +320,12 @@ pub struct RemoteWritten {
     pub creation: Arc<tak_core::edit::label::CreationStreams>,
 }
 enum Command {
+    ProgressRead { id: u64, paths: Vec<String>, cancel: CancelToken },
+    ProgressWrite {
+        id: u64, location: RemoteLocation, source: Option<tak_core::remote::RemoteSource>, use_open: bool,
+        before: Option<i64>, after: Option<i64>,
+        reply: Sender<Result<tak_core::remote::RemoteWriteOutcome, String>>, cancel: CancelToken,
+    },
     List {
         id: u64,
         path: String,
@@ -311,6 +352,7 @@ enum Command {
 }
 
 enum WorkerEvent {
+    ProgressRows { id: u64, rows: Vec<(String, Option<tak_core::remote::RemoteProgress>)> },
     Editable(RemoteLocation, RemoteDocument),
     Aliases(Result<Vec<String>, String>),
     Connected(String),
@@ -472,10 +514,14 @@ impl SshManager {
         let index = self.hosts.iter().position(|h| h.alias == root.alias).unwrap();
         match self.hosts[index].state {
             HostState::Off | HostState::Lost => {
-                if !refresh { return Err(self.hosts[index].note.clone().unwrap_or_else(|| "SSH 연결이 끝났어요. ↻로 다시 연결해 주세요.".into())); }
-                self.set_platform(&root.alias, &root.platform);
-                self.connect_at(&root.alias, &location.path)?;
-                return Ok(None);
+                if refresh {
+                    self.set_platform(&root.alias, &root.platform);
+                    self.connect_at(&root.alias, &location.path)?;
+                    return Ok(None);
+                }
+                if !matches!(self.hosts[index].listings.get(&location.path), Some(Listing::Ready(_))) {
+                    return Err(self.hosts[index].note.clone().unwrap_or_else(|| "SSH 연결이 끝났어요. ↻로 다시 연결해 주세요.".into()));
+                }
             }
             HostState::Connecting => return Ok(None),
             HostState::Connected => {}
@@ -642,6 +688,59 @@ impl SshManager {
     }
 
     /// Queue a write on the same SSH worker as reads; the caller only polls this receiver.
+    pub fn begin_progress_frame(&mut self) {
+        for host in &mut self.hosts { host.progress_visible.clear(); }
+    }
+
+    pub fn progress_visible(&self) -> bool {
+        !self.demo && self.hosts.iter().any(|host| !host.progress_visible.is_empty())
+    }
+
+    pub fn finish_progress_frame(&mut self, opening: bool) {
+        if self.demo || opening { return; }
+        for host in &mut self.hosts {
+            let Some(worker) = &mut host.worker else { continue };
+            if host.state != HostState::Connected || !worker.operations.is_empty() || host.progress_visible.is_empty() { continue; }
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            let cancel = CancelToken::default();
+            if worker.tx.send(Command::ProgressRead { id, paths: std::mem::take(&mut host.progress_visible), cancel: cancel.clone() }).is_ok() {
+                worker.operations.insert(id, Operation { cancel, kind: OperationKind::Progress });
+            }
+            // At most one new batch per frame, even with many hosts.
+            break;
+        }
+    }
+
+    pub fn visible_progress(&mut self, location: &RemoteLocation) -> Option<crate::take_progress::State> {
+        self.hosts.iter_mut().find(|h| h.alias == location.host)?.visible_progress(&location.path)
+    }
+
+    pub fn write_progress(&mut self, location: RemoteLocation, before: Option<i64>, after: Option<i64>, use_open: bool)
+        -> Result<Receiver<Result<tak_core::remote::RemoteWriteOutcome, String>>, String> {
+        let id = self.id();
+        let host = self.hosts.iter_mut().find(|h| h.alias == location.host && h.state == HostState::Connected)
+            .ok_or("SSH를 다시 연결한 뒤 진행 상태를 바꿔 주세요.")?;
+        let source = self.documents.get(&location).filter(|_| use_open).map(|doc| doc.source.clone()).or_else(||
+            host.progress.get(&location.path).and_then(Option::as_ref).map(|p| p.source.clone()));
+        let worker = host.worker.as_mut().ok_or("SSH를 다시 연결해 주세요.")?;
+        if worker.operations.values().any(|op| op.kind != OperationKind::Progress) {
+            return Err("서버 작업이 끝난 뒤 진행 상태를 바꿔 주세요.".into());
+        }
+        let cancel = CancelToken::default();
+        let (reply, rx) = mpsc::channel();
+        worker.tx.send(Command::ProgressWrite { id, location, source, use_open, before, after, reply, cancel: cancel.clone() })
+            .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
+        worker.operations.insert(id, Operation { cancel, kind: OperationKind::ProgressWrite });
+        Ok(rx)
+    }
+
+    pub fn cache_progress_write(&mut self, location: &RemoteLocation, source: tak_core::remote::RemoteSource, value: Option<i64>) {
+        if let Some(host) = self.hosts.iter_mut().find(|h| h.alias == location.host) {
+            host.cache_progress(location.path.clone(), Some(tak_core::remote::RemoteProgress { source, value }));
+        }
+    }
+
     pub fn write(&mut self, location: RemoteLocation, snapshot: Option<tak_core::edit::DocumentSnapshot>,
                  events: Vec<comments::Event>, data:Arc<ViewData>) -> Result<Receiver<Result<RemoteWritten, String>>, String> {
         let id = self.id();
@@ -854,6 +953,11 @@ impl SshManager {
             }
             let host = &mut self.hosts[index];
             match envelope.event {
+                WorkerEvent::ProgressRows { id, rows } => {
+                    if host.worker.as_mut().and_then(|w| w.operations.remove(&id)).is_some() {
+                        for (path, row) in rows { host.cache_progress(path, row); }
+                    }
+                }
                 WorkerEvent::Metrics(bytes) => host.received_bytes = bytes,
                 WorkerEvent::Progress(counter) => host.received_counter = Some(counter),
                 WorkerEvent::Diagnostic(error) => host.diagnostic = Some(error),
@@ -881,6 +985,7 @@ impl SshManager {
                                 host.path = path.clone();
                                 host.path_input = path.clone();
                             }
+                            for entry in &list.entries { host.progress.remove(&entry.path); }
                             host.listings.remove(&requested);
                             host.listings.insert(path, Listing::Ready(list));
                         }
@@ -985,11 +1090,11 @@ impl SshManager {
         h.expanded = state != "off";
         h.state = match state {
             "connecting" => HostState::Connecting,
-            "connected" | "markers_ready" => HostState::Connected,
+            "connected" | "markers_ready" | "progress" => HostState::Connected,
             "lost" => HostState::Lost,
             _ => HostState::Off,
         };
-        if matches!(state, "connected" | "markers_ready" | "lost") {
+        if matches!(state, "connected" | "markers_ready" | "lost" | "progress") {
             h.path = "~/data/2_gait".into();
             h.path_input = h.path.clone();
             let entries = [
@@ -1015,6 +1120,10 @@ impl SshManager {
                 }),
             );
             h.rebuild_rows();
+            for (name, value) in [("gait_001.tak", Some(1)), ("gait_002.tak", Some(2)),
+                    ("gait_001.takm", Some(4)), ("static_001.tak", None)] {
+                h.demo_progress.insert(format!("{}/{name}", h.path), crate::take_progress::State(value));
+            }
         }
         if state == "lost" {
             h.note = Some(LOST_NOTE.into());
@@ -1118,7 +1227,7 @@ fn send(
 }
 
 fn classify_error(error: &str) -> (SshErrorKind, String) {
-    if error.contains("source_changed") {
+    if error.contains("source_changed") || error.starts_with("progress_changed:") {
         (SshErrorKind::Changed, CHANGED_NOTE.into())
     } else if error.contains("SSH")
         || error.contains("EOF")
@@ -1256,6 +1365,48 @@ fn host_worker(
         };
         match command {
             Some(Command::Stop) => return,
+            Some(Command::ProgressRead { id, paths, cancel }) => {
+                if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }
+                let result = session.progress_batch(&paths, &cancel);
+                if cancel.is_cancelled() || !session.is_alive() {
+                    emit(WorkerEvent::Stopped { cancelled: cancel.is_cancelled() });
+                    return;
+                }
+                let rows = result.unwrap_or_else(|_| vec![None; paths.len()]);
+                emit(WorkerEvent::ProgressRows { id, rows: paths.into_iter().zip(rows).collect() });
+            }
+            Some(Command::ProgressWrite { id, location, source, use_open, before, after, reply, cancel }) => {
+                if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }
+                let source = editable.get(&location).filter(|_| use_open).map(|doc| doc.source.clone()).or(source);
+                let source = source.map_or_else(|| session.stat(&location.path, &cancel), Ok);
+                let result = source.as_ref().map_err(Clone::clone)
+                    .and_then(|source| session.write_progress(source, before, after, &cancel));
+                if let Ok(outcome) = &result {
+                    if let Some(doc) = editable.get_mut(&location).filter(|doc| source.as_ref() == Ok(&doc.source)) {
+                        doc.source = outcome.source.clone();
+                        doc.fixed_len = outcome.fixed_len;
+                        doc.file_size = outcome.output_bytes as usize;
+                        emit(WorkerEvent::Editable(location.clone(), doc.clone()));
+                    }
+                    if let Some(loaded) = deferred.get_mut(&location).filter(|loaded| source.as_ref() == Ok(&loaded.source)) {
+                        loaded.source = outcome.source.clone();
+                    }
+                    for (_, job_location, loaded, _, _, _) in &mut analog {
+                        if *job_location == location && source.as_ref() == Ok(&loaded.source) {
+                            loaded.source = outcome.source.clone();
+                        }
+                    }
+                }
+                emit(WorkerEvent::Done(id));
+                let _ = reply.send(result.map_err(|error| {
+                    match classify_error(&error).0 {
+                        SshErrorKind::Changed => CHANGED_NOTE.to_owned(),
+                        SshErrorKind::Lost => LOST_NOTE.to_owned(),
+                        SshErrorKind::Failed => "서버 파일에 진행 상태를 저장할 수 없어요. 파일과 폴더의 쓰기 권한을 확인해 주세요.".into(),
+                    }
+                }));
+                ctx.request_repaint();
+            }
             Some(Command::List {
                 id,
                 path,
@@ -1832,7 +1983,7 @@ mod tests {
             assert!(!manager.discovery_pending);
             assert_eq!(
                 manager.hosts[0].rows.len(),
-                if matches!(state, "connected" | "markers_ready" | "lost") {
+                if matches!(state, "connected" | "markers_ready" | "lost" | "progress") {
                     4
                 } else {
                     0

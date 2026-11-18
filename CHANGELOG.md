@@ -1,5 +1,26 @@
 # 변경 사항
 
+## v0.69.2 — 2026-11-18
+
+- The SSH Progress test takes a server alias, platform and Python command. It checks the test folder before it connects.
+
+## v0.69.1 — 2026-11-18
+
+- QuickLabel advances after a same-label click with points in scope. Undo restores the armed row. Both Label Marker menus keep the armed row.
+
+## v0.69.0 — 2026-11-18
+
+- Comment types are now seven: `Jitter`, `Jump`, `Visual check`, `File bad`, `Agree`, `No problem`, `Keep this only`. Pick a Comment, then click a type above the COMMENTS table. One click, saved at once.
+- Type buttons after a new Comment wrap to two rows on a narrow view. Old types (`Needs visual check`, `Marker swap`) stay as stored and the Comment command still takes them.
+
+## v0.68.0 — 2026-11-18
+
+- Use brackets for the green working range and V and B for the yellow edit range. Shift+brackets reset the working range.
+
+## v0.67.0 — 2026-11-18
+
+- Show six saved take states as leading letters in OPEN EDITORS, WORKSPACE and SSH. Click a TAKM mark to save Progress. Undo and redo restore the saved value.
+
 ## v0.66.2 — 2026-11-18
 
 - GRAPH right-drag scales prepared curves as the value axis moves. Build exact curves once at the final scale after release.

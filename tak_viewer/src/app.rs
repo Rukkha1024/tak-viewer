@@ -33,6 +33,8 @@ mod overlay;
 mod overlay_dirty;
 #[path = "app_takm.rs"]
 mod takm_save;
+#[path = "app_progress.rs"]
+mod progress_edit;
 #[path = "app_editors.rs"]
 mod editors;
 #[path = "app_comment_multi.rs"]
@@ -311,6 +313,10 @@ struct Hold {
     wraps: u64,
 }
 
+/// Right after a Comment is made, the type buttons float by the `Comment` button of its view's
+/// bar. A click on one gives the
+/// comment that type; the next action elsewhere (a key other than `T`, a press outside it, the
+/// wheel) closes it and still does what it always did. Mouse moves and playback leave it.
 #[derive(Clone, Debug, PartialEq)]
 struct TypeStrip {
     slot: usize,
@@ -319,7 +325,8 @@ struct TypeStrip {
     /// Where it was drawn last (presses inside it do not close it).
     rect: egui::Rect,
     /// Its buttons as drawn last (tests click them).
-    buttons: [egui::Rect; 3],
+    #[cfg(test)]
+    buttons: Vec<egui::Rect>,
     /// Shown for a picture only (`--type-strip`, a command run that writes nothing).
     shot: bool,
 }
@@ -539,6 +546,7 @@ pub struct TakViewerApp {
     overlay_click: Option<(usize, usize, bool)>,
     /// "`.takm`으로 저장" running in the background (`app_takm.rs`), one at a time.
     takm_job: Option<takm_save::Job>,
+    progress_job: Option<progress_edit::Job>,
     /// Its result, or why it or a Comment on a TAK cannot be done (plain Korean) and when:
     /// shown in the status bar for a few seconds.
     takm_note: Option<(String, f64)>,
@@ -748,6 +756,7 @@ impl TakViewerApp {
             overlay_note: None,
             overlay_click: None,
             takm_job: None,
+            progress_job: None,
             takm_note: None,
             #[cfg(test)]
             takm_gate: None,
@@ -1050,7 +1059,7 @@ impl TakViewerApp {
         let creating_tab = self.layout_tabs.active_id().is_none();
         if self.views[slot].target() == Some(path.as_path()) { self.discard_identity_candidate(); return; }
         if !self.allow_open_file(&path, Some(slot)) { return; }
-        if self.save_destination_reserved(&path) {
+        if self.save_destination_reserved(&path) || self.progress_writing(&path) {
             self.discard_identity_candidate();
             self.takm_note = Some(("Save in progress for this file.".into(), ctx.input(|i| i.time)));
             return;
@@ -1255,6 +1264,7 @@ impl TakViewerApp {
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
         self.poll_ssh(ctx);
+        self.poll_progress_write(ctx);
         self.poll_remote_emg(ctx);
     }
 
@@ -1436,7 +1446,7 @@ impl TakViewerApp {
                     let slot = self.active;
                     let file_id = self.views[slot].file_id;
                     if self.views[slot].comments.list.get(id).is_some() {
-                        self.type_strip = Some(TypeStrip { slot, file_id, id, rect: egui::Rect::NOTHING, buttons: [egui::Rect::NOTHING; 3], shot: true });
+                        self.type_strip = Some(TypeStrip { slot, file_id, id, rect: egui::Rect::NOTHING, #[cfg(test)] buttons: Vec::new(), shot: true });
                     }
                 }
                 if auto.menu_capture {
@@ -1945,11 +1955,11 @@ impl TakViewerApp {
         self.comment_scroll = Some((self.views[slot].file_id, c.id));
         // The type strip for it (step 5; only here, where it was written).
         let file_id = self.views[slot].file_id;
-        self.type_strip = Some(TypeStrip { slot, file_id, id: c.id, rect: egui::Rect::NOTHING, buttons: [egui::Rect::NOTHING; 3], shot: false });
+        self.type_strip = Some(TypeStrip { slot, file_id, id: c.id, rect: egui::Rect::NOTHING, #[cfg(test)] buttons: Vec::new(), shot: false });
         self.push_comment(slot, Change::Added(c), cleared);
     }
 
-    /// View `slot`'s comment `id` gets type `t` (the strip, `T`): one `edit` line and one undo
+    /// View `slot`'s comment `id` gets type `t`: one `edit` line and one undo
     /// action (consecutive type changes of one comment are one action, `app_undo.rs`); the same
     /// type = nothing. A short note in the status bar says what it is now.
     fn set_comment_type(&mut self, ctx: &egui::Context, slot: usize, id: u64, t: &str) -> bool {
@@ -1963,8 +1973,7 @@ impl TakViewerApp {
         true
     }
 
-    /// `T` (step 5): the selected comment of the active view goes to its next type (none →
-    /// Jitter → Marker swap → Needs visual check → none, type-combo). Nothing with no comment
+    /// `T`: the selected Comment of the active view goes to its next type. Nothing with no Comment
     /// selected, during a cell edit or with the type list open, while `M` is held, or where
     /// comments cannot be written (the key
     /// is used up either way; while a text field has the keys it never gets here). The strip
@@ -2610,6 +2619,9 @@ impl TakViewerApp {
                     self.start_comment_edit(id, Field::Type);
                 }
             }
+            Some(ListAction::SetType(id, kind)) => {
+                self.set_comment_type(ctx, slot, id, kind);
+            }
             // A click on an item of the type list (it is in the edit already): saved at once.
             Some(ListAction::SaveEdit) => self.save_comment_edit(ctx),
             Some(ListAction::Edit(..)) | None => {}
@@ -2726,20 +2738,6 @@ impl TakViewerApp {
                 no_gap = true;
             }
         }
-        // Frame range of the playback bar's band strip: `[` = start here, `]` = end here.
-        if pressed(Key::OpenBracket) {
-            v.range_start_here();
-        }
-        if pressed(Key::CloseBracket) {
-            v.range_end_here();
-        }
-        if edit_keys_allowed && !ctx.input(|i| i.key_down(Key::M)) {
-            let reset_start = exact_key(ctx, Key::OpenBracket, false, true, false);
-            let reset_end = exact_key(ctx, Key::CloseBracket, false, true, false);
-            if reset_start || reset_end {
-                v.pb.set_working_range(v.pb.first, v.pb.last, now);
-            }
-        }
         if edit_keys_allowed && pressed(Key::V) { v.range_start_here(); }
         if edit_keys_allowed && pressed(Key::B) { v.range_end_here(); }
         if edit_keys_allowed && exact_key(ctx, Key::B, false, true, false) { v.range = None; }
@@ -2755,6 +2753,50 @@ impl TakViewerApp {
         }
         if no_gap {
             self.takm_note = Some(("빈 구간을 찾지 못했어요.".into(), now));
+        }
+        if edit_keys_allowed && !ctx.input(|i| i.key_down(Key::M)) {
+            self.working_range_keys(ctx, now);
+        }
+    }
+
+    fn working_range_keys(&mut self, ctx: &egui::Context, now: f64) {
+        let presses = ctx.input_mut(|input| {
+            let mut presses = Vec::new();
+            input.events.retain(|event| {
+                let egui::Event::Key { key, modifiers, pressed: true, repeat, .. } = event else {
+                    return true;
+                };
+                if !matches!(key, Key::OpenBracket | Key::CloseBracket)
+                    || !matches!(*modifiers, Modifiers::NONE | Modifiers::SHIFT)
+                {
+                    return true;
+                }
+                if !repeat {
+                    presses.push((*key, modifiers.shift));
+                }
+                false
+            });
+            presses
+        });
+        if presses.is_empty() {
+            return;
+        }
+        // Two presses can arrive in one UI frame. Record each changed range separately.
+        self.observe(true);
+        for (key, reset) in presses {
+            let pb = &mut self.views[self.active].pb;
+            let (start, end) = pb.working_range();
+            let bounds = if reset {
+                (pb.first, pb.last)
+            } else if key == Key::OpenBracket {
+                (pb.frame, end)
+            } else {
+                (start, pb.frame)
+            };
+            pb.set_working_range(bounds.0, bounds.1, now);
+            if pb.working_range() != (start, end) {
+                self.observe(true);
+            }
         }
     }
 
@@ -2989,8 +3031,8 @@ impl TakViewerApp {
                     Some(d) => {
                         let open = self.open_views();
                         ui.label(text(self.view_label(self.active, &open).unwrap_or_else(|| d.file_name())).strong());
-                        if let Some(number) = crate::take_progress::saved(&d.take) {
-                            ui.label(text(crate::take_progress::label(number).into_owned()));
+                        if let Some(state) = self.view().take_progress() {
+                            ui.label(text(state.label().into_owned()));
                         }
                         ui.label(text(format!("{:.0} Hz", d.take.frame_rate)));
                         if (d.unit_scale - 1.0).abs() > f32::EPSILON {
@@ -3125,6 +3167,7 @@ impl TakViewerApp {
             WsAction::Overlay(p) => self.overlay_on(ctx, p),
             WsAction::OverlayOff => self.overlay_off(self.active),
             WsAction::ToTakm(p) => self.save_takm(ctx, p),
+            WsAction::Progress(pick) => self.pick_progress(ctx, pick),
         }
     }
 
@@ -3427,7 +3470,9 @@ impl TakViewerApp {
                 self.strip_pick = Some(t);
             }
             if let Some(s) = self.type_strip.as_mut() {
-                (s.rect, s.buttons) = (r, buttons);
+                s.rect = r;
+                #[cfg(test)]
+                { s.buttons = buttons; }
             }
         }
         // Name tag and blue edge may reach over the tab row: own clip rect. Painted after the
@@ -3580,7 +3625,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 let workspace_h = (available - reserve).max(26.0);
                 let max = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), workspace_h));
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(max), |ui| {
-                    if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, overlaid, &mut app.explorer) {
+                    if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, overlaid, &mut app.explorer, &mut app.ssh) {
                         self.ws_action = Some(a);
                     }
                 });
@@ -3834,6 +3879,7 @@ impl TakViewerApp {
             self.drive_capture(ctx, now);
         }
         self.explorer.progress.begin_frame();
+        self.ssh.begin_progress_frame();
         // A cell edit of the COMMENTS pane first (its Enter / Esc), then `M` held (comment while
         // watching): its Esc and its key-up come before the rest.
         // The type strip closes on the next action elsewhere (it uses nothing up).
@@ -4163,11 +4209,15 @@ impl TakViewerApp {
         // Last: what a person changed this frame becomes an undo action (`app_undo.rs`).
         self.graph_in_one_place();
         self.observe_frame(ctx);
-        if self.explorer.progress.has_work() {
+        let local_progress = self.explorer.progress.has_work();
+        if local_progress || self.ssh.progress_visible() {
             let minimized = ctx.input(|input| input.viewport().minimized).unwrap_or(false);
             let opening = self.views.iter().any(|v| v.loading.is_some() || v.overlay_load.is_some()
                 || v.waiting_shared_path().is_some()) || self.hidden_file_work_pending();
-            self.explorer.progress.finish_frame(ctx, minimized || opening);
+            if local_progress {
+                self.explorer.progress.finish_frame(ctx, minimized || opening);
+            }
+            self.ssh.finish_progress_frame(minimized || opening);
         }
         self.finish_launch_frame(ctx);
         self.publish_window(ctx);
@@ -6216,7 +6266,7 @@ mod tests {
     }
 
     #[test]
-    fn bracket_keys_set_the_range_ends_at_the_current_frame() {
+    fn edit_range_keys_set_the_range_ends_at_the_current_frame() {
         let ctx = egui::Context::default();
         let mut app = one_view(&ctx);
         let key = |k| [(Modifiers::NONE, k)];
@@ -6225,14 +6275,14 @@ mod tests {
             run_frame(&ctx, app, &key(k));
             app.views[0].range
         };
-        // No range yet: `]` (or `[`) makes a one-frame range at the current frame.
-        assert_eq!(at(&mut app, 4, Key::CloseBracket), Some((4, 4)));
-        assert_eq!(at(&mut app, 7, Key::CloseBracket), Some((4, 7)), "] = end here");
-        assert_eq!(at(&mut app, 2, Key::CloseBracket), Some((2, 4)), "an end before the start: swapped");
-        assert_eq!(at(&mut app, 3, Key::OpenBracket), Some((3, 4)), "[ = start here");
-        assert_eq!(at(&mut app, 8, Key::OpenBracket), Some((4, 8)), "a start after the end: swapped");
+        // No range yet: B (or V) makes a one-frame range at the current frame.
+        assert_eq!(at(&mut app, 4, Key::B), Some((4, 4)));
+        assert_eq!(at(&mut app, 7, Key::B), Some((4, 7)), "B = end here");
+        assert_eq!(at(&mut app, 2, Key::B), Some((2, 4)), "an end before the start: swapped");
+        assert_eq!(at(&mut app, 3, Key::V), Some((3, 4)), "V = start here");
+        assert_eq!(at(&mut app, 8, Key::V), Some((4, 8)), "a start after the end: swapped");
         app.views[0].range = None;
-        assert_eq!(at(&mut app, 6, Key::OpenBracket), Some((6, 6)));
+        assert_eq!(at(&mut app, 6, Key::V), Some((6, 6)));
         assert_eq!(app.views[0].pb.frame, 6, "the keys do not move the frame");
     }
 
@@ -7459,7 +7509,7 @@ mod tests {
     }
 
     #[test]
-    fn a_band_drag_is_one_undo_step_brackets_are_two_and_clears_come_back() {
+    fn a_band_drag_is_one_undo_step_v_and_b_are_two_and_clears_come_back() {
         let ctx = egui::Context::default();
         let mut app = one_view(&ctx);
         assert!(app.views[0].comments.target.is_none(), "comment file not read: no comment can be written, the range still undoes");
@@ -7490,13 +7540,13 @@ mod tests {
         // Esc clears it: one step (the redo side goes), undone.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         assert_eq!((range(&app), steps(&app, 0)), (None, (3, 0)));
-        // `[` then `]`: two steps.
+        // V then B: two steps.
         app.views[0].pb.set_frame(4, 0.0);
         app.quiet();
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::V)]);
         app.views[0].pb.set_frame(6, 0.0);
         app.quiet();
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         assert_eq!((range(&app), steps(&app, 0)), (Some((4, 6)), (5, 0)));
         undo_key(&ctx, &mut app);
         assert_eq!((range(&app), note(&app).as_str()), (Some((4, 4)), "Undo · Range 4"));
@@ -7650,7 +7700,7 @@ mod tests {
         label_click(&mut app, 0, false);
         app.views[0].pb.set_frame(2, 0.0);
         app.quiet(); // (setup: since v0.16.0 a frame move is an action too)
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         undo_key(&ctx, &mut app);
         assert_eq!(steps(&app, 0), (1, 1));
         // The marker already selected alone, the same marker in Labels, Esc-less nothing: no step.
@@ -7661,11 +7711,11 @@ mod tests {
         idle(&ctx, &mut app);
         label_click(&mut app, 0, false);
         assert_eq!(steps(&app, 0), (1, 1), "redo kept: {:?}", app.history.kinds());
-        // `[` / `]` that give the range it already has, a drag to the same range: no step.
+        // V / B that give the range it already has, a drag to the same range: no step.
         redo_key(&ctx, &mut app);
         assert_eq!(app.views[0].range, Some((2, 2)));
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::V)]);
         drag(&ctx, &mut app, bar.band(2.0), bar.band(2.2));
         assert_eq!((app.views[0].range, steps(&app, 0)), (Some((2, 2)), (2, 0)));
         // A real change still clears the redo side.
@@ -7760,10 +7810,10 @@ mod tests {
         assert_eq!(app.views[0].pb.frame, 6);
         app.views[0].pb.set_frame(8, 0.0);
         app.quiet();
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         app.views[0].pb.set_frame(2, 0.0);
         app.quiet();
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].range, steps(&app, 0)), (Some((8, 8)), (3, 1)));
         // Ctrl+Shift+Z: no redo, no undo, no gap jump, no note.
@@ -7843,7 +7893,7 @@ mod tests {
             "Undo · Camera",
         );
         round_trip(&ctx, &mut app, "selection", |_, a| label_click(a, 1, false), |a| sel(a), "Undo · Selection M");
-        round_trip(&ctx, &mut app, "range", |c, a| run_frame(c, a, &[(Modifiers::NONE, Key::OpenBracket)]), |a| v0(a).range, "Undo · Range cleared");
+        round_trip(&ctx, &mut app, "range", |c, a| run_frame(c, a, &[(Modifiers::NONE, Key::V)]), |a| v0(a).range, "Undo · Range cleared");
         idle(&ctx, &mut app);
         let p = plate_middle(&app, 0, 0);
         round_trip(&ctx, &mut app, "plate", |c, a| { click_at(c, a, p); }, |a| v0(a).plate, "Undo · Plate none");
@@ -7931,7 +7981,7 @@ mod tests {
         app.activate(1);
         label_click(&mut app, 0, false);
         app.activate(0);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         let opacity = app.settings.graph_opacity;
         app.settings.graph_opacity = 30;
         frame_with(&ctx, &mut app, vec![]);
@@ -8200,7 +8250,7 @@ mod tests {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowRight)]);
         }
         label_click(&mut app, 1, false);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::V)]);
         app.settings.scene.grid = !app.settings.scene.grid;
         run_frame(&ctx, &mut app, &[(ctrl(), Key::B)]);
         assert_eq!(steps(&app, 0), (0, 0));
@@ -9083,11 +9133,11 @@ mod tests {
         double_click(&ctx, &mut app, cell);
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.comment_edit.is_some() && ctx.wants_keyboard_input(), "the note box has the keys");
-        // App keys do nothing while it does (M, Space, →, `[`, Ctrl+Z, Ctrl+Y).
+        // App keys do nothing while it does (M, Space, →, V, Ctrl+Z, Ctrl+Y).
         app.views[0].range = Some((1, 2));
         app.quiet();
         let before = (app.views[0].pb.frame, app.views[0].pb.playing, app.views[0].range, ids(&app), steps(&app, 0));
-        for (m, k) in [(Modifiers::NONE, Key::M), (Modifiers::NONE, Key::Space), (Modifiers::NONE, Key::ArrowRight), (Modifiers::NONE, Key::OpenBracket), (ctrl(), Key::Z), (ctrl(), Key::Y)] {
+        for (m, k) in [(Modifiers::NONE, Key::M), (Modifiers::NONE, Key::Space), (Modifiers::NONE, Key::ArrowRight), (Modifiers::NONE, Key::V), (ctrl(), Key::Z), (ctrl(), Key::Y)] {
             run_frame(&ctx, &mut app, &[(m, k)]);
         }
         assert_eq!((app.views[0].pb.frame, app.views[0].pb.playing, app.views[0].range, ids(&app), steps(&app, 0)), before, "no app key fired");
@@ -9199,23 +9249,23 @@ mod tests {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, comment_list::ROW_H));
         let [s, e, note] = comment_list::box_rects(row);
         for r in [s, e] {
-            assert!(width("99999", 12.5) + 6.0 <= r.width(), "a five-digit frame fits: {r:?}");
+            assert!(width("99999", comment_list::FRAME_FONT) + 6.0 <= r.width(), "a five-digit frame fits: {r:?}");
         }
-        assert!(note.width() >= 80.0 && note.right() <= 380.0 - 20.0, "the note box and the ✕: {note:?}");
-        // The Type column (type-combo): its name when sorted fits, and each short form fits its
-        // box before the ▼ (text from 5 pt in, ▼ room 15 pt).
+        assert!(note.width() >= 60.0 && note.right() <= 380.0 - 20.0, "the note box and the ✕: {note:?}");
+        // The Type column (type-combo): its name when sorted fits, and each current name fits its
+        // box before the ▼.
         let cell = comment_list::type_cell(row);
         assert!(width("Type ▼", 12.5) + 6.0 <= cell.width(), "Type ▼ fits: {}", cell.width());
         let tbox = comment_list::type_box_of(row);
-        for s in ["Jitter", "Check", "Swap", "—"] {
-            assert!(width(s, 12.5) + 5.0 + 15.0 <= tbox.width(), "{s} fits the Type box: {}", tbox.width());
+        for s in comments::TYPES.iter().copied().chain(["—", "Needs visual check", "Marker swap"]) {
+            assert!(width(s, 9.0) + 4.0 + 13.0 <= tbox.width(), "{s} fits the Type box: {}", tbox.width());
         }
         // The type list: its items have no hover text either, and the list fits ~380 pt.
         let ty = comment_list::type_point(row_of(&ctx, &mut app, 1));
         tap(&ctx, &mut app, ty);
         frame_with(&ctx, &mut app, vec![]);
         let items = app.type_items.clone();
-        assert_eq!(items.len(), 4, "the list is open");
+        assert_eq!(items.len(), comments::TYPES.len() + 1, "the list is open");
         for (_, r) in items {
             frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(r.center())]);
             for _ in 0..3 {
@@ -9223,7 +9273,7 @@ mod tests {
                 assert!(!ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|l| l.order == egui::Order::Tooltip)), "no hover text on an item");
             }
         }
-        let name_w = comment_list::TYPE_LIST.iter().map(|v| width(comment_list::item_name(v), 12.5)).fold(0.0, f32::max);
+        let name_w = comment_list::type_choices().map(|v| width(comment_list::item_name(v), 12.5)).fold(0.0, f32::max);
         let size = comment_list::list_size(name_w);
         let room = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 300.0));
         let at = comment_list::list_place(tbox.translate(egui::vec2(0.0, 100.0)), size, room);
@@ -9278,8 +9328,7 @@ mod tests {
         app.type_strip.as_ref().map(|s| s.id)
     }
 
-    /// Middle of type button `k` (0 Jitter, 1 Marker swap, 2 Needs visual check; type-combo order) of the strip as
-    /// drawn now.
+    /// Middle of type button `k` on the strip.
     fn strip_button(ctx: &egui::Context, app: &mut TakViewerApp, k: usize) -> egui::Pos2 {
         frame_with(ctx, app, vec![]);
         app.type_strip.as_ref().expect("a strip").buttons[k].center()
@@ -9309,7 +9358,93 @@ mod tests {
     }
 
     #[test]
+    fn one_click_types_an_existing_agent_comment_and_keeps_the_legacy_tail() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("type_agent_legacy_tail");
+        typed_on_disk(&dir, &[(1, 2, "Needs visual check"), (2, 3, "Marker swap"), (3, 4, "Custom type")]);
+        let path = dir.join("a.takm");
+        let added = tak_core::comment_command::add(
+            &path,
+            br#"[{"markers":[],"start":5,"end":5,"text":"agent review"}]"#,
+            Default::default(),
+            capture::local_iso_time,
+        ).unwrap();
+        let added = serde_json::to_value(added).unwrap();
+        let agent = added["added"][0]["id"].as_u64().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.show_pane(Pane::Comments);
+        let open = |app: &mut TakViewerApp| {
+            app.open(&ctx, path.clone());
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while app.views[0].comments.list.get(agent).is_none() {
+                assert!(Instant::now() < deadline, "open did not load Comments: {:?}", app.error);
+                frame_with(&ctx, app, vec![]);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        open(&mut app);
+        let [_, _, note_cell, _] = cells_of(&ctx, &mut app, 1);
+        tap(&ctx, &mut app, note_cell);
+        assert_eq!((picked(&app), type_of(&app, 1).as_str()), (Some(1), "Needs visual check"));
+        app.close_view(0);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "open, pick and close are byte-identical");
+
+        open(&mut app);
+        let [_, _, note_cell, _] = cells_of(&ctx, &mut app, agent);
+        tap(&ctx, &mut app, note_cell);
+        assert_eq!((picked(&app), type_of(&app, agent).as_str(), list_open(&app)), (Some(agent), "", None));
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let pane = place_of(&app, Pane::Comments);
+        let table = row_of(&ctx, &mut app, 1);
+        let buttons: Vec<_> = comments::TYPES.iter().map(|kind| {
+            let r = text_rects(&out, kind).into_iter().find(|r| r.bottom() < table.top()).unwrap();
+            assert!(pane.contains_rect(r), "{kind} is visible within {pane:?}");
+            r
+        }).collect();
+        tap(&ctx, &mut app, buttons.last().unwrap().center());
+        let last_kind = *comments::TYPES.last().unwrap();
+        assert_eq!(type_of(&app, agent), last_kind);
+        until_saved(&ctx, &mut app);
+        assert!(std::fs::read(&path).unwrap().starts_with(&original), "edit appends after every original byte");
+        undo_key(&ctx, &mut app);
+        assert_eq!(type_of(&app, agent), "");
+        redo_key(&ctx, &mut app);
+        assert_eq!(type_of(&app, agent), last_kind);
+        until_saved(&ctx, &mut app);
+        let parsed = tak_core::takm::read_comments(&path).unwrap();
+        for (id, kind) in [(1, "Needs visual check"), (2, "Marker swap"), (3, "Custom type")] {
+            assert_eq!(parsed.comments().get(id).unwrap().comment_type, kind);
+            assert_eq!(parsed.events.iter().filter(|event| event.id == id).count(), 1);
+        }
+        app.close_view(0);
+        assert!(std::fs::read(path).unwrap().starts_with(&original), "undo, redo and close preserve the original bytes");
+    }
+
+    #[test]
+    fn post_create_type_buttons_wrap_and_fit_the_narrow_playback_bar() {
+        let ctx = egui::Context::default();
+        let deck = egui::Rect::from_min_size(egui::pos2(20.0, 400.0), egui::vec2(220.0, 60.0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let buttons = panels::type_strip_rects(ctx, deck);
+            let strip = panels::type_strip_rect(&buttons);
+            assert_eq!(buttons.len(), comments::TYPES.len());
+            assert!(strip.left() >= deck.left() && strip.right() <= deck.right());
+            assert!(strip.bottom() <= deck.top() && buttons.last().unwrap().top() > buttons[0].top());
+            let font = egui::FontId::proportional(13.0);
+            for (kind, r) in comments::TYPES.iter().zip(&buttons) {
+                let width = ctx.fonts(|f| f.layout_no_wrap((*kind).to_owned(), font.clone(), egui::Color32::WHITE).size().x);
+                assert!(r.width() > width && strip.contains_rect(*r), "{kind} fits its button");
+            }
+            for (index, a) in buttons.iter().enumerate() {
+                assert!(buttons[index + 1..].iter().all(|b| !a.intersects(*b)));
+            }
+        });
+    }
+
+    #[test]
     fn a_type_strip_follows_each_new_comment_a_click_sets_the_type_and_the_next_action_closes_it() {
+        // M creates a Comment and briefly shows the type buttons by the bar.
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("strip");
         let dir = _dir_guard.to_path_buf();
@@ -9319,12 +9454,12 @@ mod tests {
         app.views[0].select(0, false);
         let button_before = comment_button_at(&ctx, &mut app);
         let scene_before = app.views[0].scene_rect;
-        // M short: comment 1, its strip with the three full names, over the 3D right above the
+        // M short: comment 1, its strip with the full names, over the 3D right above the
         // bar's right end; nothing in the bar or the 3D moved.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::M)]);
         assert_eq!((ids(&app), strip_for(&app)), (vec![1], Some(1)));
         let out = frame_with(&ctx, &mut app, vec![]);
-        for t in comments::TYPES {
+        for &t in comments::TYPES {
             assert_eq!(text_rects(&out, t).len(), 1, "{t} on the strip");
         }
         let s = app.type_strip.clone().unwrap();
@@ -9352,24 +9487,24 @@ mod tests {
         // stays open and marks it.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Jitter", Some(1)));
-        // A click on Marker swap: that type, one edit line; the strip closes. With the T just
+        // A click on Jump: that type, one edit line; the strip closes. With the T just
         // before it is one action (type changes of one comment in a row).
         let at = strip_button(&ctx, &mut app, 1);
         tap(&ctx, &mut app, at);
-        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Marker swap", None));
-        assert_eq!(note(&app), "Comment 1 · Marker swap");
+        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Jump", None));
+        assert_eq!(note(&app), "Comment 1 · Jump");
         assert_eq!(app.history.kinds().len(), kinds.len() + 1);
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment"));
         file_matches_memory(&ctx, &mut app, &dir);
         let ev = file_events(&dir);
         let types: Vec<(comments::Kind, &str)> = ev[lines..].iter().map(|e| (e.kind, e.comment_type.as_str())).collect();
-        assert_eq!(types, vec![(comments::Kind::Edit, "Jitter"), (comments::Kind::Edit, "Marker swap")]);
+        assert_eq!(types, vec![(comments::Kind::Edit, "Jitter"), (comments::Kind::Edit, "Jump")]);
         assert_eq!(app.views[0].selected, BTreeSet::from([0]), "the click on the strip did not reach the 3D");
         // Ctrl+Z / Ctrl+Y: the type goes and comes back (edit lines).
         undo_key(&ctx, &mut app);
         assert_eq!((type_of(&app, 1).as_str(), note(&app).as_str()), ("", "Undo · Comment 1 edited"));
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 1), "Marker swap");
+        assert_eq!(type_of(&app, 1), "Jump");
         file_matches_memory(&ctx, &mut app, &dir);
         // M held over frames: the strip comes when M goes up.
         app.views[0].pb.set_frame(2, 0.0);
@@ -9423,9 +9558,9 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::M)]);
         assert_eq!((ids(&app), strip_for(&app)), (vec![1], None));
         // `--type-strip` (pictures): drawn, but a click on it writes nothing.
-        app.type_strip = Some(TypeStrip { slot: 0, file_id: app.views[0].file_id, id: 1, rect: egui::Rect::NOTHING, buttons: [egui::Rect::NOTHING; 3], shot: true });
+        app.type_strip = Some(TypeStrip { slot: 0, file_id: app.views[0].file_id, id: 1, rect: egui::Rect::NOTHING, buttons: Vec::new(), shot: true });
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, "Needs visual check").len(), 1, "shown for the picture");
+        assert_eq!(text_rects(&out, "Visual check").len(), 1, "shown for the picture");
         let at = strip_button(&ctx, &mut app, 0);
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 1), "");
@@ -9442,61 +9577,57 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("t_key");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 2, ""), (2, 7, "")]);
+        typed_on_disk(&dir, &[(1, 2, "Needs visual check"), (2, 7, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         // Nothing selected: T does nothing.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), (String::new(), String::new(), 2));
+        assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), ("Needs visual check".into(), String::new(), 2));
         assert!(app.history.kinds().is_empty());
         // Comment 2 selected (a row click): T goes round; back at none the presses cancel out.
         let [_, at, _, _] = cells_of(&ctx, &mut app, 2);
         tap(&ctx, &mut app, at);
         let kinds = app.history.kinds();
-        for want in ["Jitter", "Marker swap", "Needs visual check", ""] {
+        for want in comment_list::type_choices() {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
             assert_eq!(type_of(&app, 2), want);
-            assert_eq!(type_of(&app, 1), "", "only the selected one");
+            assert_eq!(type_of(&app, 1), "Needs visual check", "only the selected one");
         }
-        assert_eq!(app.history.kinds(), kinds, "four presses back to the start: no action left");
+        assert_eq!(app.history.kinds(), kinds, "a full cycle removes the undo action");
         until_saved(&ctx, &mut app);
-        assert_eq!(line_count(&dir), 6, "one edit line per press");
+        assert_eq!(line_count(&dir), 2 + comments::TYPES.len() + 1, "one edit line per press");
         // Two presses: one action, its note; the tab shows the short form.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("Marker swap", "Comment 2 · Marker swap"));
+        assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("Jump", "Comment 2 · Jump"));
         assert_eq!(app.history.kinds().len(), kinds.len() + 1);
         let out = frame_with(&ctx, &mut app, vec![]);
         let cell = comment_list::type_cell(app.comment_rows.iter().find(|r| r.0 == 2).unwrap().1);
-        assert_eq!(text_rects(&out, "Swap").iter().filter(|t| cell.contains(t.center())).count(), 1, "short form in the Type box");
+        assert_eq!(text_rects(&out, "Jump").iter().filter(|t| cell.contains(t.center())).count(), 1, "stored name in the Type box");
         // One Ctrl+Z takes both presses back; Ctrl+Y does them again.
         undo_key(&ctx, &mut app);
         assert_eq!(type_of(&app, 2), "");
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 2), "Marker swap");
+        assert_eq!(type_of(&app, 2), "Jump");
         // After a frame move the next press is a new action.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowRight)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "Needs visual check");
+        assert_eq!(type_of(&app, 2), "Visual check");
         let k = app.history.kinds();
         assert_eq!(k[k.len() - 2..].to_vec(), vec!["Frame".to_owned(), "Comment".to_owned()]);
         // A held T repeats (egui marks the presses while it is down): only the real press counts.
         key_down(&ctx, &mut app, Key::T);
-        assert_eq!(type_of(&app, 2), "");
+        assert_eq!(type_of(&app, 2), "File bad");
         for _ in 0..3 {
             frame_with(&ctx, &mut app, vec![key_event(Key::T, true, Modifiers::NONE)]);
         }
         key_up(&ctx, &mut app, Key::T);
-        assert_eq!(type_of(&app, 2), "", "the auto-repeat did nothing");
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "Needs visual check");
+        assert_eq!(type_of(&app, 2), "File bad", "the auto-repeat did nothing");
         // During a cell edit (here the note box has the keys): T does nothing.
         let [_, _, note_cell, _] = cells_of(&ctx, &mut app, 2);
         double_click(&ctx, &mut app, note_cell);
         assert_eq!(app.comment_edit.as_ref().map(|e| e.field), Some(Field::Text));
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "Needs visual check");
+        assert_eq!(type_of(&app, 2), "File bad");
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         // The type list open (type-combo; no text box): T and M do nothing, the list stays.
         let t = comment_list::type_point(row_of(&ctx, &mut app, 2));
@@ -9508,7 +9639,7 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::M)]);
         frame_with(&ctx, &mut app, vec![]);
-        assert_eq!((type_of(&app, 2).as_str(), ids(&app), line_count(&dir)), ("Needs visual check", vec![1, 2], lines));
+        assert_eq!((type_of(&app, 2).as_str(), ids(&app), line_count(&dir)), ("File bad", vec![1, 2], lines));
         assert_eq!(app.comment_edit.as_ref().map(|e| (e.id, e.field)), Some((2, Field::Type)), "still open");
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         assert!(app.comment_edit.is_none());
@@ -9518,7 +9649,16 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert!(ctx.wants_keyboard_input());
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "Needs visual check");
+        assert_eq!(type_of(&app, 2), "File bad");
+        app.path_input = None;
+        let [_, at, _, _] = cells_of(&ctx, &mut app, 1);
+        tap(&ctx, &mut app, at);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
+        assert_eq!(type_of(&app, 1), "");
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
+        assert_eq!(type_of(&app, 1), "Jitter");
+        undo_key(&ctx, &mut app);
+        assert_eq!(type_of(&app, 1), "Needs visual check");
         file_matches_memory(&ctx, &mut app, &dir);
     }
 
@@ -9544,7 +9684,7 @@ mod tests {
 
     /// The item highlighted in the open list (None: no list, or nothing highlighted).
     fn highlighted(app: &TakViewerApp) -> Option<String> {
-        app.comment_edit.as_ref().filter(|e| e.field == Field::Type && comment_list::TYPE_LIST.contains(&e.choice.as_str())).map(|e| e.choice.clone())
+        app.comment_edit.as_ref().filter(|e| e.field == Field::Type && comment_list::type_choices().any(|value| value == e.choice)).map(|e| e.choice.clone())
     }
 
     /// Whether `text` was painted with its left end inside `r`.
@@ -9557,54 +9697,52 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("tab_type");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "Marker swap"), (5, 5, "Later kind")]);
+        typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "Marker swap"), (5, 5, "Later kind"), (6, 6, "Jump")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let place = place_of(&app, Pane::Comments);
         // Every row: its box with the short form (`—` for none, an unknown value as written).
         let out = frame_with(&ctx, &mut app, vec![]);
         let rows = app.comment_rows.clone();
-        assert_eq!(rows.len(), 5);
-        for (id, short) in [(1, "Jitter"), (2, "—"), (3, "Check"), (4, "Swap"), (5, "Later kind")] {
+        assert_eq!(rows.len(), 6);
+        for (id, short) in [(1, "Jitter"), (2, "—"), (3, "Needs visual check"), (4, "Marker swap"), (5, "Later kind"), (6, "Jump")] {
             let b = comment_list::type_box_of(rows.iter().find(|r| r.0 == id).unwrap().1);
             assert!(text_in_box(&out, short, b), "{short} in the box of row {id}");
         }
-        for long in ["Marker swap", "Needs visual check", "None"] {
-            assert!(text_rects(&out, long).is_empty(), "no full name while the list is closed: {long}");
-        }
+        assert!(text_rects(&out, "None").is_empty(), "None appears only in the dropdown");
         assert!(app.type_items.is_empty() && list_open(&app).is_none());
-        // The Type column sorts in the one order: none, Jitter, Marker swap, Needs visual check,
-        // then unknown values.
+        // Current types sort before retired and unknown ones.
         let h = header(&ctx, &mut app, "Type");
         tap(&ctx, &mut app, h);
-        assert_eq!(shown_ids(&ctx, &mut app), vec![2, 1, 4, 3, 5]);
+        assert_eq!(shown_ids(&ctx, &mut app), vec![2, 1, 6, 5, 4, 3]);
         let h = header(&ctx, &mut app, "Type ▲");
         tap(&ctx, &mut app, h);
-        assert_eq!(shown_ids(&ctx, &mut app), vec![5, 3, 4, 1, 2]);
+        assert_eq!(shown_ids(&ctx, &mut app), vec![3, 4, 5, 6, 1, 2]);
         let h = header(&ctx, &mut app, "Type ▼");
         tap(&ctx, &mut app, h);
-        assert_eq!(shown_ids(&ctx, &mut app), vec![2, 1, 4, 3, 5]);
-        // One click on the box of comment 4 (a middle row): it is selected and gone to (a row
-        // click), and its list opens right under the box, inside the tab: the full names in
+        assert_eq!(shown_ids(&ctx, &mut app), vec![2, 1, 6, 5, 4, 3]);
+        // One click on the box of comment 6 (a middle row): it is selected and gone to (a row
+        // click), and its list opens next to the box: the full names in
         // the one order, None last, its type highlighted. Nothing written.
         let lines = line_count(&dir);
         let f0 = app.views[0].pb.frame;
-        open_type_list(&ctx, &mut app, 4);
-        assert_eq!((list_open(&app), picked(&app), app.views[0].pb.frame), (Some(4), Some(4), f0), "selected, not gone to (v0.27.3)");
+        open_type_list(&ctx, &mut app, 6);
+        assert_eq!((list_open(&app), picked(&app), app.views[0].pb.frame), (Some(6), Some(6), f0), "selected, not gone to (v0.27.3)");
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, "Comment 4 유형 · ↑ ↓ Enter · Esc 닫기").len(), 1, "the line at the top");
+        assert_eq!(text_rects(&out, "Comment 6 유형 · ↑ ↓ Enter · Esc 닫기").len(), 1, "the line at the top");
         let items = app.type_items.clone();
-        assert_eq!(items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), ["Jitter", "Marker swap", "Needs visual check", ""]);
-        let bx = comment_list::type_box_of(row_of(&ctx, &mut app, 4));
+        assert!(items.iter().map(|i| i.0.as_str()).eq(comment_list::type_choices()));
+        let bx = comment_list::type_box_of(row_of(&ctx, &mut app, 6));
         let list = items.iter().fold(egui::Rect::NOTHING, |a, i| a.union(i.1));
-        assert!(place.contains_rect(list), "inside the tab: {list:?} in {place:?}");
-        assert!(list.top() >= bx.bottom() - 0.5 && list.top() <= bx.bottom() + 6.0, "right under the box: {list:?} / {bx:?}");
-        for k in 1..4 {
+        assert!(ctx.screen_rect().contains_rect(list) && place.x_range().contains(list.left()) && place.x_range().contains(list.right()));
+        assert!(((list.top() - bx.bottom()) - 3.0).abs() <= 1.0 || ((bx.top() - list.bottom()) - 3.0).abs() <= 1.0,
+            "opens beside the box: {list:?} / {bx:?}");
+        for k in 1..items.len() {
             assert!(items[k].1.top() >= items[k - 1].1.bottom() - 0.5, "top to bottom");
         }
-        for name in ["Jitter", "Marker swap", "Needs visual check", "None"] {
+        for name in comment_list::type_choices().map(comment_list::item_name) {
             assert!(text_rects(&out, name).iter().any(|t| list.contains(t.center())), "{name} in the list");
         }
-        assert_eq!(highlighted(&app).as_deref(), Some("Marker swap"), "the current one highlighted");
+        assert_eq!(highlighted(&app).as_deref(), Some("Jump"), "the current one highlighted");
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), lines, "opening writes nothing");
         // A click elsewhere in a row (not on the box) is a plain row click: the list closes and
@@ -9643,33 +9781,33 @@ mod tests {
         open_type_list(&ctx, &mut app, 2);
         assert_eq!(highlighted(&app).as_deref(), Some(""), "none: None highlighted");
         let (lines, kinds, rev) = (line_count(&dir), app.history.kinds().len(), app.views[0].comments.list.revision());
-        // Marker swap: saved at once (one edit line, one action), the list closes; the click
+        // Jump: saved at once (one edit line, one action), the list closes; the click
         // does not reach the row under the list.
-        let at = item_at(&ctx, &mut app, "Marker swap");
+        let at = item_at(&ctx, &mut app, "Jump");
         tap(&ctx, &mut app, at);
-        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, "Marker swap"));
+        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, "Jump"));
         assert_eq!((picked(&app), app.views[0].pb.frame), (Some(2), f0), "the row under the list got nothing");
-        assert_eq!(note(&app), "Comment 2 · Marker swap");
+        assert_eq!(note(&app), "Comment 2 · Jump");
         assert_eq!(app.history.kinds().len(), kinds + 1);
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment"));
         assert!(app.views[0].comments.list.revision() != rev, "the list and the band are made again");
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), lines + 1);
         let last = file_events(&dir).pop().unwrap();
-        assert_eq!((last.kind, last.id, last.comment_type.as_str()), (comments::Kind::Edit, 2, "Marker swap"));
+        assert_eq!((last.kind, last.id, last.comment_type.as_str()), (comments::Kind::Edit, 2, "Jump"));
         file_matches_memory(&ctx, &mut app, &dir);
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert!(text_in_box(&out, "Swap", comment_list::type_box_of(row_of(&ctx, &mut app, 2))), "the box shows it");
+        assert!(text_in_box(&out, "Jump", comment_list::type_box_of(row_of(&ctx, &mut app, 2))), "the box shows it");
         // Ctrl+Z / Ctrl+Y.
         undo_key(&ctx, &mut app);
         assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("", "Undo · Comment 2 edited"));
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 2), "Marker swap");
+        assert_eq!(type_of(&app, 2), "Jump");
         file_matches_memory(&ctx, &mut app, &dir);
         // The same type again: no line, no action; the list closes.
         open_type_list(&ctx, &mut app, 2);
         let (lines, kinds) = (line_count(&dir), app.history.kinds().len());
-        let at = item_at(&ctx, &mut app, "Marker swap");
+        let at = item_at(&ctx, &mut app, "Jump");
         tap(&ctx, &mut app, at);
         until_saved(&ctx, &mut app);
         assert_eq!((list_open(&app), line_count(&dir), app.history.kinds().len()), (None, lines, kinds));
@@ -9690,22 +9828,24 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("type_keys");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 1, ""), (2, 2, "Needs visual check"), (3, 3, "Later kind")]);
+        typed_on_disk(&dir, &[(1, 1, ""), (2, 2, comments::TYPES.last().unwrap()), (3, 3, "Later kind")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         open_type_list(&ctx, &mut app, 2);
         let (frame, lines, kinds) = (app.views[0].pb.frame, line_count(&dir), app.history.kinds().len());
-        // ↓ to None (stops there), ↑ ↑ to Marker swap; the frame stays (↑ ↓ go to the list).
+        // ↓ to None (stops there), ↑ ↑ to the penultimate type; the frame stays (↑ ↓ go to the list).
         let mut seen = vec![];
         for key in [Key::ArrowDown, Key::ArrowDown, Key::ArrowUp, Key::ArrowUp] {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, key)]);
             seen.push(highlighted(&app).unwrap());
         }
-        assert_eq!(seen, ["", "", "Needs visual check", "Marker swap"]);
-        assert_eq!((app.views[0].pb.frame, type_of(&app, 2).as_str()), (frame, "Needs visual check"), "not saved yet");
+        let last = comments::TYPES[comments::TYPES.len() - 1];
+        let previous = comments::TYPES[comments::TYPES.len() - 2];
+        assert_eq!(seen, ["", "", last, previous]);
+        assert_eq!((app.views[0].pb.frame, type_of(&app, 2).as_str()), (frame, last), "not saved yet");
         // Enter picks it: one edit line, one action, the list closes.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Enter)]);
         until_saved(&ctx, &mut app);
-        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, "Marker swap"));
+        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, previous));
         assert_eq!((line_count(&dir), app.history.kinds().len()), (lines + 1, kinds + 1));
         // Esc: closed with nothing changed, no action; the Esc does not also clear the
         // selection.
@@ -9714,7 +9854,7 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowUp)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         until_saved(&ctx, &mut app);
-        assert_eq!((list_open(&app), type_of(&app, 2).as_str(), picked(&app)), (None, "Marker swap", Some(2)));
+        assert_eq!((list_open(&app), type_of(&app, 2).as_str(), picked(&app)), (None, previous, Some(2)));
         assert_eq!((line_count(&dir), app.history.kinds().len()), (lines, kinds));
         // A value the app does not know: the list opens with nothing highlighted; Enter changes
         // nothing; ↓ starts at the first item, and any item replaces the value.
@@ -9726,9 +9866,9 @@ mod tests {
         open_type_list(&ctx, &mut app, 3);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowDown)]);
         assert_eq!(highlighted(&app).as_deref(), Some("Jitter"));
-        let at = item_at(&ctx, &mut app, "Needs visual check");
+        let at = item_at(&ctx, &mut app, "Visual check");
         tap(&ctx, &mut app, at);
-        assert_eq!(type_of(&app, 3), "Needs visual check");
+        assert_eq!(type_of(&app, 3), "Visual check");
         // With the list closed, ↑ ↓ step frames as always.
         let f = app.views[0].pb.frame;
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowUp)]);
@@ -9764,9 +9904,9 @@ mod tests {
         frame_with(&ctx, &mut app, vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 1.0), modifiers: Modifiers::NONE }]);
         assert_eq!(list_open(&app), None);
         // Another box (not under the list): closed, then that one's list opens.
-        open_type_list(&ctx, &mut app, 2);
         open_type_list(&ctx, &mut app, 1);
-        assert_eq!((list_open(&app), picked(&app)), (Some(1), Some(1)));
+        open_type_list(&ctx, &mut app, 2);
+        assert_eq!((list_open(&app), picked(&app)), (Some(2), Some(2)));
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         until_saved(&ctx, &mut app);
         assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), (String::new(), String::new(), lines), "nothing written");
@@ -9777,7 +9917,8 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("type_last_row");
         let dir = _dir_guard.to_path_buf();
-        let list: Vec<(u64, i64, &str)> = (1..=60u64).map(|k| (k, (k % 10) as i64, ["", "Jitter", "Marker swap", "Needs visual check"][k as usize % 4])).collect();
+        let types: Vec<_> = comment_list::type_choices().collect();
+        let list: Vec<_> = (1..=60u64).map(|k| (k, (k % 10) as i64, types[k as usize % types.len()])).collect();
         typed_on_disk(&dir, &list);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let place = place_of(&app, Pane::Comments);
@@ -9786,7 +9927,8 @@ mod tests {
         assert!(rows.len() < 60, "the tab is full of rows: {}", rows.len());
         // A box in every row on screen.
         for (id, row) in &rows {
-            let short = ["—", "Jitter", "Swap", "Check"][*id as usize % 4];
+            let kind = types[*id as usize % types.len()];
+            let short = if kind.is_empty() { "—" } else { kind };
             let b = comment_list::type_box_of(*row);
             if place.contains_rect(b) {
                 assert!(text_in_box(&out, short, b), "{short} in row {id}");
@@ -9834,8 +9976,8 @@ mod tests {
         app.comment_edit = Some(comment_list::Edit::new(0, v.file_id, v.comments.list.get(1).unwrap(), Field::Type, v.selection()));
         frame_with(&ctx, &mut app, vec![]);
         frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(app.type_items.len(), 4, "shown for the picture");
-        let at = item_at(&ctx, &mut app, "Marker swap");
+        assert_eq!(app.type_items.len(), comments::TYPES.len() + 1, "shown for the picture");
+        let at = item_at(&ctx, &mut app, "Jump");
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 1), "Jitter");
         assert!(app.comment_writer.is_none());
@@ -10338,7 +10480,8 @@ mod tests {
     fn editor_lines(ctx: &egui::Context, app: &mut TakViewerApp) -> Vec<String> {
         let explorer = place_of(app, Pane::Explorer);
         let out = frame_with(ctx, app, vec![]);
-        editor_texts(&out, explorer).into_iter().map(|t| t.1).filter(|text| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두")).collect()
+        editor_texts(&out, explorer).into_iter().map(|t| t.1)
+            .filter(|text| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두") && text != "·").collect()
     }
 
     /// Where an OPEN EDITORS text is (its middle).
@@ -11622,9 +11765,9 @@ mod tests {
         app.takm_note = None;
         // The range on the band strip works as before.
         app.views[0].pb.set_frame(2, 0.0);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::V)]);
         app.views[0].pb.set_frame(6, 0.0);
-        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::B)]);
         assert_eq!(app.views[0].range, Some((2, 6)));
         // The COMMENTS pane: the reason and the button, no list.
         app.show_pane(Pane::Comments);

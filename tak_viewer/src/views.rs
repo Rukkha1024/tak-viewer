@@ -53,6 +53,7 @@ impl RetainedDocument {
 pub struct SharedFile(Arc<Mutex<SharedFileState>>);
 
 struct SharedFileState {
+    progress: Option<crate::take_progress::State>,
     filters: crate::device_filter::SharedFilters,
     generation: u64,
     data: Arc<ViewData>,
@@ -712,6 +713,7 @@ impl View {
         if self.shared_file.is_none() {
             self.shared_file = Some(SharedFile(Arc::new(Mutex::new(SharedFileState {
                 generation: 0,
+                progress: None,
                 filters: self.filters.clone(),
                 data: self.data.clone()?,
                 document: self.edit_document.clone()?,
@@ -726,6 +728,31 @@ impl View {
         }
         self.sync_shared();
         self.shared_file.clone()
+    }
+
+    pub fn take_progress(&self) -> Option<crate::take_progress::State> {
+        self.shared_file.as_ref().and_then(|shared| shared.0.lock().ok()?.progress)
+            .or_else(|| self.data.as_ref().and_then(|data| crate::take_progress::saved(&data.take)))
+    }
+
+    pub fn set_progress_stamp(&mut self, path: PathBuf, stamp: (u64, Option<std::time::SystemTime>)) {
+        let current = (path, stamp.0, stamp.1);
+        if let Some(stamp) = &self.source_stamp {
+            if let Ok(mut stamp) = stamp.lock() { *stamp = Some(current); }
+        }
+        self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
+    }
+
+    pub fn set_take_progress(&mut self, progress: crate::take_progress::State, fixed_len: u64) {
+        let label = self.path().map(|path| comments::file_label(path, fixed_len));
+        if let Some(shared) = self.shared_file.clone() {
+            if let Ok(mut state) = shared.0.lock() {
+                state.progress = Some(progress);
+                state.comments.label = label.clone();
+            }
+        }
+        self.comments.label = label;
+        self.editor_revision = self.editor_revision.wrapping_add(1);
     }
 
     pub fn shares_document(&self, other: &View) -> bool {

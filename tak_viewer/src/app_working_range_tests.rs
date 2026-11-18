@@ -25,6 +25,57 @@ fn playback_working_range_handle_drag_sorts_clamps_and_undoes_independently() {
 }
 
 #[test]
+fn playback_brackets_swap_bounds_without_changing_the_edit_range_or_frame() {
+    let ctx = egui::Context::default();
+    let mut app = one_view(&ctx);
+    app.views[0].pb.set_working_range(2, 6, 0.0);
+    app.views[0].set_range(1, 4);
+    app.views[0].pb.set_frame(9, 0.0);
+    app.quiet();
+
+    key_down(&ctx, &mut app, Key::OpenBracket);
+    assert_eq!(app.views[0].pb.working_range(), (6, 9));
+    key_down(&ctx, &mut app, Key::OpenBracket);
+    assert_eq!(app.views[0].pb.working_range(), (6, 9), "ignore OS repeats");
+    key_up(&ctx, &mut app, Key::OpenBracket);
+    app.views[0].pb.set_frame(0, 0.0);
+    app.quiet();
+    run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::CloseBracket)]);
+    assert_eq!(app.views[0].pb.working_range(), (0, 6));
+    assert_eq!(app.views[0].pb.frame, 0);
+    assert_eq!(app.views[0].range, Some((1, 4)));
+    assert_eq!(app.history.kinds(), ["PlaybackControls", "PlaybackControls"]);
+    undo_key(&ctx, &mut app);
+    assert_eq!(app.views[0].pb.working_range(), (6, 9));
+    undo_key(&ctx, &mut app);
+    assert_eq!(app.views[0].pb.working_range(), (2, 6));
+    redo_key(&ctx, &mut app);
+    redo_key(&ctx, &mut app);
+    assert_eq!(app.views[0].pb.working_range(), (0, 6));
+    assert_eq!(app.views[0].range, Some((1, 4)));
+}
+
+#[test]
+fn playback_brackets_make_one_action_per_press_in_the_same_ui_frame() {
+    let ctx = egui::Context::default();
+    let mut app = one_view(&ctx);
+    app.views[0].pb.set_working_range(2, 8, 0.0);
+    app.views[0].pb.set_frame(6, 0.0);
+    app.quiet();
+    run_frame(
+        &ctx,
+        &mut app,
+        &[(Modifiers::NONE, Key::OpenBracket), (Modifiers::NONE, Key::CloseBracket)],
+    );
+    assert_eq!(app.views[0].pb.working_range(), (6, 6));
+    assert_eq!(app.history.kinds(), ["PlaybackControls", "PlaybackControls"]);
+    undo_key(&ctx, &mut app);
+    assert_eq!(app.views[0].pb.working_range(), (6, 8));
+    undo_key(&ctx, &mut app);
+    assert_eq!(app.views[0].pb.working_range(), (2, 8));
+}
+
+#[test]
 fn playback_working_range_reset_keys_are_exact_and_follow_input_priority() {
     let ctx = egui::Context::default();
     let mut app = one_view(&ctx);
@@ -36,7 +87,7 @@ fn playback_working_range_reset_keys_are_exact_and_follow_input_priority() {
     app.views[0].pb.set_frame(3, 0.0);
     app.quiet();
 
-    run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
+    run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::V)]);
     assert_eq!(app.views[0].range, Some((3, 3)));
     assert_eq!(app.views[0].pb.working_range(), (2, 8));
     run_frame(
@@ -52,6 +103,7 @@ fn playback_working_range_reset_keys_are_exact_and_follow_input_priority() {
     );
     assert_eq!(app.views[0].pb.working_range(), (2, 8));
     key_down(&ctx, &mut app, Key::M);
+    run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::OpenBracket)]);
     run_frame(&ctx, &mut app, &[(shift, Key::OpenBracket)]);
     assert_eq!(app.views[0].pb.working_range(), (2, 8));
     key_up(&ctx, &mut app, Key::M);

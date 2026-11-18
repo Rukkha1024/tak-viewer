@@ -41,6 +41,7 @@ mod shot_output;
 mod label_increment;
 mod ssh;
 mod ssh_probe;
+mod ssh_progress_probe;
 mod soft_render;
 mod take_progress;
 mod ui;
@@ -132,6 +133,13 @@ fn main() -> eframe::Result<()> {
         let takm_args: Vec<String> = std::iter::once(args[1].clone()).chain(paths).collect();
         std::process::exit(tak_core::takm::run(&takm_args));
     }
+    if args.iter().skip(1).find(|arg| *arg != "--headless").is_some_and(|arg| arg == "--ssh-test-progress") {
+        if !args.iter().skip(1).any(|arg| arg == "--headless") {
+            cli_exit(2, &format!("SSH 진행 상태 시험에는 --headless가 필요해요.\n{}", ssh_progress_probe::USAGE));
+        }
+        args.retain(|arg| arg != "--headless");
+        std::process::exit(ssh_progress_probe::run(&args[2..]));
+    }
     if args.iter().any(|a| a == "--ssh-workspace") {
         std::process::exit(ssh_probe::run_workspace(&args[1..]));
     }
@@ -140,8 +148,8 @@ fn main() -> eframe::Result<()> {
     }
     if let Some(i) = args.iter().position(|a| a == "--ssh-demo") {
         let state = args.get(i + 1).map(String::as_str).unwrap_or("");
-        if !matches!(state, "off" | "connecting" | "connected" | "markers_ready" | "lost" | "top_windows" | "top_linux") || !args.iter().any(|a| a == "--screenshot") {
-            eprintln!("--ssh-demo는 --screenshot과 함께 off|connecting|connected|markers_ready|lost|top_windows|top_linux를 써요.");
+        if !matches!(state, "off" | "connecting" | "connected" | "markers_ready" | "lost" | "top_windows" | "top_linux" | "progress") || !args.iter().any(|a| a == "--screenshot") {
+            eprintln!("--ssh-demo는 --screenshot과 함께 off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress를 써요.");
             std::process::exit(2);
         }
         ssh::set_demo_state(state);
@@ -153,6 +161,10 @@ fn main() -> eframe::Result<()> {
     }
     if let Some(gesture) = args.get(1).and_then(|a| headless::graph_gesture::Gesture::parse(a)) {
         std::process::exit(headless::graph_gesture::run(gesture, &args[2..]));
+    }
+    if let Err(error) = take_progress::parse_demo(&mut args, headless) {
+        eprintln!("{error}");
+        std::process::exit(2);
     }
     if let Err(error) = ui::graph::tracks::parse_probe(&mut args) {
         eprintln!("{error}");
@@ -294,6 +306,7 @@ fn usage() -> String {
         capture::USAGE,
         shot_output::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
+        "  --shot-label =TARGET   Arm only. NAME=NAME confirms the same label.",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         help_shot::USAGE,
         "Headless layout tabs: --shot-tabs [N[:POINTS]] with --screenshot and 1–30 local TAK/TAKM files",
@@ -301,6 +314,8 @@ fn usage() -> String {
         "Headless 3D selection: --select-visible or --select A,B[,C]",
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",
         "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
+        "Headless Progress menu: --progress-menu NAME with --screenshot. Use --ssh-demo progress for fake SSH rows.",
+        ssh_progress_probe::USAGE,
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         "GRAPH screenshot or benchmark: --graph-layout channels|tracks|combined and --graph-zoom A-B",
         "Graph gestures:\n  tak_viewer --bench-value-zoom FRAMES FILE\n  tak_viewer --bench-time-zoom FRAMES FILE\n  tak_viewer --bench-pan FRAMES FILE",
@@ -318,7 +333,7 @@ fn usage() -> String {
         tak_core::takm::verify::USAGE,
         check_command::USAGE,
         tak_core::dump::USAGE,
-        "tak_viewer --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]\ntak_viewer --headless --ssh-open ALIAS --ssh-path FILE --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]\n  --ssh-cancel-after-ms N   --ssh-stall-cancel-after-ms N   --ssh-dump OUT.json\n  --ssh-markers-only   --ssh-comment TEXT   --ssh-label unlabel   --ssh-save\ntak_viewer --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--ssh-workspace-expand]\nLocal SSH demo screenshot: --ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux",
+        "tak_viewer --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]\ntak_viewer --headless --ssh-open ALIAS --ssh-path FILE --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]\n  --ssh-cancel-after-ms N   --ssh-stall-cancel-after-ms N   --ssh-dump OUT.json\n  --ssh-markers-only   --ssh-comment TEXT   --ssh-label unlabel   --ssh-save\ntak_viewer --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--ssh-workspace-expand]\nLocal SSH demo screenshot: --ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress",
     ]
     .join("\n\n")
 }

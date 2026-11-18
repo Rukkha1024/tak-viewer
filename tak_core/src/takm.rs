@@ -33,6 +33,9 @@ use crate::tak::{err, in_repo_input, is_take_path, repo_root, Result, Take, TakE
 #[path = "takm_verify.rs"]
 pub mod verify;
 
+#[path = "takm_progress.rs"]
+pub(crate) mod progress;
+
 /// First 8 bytes. The first `.takm` (markers only, removed in v0.4.0) began `TAKM\r\n\x1a\n`.
 pub const MAGIC: [u8; 8] = *b"TAKM-2\r\n";
 const OLD_MAGIC: [u8; 8] = *b"TAKM\r\n\x1a\n";

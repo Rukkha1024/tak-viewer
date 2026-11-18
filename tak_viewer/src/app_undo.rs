@@ -272,6 +272,7 @@ impl Folders {
 /// the nested file path validates the slot. Marker changes still identify one shared document.
 #[derive(Clone)]
 pub(super) enum Part {
+    Progress(crate::take_progress::Pick),
     View { tab: Option<layout_tabs::TabId>, slot: usize, part: Box<Part> },
     Frame { file: PathBuf, before: i64, after: i64 },
     Camera { file: PathBuf, before: Camera, after: Camera },
@@ -546,6 +547,7 @@ impl History {
             Part::DeviceGrid { .. } => "DeviceGrid",
             Part::Comment { .. } => "Comment",
             Part::MarkerEdit { .. } => "MarkerEdit",
+            Part::Progress(_) => "Progress",
             Part::Layout { .. } => "Layout",
             Part::TakmSwitch { .. } => "TakmSwitch",
             Part::EditorSelection { .. } => "EditorSelection",
@@ -1454,7 +1456,30 @@ impl TakViewerApp {
     /// Ctrl+Z (`redo` false) takes back the newest action; Ctrl+Y (`redo` true) does the newest
     /// undone one again. What was changed just before is recorded first. An action on a file
     /// being read waits; one that cannot be done any more is dropped and the next one is taken.
+    pub(super) fn finish_progress_history(&mut self, pick: crate::take_progress::Pick, replay: Option<bool>, now: f64) {
+        match replay {
+            None => self.history.push(vec![Part::Progress(pick)]),
+            Some(redo) => {
+                let (from, to) = if redo { (&mut self.history.redo, &mut self.history.undo) }
+                    else { (&mut self.history.undo, &mut self.history.redo) };
+                if let Some(index) = from.iter().rposition(|action| matches!(action.as_slice(),
+                    [Part::Progress(old)] if old.target == pick.target
+                        && (if redo { (old.before, old.after) } else { (old.after, old.before) }) == (pick.before, pick.after))) {
+                    let action = from.remove(index);
+                    if redo || index == from.len() { to.push(action); }
+                }
+                let word = if redo { "Redo" } else { "Undo" };
+                self.history.note = Some((format!("{word} · {}", pick.after.label()), now));
+                self.history.merge_open = false;
+            }
+        }
+    }
+
     pub(super) fn undo_redo(&mut self, ctx: &egui::Context, redo: bool) {
+        if self.progress_job.is_some() {
+            self.history.note = Some(("진행 상태 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         if self.open_views().into_iter().any(|slot| self.marker_saving(slot))
             || self.overlay_marker_ui.values().any(marker_edit::MarkerUi::has_save) {
             self.history.note = Some(("저장 중에는 되돌릴 수 없어요.".into(), ctx.input(|i| i.time)));
@@ -1465,6 +1490,14 @@ impl TakViewerApp {
         self.stop_history_playback();
         self.observe(true);
         self.history.merge_open = false;
+        let progress = (if redo { self.history.redo.last() } else { self.history.undo.last() })
+            .and_then(|action| match action.as_slice() { [Part::Progress(pick)] => Some(pick.clone()), _ => None });
+        if let Some(mut pick) = progress {
+            if !redo { std::mem::swap(&mut pick.before, &mut pick.after); }
+            pick.stamp = None;
+            self.start_progress(ctx, pick, Some(redo));
+            return;
+        }
         let batch = (if redo { self.history.redo.last() } else { self.history.undo.last() }).and_then(|action| match action.as_slice() {
             [Part::EditorBatch { archive, close_after }] => Some((archive.clone(), *close_after)), _ => None,
         });
@@ -1812,7 +1845,7 @@ impl TakViewerApp {
                     Err(_) => "Marker edit failed".into(),
                 }
             }
-            Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
+            Part::Progress(_) | Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
             | Part::TabSwitch { .. } | Part::TabRename { .. } | Part::TabMove { .. }
             | Part::TabLifecycle { .. } | Part::View { .. } => String::new(),
         }

@@ -39,10 +39,8 @@ fn field(p: &roxmltree::Node, key: &str) -> Option<String> {
     }
 }
 
-/// Properties in file order; a repeated name keeps its first position and takes the last
-/// value (Python dict). Missing values become "" (Python `None`); missing names are skipped.
-pub fn parse_properties(meta: &[u8]) -> Result<Vec<(String, String)>> {
-    let mut xml: Option<String> = None;
+/// XML text, its byte start in the stream, and whether it uses UTF-16LE.
+fn properties_xml(meta: &[u8]) -> Result<(String, usize, bool)> {
     for utf16 in [true, false] {
         let opening = encode("<properties>", utf16);
         let closing = encode("</properties>", utf16);
@@ -54,10 +52,15 @@ pub fn parse_properties(meta: &[u8]) -> Result<Vec<(String, String)>> {
         } else {
             std::str::from_utf8(slice).map_err(|e| TakError(format!("Metadata XML not UTF-8: {e}")))?.to_string()
         };
-        xml = Some(text);
-        break;
+        return Ok((text, start, utf16));
     }
-    let Some(xml) = xml else { return err("Metadata XML missing") };
+    err("Metadata XML missing")
+}
+
+/// Properties in file order; a repeated name keeps its first position and takes the last
+/// value (Python dict). Missing values become "" (Python `None`); missing names are skipped.
+pub fn parse_properties(meta: &[u8]) -> Result<Vec<(String, String)>> {
+    let (xml, _, _) = properties_xml(meta)?;
     let options = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
     let doc = roxmltree::Document::parse_with_options(&xml, options)
         .map_err(|e| TakError(format!("Metadata XML invalid: {e}")))?;
@@ -70,6 +73,55 @@ pub fn parse_properties(meta: &[u8]) -> Result<Vec<(String, String)>> {
             None => out.push((name, value)),
         }
     }
+    Ok(out)
+}
+
+/// Replace only the saved property value. Insert/remove the property when entering/leaving
+/// an absent state. Refuse ambiguous or structured values instead of reserializing the XML.
+pub(crate) fn patch_progress(meta: &[u8], expected: Option<i64>, next: Option<i64>) -> Result<Vec<u8>> {
+    let (xml, start, utf16) = properties_xml(meta)?;
+    let doc = roxmltree::Document::parse(&xml).map_err(|e| TakError(e.to_string()))?;
+    let root = doc.root_element();
+    let mut matches = root.children().filter(|p| {
+        is_named(p, "property") && field(p, "name").as_deref() == Some("Progress")
+    });
+    let (range, replacement) = match matches.next() {
+        Some(property) => {
+            if matches.next().is_some() || expected.is_none()
+                || field(&property, "value").and_then(|text| python_int(&text).ok()) != expected
+            {
+                return err("Progress changed or is ambiguous");
+            }
+            match next {
+                None => (property.range(), String::new()),
+                Some(next) => {
+                    let range = if let Some(value) = property.children().find(|c| is_named(c, "value")) {
+                        let mut children = value.children();
+                        let child = children.next().filter(|node| node.is_text())
+                            .ok_or_else(|| TakError("Unsupported Progress value".into()))?;
+                        if children.next().is_some() { return err("Unsupported Progress value"); }
+                        child.range()
+                    } else {
+                        property.attribute_node("value")
+                            .ok_or_else(|| TakError("Missing Progress value".into()))?.range_value()
+                    };
+                    let value = &xml[range.clone()];
+                    let leading = value.len() - value.trim_start().len();
+                    let trailing = value.len() - value.trim_end().len();
+                    (range.start + leading..range.end - trailing, next.to_string())
+                }
+            }
+        }
+        None => {
+            if expected.is_some() { return err("Progress changed"); }
+            let Some(next) = next else { return Ok(meta.to_vec()) };
+            let end = root.range().end - "</properties>".len();
+            (end..end, format!("<property name=\"Progress\" value=\"{next}\"/>"))
+        }
+    };
+    let offset = |pos| start + if utf16 { xml[..pos].encode_utf16().count() * 2 } else { pos };
+    let mut out = meta.to_vec();
+    out.splice(offset(range.start)..offset(range.end), encode(&replacement, utf16));
     Ok(out)
 }
 

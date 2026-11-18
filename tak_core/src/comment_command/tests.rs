@@ -58,6 +58,24 @@ fn parses_bom_optional_type_and_korean_csv_fields() {
 }
 
 #[test]
+fn accepts_current_and_retired_types_and_lists_only_current_choices_in_refusal() {
+    let (_dir, path) = fixture("comment_command_types");
+    let expected = comments::TYPES.iter().copied().chain(["Needs visual check", "Marker swap"]);
+    let rows: Vec<_> = expected.clone().enumerate().map(|(frame, kind)| {
+        json!({"markers": [], "start": frame, "end": frame, "type": kind.to_ascii_lowercase(), "text": ""})
+    }).collect();
+    add_default(&path, &serde_json::to_vec(&rows).unwrap()).unwrap();
+    let all = list(&path).unwrap();
+    assert!(all.comments.iter().map(|row| row.content.comment_type.as_str()).eq(expected));
+
+    let before = fs::read(&path).unwrap();
+    let error = add_default(&path, br#"[{"markers":[],"start":1,"end":1,"type":"Other","text":""}]"#).unwrap_err();
+    assert!(error.contains(&comments::TYPES.join(", ")), "{error}");
+    assert!(!error.contains("Needs visual check") && !error.contains("Marker swap"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn reports_every_bad_row_without_writing_any_valid_rows() {
     let (_dir, path) = fixture("comment_command_invalid_rows");
     let original = fs::read(&path).unwrap();

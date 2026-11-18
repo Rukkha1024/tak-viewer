@@ -177,6 +177,10 @@ impl TakViewerApp {
     /// Explorer "이 화면에 얹기": lay `path` over the active view (replacing the one laid over it).
     /// Read on a background thread; it is checked and shown when its markers are in.
     pub(super) fn overlay_on(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.progress_writing(&path) {
+            self.overlay_say(ctx, "진행 상태를 저장 중이에요. 저장이 끝난 뒤 열어 주세요.".into());
+            return;
+        }
         let slot = self.active;
         // An explicit open rechecks a symlink; previously admitted aliases stay bound.
         self.admit_identity(&path);

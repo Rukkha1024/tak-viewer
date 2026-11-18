@@ -126,6 +126,10 @@ impl TakViewerApp {
     /// Save `tak` as `.takm` (COMMENTS pane button, `파일` menu, Explorer menu): starts the
     /// background conversion, or says why not in the status bar.
     pub(super) fn save_takm(&mut self, ctx: &egui::Context, tak: PathBuf) {
+        if self.progress_job.is_some() {
+            self.takm_note = Some(("진행 상태를 저장 중이에요. 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         let now = ctx.input(|i| i.time);
         let tak = match self.takm_allowed(Some(&tak)) {
             Ok(t) => t,
