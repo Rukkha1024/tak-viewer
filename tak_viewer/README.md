@@ -269,7 +269,7 @@ tak_viewer.exe --summary file.tak --markers LKNE,LTHI --frames 100:300 --json
 tak_viewer.exe --summary file.takm --xyz LFHD,C7 --frames 205:215 --json
 ```
 
-List files first. WSL and Windows paths work. Default Korean text. Use `--summary --help` for command help. With `--json`, omit the path for stdout. `--envelope` requires JSON.
+List files first. WSL and Windows paths work. Default output and `--summary --help` use simple English. With `--json`, omit the path for stdout. `--envelope` requires JSON.
 
 - `--frames a:b` adds window coverage and limits the gap search. Reject reversed or out-of-file ranges.
 - `--markers A,B` lists all gap ranges for exact names in each take, including every duplicate name and gapless matches. Unknown names fail. Whole-file counts and coverage stay in the result.
@@ -295,7 +295,7 @@ Put the trusted take first, usually the labeled copy. Use raw when copy is unava
 
 One to four files. Roles default to `file1`…`file4`. Give one role per file when using `--roles`. Use `--frames auto[:N]` (default 12) or capture syntax, e.g. `600,900`, `100:1000:100`, `even:5`. Capture limits apply per file. Use `--top N` for distance rankings and UID observations (default 10). Views default to `persp,top,side,front`. Picture options match capture: `--size WxH`, `--fit frame|take|selected`, `--trail N`, `--no-names`, `--no-sheet`, `--ui`.
 
-Use `--check --help` for command help. Use `--select` to highlight names in every picture. `--no-pictures` runs the same numeric comparison and source check without rendering. Use a new or empty output folder for `--out`. [Check outputs](../docs/cli-outputs.md#take-check)
+Stdout and `--check --help` use simple English. Use `--select` to highlight names in every picture. `--no-pictures` runs the same numeric comparison and source check without rendering. Use a new or empty output folder for `--out`. [Check outputs](../docs/cli-outputs.md#take-check)
 
 ### Add and list Comments
 

@@ -89,14 +89,14 @@ impl ViewPreset {
     pub fn label(self) -> &'static str {
         match self {
             Self::Current | Self::Persp => "Perspective",
-            Self::Top => "Top · 위에서",
-            Self::Bottom => "Bottom · 아래에서",
-            Self::Side => "Side · 옆에서 (진행 방향이 가로)",
-            Self::Front => "Front · 진행 방향에서",
-            Self::PlusX => "+X 쪽에서",
-            Self::MinusX => "-X 쪽에서",
-            Self::PlusZ => "+Z 쪽에서",
-            Self::MinusZ => "-Z 쪽에서",
+            Self::Top => "Top · From above",
+            Self::Bottom => "Bottom · From below",
+            Self::Side => "Side · Walk goes across the screen",
+            Self::Front => "Front · From the direction of travel",
+            Self::PlusX => "From +X",
+            Self::MinusX => "From -X",
+            Self::PlusZ => "From +Z",
+            Self::MinusZ => "From -Z",
         }
     }
 

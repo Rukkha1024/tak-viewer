@@ -10,8 +10,8 @@ use crate::summary::{
 use crate::{tak, takm};
 
 pub const USAGE: &str =
-    "사용법: tak_viewer --summary <file.tak|file.takm> [<file2> …] [--markers A,B,…] [--frames a:b] [--top N] [--json [out.json] [--envelope]]
-         좌표: tak_viewer --summary <file> --xyz A,B [--frames a:b|n,m,…] [--json [out.json] [--envelope]]";
+    "Usage: tak_viewer --summary <file.tak|file.takm> [<file2> …] [--markers A,B,…] [--frames a:b] [--top N] [--json [out.json] [--envelope]]
+         Positions: tak_viewer --summary <file> --xyz A,B [--frames a:b|n,m,…] [--json [out.json] [--envelope]]";
 
 #[derive(Debug)]
 struct Command<'a> {
@@ -289,20 +289,20 @@ pub fn run(args: &[String], resolve: impl Fn(&str) -> PathBuf) -> i32 {
 fn value_or_unknown<T: ToString>(value: Option<T>) -> String {
     value
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "알 수 없음".into())
+        .unwrap_or_else(|| "Unknown".into())
 }
 
 fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
     let file = &summary.file;
     let progress = &file.progress;
     let progress_label = match progress.value {
-        Some(1) => "녹화됨",
-        Some(4) => "라벨링 완료",
-        _ => "알 수 없음",
+        Some(1) => "Recorded",
+        Some(4) => "Labeled",
+        _ => "Unknown",
     };
     writeln!(
         out,
-        "{} ({}, {}바이트)",
+        "{} ({}, {} bytes)",
         file.name, file.kind, file.size_bytes
     )?;
     writeln!(
@@ -312,7 +312,7 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  프레임 {} ({}개) · {} Hz · {}초",
+        "  Frames {} ({}) · {} Hz · {} s",
         file.frames,
         file.frame_count,
         value_or_unknown(file.frame_rate),
@@ -320,20 +320,20 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
     )?;
     if let Some(takm) = &summary.takm {
         let seal = if takm.seal_ok {
-            "정상"
+            "OK"
         } else {
-            "확인 실패"
+            "Check failed"
         };
         writeln!(
             out,
-            "  봉인 {seal} · Comment {}개 · 원본 {}",
+            "  Seal {seal} · Comments {} · Source {}",
             takm.comment_count, takm.source_name
         )?;
     }
     let markers = &summary.markers;
     writeln!(
         out,
-        "  마커 세트 {} · 추가 {} · 라벨 없음 {} · 구조 미확인 {}",
+        "  Marker set {} · Extra {} · No label {} · Unknown kind {}",
         markers.template, markers.extra, markers.unlabeled, markers.unknown
     )?;
     if !markers.assets.is_empty() {
@@ -341,21 +341,21 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
             .assets
             .iter()
             .map(|asset| match &asset.markerset_name {
-                Some(set) => format!("{} ({set}) {}개", asset.name, asset.template_count),
-                None => format!("{} {}개", asset.name, asset.template_count),
+                Some(set) => format!("{} ({set}) {}", asset.name, asset.template_count),
+                None => format!("{} {}", asset.name, asset.template_count),
             })
             .collect();
-        writeln!(out, "  마커 세트별 {}", assets.join(" · "))?;
+        writeln!(out, "  By marker set {}", assets.join(" · "))?;
     }
-    coverage_text(out, "전체", &summary.coverage)?;
+    coverage_text(out, "All frames", &summary.coverage)?;
     if let Some(window) = &summary.window_coverage {
-        coverage_text(out, "지정 구간", window)?;
+        coverage_text(out, "Picked frames", window)?;
     }
     let gaps = &summary.gaps;
-    gap_text(out, "마커 세트 빈 구간", &gaps.template, gaps.template_more)?;
-    gap_text(out, "추가 마커 빈 구간", &gaps.extra, gaps.extra_more)?;
+    gap_text(out, "Marker set gaps", &gaps.template, gaps.template_more)?;
+    gap_text(out, "Extra marker gaps", &gaps.extra, gaps.extra_more)?;
     if !gaps.other.is_empty() {
-        gap_text(out, "그 외 지정 마커 빈 구간", &gaps.other, 0)?;
+        gap_text(out, "Other picked marker gaps", &gaps.other, 0)?;
     }
     let devices = &summary.devices;
     let analog: Vec<_> = devices
@@ -364,7 +364,7 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
         .enumerate()
         .map(|(i, device)| {
             let name = device.name.clone().unwrap_or_else(|| format!("#{}", i + 1));
-            // Short text: channels sharing one rate collapse to "프레임당 N샘플"; JSON keeps every channel.
+            // Short text: channels sharing one rate collapse to "N samples per frame"; JSON keeps every channel.
             let mut rates: Vec<(String, usize)> = Vec::new();
             for channel in &device.channels {
                 let rate = value_or_unknown(channel.samples_per_frame);
@@ -374,36 +374,36 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
                 }
             }
             let rates = match rates.as_slice() {
-                [] => "채널 정보 없음".to_owned(),
-                [(rate, _)] => format!("프레임당 {rate}샘플"),
+                [] => "No channel info".to_owned(),
+                [(rate, _)] => format!("{rate} samples per frame"),
                 many => many
                     .iter()
-                    .map(|(rate, count)| format!("프레임당 {rate}샘플 채널 {count}개"))
+                    .map(|(rate, count)| format!("{count} with {rate} samples per frame"))
                     .collect::<Vec<_>>()
                     .join(", "),
             };
-            format!("{name} (채널 {}개 · {rates})", device.channel_count)
+            format!("{name} (channels {} · {rates})", device.channel_count)
         })
         .collect();
     writeln!(
         out,
-        "  힘판 {}개 · 아날로그 장치 {}개",
+        "  Force plates {} · Analog devices {}",
         devices.force_plate_count, devices.analog_device_count
     )?;
     if !analog.is_empty() {
-        writeln!(out, "  아날로그 {}", analog.join(" · "))?;
+        writeln!(out, "  Analog {}", analog.join(" · "))?;
     }
     for warning in &summary.warnings {
-        writeln!(out, "  읽기 참고 · {warning}")?;
+        writeln!(out, "  Read note · {warning}")?;
     }
     if let Some(xyz) = &summary.xyz {
-        writeln!(out, "  저장된 좌표 · mm (coordinate unit unverified)")?;
+        writeln!(out, "  Saved positions · mm (unit not checked)")?;
         for track in &xyz.trajectories {
-            let parent = track.parent_uid_hex.as_deref().unwrap_or("없음");
+            let parent = track.parent_uid_hex.as_deref().unwrap_or("None");
             let slot = value_or_unknown(track.slot);
             writeln!(
                 out,
-                "    {} · {} · {} · 부모 {parent} · slot {slot}",
+                "    {} · {} · {} · parent {parent} · slot {slot}",
                 track.name, track.uid_hex, track.kind
             )?;
             for sample in &track.samples {
@@ -411,7 +411,7 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
                     Some([x, y, z]) => {
                         writeln!(out, "      {} · {x:.2}, {y:.2}, {z:.2}", sample.frame)?
                     }
-                    None => writeln!(out, "      {} · 관측 없음", sample.frame)?,
+                    None => writeln!(out, "      {} · No sample", sample.frame)?,
                 }
             }
         }
@@ -422,7 +422,7 @@ fn text(out: &mut impl Write, summary: &TakeSummary) -> io::Result<()> {
 fn coverage_text(out: &mut impl Write, label: &str, stats: &Coverage) -> io::Result<()> {
     writeln!(
         out,
-        "  {label} {} · 관측 최소 {}/{} · 중앙값 {}/{} · 모두 관측 {}프레임 · 누락 {}칸",
+        "  {label} {} · Fewest seen {}/{} · Median {}/{} · All seen in {} frames · Missing cells {}",
         stats.frames,
         stats.min_present,
         stats.marker_total,
@@ -435,28 +435,28 @@ fn coverage_text(out: &mut impl Write, label: &str, stats: &Coverage) -> io::Res
 
 fn gap_text(out: &mut impl Write, label: &str, rows: &[MarkerGaps], more: usize) -> io::Result<()> {
     if rows.is_empty() && more == 0 {
-        return writeln!(out, "  {label} 없음");
+        return writeln!(out, "  {label} · None");
     }
     writeln!(out, "  {label}")?;
     for row in rows {
         write!(
             out,
-            "    {} · {}구간 · 누락 {}프레임",
+            "    {} · Gaps {} · Missing frames {}",
             row.name, row.gap_count, row.missing_frames
         )?;
         if let Some(gap) = &row.longest_gap {
-            write!(out, " · 최장 {}프레임 ({})", gap.length, gap.frames)?;
+            write!(out, " · Longest gap {} frames ({})", gap.length, gap.frames)?;
         }
         if let Some(ranges) = &row.ranges {
             let ranges: Vec<_> = ranges.iter().map(ToString::to_string).collect();
             if !ranges.is_empty() {
-                write!(out, " · 전체 범위 {}", ranges.join(", "))?;
+                write!(out, " · All ranges {}", ranges.join(", "))?;
             }
         }
         writeln!(out)?;
     }
     if more > 0 {
-        writeln!(out, "    그 외 {more}개")?;
+        writeln!(out, "    {more} more")?;
     }
     Ok(())
 }
@@ -605,7 +605,7 @@ mod tests {
             })
         );
         let warnings = json[1]["warnings"].to_string();
-        assert!(warnings.contains("봉인을 확인하지") && warnings.contains("잘린 Comment"));
+        assert!(warnings.contains("TAKM seal check failed") && warnings.contains("cut-off Comment"));
         assert_eq!(fs::read(first).unwrap(), baseline);
         assert_eq!(fs::read(second).unwrap(), bytes);
     }
@@ -617,9 +617,9 @@ mod tests {
         let mut stdout = Vec::new();
         in_folder(&scratch, &["real.takm", "--markers", "RKNE"], &mut stdout).unwrap();
         let text = String::from_utf8(stdout).unwrap();
-        assert!(text.contains("관측 최소 1/2"));
+        assert!(text.contains("Fewest seen 1/2"));
         assert!(text.contains(
-            "RKNE · 1구간 · 누락 40프레임 · 최장 40프레임 (100–139) · 전체 범위 100–139"
+            "RKNE · Gaps 1 · Missing frames 40 · Longest gap 40 frames (100–139) · All ranges 100–139"
         ));
         let mut stdout = Vec::new();
         let output = scratch.join("output.json");
@@ -755,7 +755,7 @@ mod tests {
         .unwrap();
         assert!(String::from_utf8(stdout)
             .unwrap()
-            .contains("100 · 관측 없음"));
+            .contains("100 · No sample"));
         for frame in ["-1", "300", "299:300"] {
             assert!(in_folder(
                 &scratch,

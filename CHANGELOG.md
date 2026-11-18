@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.70.2 — 2026-11-18
+
+- `--summary` and `--check` print results, help and capture captions in simple English. Refusal and save failure reasons stay in easy Korean. JSON keys and codes unchanged.
+
 ## v0.70.1 — 2026-11-18
 
 - Release helper: reuse the worker's warm build folder, reserve offline from cached public tags, record and resume a killed check, `prepare --refresh` after review edits keeps the number, versions tagged on main no longer block later ones.

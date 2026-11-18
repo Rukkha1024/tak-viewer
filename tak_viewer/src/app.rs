@@ -1663,7 +1663,7 @@ impl TakViewerApp {
                         found.insert(i);
                         last = Some(i);
                     }
-                    None => run.notes.push(format!("선택할 마커 이름을 찾지 못했어요: {name}")),
+                    None => run.notes.push(format!("No marker named {name}")),
                 }
             }
             let v = &mut self.views[slot];

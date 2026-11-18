@@ -287,7 +287,7 @@ pub fn read_summary_with_take(
     let mut take = read.take;
     if let Some(reason) = fallback {
         take.warnings
-            .push(format!("빠른 읽기 대신 전체를 읽었어요. ({reason})"));
+            .push(format!("Read the whole file. ({reason})"));
     }
     if let Some(job) = read.analog {
         if let Some(reason) = job.fallback_reason().map(str::to_owned) {
@@ -297,7 +297,7 @@ pub fn read_summary_with_take(
             take.analog = analog;
             take.warnings.extend(warning);
             take.warnings
-                .push(format!("장치 데이터를 전체 읽었어요. ({reason})"));
+                .push(format!("Read all device data. ({reason})"));
         }
     }
     let mut summary = summarize(&take, options)?;
@@ -308,21 +308,21 @@ pub fn read_summary_with_take(
             .map_err(|e| {
                 summary
                     .warnings
-                    .push(format!("TAKM 봉인을 확인하지 못했어요. ({e})"));
+                    .push(format!("TAKM seal check failed. ({e})"));
             })
             .is_ok();
         let parsed = takm::read_comments(path)
             .map_err(|e| SummaryError::Read(format!("Comment를 읽지 못했어요. ({e})")))?;
         if parsed.skipped > 0 {
             summary.warnings.push(format!(
-                "읽을 수 없는 Comment 줄 {}개를 건너뛰었어요.",
+                "Skipped Comment lines we could not read ({}).",
                 parsed.skipped
             ));
         }
         if parsed.cut {
             summary
                 .warnings
-                .push("끝에서 잘린 Comment 줄을 건너뛰었어요.".into());
+                .push("Skipped the cut-off Comment line at the end.".into());
         }
         summary.takm = Some(TakmSummary {
             seal_ok,
@@ -379,7 +379,7 @@ fn summarize(take: &Take, options: &SummaryOptions) -> Result<TakeSummary, Summa
         .count();
     if recovered > 0 {
         warnings.push(format!(
-            "보완 읽기로 마커 {recovered}개의 구조를 확인했어요."
+            "Found the kind of {recovered} markers with an extra read."
         ));
     }
     let frame_rate = take.frame_rate.is_finite().then_some(take.frame_rate);

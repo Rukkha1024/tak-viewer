@@ -8,8 +8,8 @@ Syntax → [Agent commands](../tak_viewer/README.md#agent-commands).
 |---|---|---|---|
 | `--help`, `--version` | Help text or one version line to stdout | — | 0 |
 | `--dump`, `--dump-fast`, `tak_dump` | Reader object in requested file | 1 | 0 exported, 1 read/write failure, 2 arguments or protected extension |
-| `--summary` | Korean text or `--json` array in input order, optional envelope | 1 in envelope | 0 exported, 1 read/write failure, 2 arguments |
-| `--check` | Korean text, `check.json` object, optional per-file capture folders | 1 | 0 complete, 1 incomplete or I/O failure, 2 arguments |
+| `--summary` | English text or `--json` array in input order, optional envelope | 1 in envelope | 0 exported, 1 read/write failure, 2 arguments |
+| `--check` | English text, `check.json` object, optional per-file capture folders | 1 | 0 complete, 1 incomplete or I/O failure, 2 arguments |
 | `--capture` | Shot PNGs, optional sheet, `captures.json` object and printed location | 1 | 0 completed run, 1 load/render/write failure, 2 arguments. Inspect notes and files for per-shot evidence |
 | `--screenshot` | Full PNG, optional crop PNG and `--regions` object | Unversioned | 0 verified, 1 load/render/write failure, 2 arguments |
 | `checks/compare_png.py` | Text or `--json` object to stdout, optional diff PNG | Unversioned | 0 equal outside ignored regions, 1 size mismatch or differing pixels outside ignores, 2 invalid args/file |
@@ -30,6 +30,8 @@ Syntax → [Agent commands](../tak_viewer/README.md#agent-commands).
 | `--ssh-workspace` | Restart screenshot PNG and JSON restart line | Unversioned | 0 saved, 1 failure, 2 missing/invalid required arguments |
 
 Fields required unless marked optional. `null` means the field exists without a value. Frames use viewer numbering and inclusive endpoints. Marker kinds (where present) = `template`, `skeleton_extra`, `other_parent`, `unlabeled`, `unknown`. UIDs = hex strings. Paths use host syntax unless a WSL field is supplied.
+
+`--summary` and `--check` use simple English for results and help. Reasons for refusals, failed reads and failed writes stay in Korean. Use JSON fields and codes for scripts. Human notes, error details and view labels can change wording.
 
 ## Reader dump
 

@@ -18,14 +18,14 @@ use crate::capture::{self, FrameSpec, ViewPreset, MAX_FRAMES, MAX_SHOTS};
 use crate::workspace;
 
 pub const USAGE: &str = "\
-사용법: tak_viewer --check <file.tak|file.takm> [<file2> … 최대 4개] --out <폴더>
-  [--roles raw,copy,agent,…] [--frames <캡처 범위>|auto[:N]] [--views persp,top,side,front]
+Usage: tak_viewer --check <file.tak|file.takm> [<file2> … up to 4 files] --out <folder>
+  [--roles raw,copy,agent,…] [--frames <frames>|auto[:N]] [--views persp,top,side,front]
   [--select A,B] [--top N] [--no-pictures]
   [--size WxH] [--fit frame|take|selected] [--trail N] [--no-names] [--no-sheet] [--ui]
-믿을 기준 파일을 먼저 써 주세요. 라벨링한 복사본이 없으면 원본을 써 주세요.
-마커 세트는 같은 slot끼리, 같은 궤적의 이동과 라벨 변경은 UID끼리 비교해요.
-기본 프레임은 auto:12, 기본 --top은 10이에요.
-창 없이 숫자와 그림을 저장해요. --out은 새 폴더나 빈 폴더로 정해 주세요.";
+Put the file you trust first. Use the labeled copy if you have one. Otherwise use the original.
+Match marker sets by slot. Match tracks by UID to see moves and label changes.
+Defaults are --frames auto:12 and --top 10.
+Save numbers and pictures without opening a window. Use a new or empty folder for --out.";
 
 const UNIT_NOTE: &str = "coordinate unit unverified";
 
@@ -366,7 +366,7 @@ fn audit_pictures(
         Ok(manifest) => {
             audit.tak_unchanged = Some(manifest.tak_unchanged);
             if !manifest.tak_unchanged {
-                errors.push("캡처 중에 원본 파일의 크기나 수정 시간이 바뀌었어요.".into());
+                errors.push("The source file size or time changed while taking pictures.".into());
             }
             audit.notes = manifest.notes;
             errors.extend(audit.notes.iter().cloned());
@@ -376,18 +376,18 @@ fn audit_pictures(
                 || manifest.select != inputs.select
             {
                 errors
-                    .push("captures.json의 범위, 각도 또는 마커 선택이 확인 요청과 달라요.".into());
+                    .push("The frame range, views, or picked markers in captures.json differ from the request.".into());
             }
             if inputs.picture_options.sheet && manifest.sheet.as_deref() != Some("sheet.png") {
-                errors.push("captures.json에 sheet.png 기록이 없어요.".into());
+                errors.push("captures.json has no entry for sheet.png.".into());
             }
             if !inputs.picture_options.sheet && manifest.sheet.is_some() {
-                errors.push("요청하지 않은 sheet.png 기록이 있어요.".into());
+                errors.push("captures.json lists an extra sheet.png.".into());
             }
             for shot in manifest.shots {
                 if records.insert((shot.frame, shot.view), shot.file).is_some() {
                     errors.push(format!(
-                        "captures.json에 {} 프레임 기록이 겹쳐요.",
+                        "captures.json lists the same view of frame {} twice.",
                         shot.frame
                     ));
                 }
@@ -396,7 +396,7 @@ fn audit_pictures(
         Err(e) => errors.push(format!("captures.json을 읽지 못했어요. ({e})")),
     }
     if inputs.picture_options.sheet && !nonempty_file(&dir.join("sheet.png")) {
-        errors.push("sheet.png 파일이 없거나 비어 있어요.".into());
+        errors.push("sheet.png is missing or empty.".into());
     }
     for frame in expected {
         for &view in &inputs.views {
@@ -408,14 +408,14 @@ fn audit_pictures(
                 audit.complete_shots += 1;
             }
             if !exists {
-                errors.push(format!("{filename} 파일이 없거나 비어 있어요."));
+                errors.push(format!("{filename} is missing or empty."));
             } else if !recorded {
-                errors.push(format!("captures.json에 {filename} 기록이 없거나 달라요."));
+                errors.push(format!("The entry for {filename} in captures.json is missing or different."));
             }
         }
     }
     if !records.is_empty() {
-        errors.push("captures.json에 요청하지 않은 장면이 있어요.".into());
+        errors.push("captures.json lists extra pictures.".into());
     }
     audit
 }
@@ -643,7 +643,7 @@ fn execute(
         file.tak_unchanged = before.is_some() && before == capture::stat_key(&input.path);
         if !file.tak_unchanged && file.summary.is_some() {
             file.errors
-                .push("확인 중에 파일의 크기나 수정 시간이 바뀌었어요.".into());
+                .push("The file size or time changed during the check.".into());
         }
     }
     let complete = files.iter().all(|file| file.errors.is_empty());
@@ -695,7 +695,7 @@ fn stats_text(s: &SampleStats) -> String {
         .map_or("—".into(), |p| format!("{:.2} mm @{}", p.mm, p.frame));
     let mean = s.mean_mm.map_or("—".into(), |mean| format!("{mean:.2} mm"));
     format!(
-        "한쪽만 {}/{} · 공통 {} (거리 {}) · 최대 {max} · 평균 {mean} · 1/20 mm 초과 {}/{}",
+        "Only in one file {}/{} · In both {} (measured {}) · Max {max} · Mean {mean} · Over 1/20 mm {}/{}",
         s.reference_only,
         s.other_only,
         s.both_present,
@@ -707,20 +707,20 @@ fn stats_text(s: &SampleStats) -> String {
 
 fn reason_text(reason: FrameReason) -> &'static str {
     match reason {
-        FrameReason::Explicit => "직접 지정",
-        FrameReason::GapEdge => "빈 구간 경계",
-        FrameReason::LargestDistance => "거리 차이",
-        FrameReason::PresenceStart => "한쪽만 있는 구간 시작",
-        FrameReason::PresenceMiddle => "한쪽만 있는 구간 중간",
-        FrameReason::PresenceEnd => "한쪽만 있는 구간 끝",
-        FrameReason::Control => "고른 간격",
+        FrameReason::Explicit => "Picked by you",
+        FrameReason::GapEdge => "Gap edge",
+        FrameReason::LargestDistance => "Largest distance",
+        FrameReason::PresenceStart => "Start of one-file run",
+        FrameReason::PresenceMiddle => "Middle of one-file run",
+        FrameReason::PresenceEnd => "End of one-file run",
+        FrameReason::Control => "Even spacing",
     }
 }
 
 fn short_list<T>(items: &[T], limit: usize, label: impl Fn(&T) -> String) -> String {
     let mut parts: Vec<_> = items.iter().take(limit).map(label).collect();
     if items.len() > limit {
-        parts.push(format!("외 {}개", items.len() - limit));
+        parts.push(format!("{} more", items.len() - limit));
     }
     if parts.is_empty() {
         "—".into()
@@ -731,64 +731,64 @@ fn short_list<T>(items: &[T], limit: usize, label: impl Fn(&T) -> String) -> Str
 
 fn structural_role_text(role: &StructuralRole) -> String {
     let kind = match role.kind {
-        "template" => "마커 세트",
-        "skeleton_extra" => "스켈레톤 추가",
-        "other_parent" => "기타 소속",
-        "unlabeled" => "라벨 없음",
-        _ => "구조 미확인",
+        "template" => "Marker set",
+        "skeleton_extra" => "Skeleton extra",
+        "other_parent" => "Other parent",
+        "unlabeled" => "No label",
+        _ => "Unknown kind",
     };
     role.slot
         .map_or_else(|| kind.into(), |slot| format!("{kind} slot {slot}"))
 }
 
 fn text(out: &Path, report: &Report) {
-    println!("파일 확인 · 기준 {:?} · {UNIT_NOTE}", report.reference_role);
+    println!("File check · First file {:?} · {UNIT_NOTE}", report.reference_role);
     for file in &report.files {
         if let Some(summary) = &file.summary {
             let f = &summary.file;
             let k = &summary.markers;
             let rate = f.frame_rate.map_or("—".into(), |v| v.to_string());
             let progress = match f.progress.value {
-                Some(1) => "녹화됨",
-                Some(4) => "라벨링 완료",
-                _ => "진행 상태 알 수 없음",
+                Some(1) => "Recorded",
+                Some(4) => "Labeled",
+                _ => "Unknown progress",
             };
-            println!("{:?} {:?} · {}바이트 · {} · {} Hz · {progress} · 마커 세트 {} / 추가 {} / 라벨 없음 {} / 구조 미확인 {}",
+            println!("{:?} {:?} · {} bytes · {} · {} Hz · {progress} · Marker set {} / Extra {} / No label {} / Unknown kind {}",
                 file.role, f.name, f.size_bytes, f.frames, rate, k.template, k.extra, k.unlabeled, k.unknown);
             let pics = match &file.pictures {
-                Some(p) => format!("그림 {}/{}", p.complete_shots, p.expected_shots),
-                None if report.pictures_requested => "그림 없음".into(),
-                None => "숫자만".into(),
+                Some(p) => format!("Pictures {}/{}", p.complete_shots, p.expected_shots),
+                None if report.pictures_requested => "No pictures".into(),
+                None => "Numbers only".into(),
             };
-            println!("  {pics} · 원본 크기/수정 시간 {} · 가장 적은 프레임 {}/{} · 빈 칸 {} · 힘판 {} / 장치 {} · 읽기 참고 {}건",
-                if file.tak_unchanged { "같음" } else { "바뀜" }, summary.coverage.min_present,
+            println!("  {pics} · Source size and time {} · Fewest seen {}/{} · Missing cells {} · Force plates {} / Analog devices {} · Read notes {}",
+                if file.tak_unchanged { "same" } else { "changed" }, summary.coverage.min_present,
                 summary.coverage.marker_total, summary.coverage.missing_cells, summary.devices.force_plate_count,
                 summary.devices.analog_device_count, summary.warnings.len());
             if let Some(takm) = &summary.takm {
                 let seal = if takm.seal_ok {
-                    "정상"
+                    "OK"
                 } else {
-                    "확인 실패"
+                    "Check failed"
                 };
                 println!(
-                    "  봉인 {seal} · Comment {}개 · 원본 {:?}",
+                    "  Seal {seal} · Comments {} · Source {:?}",
                     takm.comment_count, takm.source_name
                 );
             }
         }
         if !file.errors.is_empty() {
             println!(
-                "  {:?} 확인 실패 · {}",
+                "  {:?} check failed · {}",
                 file.role,
                 file.errors.join(" / ").replace(['\r', '\n'], " ")
             );
         }
     }
     for pair in &report.comparisons {
-        println!("{:?} 비교", pair.role);
+        println!("Compare {:?}", pair.role);
         match &pair.slot_comparison {
             SlotComparison::Skipped { reason } => {
-                println!("  마커 세트가 달라 slot 비교 안 함 · {}", reason.text());
+                println!("  Slot check skipped · {}", reason.text());
             }
             SlotComparison::Compared(result) | SlotComparison::Incomplete(result) => {
                 let count = result
@@ -797,17 +797,17 @@ fn text(out: &Path, report: &Report) {
                     .filter(|row| row.samples.is_none())
                     .count();
                 let missing = if count != 0 {
-                    format!(" · 겹친 slot {count}개 제외")
+                    format!(" · Skipped {count} slots with more than one track")
                 } else {
                     String::new()
                 };
                 println!(
-                    "  마커 세트(slot) · {}개{missing} · {}",
+                    "  Marker set slots · {}{missing} · {}",
                     result.slots.len(),
                     stats_text(&result.totals)
                 );
                 println!(
-                    "  slot 최대 거리 순 · {}",
+                    "  Slots with biggest moves · {}",
                     short_list(
                         &result.slots[..result.top_distance_slots.len()],
                         10,
@@ -826,7 +826,7 @@ fn text(out: &Path, report: &Report) {
                 );
                 if !result.name_differences.is_empty() {
                     println!(
-                        "  같은 slot의 이름 차이 {}건 · {}",
+                        "  Same slot, different name ({}) · {}",
                         result.name_differences.len(),
                         short_list(&result.name_differences, 10, |row| {
                             format!(
@@ -842,21 +842,21 @@ fn text(out: &Path, report: &Report) {
             }
         }
         let Some(c) = &pair.comparison else {
-            println!("  같은 궤적(UID) · 비교 미완료");
+            println!("  Same tracks (UID) · Check incomplete");
             continue;
         };
-        let equality = |same| if same { "같음" } else { "다름" };
+        let equality = |same| if same { "same" } else { "different" };
         println!(
-            "  같은 궤적(UID) · 범위 {} · 속도 {} · 마커 세트 {} / {}",
+            "  Same tracks (UID) · Frame range {} · Frame rate {} · Marker sets {} / {}",
             equality(c.frame_range_equal),
             equality(c.frame_rate_equal),
             c.reference_template,
             c.other_template
         );
-        println!("  한 파일에만 있는 UID (세트/스켈레톤 추가/기타 부모/미라벨/미확인) · 기준 {} · 비교 {}",
+        println!("  UIDs in one file (set/extra on skeleton/other parent/no label/unknown) · First {} · Other {}",
             kind_counts(&c.reference_only), kind_counts(&c.other_only));
         println!(
-            "  같은 UID의 이름 차이 {}건 · {}",
+            "  Same UID, different name ({}) · {}",
             c.rename_count,
             short_list(&c.renames, 10, |r| format!(
                 "{:?} → {:?}",
@@ -865,11 +865,11 @@ fn text(out: &Path, report: &Report) {
         );
         if c.role_change_count > 0 {
             println!(
-                "  같은 UID의 마커 소속·slot 변경 {}건 · {}",
+                "  Same UID, parent or slot changed ({}) · {}",
                 c.role_change_count,
                 short_list(&c.role_changes, 4, |r| {
                     let parent = if r.reference.parent_uid_hex != r.other.parent_uid_hex {
-                        " · 부모 변경"
+                        " · Parent changed"
                     } else {
                         ""
                     };
@@ -884,24 +884,24 @@ fn text(out: &Path, report: &Report) {
             );
         }
         println!(
-            "  다른 UID의 같은 이름 {}건 · {}",
+            "  Different UID, same name ({}) · {}",
             c.shared_name_count,
             short_list(&c.shared_names, 10, |n| format!("{:?}", n.name))
         );
         println!(
-            "  세트 관련 UID 합계 (이름·소속 변경 포함) · {}",
+            "  Marker set UID totals (with name or parent changes) · {}",
             stats_text(&c.marker_set_totals)
         );
         println!(
-            "  UID 최대 이동 순 · {}",
+            "  UIDs with biggest moves · {}",
             short_list(&c.marker_set[..c.top_distance_uids.len()], 10, |m| {
                 let peak = m.samples.max.unwrap();
                 let mut labels = Vec::new();
                 if m.reference_name != m.other_name {
-                    labels.push("이름 변경");
+                    labels.push("Name changed");
                 }
                 if m.structural_role_changed {
-                    labels.push("소속·slot 변경");
+                    labels.push("Parent or slot changed");
                 }
                 let label = if labels.is_empty() {
                     String::new()
@@ -912,14 +912,14 @@ fn text(out: &Path, report: &Report) {
             })
         );
         println!(
-            "  세트 밖 마커 · 기준 {} · 비교 {} · {}",
+            "  Markers outside the set · First {} · Other {} · {}",
             kind_counts(&c.extra_markers.reference),
             kind_counts(&c.extra_markers.other),
             stats_text(&c.extra_markers.samples)
         );
     }
     if !report.frames.is_empty() {
-        println!("프레임 선택과 마커 세트 수 (보임/전체)");
+        println!("Picked frames and marker set counts (seen/total)");
     }
     for (i, picked) in report.frames.iter().enumerate() {
         let values: Vec<_> = report
@@ -936,7 +936,7 @@ fn text(out: &Path, report: &Report) {
                             String::new()
                         } else {
                             format!(
-                                " (빈 마커 {})",
+                                " (Missing markers {})",
                                 short_list(&f.missing_template, 2, |n| format!("{n:?}"))
                             )
                         }
@@ -954,9 +954,9 @@ fn text(out: &Path, report: &Report) {
     println!(
         "{} · {}",
         if report.complete {
-            "확인 완료"
+            "Check done"
         } else {
-            "확인 미완료"
+            "Check incomplete"
         },
         out.join("check.json").display()
     );
@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(file["pictures"]["complete_shots"], 1);
         assert_eq!(
             file["errors"][0],
-            "f000002_top.png 파일이 없거나 비어 있어요."
+            "f000002_top.png is missing or empty."
         );
     }
 
