@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.70.0 — 2026-11-18
+
+- Set Comment type names, meanings and order in View → Settings (up to eight). Save works in review (`--only`) windows too; other open windows pick the list up within a second. One undo step per save.
+- `--list-comment-types [--json]` prints the list, its file path and load status. Each type assignment keeps the meaning of that moment in the TAKM tail; `--list-comments` rows gain `type_meaning`.
+
 ## v0.69.8 — 2026-11-18
 
 - Draw the skeleton lines stored in old takes (Motive build 40156, SKL 120:2039). 3D view, captures and screenshots use the same lines.

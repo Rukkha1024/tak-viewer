@@ -15,7 +15,7 @@ impl TakViewerApp {
         for host in self.views.iter_mut().chain(hidden) {
             let update = |view: &mut View| {
                 let list = view.comments.list.list();
-                let order: Vec<_> = comment_list::sorted(list, sort).into_iter().map(|i| list[i].id).collect();
+                let order: Vec<_> = comment_list::sorted(list, sort, &self.comment_types.types).into_iter().map(|i| list[i].id).collect();
                 view.comment_selection.set_order(&order);
             };
             update(host);
@@ -25,7 +25,7 @@ impl TakViewerApp {
 
     fn comment_ids_in_order(&self, slot: usize) -> Vec<u64> {
         let list = self.views[slot].comments.list.list();
-        comment_list::sorted(list, self.comment_sort).into_iter().map(|i| list[i].id).collect()
+        comment_list::sorted(list, self.comment_sort, &self.comment_types.types).into_iter().map(|i| list[i].id).collect()
     }
 
     pub(super) fn comment_gesture(&mut self, slot: usize, id: u64, ctrl: bool, shift: bool) {
@@ -170,7 +170,7 @@ impl TakViewerApp {
                 } else {
                     v.comments.failed = Some("다른 창의 Comment와 달라졌고 파일을 다시 읽지 못했어요. 파일을 다시 열어 주세요.".into());
                 }
-                let order: Vec<_> = comment_list::sorted(v.comments.list.list(), self.comment_sort).into_iter().map(|i| v.comments.list.list()[i].id).collect();
+                let order: Vec<_> = comment_list::sorted(v.comments.list.list(), self.comment_sort, &self.comment_types.types).into_iter().map(|i| v.comments.list.list()[i].id).collect();
                 let gone: Vec<_> = v.comment_selection.ids().filter(|id| v.comments.list.get(*id).is_none()).collect();
                 for id in gone { v.comment_selection.remove(id, &order); }
                 v.picked = v.comment_selection.representative;

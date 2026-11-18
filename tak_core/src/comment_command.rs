@@ -1,6 +1,7 @@
 //! Local TAKM Comment commands. The viewer supplies path resolution and its Comment clock.
 
 use crate::cli_json::{Envelope, Version};
+use crate::comment_types::TypeList;
 use crate::comments::{self, Comment, Event, Kind};
 use crate::tak::{fast_read::read_take_fast, is_take_path, MarkerKind, Take};
 use crate::takm;
@@ -48,36 +49,27 @@ impl Row {
         }
     }
 
-    fn duplicate_key(&self) -> Self {
+    fn duplicate_key(&self, types: &TypeList) -> Self {
         let mut key = self.clone();
         key.markers.sort_unstable();
-        if let Some(kind) = known_type(&key.comment_type) {
+        if let Some((kind, _)) = types.accepted(&key.comment_type) {
             key.comment_type = kind.to_owned();
         }
         key
     }
 
-    fn into_comment(self, id: u64) -> Comment {
+    fn into_comment(self, id: u64, types: &TypeList) -> Comment {
+        let type_meaning = types.accepted(&self.comment_type).and_then(|(_, meaning)| meaning).map(str::to_owned);
         Comment {
             id,
             markers: self.markers,
             start: self.start,
             end: self.end,
             comment_type: self.comment_type,
+            type_meaning,
             text: self.text,
         }
     }
-}
-
-fn known_type(text: &str) -> Option<&'static str> {
-    comments::TYPES
-        .iter()
-        .copied()
-        .chain([
-            "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
-            "Needs visual check", "Marker swap",
-        ])
-        .find(|kind| kind.eq_ignore_ascii_case(text))
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +104,7 @@ pub struct Listed {
     id: u64,
     #[serde(flatten)]
     content: Row,
+    type_meaning: Option<String>,
     time: String,
     by: &'static str,
 }
@@ -162,6 +155,7 @@ fn validate_row(
     first: i64,
     last: i64,
     allow_unknown: bool,
+    types: &TypeList,
 ) -> Result<Row, String> {
     let object = value.as_object().ok_or("각 행을 JSON 객체로 써 주세요.")?;
     let mut reasons = Vec::new();
@@ -207,11 +201,13 @@ fn validate_row(
         None => "",
         Some(v) => match v.as_str() {
             Some("") => "",
-            Some(raw) => known_type(raw).unwrap_or_else(|| {
-                reasons.push(format!(
-                    "type 값 {raw:?}을 쓸 수 없어요. {} 중 하나를 골라 주세요.",
-                    comments::TYPES.join(", ")
-                ));
+            Some(raw) => types.accepted(raw).map(|(name, _)| name).unwrap_or_else(|| {
+                let choices = if types.rows().is_empty() {
+                    "현재 목록에는 종류가 없어요.".to_owned()
+                } else {
+                    format!("{} 중 하나를 골라 주세요.", types.names().collect::<Vec<_>>().join(", "))
+                };
+                reasons.push(format!("type 값 {raw:?}을 쓸 수 없어요. {choices}"));
                 ""
             }),
             None => {
@@ -243,7 +239,7 @@ fn validate_row(
     })
 }
 
-fn validate_rows(rows: &[Value], take: &Take, allow_unknown: bool) -> Result<Vec<Row>, String> {
+fn validate_rows(rows: &[Value], take: &Take, allow_unknown: bool, types: &TypeList) -> Result<Vec<Row>, String> {
     let names = take
         .trajectories
         .iter()
@@ -264,6 +260,7 @@ fn validate_rows(rows: &[Value], take: &Take, allow_unknown: bool) -> Result<Vec
             take.start_frame,
             take.end_frame.max(take.start_frame),
             allow_unknown,
+            types,
         ) {
             Ok(row) => valid.push(row),
             Err(reason) => errors.push(format!("{}번째 행: {reason}", index + 1)),
@@ -276,7 +273,8 @@ fn validate_rows(rows: &[Value], take: &Take, allow_unknown: bool) -> Result<Vec
     }
 }
 
-struct PreparedAdd {
+struct PreparedAdd<'a> {
+    types: &'a TypeList,
     path: PathBuf,
     actual: PathBuf,
     before: (u64, [u8; 32]),
@@ -287,12 +285,12 @@ fn read_error(e: impl std::fmt::Display) -> String {
     format!(".takm을 읽지 못했어요. ({e})")
 }
 
-impl PreparedAdd {
-    fn new(path: PathBuf, rows: &[Value], options: AddOptions) -> Result<Self, String> {
+impl<'a> PreparedAdd<'a> {
+    fn new(path: PathBuf, rows: &[Value], options: AddOptions, types: &'a TypeList) -> Result<Self, String> {
         let actual = target(&path, true)?;
         let before = takm::verify_fixed_seal(&actual).map_err(read_error)?;
         let take = read_take_fast(&actual, false).map_err(read_error)?.take;
-        let rows = validate_rows(rows, &take, options.allow_unknown_markers)?;
+        let rows = validate_rows(rows, &take, options.allow_unknown_markers, types)?;
         if !rows.is_empty() {
             OpenOptions::new()
                 .read(true)
@@ -301,6 +299,7 @@ impl PreparedAdd {
                 .map_err(|e| format!(".takm에 Comment를 쓸 수 없어요. ({e})"))?;
         }
         Ok(Self {
+            types,
             path,
             actual,
             before,
@@ -334,13 +333,13 @@ impl PreparedAdd {
         let mut seen = HashMap::new();
         if !options.allow_duplicates {
             for c in current.list() {
-                seen.entry(Row::from_comment(c).duplicate_key())
+                seen.entry(Row::from_comment(c).duplicate_key(self.types))
                     .or_insert(Some(c.id));
             }
         }
         for (index, content) in rows.into_iter().enumerate() {
             if !options.allow_duplicates {
-                match seen.entry(content.duplicate_key()) {
+                match seen.entry(content.duplicate_key(self.types)) {
                     std::collections::hash_map::Entry::Occupied(previous) => {
                         result.skipped_existing.push(Skipped {
                             row: index + 1,
@@ -378,16 +377,14 @@ impl PreparedAdd {
             let id = added.id.expect("reserved ID");
             let mut event = Event::of(
                 Kind::Add,
-                &added.content.clone().into_comment(id),
+                &added.content.clone().into_comment(id, self.types),
                 time.to_owned(),
                 label.clone(),
             );
             // Mark the writer: result extraction must not take an agent's note for a user interval.
-            event.operation = Some(format!(
-                "{}{}",
-                comments::AGENT_OPERATION_PREFIX,
-                comments::new_operation_token()
-            ));
+            if let Some(operation) = &mut event.operation {
+                operation.insert_str(0, comments::AGENT_OPERATION_PREFIX);
+            }
             events.push(event);
         }
         let (conflict, _) = takm::append_events_locked(&self.actual, &events, None)
@@ -402,7 +399,7 @@ impl PreparedAdd {
         for added in &result.added {
             let id = added.id.expect("reserved ID");
             if saved.id_is_ambiguous(id)
-                || saved.get(id).map(Row::from_comment).as_ref() != Some(&added.content)
+                || saved.get(id) != Some(&added.content.clone().into_comment(id, self.types))
             {
                 return Err(format!("저장한 Comment {id}의 내용이 요청과 달라요."));
             }
@@ -424,8 +421,18 @@ pub fn add(
     options: AddOptions,
     now: impl FnOnce() -> String,
 ) -> Result<AddResult, String> {
+    add_with_types(path, json, options, now, &TypeList::default())
+}
+
+pub fn add_with_types(
+    path: &Path,
+    json: &[u8],
+    options: AddOptions,
+    now: impl FnOnce() -> String,
+    types: &TypeList,
+) -> Result<AddResult, String> {
     let rows: Vec<Value> = read_input(json, "배열")?;
-    let mut prepared = PreparedAdd::new(path.to_path_buf(), &rows, options)?;
+    let mut prepared = PreparedAdd::new(path.to_path_buf(), &rows, options, types)?;
     // Dry runs never create a lock. Real adds keep lookup and append under the same lock.
     let _lock = (!options.dry_run && !prepared.rows.is_empty())
         .then(|| prepared.lock())
@@ -466,6 +473,7 @@ fn list_by(
             Some(Listed {
                 id: c.id,
                 content: Row::from_comment(c),
+                type_meaning: c.type_meaning.clone(),
                 time: source.time.clone(),
                 by: writer,
             })
@@ -484,7 +492,7 @@ fn list_by(
     ))
 }
 
-fn check_output(path: &Path) -> Result<PathBuf, String> {
+pub fn check_output(path: &Path) -> Result<PathBuf, String> {
     let actual = takm::canonical_target(path)
         .map_err(|e| format!("JSON을 저장할 경로를 확인하지 못했어요. ({e})"))?;
     if [path, &actual]
@@ -614,7 +622,7 @@ fn parse_args(args: &[String]) -> Result<Command<'_>, String> {
     }
 }
 
-fn json_output(value: &impl Serialize, output: Option<&Path>) -> Result<(), String> {
+pub fn json_output(value: &impl Serialize, output: Option<&Path>) -> Result<(), String> {
     let mut json =
         serde_json::to_vec_pretty(value).map_err(|e| format!("JSON을 만들지 못했어요. ({e})"))?;
     json.push(b'\n');
@@ -625,10 +633,15 @@ fn json_output(value: &impl Serialize, output: Option<&Path>) -> Result<(), Stri
     .map_err(|e| format!("JSON을 쓰지 못했어요. ({e})"))
 }
 
-pub fn run(
+pub fn run(args: &[String], resolve: impl Fn(&str) -> PathBuf, now: impl FnOnce() -> String) -> i32 {
+    run_with_types(args, resolve, now, &TypeList::default())
+}
+
+pub fn run_with_types(
     args: &[String],
     resolve: impl Fn(&str) -> PathBuf,
     now: impl FnOnce() -> String,
+    types: &TypeList,
 ) -> i32 {
     let command = match parse_args(args) {
         Ok(command) => command,
@@ -647,11 +660,11 @@ pub fn run(
             .map_err(|e| format!("Comment 목록 JSON을 읽지 못했어요. ({e})"))
             .and_then(|rows| match file {
                 Some(file) => {
-                    json_output(&add(&resolve(file), &rows, options, now)?, None).map(|()| false)
+                    json_output(&add_with_types(&resolve(file), &rows, options, now, types)?, None).map(|()| false)
                 }
                 None => {
                     let rows: batch::BatchRows = read_input(&rows, "파일별 객체")?;
-                    let (report, failed) = batch::add(rows, &resolve, options, now);
+                    let (report, failed) = batch::add(rows, &resolve, options, now, types);
                     batch_output(&report, envelope, None).map(|()| failed)
                 }
             }),

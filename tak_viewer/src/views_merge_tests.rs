@@ -2,7 +2,7 @@
 fn merged_shared_comment_deletion_prunes_only_that_views_selection() {
     let mut owner = selection_view();
     for id in 1..=3 {
-        let comment = comments::Comment { id, markers: vec![["A", "B", "C"][id as usize - 1].into()], start: 0, end: 1, comment_type: String::new(), text: format!("row {id}") };
+        let comment = comments::Comment { id, markers: vec![["A", "B", "C"][id as usize - 1].into()], start: 0, end: 1, comment_type: String::new(), type_meaning: None, text: format!("row {id}") };
         owner.comments.list.apply(&comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new()));
     }
     let shared = owner.shared_file().unwrap();

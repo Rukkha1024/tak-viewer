@@ -48,7 +48,7 @@ impl<T> Envelope<T> {
     }
 }
 
-pub(crate) fn replace_file(destination: &Path, json: &[u8]) -> io::Result<()> {
+pub fn replace_file(destination: &Path, json: &[u8]) -> io::Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let temporary = destination.with_file_name(format!(
         ".tak-cli-{}-{}.part",

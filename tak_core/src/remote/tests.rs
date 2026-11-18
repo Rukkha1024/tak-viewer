@@ -368,7 +368,7 @@ os.scandir = scan
     }
     fn write_event(id: u64) -> crate::comments::Event {
         use crate::comments::{Comment, Event, Kind};
-        let item = Comment { id, markers:vec![], start:1,end:2,comment_type:String::new(),text:"remote write".into() };
+        let item = Comment { id, markers:vec![], start:1,end:2,comment_type:String::new(),type_meaning:None,text:"remote write".into() };
         let mut event = Event::of(Kind::Add, &item, "2026-11-17T00:00:00+00:00".into(), "test.takm|1".into());
         event.operation = Some(format!("ssh-write-{id}"));
         event

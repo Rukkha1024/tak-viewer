@@ -188,6 +188,7 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --range a-b | Clamp/sort endpoints; malformed warns, never filename |
 | --shot-label SOURCE=TARGET | Headless screenshot only. Repeat in order, one local file. Exact unique names. Apply QuickLabel in memory at --frame/--range. NAME=NAME confirms and advances. =TARGET arms the row for a before shot |
 | --shot-marker-menu menu\|info\|label | Headless screenshot only. Use --select and --frame to pick visible points in the active view. Open the 3D marker menu alone or with Marker Info / Label Marker expanded. Label submenu needs one selected point. Read/write no settings or take data |
+| --shot-comment-types | With `--headless --screenshot out.png`, open Settings at Comment types. Crop with `--crop-panel Settings`. A take is optional |
 | --shot-help | Use with `--headless --screenshot out.png`, without a take. Open `Controls`. Default 1600×960 px at 100%. Optional `--shot-help-size 1920x1080@1.5` sets pixel size and scale. Add `--shot-help-bottom` to capture the last rows |
 | --comments | Bring COMMENTS forward |
 | --pick-comment ID | Jump/select; explicit --frame wins |
@@ -301,12 +302,13 @@ Use `--check --help` for command help. Use `--select` to highlight names in ever
 ```text
 tak_viewer.exe --add-comments file.takm --from rows.json [--dry-run] [--allow-unknown-markers] [--allow-duplicates]
 tak_viewer.exe --add-comments --from batch.json [--dry-run] [--allow-unknown-markers] [--allow-duplicates] [--envelope]
+tak_viewer.exe --list-comment-types [--json [out.json]]
 tak_viewer.exe --list-comments file.takm [out.json]
 tak_viewer.exe --list-comments a.takm b.takm [--json out.json] [--by agent|viewer|legacy] [--envelope]
 tak_viewer.exe --list-comments --dir folder [--recursive] [--json out.json] [--by agent|viewer|legacy] [--envelope]
 ```
 
-Existing TAKM outside repo input for adds. WSL and Windows paths work. No window or settings. Refused rows reported to stderr with 1-based row numbers. JSON input UTF-8, optional BOM.
+Existing TAKM outside repo input for adds. WSL and Windows paths work. Runs without a window. Adds read the current type list. Refused rows reported to stderr with 1-based row numbers. JSON input UTF-8, optional BOM.
 
 ```json
 [
@@ -317,7 +319,9 @@ Existing TAKM outside repo input for adds. WSL and Windows paths work. No window
 
 Frames inclusive, in the viewer's numbering. Omit `type` for None. Text may be empty. Without a positional file, supply a JSON object mapping each TAKM path to its row array. Relative paths start at the working directory. Validate every file and row before appending to any file.
 
-Current types in order: `File bad`, `Range OK`, `Range bad`, `File OK`. See [Comment](#comment) for meanings. Retired, still accepted: `Jitter`, `Jump`, `Visual check`, `Agree`, `No problem`, `Keep this only`, `Needs visual check`, `Marker swap`. Add stores the matching name. List returns the stored type, including retired and unknown values. `--by` filters by writer.
+Read the ordered choices and meanings with `--list-comment-types --json`. The list lives in `%APPDATA%\tak_viewer\data\comment_types.json` on Windows, or beside `app.ron` in `TAK_VIEWER_DATA_DIR`. For an existing Comment use its saved `type_meaning` from `--list-comments`. Null means no saved meaning. A blank string means a saved empty meaning.
+
+Adds accept current choices, all four first-run names and eight retired names: `Jitter`, `Jump`, `Visual check`, `Agree`, `No problem`, `Keep this only`, `Needs visual check`, `Marker swap`. Add stores the matching name. List returns the stored type, including retired and unknown values. `--by` filters by writer.
 
 `--dry-run` validates and plans without reserving IDs or writing. `--allow-unknown-markers` skips exact labeled-name validation. `--allow-duplicates` appends matching rows again. Without it, live matches and in-batch repeats are skipped after comparing marker lists without regard to order. Type names match without regard to case. Text stays one line, with tabs replaced by spaces.
 

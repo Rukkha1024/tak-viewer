@@ -837,6 +837,7 @@ impl TakViewerApp {
                     start,
                     end,
                     comment_type: String::new(),
+                    type_meaning: None,
                     text: text.into(),
                 };
                 v.comments
@@ -1135,6 +1136,7 @@ mod tests {
             start: 2,
             end: 4,
             comment_type: "Jitter".into(),
+            type_meaning: None,
             text: "서버의 Comment".into(),
         };
         let mut list = comments::Comments::default();

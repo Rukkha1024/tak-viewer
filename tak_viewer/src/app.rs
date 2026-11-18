@@ -33,6 +33,8 @@ mod overlay;
 mod overlay_dirty;
 #[path = "app_takm.rs"]
 mod takm_save;
+#[path = "app_comment_types.rs"]
+mod comment_types_ui;
 #[path = "app_progress.rs"]
 mod progress_edit;
 #[path = "app_editors.rs"]
@@ -468,6 +470,7 @@ pub struct TakViewerApp {
     show_warnings: bool,
     /// "설정" window (menu "보기 → 설정…").
     show_settings: bool,
+    comment_types: comment_types_ui::State,
     /// A view's floating graph asked for the GRAPH pane this frame (applied after drawing).
     graph_to_panel: bool,
     auto: Option<AutoShot>,
@@ -533,11 +536,11 @@ pub struct TakViewerApp {
     /// number its selection action gets, `History::pushed`). A double click on `#` right after
     /// it makes that selection and the go-to one action (`reopen_row_select`).
     row_select: Option<(usize, usize, u64, u64)>,
-    /// The type strip after a new comment (step 5): three type buttons by the `Comment`
+    /// The type strip after a new comment: configured choices by the `Comment`
     /// button until the next action elsewhere; and the type clicked on it this frame (applied
     /// after drawing).
     type_strip: Option<TypeStrip>,
-    strip_pick: Option<&'static str>,
+    strip_pick: Option<String>,
     /// Why a file could not be laid over a view (plan step 7, plain Korean) and when: shown in
     /// the status bar for a few seconds (`app_overlay.rs`).
     overlay_note: Option<(String, f64)>,
@@ -707,7 +710,8 @@ impl TakViewerApp {
             error: None,
             show_help: false,
             show_warnings: false,
-            show_settings: false,
+            show_settings: auto.as_ref().is_some_and(|shot| shot.comment_types),
+            comment_types: Default::default(),
             graph_to_panel: false,
             auto,
             shot_regions: None,
@@ -1326,7 +1330,8 @@ impl TakViewerApp {
         // Pictures are taken with every view's file and force plates loaded, and every graph
         // complete (v0.27.0 speed fix: markers past a frame's work come in the next frames).
         let open = self.open_views();
-        let waiting = open.iter().any(|&k| self.views[k].busy()) || self.view().data.is_none() || self.graph_put_off;
+        let settings_only = auto.comment_types && open.iter().all(|&k| self.views[k].target().is_none());
+        let waiting = open.iter().any(|&k| self.views[k].busy()) || (self.view().data.is_none() && !settings_only) || self.graph_put_off;
         let processing_wait=auto.stage>0 && open.iter().any(|&k|{
             let v=&self.views[k]; v.analog_work_pending() || (v.emg_requested && v.data.as_ref().is_some_and(|d|d.emg_pending))
                 || v.lanes.preparing() || v.filters.lock().unwrap().devices.values().any(|device|device.pending()) || v.devices.graphs_pending()
@@ -1944,7 +1949,7 @@ impl TakViewerApp {
             self.notice = Some("Comment 번호를 준비 중이에요. 잠시 뒤 다시 눌러 주세요.".into());
             return;
         };
-        let c = Comment { id, markers, start, end, comment_type: String::new(), text: String::new() };
+        let c = Comment { id, markers, start, end, comment_type: String::new(), type_meaning: None, text: String::new() };
         // What changed before it (e.g. frames moved while `M` was held) comes first.
         self.observe(true);
         if !self.write_change(ctx, slot, EventKind::Add, &c) {
@@ -1966,8 +1971,11 @@ impl TakViewerApp {
     /// type = nothing. A short note in the status bar says what it is now.
     fn set_comment_type(&mut self, ctx: &egui::Context, slot: usize, id: u64, t: &str) -> bool {
         let Some(c) = self.views[slot].comments.list.get(id).cloned() else { return false };
+        if c.comment_type == t || !self.comment_types.ready() { return false; }
+        let type_meaning = self.comment_types.types.meaning(t).map(str::to_owned);
+        if !t.is_empty() && type_meaning.is_none() { return false; }
         self.observe(true);
-        if !self.edit_comment(ctx, slot, Comment { comment_type: t.to_owned(), ..c }) {
+        if !self.edit_comment(ctx, slot, Comment { comment_type: t.to_owned(), type_meaning, ..c }) {
             return false;
         }
         let shown = if t.is_empty() { "no type" } else { t };
@@ -1990,8 +1998,8 @@ impl TakViewerApp {
             return;
         };
         let file_id = v.file_id;
-        let next = comments::step_type(&now);
-        self.set_comment_type(ctx, slot, id, next);
+        let next = self.comment_types.types.next(&now).to_owned();
+        self.set_comment_type(ctx, slot, id, &next);
         if !self.type_strip.as_ref().is_some_and(|s| (s.slot, s.file_id, s.id) == (slot, file_id, id)) {
             self.type_strip = None;
         }
@@ -2154,7 +2162,7 @@ impl TakViewerApp {
                 Comment { start, end, ..c }
             }
             Field::Text => Comment { text: comments::clean_text(&e.text), ..c },
-            Field::Type => Comment { comment_type: e.choice.clone(), ..c },
+            Field::Type => unreachable!("handled above"),
         };
         if !self.edit_comment(ctx, e.slot, after) && e.field == Field::Markers {
             self.views[e.slot].set_selection(e.before);
@@ -2198,7 +2206,7 @@ impl TakViewerApp {
         if e.field == Field::Type {
             let (up, down) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowUp), i.consume_key(Modifiers::NONE, Key::ArrowDown)));
             if let Some(e) = self.comment_edit.as_mut().filter(|_| up != down) {
-                e.choice = comment_list::step_item(&e.choice, up).to_owned();
+                e.choice = comment_list::step_item(&self.comment_types.types, &e.choice, up).to_owned();
             }
         }
         let (enter, esc) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::NONE, Key::Escape)));
@@ -2524,7 +2532,7 @@ impl TakViewerApp {
         // During a marker edit its cell shows the selection now.
         let live_markers = (self.marker_edit() == Some((slot, v.file_id))).then(|| v.selected_names().join(", "));
         let (first, last) = (v.pb.first, v.pb.last);
-        let input = comment_list::ListIn { list: &v.comments.list, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, selection: &v.comment_selection, live_markers, first, last };
+        let input = comment_list::ListIn { list: &v.comments.list, types: &self.comment_types.types, file_id: v.file_id, frame: v.pb.frame, sort: self.comment_sort, write, scroll_to, picked: v.picked, selection: &v.comment_selection, live_markers, first, last };
         let show = comment_list::show;
         let mut out = show(ui, input, &mut self.comment_order, &mut self.comment_edit);
         #[cfg(test)]
@@ -2621,8 +2629,11 @@ impl TakViewerApp {
                     self.start_comment_edit(id, Field::Type);
                 }
             }
-            Some(ListAction::SetType(id, kind)) => {
-                self.set_comment_type(ctx, slot, id, kind);
+            Some(ListAction::SetType(id, index)) => {
+                if let Some(row) = self.comment_types.types.rows().get(index) {
+                    let name = row.name.clone();
+                    self.set_comment_type(ctx, slot, id, &name);
+                }
             }
             // A click on an item of the type list (it is in the edit already): saved at once.
             Some(ListAction::SaveEdit) => self.save_comment_edit(ctx),
@@ -2989,7 +3000,7 @@ impl TakViewerApp {
                         self.fit_all();
                     }
                     ui.separator();
-                    if ui.button("Settings…").on_hover_text("Set the background of floating graphs.").clicked() {
+                    if ui.button("Settings…").clicked() {
                         ui.close_menu();
                         self.show_settings = true;
                     }
@@ -3250,7 +3261,7 @@ impl TakViewerApp {
         let draft = self.frames_draft(slot);
         // The type strip of a comment just made in this view (not in pictures of a capture).
         let file_now = self.views[slot].file_id;
-        let strip = self.type_strip.as_ref().filter(|s| s.slot == slot && s.file_id == file_now && !capturing).map(|s| (s.id, panels::type_strip_rects(ui.ctx(), deck_rect)));
+        let strip = self.type_strip.as_ref().filter(|s| s.slot == slot && s.file_id == file_now && !capturing && !self.comment_types.types.rows().is_empty()).map(|s| (s.id, panels::type_strip_rects(ui.ctx(), deck_rect, &self.comment_types.types)));
         let quick_available = self.quick_label_available(ui.ctx(), slot);
         let v = &mut self.views[slot];
         if v.fit_pending {
@@ -3469,8 +3480,8 @@ impl TakViewerApp {
             key_focus::region(ui, r, key_focus::Target::Blocked);
             let type_now = v.comments.list.get(id).map(|c| c.comment_type.clone()).unwrap_or_default();
             let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("type_strip", slot)).max_rect(r));
-            if let Some(t) = panels::type_strip(&mut child, &buttons, &type_now) {
-                self.strip_pick = Some(t);
+            if let Some(t) = panels::type_strip(&mut child, &buttons, &type_now, &self.comment_types.types) {
+                self.strip_pick = Some(t.to_owned());
             }
             if let Some(s) = self.type_strip.as_mut() {
                 s.rect = r;
@@ -3774,6 +3785,7 @@ impl Drop for GraphFrame {
 impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        self.poll_comment_types(ctx);
         // Clip rectangles still constrain every painter. Avoid rescanning all vertices of
         // already-built graph meshes in egui's additional coarse tessellation culling.
         ctx.tessellation_options_mut(|options| options.coarse_tessellation_culling = false);
@@ -3980,9 +3992,6 @@ impl TakViewerApp {
         } else {
             self.layout_strip.wheel.clear_region();
         }
-        if let Some(regions) = &mut self.shot_regions {
-            regions.freeze();
-        }
         // A click on a view's tab or inside a view makes it the active one.
         let focused = self.dock.find_active_focused().map(|(_, t)| *t);
         if self.dirty_prompt.is_none() && focused != self.focused_tab {
@@ -4007,7 +4016,7 @@ impl TakViewerApp {
         if let Some(t) = self.strip_pick.take() {
             if let Some(s) = self.type_strip.take().filter(|s| !s.shot) {
                 if self.views[s.slot].file_id == s.file_id {
-                    self.set_comment_type(ctx, s.slot, s.id, t);
+                    self.set_comment_type(ctx, s.slot, s.id, &t);
                 }
             }
         }
@@ -4193,7 +4202,10 @@ impl TakViewerApp {
                     entry.1 = entry.1.max(device.channels.len());
                 }
             }
-            egui::Window::new("Settings").id(egui::Id::new("설정")).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+            let window = egui::Window::new("Settings").id(egui::Id::new("설정")).open(&mut open)
+                .collapsible(false).resizable(false).default_width(500.0)
+                .default_pos(egui::pos2((area.center().x - 250.0).max(area.left()), area.top() + 42.0))
+                .vscroll(true).show(ctx, |ui| {
                 if self.dirty_prompt.is_some() { ui.disable(); }
                 ui.label(RichText::new("Floating Graphs").color(theme::TEXT_DIM));
                 ui.horizontal(|ui| {
@@ -4205,8 +4217,13 @@ impl TakViewerApp {
                 if ui.button(format!("Reset ({}%)", graph_float::DEFAULT_OPACITY)).clicked() {
                     self.settings.graph_opacity = graph_float::DEFAULT_OPACITY;
                 }
+                self.show_comment_type_settings(ui);
                 crate::ui::channel_names::show(ui, channel_catalog, &mut self.settings.channel_names);
             });
+            if let (Some(window), Some(regions)) = (window, &mut self.shot_regions) {
+                regions.record("Settings", window.response.rect);
+            }
+            if !open { self.close_comment_type_settings(); }
             if names_before != self.settings.channel_names { self.observe(true); }
             self.show_settings = open;
         }
@@ -4214,6 +4231,9 @@ impl TakViewerApp {
             crate::ui::help_window::show(ctx, &mut self.show_help, area);
         }
         if !self.desktop_hover.paths.is_empty() { self.paint_desktop_drop(ctx); }
+        if let Some(regions) = &mut self.shot_regions {
+            regions.freeze();
+        }
         // Current click geometry and higher-priority widgets settle before destructive keys.
         key_focus::finish_frame(ctx);
         self.graph_fit_keys(ctx);
@@ -4558,7 +4578,7 @@ mod tests {
 
     #[test]
     fn command_line_runs_leave_the_settings_file_alone() {
-        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, comment_types: false, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&egui::Context::default(), None, vec![], Some(shot), None);
         let mut st = FileLike::default();
         app.save(&mut st);
@@ -4567,6 +4587,70 @@ mod tests {
         assert!(st.kv.is_empty());
         assert!(!app.persist_egui_memory());
         assert_eq!(app.auto_save_interval(), Duration::MAX);
+    }
+
+    #[test]
+    fn only_window_saves_and_undoes_the_type_list_without_writing_app_ron() {
+        use crate::comment_types;
+        let dir = tak_core::test_support::TempDir::new("only_type_settings");
+        let ron_path = dir.join("app.ron");
+        let types_path = comment_types::path(Some(dir.as_ref())).unwrap();
+        let mut storage = FileLike::default();
+        let saved = ron::to_string(&Settings::default()).unwrap();
+        storage.set_string(eframe::APP_KEY, saved.clone());
+        storage.flush();
+        std::fs::write(&ron_path, saved.as_bytes()).unwrap();
+        let ctx = egui::Context::default();
+        let files = take_files(&dir, &["review.tak"]);
+        let tab = startup_tab("Review", &files, StartupView::default());
+        let mut app = TakViewerApp::build_window(&ctx, Some(&storage), vec![], None, None, Some(vec![tab]));
+        app.use_comment_types(Some(types_path.clone()), &ctx, false);
+        let wait = |app: &mut TakViewerApp| {
+            let limit = Instant::now() + Duration::from_secs(30);
+            while !app.comment_types.ready() || app.comment_types_saving() {
+                assert!(Instant::now() < limit, "settings worker did not finish");
+                frame_with(&ctx, app, vec![]);
+                std::thread::yield_now();
+            }
+        };
+        wait(&mut app);
+        assert!(app.only && !types_path.exists());
+        app.show_settings = true;
+        frame_with(&ctx, &mut app, vec![]);
+        let click = |app: &mut TakViewerApp, name: &str, index: usize| {
+            let out = frame_with(&ctx, app, vec![]);
+            let at = text_rects(&out, name).get(index).unwrap_or_else(|| panic!("{name} {index} not drawn")).center();
+            click_at(&ctx, app, at);
+        };
+        click(&mut app, "Add type", 0);
+        click(&mut app, "Name", 1);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("Feet OK".into())]);
+        click(&mut app, "Meaning", 1);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("두 발이 정상이에요.".into())]);
+        click(&mut app, "↑", 4);
+        click(&mut app, "Remove", 0);
+        click(&mut app, "Range bad", 0);
+        run_frame(&ctx, &mut app, &[(ctrl(), Key::A)]);
+        frame_with(&ctx, &mut app, vec![egui::Event::Text("Range bad X".into())]);
+        assert!(!types_path.exists(), "draft changes stay in memory");
+        click(&mut app, "Save", 0);
+        wait(&mut app);
+        let custom = comment_types::read(Some(&types_path)).types;
+        assert_eq!(custom.names().collect::<Vec<_>>(), ["Range OK", "Range bad X", "Feet OK", "File OK"]);
+        assert_eq!(custom.meaning("Feet OK"), Some("두 발이 정상이에요."));
+        app.show_settings = false;
+        assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment types"));
+        undo_key(&ctx, &mut app);
+        wait(&mut app);
+        assert_eq!(comment_types::read(Some(&types_path)).types, Default::default());
+        redo_key(&ctx, &mut app);
+        wait(&mut app);
+        assert_eq!(comment_types::read(Some(&types_path)).types, custom);
+        app.save(&mut storage);
+        storage.flush();
+        assert_eq!(storage.writes, 1);
+        assert_eq!(storage.get_string(eframe::APP_KEY).as_deref(), Some(saved.as_str()));
+        assert_eq!(std::fs::read(ron_path).unwrap(), saved.as_bytes());
     }
 
     #[test]
@@ -5639,7 +5723,7 @@ mod tests {
     #[test]
     fn screenshot_plate_argument_chooses_that_plate_in_every_view() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: Some("P2".into()), range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: Some("P2".into()), range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, comment_types: false, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         for (k, name) in [(0, "a.tak"), (1, "b.tak")] {
@@ -6111,7 +6195,7 @@ mod tests {
         assert_eq!(app.open_views(), vec![0, 1]);
         assert!(app.hold.is_some());
         app.hold = None;
-        let comment = Comment { id: 1, markers: vec![], start: 0, end: 1, comment_type: String::new(), text: String::new() };
+        let comment = Comment { id: 1, markers: vec![], start: 0, end: 1, comment_type: String::new(), type_meaning: None, text: String::new() };
         app.views[1].comments.list.apply(&Event::of(EventKind::Add, &comment, "t".into(), "b.tak|0".into()));
         app.comment_edit = Some(comment_list::Edit::new(1, app.views[1].file_id, &comment, comment_list::Field::Markers, app.views[1].selection()));
         run_frame(&ctx, &mut app, &[(ctrl(), Key::W)]);
@@ -6673,7 +6757,7 @@ mod tests {
         let _dir_guard = comment_dir("legacy_duplicate");
         let dir = _dir_guard.to_path_buf();
         let path = dir.join("a.takm");
-        let a = Comment { id: 1, markers: vec!["M".into()], start: 0, end: 0, comment_type: String::new(), text: String::new() };
+        let a = Comment { id: 1, markers: vec!["M".into()], start: 0, end: 0, comment_type: String::new(), type_meaning: None, text: String::new() };
         let b = Comment { markers: vec!["N".into()], ..a.clone() };
         tail_append(&path, &[Event::of(EventKind::Add, &a, "t".into(), String::new()), Event::of(EventKind::Add, &b, "t".into(), String::new())]).unwrap();
         let mut app = comment_app(&ctx, &dir, false);
@@ -6928,7 +7012,7 @@ mod tests {
         two_comments_on_disk(&dir);
         // Comment 3 (frames 4–5) overlaps comment 1 (3–6): since step 6 they share the band's
         // height, 1 in the upper row, 3 in the lower one.
-        let three = Comment { id: 3, markers: vec!["N".into()], start: 4, end: 5, comment_type: String::new(), text: String::new() };
+        let three = Comment { id: 3, markers: vec!["N".into()], start: 4, end: 5, comment_type: String::new(), type_meaning: None, text: String::new() };
         tail_append(&dir.join("a.takm"), &[Event::of(EventKind::Add, &three, "t".into(), "a.tak|0".into())]).unwrap();
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         let mut app = comment_app(&ctx, &dir, false);
@@ -7019,11 +7103,11 @@ mod tests {
         redo_key(&ctx, &mut app);
         assert_eq!(bands(&ctx, &mut app), (1, 1), "redo brought it back");
         // An edit that takes M off comment 1: gone from M's graph.
-        let one = Comment { id: 1, markers: vec!["N".into()], start: 3, end: 3, comment_type: String::new(), text: String::new() };
+        let one = Comment { id: 1, markers: vec!["N".into()], start: 3, end: 3, comment_type: String::new(), type_meaning: None, text: String::new() };
         app.views[0].comments.list.apply(&Event::of(EventKind::Edit, &one, "t".into(), "a.tak|0".into()));
         assert_eq!(bands(&ctx, &mut app), (0, 1));
         // A comment without markers: not in the graph.
-        let none = Comment { id: 9, markers: vec![], start: 0, end: 9, comment_type: String::new(), text: String::new() };
+        let none = Comment { id: 9, markers: vec![], start: 0, end: 9, comment_type: String::new(), type_meaning: None, text: String::new() };
         app.views[0].comments.list.apply(&Event::of(EventKind::Add, &none, "t".into(), "a.tak|0".into()));
         assert_eq!(bands(&ctx, &mut app), (0, 1));
         // Delete 2 with a right click on its block (frame 6, the lower row under 9): no bands.
@@ -7792,7 +7876,7 @@ mod tests {
         assert!(app.comment_writer.is_none() && no_events(&root.join("input").join("raw").join("a.takm")), "nothing written");
         // A comment step that cannot be done now is dropped and the next one is taken.
         let file = app.views[0].path().unwrap().to_path_buf();
-        app.history.push(vec![undo::Part::Comment { file, change: Change::Deleted(Comment { id: 9, markers: vec![], start: 0, end: 0, comment_type: String::new(), text: String::new() }), cleared: None }]);
+        app.history.push(vec![undo::Part::Comment { file, change: Change::Deleted(Comment { id: 9, markers: vec![], start: 0, end: 0, comment_type: String::new(), type_meaning: None, text: String::new() }), cleared: None }]);
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].range, steps(&app, 0)), (None, (1, 1)), "the comment step went, the range step was undone");
         assert!(app.views[0].comments.list.is_empty());
@@ -8386,7 +8470,7 @@ mod tests {
         let ev: Vec<Event> = list
             .iter()
             .map(|&(id, markers, start, end)| {
-                let c = Comment { id, markers: markers.iter().map(|m| m.to_string()).collect(), start, end, comment_type: String::new(), text: String::new() };
+                let c = Comment { id, markers: markers.iter().map(|m| m.to_string()).collect(), start, end, comment_type: String::new(), type_meaning: None, text: String::new() };
                 Event::of(EventKind::Add, &c, "2026-11-13T14:05:09+09:00".into(), "a.tak|0".into())
             })
             .collect();
@@ -9288,8 +9372,8 @@ mod tests {
                 assert!(!ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|l| l.order == egui::Order::Tooltip)), "no hover text on an item");
             }
         }
-        let name_w = comment_list::type_choices().map(|v| width(comment_list::item_name(v), 12.5)).fold(0.0, f32::max);
-        let size = comment_list::list_size(name_w);
+        let name_w = comment_list::type_choices(&tak_core::comment_types::TypeList::default()).map(|v| width(comment_list::item_name(v), 12.5)).fold(0.0, f32::max);
+        let size = comment_list::list_size(name_w, comments::TYPES.len());
         let room = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 300.0));
         let at = comment_list::list_place(tbox.translate(egui::vec2(0.0, 100.0)), size, room);
         assert!(room.contains_rect(at) && size.x <= 200.0, "the list fits a 380 pt pane: {at:?}");
@@ -9305,7 +9389,7 @@ mod tests {
         // 2,000 comments in memory (as if read from the file).
         let mut list = comments::Comments::default();
         for id in 1..=2000u64 {
-            let c = Comment { id, markers: vec!["M".into()], start: id as i64 % 9, end: id as i64 % 9, comment_type: String::new(), text: format!("note {id}") };
+            let c = Comment { id, markers: vec!["M".into()], start: id as i64 % 9, end: id as i64 % 9, comment_type: String::new(), type_meaning: None, text: format!("note {id}") };
             list.apply(&Event::of(EventKind::Add, &c, "t".into(), "a.tak|0".into()));
         }
         app.views[0].comments.list = list;
@@ -9365,11 +9449,56 @@ mod tests {
         let ev: Vec<Event> = list
             .iter()
             .map(|&(id, f, t)| {
-                let c = Comment { id, markers: vec![], start: f, end: f, comment_type: t.into(), text: String::new() };
+                let c = Comment { id, markers: vec![], start: f, end: f, comment_type: t.into(), type_meaning: None, text: String::new() };
                 Event::of(EventKind::Add, &c, "2026-11-14T10:00:00+09:00".into(), "a.tak|0".into())
             })
             .collect();
         tail_append(&dir.join("a.takm"), &ev).unwrap();
+    }
+
+    #[test]
+    fn custom_type_buttons_menu_key_and_sort_share_the_list_and_save_meanings() {
+        use tak_core::comment_types::{Definition, TypeList};
+        let ctx = egui::Context::default();
+        let dir = comment_dir("custom_type_paths");
+        let path = dir.join("a.takm");
+        typed_on_disk(&dir, &[(1, 2, ""), (2, 3, ""), (3, 4, "Old label"), (4, 5, "Feet OK")]);
+        let original = std::fs::read(&path).unwrap();
+        let mut app = comments_tab_app(&ctx, &dir, false);
+        assert_eq!(type_of(&app, 3), "Old label");
+        assert!(comment(&app, 3).type_meaning.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let list = |a: &str, b: &str| TypeList::validate(vec![
+            Definition { name: a.into(), meaning: "발이 정상이에요.".into() },
+            Definition { name: b.into(), meaning: "다시 봐요.".into() },
+        ]).unwrap();
+        app.comment_types.types = list("Feet OK", "Check feet");
+        let [_, _, note, _] = cells_of(&ctx, &mut app, 1);
+        tap(&ctx, &mut app, note);
+        let out = frame_with(&ctx, &mut app, vec![]);
+        tap(&ctx, &mut app, text_rects(&out, "Check feet")[0].center());
+        assert_eq!(comment(&app, 1).type_meaning.as_deref(), Some("다시 봐요."));
+        let [_, _, note, _] = cells_of(&ctx, &mut app, 2);
+        tap(&ctx, &mut app, note);
+        run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
+        assert_eq!(comment(&app, 2).type_meaning.as_deref(), Some("발이 정상이에요."));
+        open_type_list(&ctx, &mut app, 2);
+        let item = item_at(&ctx, &mut app, "Check feet");
+        tap(&ctx, &mut app, item);
+        assert_eq!(comment(&app, 2).type_meaning.as_deref(), Some("다시 봐요."));
+        // A changed definition does not alter a historic Comment or its undo/redo snapshot.
+        app.comment_types.types = list("Check feet", "Feet OK");
+        undo_key(&ctx, &mut app);
+        assert!(comment(&app, 2).type_meaning.is_none(), "consecutive T and menu picks undo together");
+        redo_key(&ctx, &mut app);
+        assert_eq!(comment(&app, 2).type_meaning.as_deref(), Some("다시 봐요."));
+        let h = header(&ctx, &mut app, "Type");
+        tap(&ctx, &mut app, h);
+        assert_eq!(shown_ids(&ctx, &mut app), vec![1, 2, 4, 3]);
+        until_saved(&ctx, &mut app);
+        let disk = tak_core::takm::read_comments(&path).unwrap().comments();
+        for id in 1..=4 { assert_eq!(disk.get(id), app.views[0].comments.list.get(id)); }
+        assert!(std::fs::read(path).unwrap().starts_with(&original));
     }
 
     #[test]
@@ -9444,7 +9573,7 @@ mod tests {
             let font = egui::FontId::proportional(13.0);
             for (width, wraps) in [(220.0, true), (362.0, false)] {
                 let deck = egui::Rect::from_min_size(egui::pos2(20.0, 400.0), egui::vec2(width, 60.0));
-                let buttons = panels::type_strip_rects(ctx, deck);
+                let buttons = panels::type_strip_rects(ctx, deck, &tak_core::comment_types::TypeList::default());
                 let strip = panels::type_strip_rect(&buttons);
                 assert_eq!(buttons.len(), comments::TYPES.len());
                 assert!(strip.left() >= deck.left() && strip.right() <= deck.right());
@@ -9606,7 +9735,7 @@ mod tests {
         let [_, at, _, _] = cells_of(&ctx, &mut app, 2);
         tap(&ctx, &mut app, at);
         let kinds = app.history.kinds();
-        for want in comment_list::type_choices() {
+        for want in comment_list::type_choices(&tak_core::comment_types::TypeList::default()) {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
             assert_eq!(type_of(&app, 2), want);
             assert_eq!(type_of(&app, 1), "Keep this only", "only the selected one");
@@ -9703,7 +9832,7 @@ mod tests {
 
     /// The item highlighted in the open list (None: no list, or nothing highlighted).
     fn highlighted(app: &TakViewerApp) -> Option<String> {
-        app.comment_edit.as_ref().filter(|e| e.field == Field::Type && comment_list::type_choices().any(|value| value == e.choice)).map(|e| e.choice.clone())
+        app.comment_edit.as_ref().filter(|e| e.field == Field::Type && comment_list::type_choices(&tak_core::comment_types::TypeList::default()).any(|value| value == e.choice)).map(|e| e.choice.clone())
     }
 
     /// Whether `text` was painted with its left end inside `r`.
@@ -9749,7 +9878,7 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(text_rects(&out, "Comment 6 type · ↑ ↓ Enter · Esc close").len(), 1, "the line at the top");
         let items = app.type_items.clone();
-        assert!(items.iter().map(|i| i.0.as_str()).eq(comment_list::type_choices()));
+        assert!(items.iter().map(|i| i.0.as_str()).eq(comment_list::type_choices(&tak_core::comment_types::TypeList::default())));
         let bx = comment_list::type_box_of(row_of(&ctx, &mut app, 6));
         let list = items.iter().fold(egui::Rect::NOTHING, |a, i| a.union(i.1));
         assert!(ctx.screen_rect().contains_rect(list) && place.x_range().contains(list.left()) && place.x_range().contains(list.right()));
@@ -9758,7 +9887,7 @@ mod tests {
         for k in 1..items.len() {
             assert!(items[k].1.top() >= items[k - 1].1.bottom() - 0.5, "top to bottom");
         }
-        for name in comment_list::type_choices().map(comment_list::item_name) {
+        for name in comment_list::type_choices(&tak_core::comment_types::TypeList::default()).map(comment_list::item_name) {
             assert!(text_rects(&out, name).iter().any(|t| list.contains(t.center())), "{name} in the list");
         }
         assert_eq!(highlighted(&app).as_deref(), Some("Range OK"), "the current one highlighted");
@@ -9936,7 +10065,8 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("type_last_row");
         let dir = _dir_guard.to_path_buf();
-        let types: Vec<_> = comment_list::type_choices().collect();
+        let defaults = tak_core::comment_types::TypeList::default();
+        let types: Vec<_> = comment_list::type_choices(&defaults).collect();
         let list: Vec<_> = (1..=60u64).map(|k| (k, (k % 10) as i64, types[k as usize % types.len()])).collect();
         typed_on_disk(&dir, &list);
         let mut app = comments_tab_app(&ctx, &dir, false);
@@ -10056,7 +10186,7 @@ mod tests {
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         // A screenshot run is a command run too.
-        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, comment_types: false, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
     }
 
@@ -10409,7 +10539,7 @@ mod tests {
     #[test]
     fn command_line_runs_do_not_use_or_fill_the_memory() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, comment_types: false, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         app.settings.file_memory = vec![views::Spot {
             path: "a.tak".into(),
@@ -11493,7 +11623,7 @@ mod tests {
         let _dir_guard = comment_dir("overlay_shot");
         let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
-        let shot = AutoShot { out: dir.join("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: dir.join("x.png"), output: Default::default(), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, comment_types: false, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);

@@ -100,7 +100,10 @@ impl Event {
             shown_b: String::new(),
             file_a,
             file_b: String::new(),
-            operation: Some(new_operation_token()),
+            operation: Some(match &c.type_meaning {
+                Some(meaning) => format!("{}{TYPE_MEANING_SUFFIX}{meaning}", new_operation_token()),
+                None => new_operation_token(),
+            }),
             expected: None,
         }
     }
@@ -109,6 +112,7 @@ impl Event {
 /// Operation tokens of command-written events (`--add-comments`) start with this, so readers
 /// can tell an agent's Comment from one a person made in a window.
 pub const AGENT_OPERATION_PREFIX: &str = "agent-";
+const TYPE_MEANING_SUFFIX: &str = "~type_meaning=";
 
 pub fn writer_of(e: &Event) -> &'static str {
     match &e.operation {
@@ -134,38 +138,23 @@ pub struct Comment {
     pub start: i64,
     pub end: i64,
     pub comment_type: String,
+    pub type_meaning: Option<String>,
     pub text: String,
 }
 
 impl Comment {
     fn from_event(e: &Event) -> Comment {
-        Comment { id: e.id, markers: e.markers.clone(), start: e.start, end: e.end, comment_type: e.comment_type.clone(), text: e.text.clone() }
+        Comment { id: e.id, markers: e.markers.clone(), start: e.start, end: e.end, comment_type: e.comment_type.clone(),
+            type_meaning: e.operation.as_deref().and_then(|token| token.split_once(TYPE_MEANING_SUFFIX))
+                .map(|(_, meaning)| meaning.to_owned()),
+            text: e.text.clone() }
     }
 }
 
 // ───────────────────────────── Types (Comment plan step 5) ─────────────────────────────
 
-/// Current choices in UI, cycle and sort order. Names are also the stored values.
-pub const TYPES: &[&str] = &["File bad", "Range OK", "Range bad", "File OK"];
-
-/// Type cell label, including retired and unknown stored text.
-pub fn type_short(t: &str) -> &str {
-    t
-}
-
-/// Empty first, then current choices, then other values (sorted by text in the UI).
-pub fn type_rank(t: &str) -> usize {
-    if t.is_empty() {
-        0
-    } else {
-        TYPES.iter().position(|k| *k == t).map_or(TYPES.len() + 1, |k| k + 1)
-    }
-}
-
-/// Cycle from None through the current choices. A retired or unknown value goes to None.
-pub fn step_type(t: &str) -> &'static str {
-    TYPES.get(type_rank(t)).copied().unwrap_or("")
-}
+/// Built-in names. Windows and commands use the current user list.
+pub use crate::comment_types::DEFAULT_NAMES as TYPES;
 
 /// The live comments of one take, folded from its events, in id order (a comment brought back
 /// by an undo goes back to its place, so the larger id stays drawn on top).
@@ -1124,7 +1113,7 @@ mod tests {
         // v0.17.0: the Comments tab writes the note (`comment_text`) with `edit` lines.
         assert_eq!(clean_text("a\r\nb\nc\rd\te"), "a b c d e");
         let notes = ["  leading spaces", "=SUM(A1)", "comma, and \"quotes\"", "한글 메모, 마커 바뀜", "trailing ", "\"", "=", ""];
-        let base = Comment { id: 1, markers: vec!["LKNE".into()], start: 3, end: 9, comment_type: String::new(), text: String::new() };
+        let base = Comment { id: 1, markers: vec!["LKNE".into()], start: 3, end: 9, comment_type: String::new(), type_meaning: None, text: String::new() };
         let mut text = header_line() + &encode(&Event::of(Kind::Add, &base, "t".into(), "a.tak|1".into()));
         let mut want = Comments::from_events(&parse(&text).events);
         for n in notes {
@@ -1152,7 +1141,7 @@ mod tests {
 
     #[test]
     fn a_comment_without_markers_round_trips_as_no_markers_and_old_lines_read_the_same() {
-        let c = Comment { id: 4, markers: vec![], start: 2, end: 9, comment_type: String::new(), text: String::new() };
+        let c = Comment { id: 4, markers: vec![], start: 2, end: 9, comment_type: String::new(), type_meaning: None, text: String::new() };
         let mut add = Event::of(Kind::Add, &c, "2026-11-13T14:05:09+09:00".into(), "a.tak|1234".into());
         add.operation = None; // This assertion checks the legacy 12-column format.
         let line = encode(&add);
@@ -1180,7 +1169,7 @@ mod tests {
         let events = [ev(Kind::Add, 1, &["LKNE"], 1, 5), ev(Kind::Add, 2, &["M"], 7, 7), edit, ev(Kind::Delete, 2, &[], 0, 0), ev(Kind::Edit, 9, &["X"], 1, 1)];
         let c = Comments::from_events(&events);
         assert_eq!(c.len(), 1);
-        assert_eq!(c.list()[0], Comment { id: 1, markers: vec!["RKNE".into()], start: 10, end: 20, comment_type: String::new(), text: "fixed".into() });
+        assert_eq!(c.list()[0], Comment { id: 1, markers: vec!["RKNE".into()], start: 10, end: 20, comment_type: String::new(), type_meaning: None, text: "fixed".into() });
         assert_eq!(c.next_id(), 10, "largest id seen + 1, the edit of a missing id counts too");
         // Ids are never used twice: after deleting the newest one the next id is still higher.
         let mut c = Comments::from_events(&[ev(Kind::Add, 1, &["A"], 0, 0), ev(Kind::Add, 2, &["B"], 0, 0)]);
@@ -1223,7 +1212,7 @@ mod tests {
             assert_eq!(c.next_id(), 4, "a restored id is the same comment, not a reuse: next is still largest + 1");
             assert_eq!(Comments::from_events(&events).list(), c.list(), "folding the whole log gives the same list");
         }
-        assert_eq!(c.get(2), Some(&Comment { id: 2, markers: vec!["B".into()], start: 4, end: 9, comment_type: String::new(), text: String::new() }), "same fields");
+        assert_eq!(c.get(2), Some(&Comment { id: 2, markers: vec!["B".into()], start: 4, end: 9, comment_type: String::new(), type_meaning: None, text: String::new() }), "same fields");
         // Undo of the newest add then redo: back on top.
         c.apply(&ev(Kind::Delete, 3, &["C"], 5, 5));
         c.apply(&ev(Kind::Add, 3, &["C"], 5, 5));
@@ -1723,7 +1712,7 @@ mod tests {
     fn each_type_none_and_an_unknown_value_round_trip_and_survive_edits_of_other_fields() {
         // Comment plan step 5: the type is the readable name in the existing `comment_type`
         // column; empty = none; a value the app does not know is kept as it is.
-        let base = Comment { id: 3, markers: vec!["LKNE".into()], start: 10, end: 20, comment_type: String::new(), text: "n".into() };
+        let base = Comment { id: 3, markers: vec!["LKNE".into()], start: 10, end: 20, comment_type: String::new(), type_meaning: None, text: "n".into() };
         for t in TYPES.iter().copied().chain([
             "", "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
             "Needs visual check", "Marker swap", "Ghost, \"later\" type",
@@ -1754,24 +1743,15 @@ mod tests {
     }
 
     #[test]
-    fn current_types_use_the_approved_order_for_labels_sort_and_cycle() {
-        assert_eq!(TYPES, ["File bad", "Range OK", "Range bad", "File OK"]);
-        assert_eq!(type_rank(""), 0);
-        let mut now = "";
-        for (index, next) in TYPES.iter().copied().enumerate() {
-            assert_eq!(type_short(next), next);
-            assert_eq!(type_rank(next), index + 1);
-            now = step_type(now);
-            assert_eq!(now, next);
-        }
-        assert_eq!(step_type(now), "");
-        for other in [
-            "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
-            "Needs visual check", "Marker swap", "Ghost",
-        ] {
-            assert_eq!(type_short(other), other);
-            assert_eq!(type_rank(other), TYPES.len() + 1);
-            assert_eq!(step_type(other), "");
+    fn meaning_snapshot_preserves_the_old_csv_shape_and_utf8_text() {
+        let mut c = Comment { id: 4, markers: vec![], start: 2, end: 9,
+            comment_type: "Custom".into(), type_meaning: Some("좋아요, \"정상\" ~type_meaning=한 줄".into()), text: "Note".into() };
+        for meaning in [c.type_meaning.clone(), Some(String::new()), None] {
+            c.type_meaning = meaning;
+            let e = Event::of(Kind::Add, &c, "t".into(), "a.takm|1".into());
+            assert_eq!(records(&encode(&e))[0].0.len(), 13);
+            let parsed = parse(&(header_line() + &encode(&e)));
+            assert_eq!(parsed.comments().get(c.id), Some(&c));
         }
     }
 }

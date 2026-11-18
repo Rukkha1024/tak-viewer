@@ -14,7 +14,7 @@ pub const USAGE: &str =
   --crop x,y,w,h      창 왼쪽 위 기준 자르기 (포인트)
   --crop-panel NAME   보이는 영역 자르기. 영역 이름:
     EXPLORER, Labeling, Edit Tools, Selected Marker (선택 마커), Devices, COMMENTS, GRAPH,
-    Layout Tabs, footer, timeline, timeline N, 3D view N (N = 1~4)
+    Layout Tabs, Settings, footer, timeline, timeline N, 3D view N (N = 1~4)
   --scale N           자른 그림을 정수 배로 확대
   --crop-only         전체 PNG 생략. 자른 그림은 OUT.crop.png
   --regions           영역 좌표를 OUT.regions.json에 저장
@@ -33,6 +33,7 @@ const PANELS: &[&str] = &[
     "COMMENTS",
     "GRAPH",
     "Layout Tabs",
+    "Settings",
     "footer",
     "timeline",
     "timeline 1",

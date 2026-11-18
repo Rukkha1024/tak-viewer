@@ -441,7 +441,12 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
     let ctx = egui::Context::default();
     let tab_files = if tab_shot.is_some() { std::mem::take(&mut initial) } else { Vec::new() };
     let initial_auto = if probe.is_some() || tab_shot.is_some() { None } else { auto.take() };
+    let data = match crate::instances::data_dir_override() {
+        Ok(dir) => dir,
+        Err(error) => { eprintln!("{error}"); return 2; }
+    };
     let mut app = TakViewerApp::build(&ctx, None, initial, initial_auto, capture);
+    app.use_comment_types(crate::comment_types::path(data.as_deref()), &ctx, true);
     if let Some(shot) = &tab_shot {
         app.set_command_run();
         app.open_shot_tabs(&ctx, &tab_files);

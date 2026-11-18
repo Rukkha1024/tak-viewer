@@ -120,11 +120,12 @@ pub fn data_dir_override() -> Result<Option<PathBuf>, String> {
     Ok(Some(dir))
 }
 
+pub fn storage_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
+    data_dir.map(Path::to_path_buf).or_else(|| eframe::storage_dir("tak_viewer"))
+}
+
 pub fn registry_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
-    data_dir
-        .map(Path::to_path_buf)
-        .or_else(|| eframe::storage_dir("tak_viewer"))
-        .map(|d| d.join("windows"))
+    storage_dir(data_dir).map(|d| d.join("windows"))
 }
 
 pub fn register(dir: &Path, only: bool) -> io::Result<Registration> {

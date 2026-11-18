@@ -3765,7 +3765,7 @@ mod integration_tests {
         assert!(typing.marker_ui[0].job.is_none());
 
         let mut editing = app(&ctx);
-        let comment = Comment { id: 4, markers: vec![], start: 0, end: 1, comment_type: String::new(), text: "draft".into() };
+        let comment = Comment { id: 4, markers: vec![], start: 0, end: 1, comment_type: String::new(), type_meaning: None, text: "draft".into() };
         editing.comment_edit = Some(comment_list::Edit::new(0, 10, &comment, Field::Markers, editing.views[0].selection()));
         press(&ctx, &mut editing, Modifiers::NONE);
         assert!(editing.marker_ui[0].job.is_none());

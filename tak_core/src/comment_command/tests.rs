@@ -263,6 +263,7 @@ fn command_and_window_writer_share_the_path_lock_and_id_reservations() {
         start: 2,
         end: 3,
         comment_type: String::new(),
+        type_meaning: None,
         text: "window".into(),
     };
     let event = Event::of(Kind::Add, &window, TIME.into(), "a.takm".into());
@@ -332,6 +333,7 @@ fn cuts_tail_before_append_and_lists_real_timestamps_and_bad_rows() {
         start: 3,
         end: 4,
         comment_type: "Jitter".into(),
+        type_meaning: None,
         text: "edited".into(),
     };
     takm::append_events(
@@ -361,7 +363,7 @@ fn cuts_tail_before_append_and_lists_real_timestamps_and_bad_rows() {
     assert_eq!(
         output["comments"],
         json!([{"id":1,"markers":[],"start":3,"end":4,
-        "type":"Jitter","text":"edited","time":"edited-time","by":"viewer"}])
+        "type":"Jitter","type_meaning":null,"text":"edited","time":"edited-time","by":"viewer"}])
     );
     assert_eq!(output["cut_tail"], false);
     assert_eq!(output["skipped_lines"], 2);
@@ -405,6 +407,7 @@ fn batch_preflights_every_file_and_reserves_no_ids_for_invalid_rows() {
         resolve,
         AddOptions::default(),
         || panic!("must preflight both files"),
+        &TypeList::default(),
     );
     let items = serde_json::to_value(items).unwrap();
     assert!(failed);
@@ -419,7 +422,7 @@ fn batch_preflights_every_file_and_reserves_no_ids_for_invalid_rows() {
 
     let (items, failed) = batch::add(input(valid.clone()), resolve, AddOptions::default(), || {
         TIME.into()
-    });
+    }, &TypeList::default());
     assert!(!failed);
     let doc = serde_json::to_value(Envelope::new(1, items)).unwrap();
     for item in doc["items"].as_array().unwrap() {
@@ -435,7 +438,7 @@ fn batch_preflights_every_file_and_reserves_no_ids_for_invalid_rows() {
         allow_duplicates: true,
         ..Default::default()
     };
-    let (items, failed) = batch::add(input(valid.clone()), resolve, options, || panic!("dry run"));
+    let (items, failed) = batch::add(input(valid.clone()), resolve, options, || panic!("dry run"), &TypeList::default());
     assert!(!failed);
     let doc = serde_json::to_value(items).unwrap();
     assert!(doc[0]["added"][0]["id"].is_null());
@@ -459,6 +462,7 @@ fn batch_rejects_duplicate_keys_and_two_paths_to_one_file() {
         |p| dir.join(p),
         AddOptions::default(),
         || panic!("aliased file"),
+        &TypeList::default(),
     );
     assert!(failed);
     assert_eq!(
@@ -469,7 +473,7 @@ fn batch_rejects_duplicate_keys_and_two_paths_to_one_file() {
 }
 
 #[test]
-fn directory_list_reports_writer_filter_and_tail_damage_without_changing_the_single_shape() {
+fn directory_list_preserves_the_single_shape_and_reports_writer_and_tail_damage() {
     let (dir, a) = fixture("comment_list_batch");
     let nested = dir.join("nested");
     fs::create_dir(&nested).unwrap();
@@ -490,7 +494,7 @@ fn directory_list_reports_writer_filter_and_tail_damage_without_changing_the_sin
         json!({
             "file": a.display().to_string(),
             "comments": [{"id":1,"markers":["LKNE","RKNE"],"start":0,"end":299,
-                          "type":"Range bad","text":"check","time":TIME,"by":"agent"}],
+                          "type":"Range bad","type_meaning":"this frame range is not normal","text":"check","time":TIME,"by":"agent"}],
             "skipped_lines":2,"malformed_lines":1,"cut_tail":true,
         })
     );
@@ -563,4 +567,37 @@ fn comment_batch_arguments_accept_both_modes_and_refuse_mixed_modes() {
         let args = words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert!(parse_args(&args).is_err(), "{words:?}");
     }
+}
+
+#[test]
+fn custom_cli_types_are_validated_and_capture_the_meaning_at_add_time() {
+    use crate::comment_types::Definition;
+    let (_dir, path) = fixture("comment_custom_meaning");
+    let list_with = |meaning: &str| TypeList::validate(vec![Definition {
+        name: "Feet OK".into(), meaning: meaning.into(),
+    }]).unwrap();
+    let types = list_with("발 움직임이 정상이에요, \"확인했어요\".");
+    let rows = serde_json::to_vec(&json!([
+        {"markers":[],"start":3,"end":4,"text":"note","type":"feet ok"},
+        {"markers":[],"start":3,"end":4,"text":"retired","type":"Jump"},
+        {"markers":[],"start":3,"end":4,"text":"default","type":"Range OK"},
+    ])).unwrap();
+    let bad = serde_json::to_vec(&json!([
+        {"markers":[],"start":3,"end":4,"text":"","type":"Feet  OK"}
+    ])).unwrap();
+    let before = fs::read(&path).unwrap();
+    let refusal = add_with_types(&path, &bad, AddOptions::default(), || unreachable!(), &types).unwrap_err();
+    assert!(refusal.contains("Feet OK"));
+    assert_eq!(before, fs::read(&path).unwrap());
+    add_with_types(&path, &rows, AddOptions::default(), || TIME.into(), &types).unwrap();
+    let duplicate = add_with_types(&path, &rows, AddOptions::default(), || unreachable!(), &list_with("changed")).unwrap();
+    assert_eq!(duplicate.skipped_existing.len(), 3);
+    let doc = serde_json::to_value(list(&path).unwrap()).unwrap();
+    let rows = doc["comments"].as_array().unwrap();
+    assert_eq!(rows[0]["type"], "Feet OK");
+    assert_eq!(rows[0]["by"], "agent");
+    assert_eq!(rows[0]["type_meaning"], types.meaning("Feet OK").unwrap());
+    assert!(rows[1]["type_meaning"].is_null());
+    assert_eq!(rows[2]["type_meaning"], "this frame range is normal");
+    assert!(fs::read(path).unwrap().starts_with(&before));
 }

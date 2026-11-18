@@ -414,7 +414,7 @@ pub(crate) fn path_lock_key(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", Sha256::digest(key)))
 }
 
-pub(crate) fn lock_path(path: &Path) -> io::Result<File> {
+pub fn lock_path(path: &Path) -> io::Result<File> {
     let target = canonical_target(path)?;
     if in_input(&target) { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "input/ 보호")); }
     let lock = coordination_root().join(format!(".tak_viewer_{}.lock", path_lock_key(&target)?));

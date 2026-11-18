@@ -15,6 +15,7 @@ Syntax → [Agent commands](../tak_viewer/README.md#agent-commands).
 | `checks/compare_png.py` | Text or `--json` object to stdout, optional diff PNG | Unversioned | 0 equal outside ignored regions, 1 size mismatch or differing pixels outside ignores, 2 invalid args/file |
 | `--to-takm` | Per-file line and TAKM output. `--verify` adds verdict to the line | — | 0 complete, 1 conversion or verification failure, 2 arguments |
 | `--verify-takm` | One object or array, optional envelope | 1 per object or envelope | 0 all fixed verdicts pass, 1 any failed verdict or write failure, 2 arguments |
+| `--list-comment-types` | Ordered names and meanings, settings path and load status. Text or optional JSON export | 1 | 0 listed, 1 export error, 2 arguments or data directory error |
 | `--list-comments` | Legacy single object or batch array, optional envelope | 1 in envelope | 0 read, 1 any file or export failure, 2 option syntax |
 | `--add-comments` | One object for row-array input. Receipt array for file-to-rows input, optional envelope | 1 per success object or envelope | 0 done or dry-run, 1 refused or I/O failure, 2 option syntax |
 | `--list-windows` | PID-sorted array, optional envelope. `--wait` prints one unwrapped window object | 1 in envelope | List: 0 listed, 1 I/O failure, 2 bad args or settings root. Wait: 0 ready, 1 file failure/timeout/I/O, 2 absent PID or bad args/settings root |
@@ -135,8 +136,9 @@ Conversion stdout carries output path, source and output size, dropped camera by
 
 | Output | Fields |
 |---|---|
+| Type settings | `schema_version` (1), `path` (config file or null), `source` (`saved`, `missing`, `broken`), `message` (string or null), `types` (ordered array of `{name, meaning}`). Missing/broken uses defaults |
 | Single list | `file`, `comments`, `skipped_lines` (includes cut row), `malformed_lines`, `cut_tail` |
-| List row | Numeric `id`, `markers` (names), inclusive `start`/`end`, `type` (stored text, including retired and unknown values), `text`, `time` (last effective event), `by` (`agent`, `viewer`, `legacy`) |
+| List row | Numeric `id`, `markers` (names), inclusive `start`/`end`, `type` (stored text, including retired and unknown values), nullable `type_meaning` (snapshot at assignment), `text`, `time` (last effective event), `by` (`agent`, `viewer`, `legacy`) |
 | Batch list | Single-list fields plus `live_count` (before filtering), `tail_note` (header/UTF-8 diagnostic or null), `error` (string or null). Unreadable file → empty `comments`, null counts/flags, error string. Positional order or sorted directory paths |
 | Add success | `file`, `added`, `skipped_existing`, `live_total`, `fixed_unchanged`, `dry_run`. Rows carry `markers`, `start`, `end`, `type`, `text`, plus nullable `id` (planned add or duplicate earlier in current batch). Skips add 1-based `row`. Dry-run total = current live count |
 | Batch add | Receipt array sorted by input path key. Validated targets have add-success shape when the batch runs. Validation failure returns one `{file,status,error}` per target, status `not_written`, error null for targets with no reported issue. Late append/I/O failure can leave earlier successful writes. Failing target has status `failed`, later targets have `not_written` |

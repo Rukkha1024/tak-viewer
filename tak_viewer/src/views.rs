@@ -2388,7 +2388,7 @@ mod tests {
         retained.range = Some((2, 8));
         retained.select(2, false);
         retained.select(0, true);
-        let comment = comments::Comment { id: 91, markers: vec![], start: 2, end: 8, comment_type: String::new(), text: "retained".into() };
+        let comment = comments::Comment { id: 91, markers: vec![], start: 2, end: 8, comment_type: String::new(), type_meaning: None, text: "retained".into() };
         let event = comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new());
         retained.comments.list.apply(&event);
         retained.select_comment(91);
@@ -2680,7 +2680,7 @@ mod tests {
         other.select(0, true);
         let selection = other.edit_selection_state();
         other.pb.set_frame(7, 0.0);
-        let comment = comments::Comment { id: 9, markers: vec![], start: 2, end: 3, comment_type: String::new(), text: "latest".into() };
+        let comment = comments::Comment { id: 9, markers: vec![], start: 2, end: 3, comment_type: String::new(), type_meaning: None, text: "latest".into() };
         owner.comments.list.apply(&comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new()));
         owner.comments.pending = 1;
         owner.comments.pending_since = Some(Instant::now());
@@ -2855,7 +2855,7 @@ mod tests {
     #[test]
     fn comment_selection_restores_an_order_and_markerless_comments_keep_click_order() {
         let mut view = selection_view();
-        let comment = comments::Comment { id: 1, markers: vec!["C".into(), "A".into(), "B".into()], start: 2, end: 3, comment_type: String::new(), text: String::new() };
+        let comment = comments::Comment { id: 1, markers: vec!["C".into(), "A".into(), "B".into()], start: 2, end: 3, comment_type: String::new(), type_meaning: None, text: String::new() };
         let markerless = comments::Comment { id: 2, markers: vec![], ..comment.clone() };
         view.comments.list = Comments::from_events(&[
             comments::Event::of(comments::Kind::Add, &comment, String::new(), String::new()),

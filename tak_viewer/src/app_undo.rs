@@ -273,6 +273,7 @@ impl Folders {
 #[derive(Clone)]
 pub(super) enum Part {
     Progress(crate::take_progress::Pick),
+    CommentTypes(crate::comment_types::Change),
     View { tab: Option<layout_tabs::TabId>, slot: usize, part: Box<Part> },
     Frame { file: PathBuf, before: i64, after: i64 },
     Camera { file: PathBuf, before: Camera, after: Camera },
@@ -403,7 +404,7 @@ impl Part {
 
 /// `a` and `b` are the same comment but for its type.
 fn only_type(a: &Comment, b: &Comment) -> bool {
-    a.comment_type != b.comment_type && Comment { comment_type: b.comment_type.clone(), ..a.clone() } == *b
+    a.comment_type != b.comment_type && Comment { comment_type: b.comment_type.clone(), type_meaning: b.type_meaning.clone(), ..a.clone() } == *b
 }
 
 /// The state last recorded.
@@ -548,6 +549,7 @@ impl History {
             Part::Comment { .. } => "Comment",
             Part::MarkerEdit { .. } => "MarkerEdit",
             Part::Progress(_) => "Progress",
+            Part::CommentTypes(_) => "Comment types",
             Part::Layout { .. } => "Layout",
             Part::TakmSwitch { .. } => "TakmSwitch",
             Part::EditorSelection { .. } => "EditorSelection",
@@ -1475,7 +1477,31 @@ impl TakViewerApp {
         }
     }
 
+    pub(super) fn finish_comment_types_history(
+        &mut self, change: crate::comment_types::Change, replay: Option<(crate::comment_types::Change, bool)>, now: f64,
+    ) {
+        if let Some((original, redo)) = replay {
+            let (from, to) = if redo { (&mut self.history.redo, &mut self.history.undo) }
+                else { (&mut self.history.undo, &mut self.history.redo) };
+            if let Some(index) = from.iter().rposition(|action|
+                matches!(action.as_slice(), [Part::CommentTypes(old)] if *old == original))
+            {
+                let action = from.remove(index);
+                if redo || index == from.len() { to.push(action); }
+            }
+            let word = if redo { "Redo" } else { "Undo" };
+            self.history.note = Some((format!("{word} · Comment types"), now));
+        } else if change.before != change.after {
+            self.history.push(vec![Part::CommentTypes(change)]);
+            self.history.note = Some(("Saved Comment types".into(), now));
+        }
+    }
+
     pub(super) fn undo_redo(&mut self, ctx: &egui::Context, redo: bool) {
+        if self.comment_types_saving() {
+            self.history.note = Some(("Comment 종류 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         if self.progress_job.is_some() {
             self.history.note = Some(("진행 상태 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
             return;
@@ -1518,6 +1544,10 @@ impl TakViewerApp {
                 }
                 return;
             };
+            if let [Part::CommentTypes(change)] = top.as_slice() {
+                self.replay_comment_types(change.clone(), redo);
+                return;
+            }
             let operation_origin = self.layout_tabs.active_id();
             let owner = self.history_owner(top);
             if let Some(tab) = owner {
@@ -1845,7 +1875,7 @@ impl TakViewerApp {
                     Err(_) => "Marker edit failed".into(),
                 }
             }
-            Part::Progress(_) | Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
+            Part::Progress(_) | Part::CommentTypes(_) | Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
             | Part::TabSwitch { .. } | Part::TabRename { .. } | Part::TabMove { .. }
             | Part::TabLifecycle { .. } | Part::View { .. } => String::new(),
         }

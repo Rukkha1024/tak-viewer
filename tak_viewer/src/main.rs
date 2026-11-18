@@ -29,6 +29,7 @@ mod device_filter;
 mod desktop_drop;
 mod device_grid;
 mod comment_selection;
+mod comment_types;
 mod capture;
 mod check_command;
 #[cfg(test)]
@@ -101,8 +102,20 @@ fn main() -> eframe::Result<()> {
     if args.get(1).map(String::as_str) == Some("--verify-takm") {
         std::process::exit(tak_core::takm::verify::run(&args[2..], workspace::resolve_path));
     }
+    if args.get(1).map(String::as_str) == Some("--list-comment-types") {
+        if let Err((code, message)) = comment_types::run_list(&args[2..]) { cli_exit(code, &message); }
+        return Ok(());
+    }
     if matches!(args.get(1).map(String::as_str), Some("--add-comments" | "--list-comments")) {
-        std::process::exit(comment_command::run(&args[1..], workspace::resolve_path, capture::local_iso_time));
+        let types = if args[1] == "--add-comments" {
+            let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
+            let snapshot = comment_types::read(comment_types::path(data.as_deref()).as_deref());
+            if let Some(message) = snapshot.message().filter(|_| snapshot.is_broken()) { eprintln!("{message}"); }
+            snapshot.types
+        } else {
+            tak_core::comment_types::TypeList::default()
+        };
+        std::process::exit(comment_command::run_with_types(&args[1..], workspace::resolve_path, capture::local_iso_time, &types));
     }
     if args.get(1).map(String::as_str) == Some("--summary") {
         std::process::exit(summary_command::run(&args[2..], workspace::resolve_path));
@@ -243,6 +256,11 @@ fn main() -> eframe::Result<()> {
     let tab_shot = app::tab_shot::TabShot::take(&mut args, headless)
         .unwrap_or_else(|error| cli_exit(2, error));
     let no_desktop = !headless && instances::no_desktop();
+    if args.iter().any(|a| a == "--shot-comment-types")
+        && !(args.iter().any(|a| a == "--screenshot") && (headless || no_desktop))
+    {
+        cli_exit(2, "--shot-comment-types는 --headless --screenshot과 함께 써 주세요.");
+    }
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
@@ -326,6 +344,8 @@ fn usage() -> String {
         BENCH_USAGE,
         &bench_load_usage,
         "tak_viewer --dump-device-signal FILE DEVICE CHANNEL CHAIN OUT.json\nDevice screenshot or benchmark: --device-chain DEVICE=CHAIN (repeat) --device-open DEVICE --device-bypass\nDevice grid: --device-grid CxR --device-cells CELLS --device-list folded --device-fill DEVICE --channel-names NAMES --device-drag DEVICE:CELL --device-pane-size WxH",
+        comment_types::LIST_USAGE,
+        "Headless Settings screenshot: --shot-comment-types with --headless --screenshot",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,
@@ -352,9 +372,8 @@ fn run_window(
 ) -> eframe::Result<()> {
     let command_run = capture.is_some() || auto.is_some();
     let only = startup.is_some();
-    let data = if command_run { None } else {
-        instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error))
-    };
+    let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
+    let types_path = comment_types::path(data.as_deref());
     let registry = if command_run { None } else { instances::registry_dir(data.as_deref()) };
     let registration = registry.and_then(|dir| match instances::register(&dir, only) {
         Ok(entry) => Some(entry),
@@ -373,7 +392,7 @@ fn run_window(
             .with_inner_size(size)
             .with_min_inner_size(min_size)
             .with_drag_and_drop(true),
-        persistence_path: data.map(|dir| dir.join("app.ron")),
+        persistence_path: if command_run { None } else { data.map(|dir| dir.join("app.ron")) },
         persist_window: !command_run && !only,
         ..Default::default()
     };
@@ -383,6 +402,7 @@ fn run_window(
         Box::new(move |cc| {
             let mut app = app::TakViewerApp::new(cc, initial, auto, capture, startup);
             app.native_command_result = app_result;
+            app.use_comment_types(types_path, &cc.egui_ctx, command_run);
             app.set_registration(registration, others_at_start);
             // WORKSPACE follows the disk in the user's window only; command runs
             // (`--screenshot`, `--capture`) never start the folder watcher.

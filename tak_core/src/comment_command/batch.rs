@@ -72,6 +72,7 @@ pub(super) fn add(
     resolve: impl Fn(&str) -> PathBuf,
     options: AddOptions,
     now: impl FnOnce() -> String,
+    types: &TypeList,
 ) -> (Vec<AddItem>, bool) {
     let (paths, rows): (Vec<_>, Vec<_>) = rows
         .0
@@ -84,7 +85,7 @@ pub(super) fn add(
     let mut errors = Vec::new();
     for (i, (path, rows)) in paths.iter().zip(rows).enumerate() {
         let prepare = || {
-            let target = PreparedAdd::new(path.clone(), &rows, options)?;
+            let target = PreparedAdd::new(path.clone(), &rows, options, types)?;
             let key = takm::path_lock_key(&target.actual).map_err(read_error)?;
             let identity = same_file::Handle::from_path(&target.actual).map_err(read_error)?;
             Ok::<_, String>((key, identity, target))

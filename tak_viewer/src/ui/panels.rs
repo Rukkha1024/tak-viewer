@@ -1320,12 +1320,12 @@ const STRIP_PAD: f32 = 3.0;
 const STRIP_GAP: f32 = 4.0;
 
 /// Wrap full-name buttons left to right, then anchor the group above the playback bar.
-pub fn type_strip_rects(ctx: &egui::Context, deck: Rect) -> Vec<Rect> {
+pub fn type_strip_rects(ctx: &egui::Context, deck: Rect, types: &tak_core::comment_types::TypeList) -> Vec<Rect> {
     let right = deck.right() - 6.0 - STRIP_PAD;
     let available = (right - deck.left() - 6.0 - STRIP_PAD).max(1.0);
-    let mut buttons = Vec::with_capacity(tak_core::comments::TYPES.len());
+    let mut buttons = Vec::with_capacity(types.rows().len());
     let (mut x, mut y, mut width) = (0.0_f32, 0.0, 0.0_f32);
-    for &kind in tak_core::comments::TYPES {
+    for kind in types.names() {
         let text_width = ctx.fonts(|f| f.layout_no_wrap(kind.to_owned(), FontId::proportional(STRIP_FONT), egui::Color32::WHITE).size().x);
         let button_width = (text_width + 14.0).min(available);
         if x > 0.0 && x + button_width > available {
@@ -1346,7 +1346,7 @@ pub fn type_strip_rect(buttons: &[Rect]) -> Rect {
     buttons.iter().copied().fold(Rect::NOTHING, Rect::union).expand(STRIP_PAD)
 }
 
-pub fn type_button(kind: &'static str, selected: bool) -> egui::Button<'static> {
+pub fn type_button(kind: &str, selected: bool) -> egui::Button<'_> {
     let color = if selected { theme::TAB_TEXT_ACTIVE } else { theme::TEXT };
     egui::Button::new(RichText::new(kind).size(STRIP_FONT).color(color))
         .wrap_mode(egui::TextWrapMode::Extend)
@@ -1354,13 +1354,13 @@ pub fn type_button(kind: &'static str, selected: bool) -> egui::Button<'static> 
 }
 
 /// Draw the strip and return the clicked type.
-pub fn type_strip(ui: &mut Ui, buttons: &[Rect], now: &str) -> Option<&'static str> {
+pub fn type_strip<'a>(ui: &mut Ui, buttons: &[Rect], now: &str, types: &'a tak_core::comment_types::TypeList) -> Option<&'a str> {
     let whole = type_strip_rect(buttons);
     ui.painter().rect_filled(whole, 4.0, theme::PANEL_BG);
     ui.painter().rect_stroke(whole, 4.0, Stroke::new(1.0_f32, theme::COMMENT));
     let mut picked = None;
-    for (&t, r) in tak_core::comments::TYPES.iter().zip(buttons) {
-        let b = type_button(t, now == t).min_size(r.size());
+    for (t, r) in types.names().zip(buttons) {
+        let b = type_button(t, now == t).wrap_mode(egui::TextWrapMode::Truncate).min_size(r.size());
         if ui.put(*r, b).clicked() {
             picked = Some(t);
         }

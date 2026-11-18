@@ -41,6 +41,7 @@ pub struct AutoShot {
     pub pick_comment: Option<u64>,
     /// `--edit-comment <id>[:cell]`: that comment selected and the edit of that cell shown.
     pub edit_comment: Option<(u64, Field)>,
+    pub comment_types: bool,
     /// `--type-strip <id>` (step 5): the type strip shown for that comment of the active view,
     /// as right after it was made (a command run writes nothing, so it is only looked at).
     pub type_strip: Option<u64>,
@@ -126,6 +127,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let mut pick_comment = None;
     let mut edit_comment = None;
     let mut type_strip = None;
+    let mut comment_types = false;
     let mut hover = None;
     let mut scene_view = None;
     let mut scene_follow = false;
@@ -151,6 +153,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                     comments: false,
                     pick_comment: None,
                     edit_comment: None,
+                    comment_types: false,
                     type_strip: None,
                     overlays: Vec::new(),
                     hide: Vec::new(),
@@ -254,6 +257,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                 }
                 i += 2;
             }
+            "--shot-comment-types" => { comment_types = true; i += 1; }
             "--edit-comment" if i + 1 < args.len() => {
                 edit_comment = parse_edit(&args[i + 1]);
                 if edit_comment.is_none() {
@@ -289,6 +293,7 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         s.comments = comments;
         s.pick_comment = edit_comment.map(|e| e.0).or(pick_comment);
         s.edit_comment = edit_comment;
+        s.comment_types = comment_types;
         s.type_strip = type_strip;
         s.overlays = overlays;
         s.hide = hide;

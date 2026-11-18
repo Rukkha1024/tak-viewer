@@ -1,7 +1,10 @@
 
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
-use tak_core::comments::{self, Comment, Comments};
+#[cfg(test)]
+use tak_core::comments;
+use tak_core::comment_types::TypeList;
+use tak_core::comments::{Comment, Comments};
 
 /// Height of a row (and of the column names, and of the line at the top).
 pub const ROW_H: f32 = 22.0;
@@ -34,8 +37,8 @@ impl SortKey {
 }
 
 /// The items of the dropdown in order, with None last.
-pub fn type_choices() -> impl Iterator<Item = &'static str> {
-    comments::TYPES.iter().copied().chain([""])
+pub fn type_choices(types: &TypeList) -> impl Iterator<Item = &str> {
+    types.names().chain([""])
 }
 
 /// What an item of the type list says: the full name, `None` for no type.
@@ -49,15 +52,15 @@ pub fn item_name(value: &str) -> &str {
 
 /// The item ↑ (`up`) or ↓ moves the list's highlight to from `now`. Nothing highlighted (a
 /// value the app does not know): ↓ = the first item, ↑ = the last. The ends stop.
-pub fn step_item(now: &str, up: bool) -> &'static str {
-    let last = comments::TYPES.len();
-    let k = match (type_choices().position(|v| v == now), up) {
+pub fn step_item<'a>(types: &'a TypeList, now: &str, up: bool) -> &'a str {
+    let last = types.rows().len();
+    let k = match (type_choices(types).position(|v| v == now), up) {
         (Some(k), true) => k.saturating_sub(1),
         (Some(k), false) => (k + 1).min(last),
         (None, true) => last,
         (None, false) => 0,
     };
-    type_choices().nth(k).unwrap_or("")
+    type_choices(types).nth(k).unwrap_or("")
 }
 
 /// How the list is sorted: a column, from the small end (▲) or reversed (▼). One for the app,
@@ -107,15 +110,15 @@ pub fn frames_text(c: &Comment) -> String {
 
 /// Positions in `list` in the order shown. Ties go by id, then by place in the list (two comments
 /// with one id, two windows); reversed (`desc`) is the exact reverse.
-pub fn sorted(list: &[Comment], sort: Sort) -> Vec<usize> {
+pub fn sorted(list: &[Comment], sort: Sort, types: &TypeList) -> Vec<usize> {
     let mut order: Vec<usize> = (0..list.len()).collect();
     let tie = |a: usize, b: usize| list[a].id.cmp(&list[b].id).then(a.cmp(&b));
     match sort.key {
         SortKey::Id => order.sort_by(|&a, &b| tie(a, b)),
         SortKey::Frames => order.sort_by(|&a, &b| (list[a].start, list[a].end).cmp(&(list[b].start, list[b].end)).then(tie(a, b))),
-        // The fixed type order, none first; values the app does not know last, by text.
+        // The configured type order, none first; values the app does not know last, by text.
         SortKey::Type => {
-            let keys: Vec<(usize, String)> = list.iter().map(|c| (comments::type_rank(&c.comment_type), c.comment_type.to_lowercase())).collect();
+            let keys: Vec<(usize, String)> = list.iter().map(|c| (types.rank(&c.comment_type), c.comment_type.to_lowercase())).collect();
             order.sort_by(|&a, &b| keys[a].cmp(&keys[b]).then(tie(a, b)));
         }
         SortKey::Markers | SortKey::Text => {
@@ -139,10 +142,12 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn get(&mut self, list: &Comments, file_id: usize, sort: Sort) -> &[usize] {
+    pub fn invalidate(&mut self) { self.key = None; }
+
+    pub fn get(&mut self, list: &Comments, file_id: usize, sort: Sort, types: &TypeList) -> &[usize] {
         let key = (file_id, list.revision(), sort);
         if self.key != Some(key) {
-            self.rows = sorted(list.list(), sort);
+            self.rows = sorted(list.list(), sort, types);
             self.key = Some(key);
             self.builds += 1;
         }
@@ -250,7 +255,7 @@ pub enum ListAction {
     /// the list already open closes it).
     TypeBox(u64, bool),
     /// Apply a visible type button to the representative Comment.
-    SetType(u64, &'static str),
+    SetType(u64, usize),
     /// Save the edit going on (a click on an item of the type list: it is in the edit already).
     SaveEdit,
 }
@@ -314,6 +319,7 @@ pub fn box_rects(row: Rect) -> [Rect; 3] {
 /// What the list shows.
 pub struct ListIn<'a> {
     pub list: &'a Comments,
+    pub types: &'a TypeList,
     pub file_id: usize,
     /// Current frame: rows whose frames hold it get a thin orange bar.
     pub frame: i64,
@@ -443,8 +449,8 @@ const LIST_PAD: f32 = 3.0;
 const CHECK_ROOM: f32 = 22.0;
 
 /// Size of the type list whose longest item name is `name_w` wide.
-pub fn list_size(name_w: f32) -> egui::Vec2 {
-    vec2((CHECK_ROOM + name_w + 14.0).ceil(), ITEM_H * (comments::TYPES.len() + 1) as f32 + 2.0 * LIST_PAD)
+pub fn list_size(name_w: f32, count: usize) -> egui::Vec2 {
+    vec2((CHECK_ROOM + name_w + 14.0).ceil(), ITEM_H * (count + 1) as f32 + 2.0 * LIST_PAD)
 }
 
 /// Where the type list of size `size` goes for a Type box `anchor` in the pane `room`: right
@@ -469,7 +475,7 @@ fn draw_check(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
 
 /// Draw the type list of comment `c` (now `current`) at `place`, on top of everything. A click
 /// on an item puts it in `choice` and returns true (saved at once by the app). No hover text.
-fn type_list(ctx: &egui::Context, place: Rect, current: &str, choice: &mut String, items: &mut Vec<(String, Rect)>) -> bool {
+fn type_list(ctx: &egui::Context, types: &TypeList, place: Rect, current: &str, choice: &mut String, items: &mut Vec<(String, Rect)>) -> bool {
     let mut picked = false;
     egui::Area::new(egui::Id::new("comment_type_list"))
         .order(egui::Order::Foreground)
@@ -481,7 +487,7 @@ fn type_list(ctx: &egui::Context, place: Rect, current: &str, choice: &mut Strin
             let p = ui.painter();
             p.rect_filled(r, 3.0, theme::MENU_BG);
             p.rect_stroke(r, 3.0, Stroke::new(1.0_f32, theme::GRAPH_GRID.gamma_multiply(1.6)));
-            for (k, value) in type_choices().enumerate() {
+            for (k, value) in type_choices(types).enumerate() {
                 let item = Rect::from_min_size(pos2(r.left() + LIST_PAD, r.top() + LIST_PAD + k as f32 * ITEM_H), vec2(r.width() - 2.0 * LIST_PAD, ITEM_H));
                 let resp = ui.interact(item, ui.id().with(("type_item", k)), Sense::click());
                 let lit = *choice == value;
@@ -590,11 +596,11 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     let picked = input.picked.and_then(|id| input.list.get(id));
     let enabled = writable && edit.is_none() && picked.is_some();
     ui.horizontal_wrapped(|ui| {
-        for &kind in comments::TYPES {
+        for (index, kind) in input.types.names().enumerate() {
             let selected = picked.is_some_and(|c| c.comment_type == kind);
             let button = ui.add_enabled(enabled, super::panels::type_button(kind, selected));
             if let Some(c) = picked.filter(|_| button.clicked()) {
-                out.action = Some(ListAction::SetType(c.id, kind));
+                out.action = Some(ListAction::SetType(c.id, index));
             }
         }
     });
@@ -615,7 +621,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     }
     ui.painter().line_segment([head.left_bottom(), head.right_bottom()], Stroke::new(1.0_f32, theme::GRAPH_SEP));
 
-    let rows = order.get(input.list, input.file_id, input.sort);
+    let rows = order.get(input.list, input.file_id, input.sort, input.types);
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut area = ScrollArea::vertical().id_salt("comment_rows").auto_shrink([false, false]);
     if let Some(id) = input.scroll_to {
@@ -674,7 +680,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             // comments cannot be written (a click is then a row click).
             let tbox = type_box(col.ty);
             let open = field == Some(Field::Type);
-            let clipped_type = draw_type_box(ui, tbox, comments::type_short(&c.comment_type), text_color, writable, open);
+            let clipped_type = draw_type_box(ui, tbox, &c.comment_type, text_color, writable, open);
             if open {
                 type_anchor = Some((c.id, tbox));
             }
@@ -790,15 +796,15 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     if let Some(e) = edit.filter(|e| e.field == Field::Type) {
         match (type_anchor, input.list.get(e.id)) {
             (Some((id, anchor)), Some(c)) if id == e.id => {
-                let name_w = type_choices().map(|v| ui.fonts(|f| f.layout_no_wrap(item_name(v).to_owned(), FontId::proportional(FONT), Color32::WHITE).size().x)).fold(0.0, f32::max);
-                let size = list_size(name_w);
+                let name_w = type_choices(input.types).map(|v| ui.fonts(|f| f.layout_no_wrap(item_name(v).to_owned(), FontId::proportional(FONT), Color32::WHITE).size().x)).fold(0.0, f32::max);
+                let size = list_size(name_w, input.types.rows().len());
                 let fits_pane = (anchor.top() - room.top()).max(room.bottom() - anchor.bottom()) >= size.y;
                 let menu_room = if fits_pane { room } else {
                     let screen = ui.ctx().screen_rect();
                     Rect::from_min_max(pos2(room.left(), screen.top()), pos2(room.right(), screen.bottom()))
                 };
                 let place = list_place(anchor, size, menu_room);
-                if type_list(ui.ctx(), place, &c.comment_type, &mut e.choice, &mut out.items) {
+                if type_list(ui.ctx(), input.types, place, &c.comment_type, &mut e.choice, &mut out.items) {
                     out.action = Some(ListAction::SaveEdit);
                 }
                 e.list = place;
@@ -815,7 +821,7 @@ mod tests {
     use super::*;
 
     fn c(id: u64, markers: &[&str], start: i64, end: i64, text: &str) -> Comment {
-        Comment { id, markers: markers.iter().map(|m| m.to_string()).collect(), start, end, comment_type: String::new(), text: text.into() }
+        Comment { id, markers: markers.iter().map(|m| m.to_string()).collect(), start, end, comment_type: String::new(), type_meaning: None, text: text.into() }
     }
 
     #[test]
@@ -827,7 +833,7 @@ mod tests {
             c(5, &["lkne"], 50, 50, "b note"),
             c(4, &["RKNE"], 700, 700, "a note"),
         ];
-        let ids = |sort: Sort| sorted(&list, sort).iter().map(|&i| list[i].id).collect::<Vec<_>>();
+        let ids = |sort: Sort| sorted(&list, sort, &TypeList::default()).iter().map(|&i| list[i].id).collect::<Vec<_>>();
         let up = |key| Sort { key, desc: false };
         assert_eq!(ids(Sort::default()), vec![1, 2, 3, 4, 5], "first: # from the small end");
         assert_eq!(ids(up(SortKey::Frames)), vec![5, 3, 2, 1, 4], "by start, then end");
@@ -857,7 +863,7 @@ mod tests {
             t(13, "Agree"), t(14, "No problem"),
         ];
         list.extend(comments::TYPES.iter().copied().enumerate().skip(1).rev().map(|(i, kind)| t(14 + i as u64, kind)));
-        let ids = |sort: Sort| sorted(&list, sort).iter().map(|&i| list[i].id).collect::<Vec<_>>();
+        let ids = |sort: Sort| sorted(&list, sort, &TypeList::default()).iter().map(|&i| list[i].id).collect::<Vec<_>>();
         let up = Sort { key: SortKey::Type, desc: false };
         let expected = [2, 8, 1, 7].into_iter()
             .chain((1..comments::TYPES.len() as u64).map(|i| 14 + i))
@@ -868,25 +874,25 @@ mod tests {
         assert_eq!(ids(Sort { key: SortKey::Type, desc: true }), back);
         assert_eq!(SortKey::ALL.map(SortKey::name), ["#", "Markers", "Frames", "Type", "Comment"], "Type between Frames and Comment");
         assert_eq!(Sort::default().clicked(SortKey::Type).words(), "Sort Type ▲");
-        assert!(type_choices().map(item_name).eq(comments::TYPES.iter().copied().chain(["None"])));
+        assert!(type_choices(&TypeList::default()).map(item_name).eq(comments::TYPES.iter().copied().chain(["None"])));
     }
 
     #[test]
     fn up_and_down_move_the_highlight_and_stop_at_the_ends() {
-        for (kind, next) in type_choices().zip(type_choices().skip(1)) {
-            assert_eq!(step_item(kind, false), next);
-            assert_eq!(step_item(next, true), kind);
+        for (kind, next) in type_choices(&TypeList::default()).zip(type_choices(&TypeList::default()).skip(1)) {
+            assert_eq!(step_item(&TypeList::default(), kind, false), next);
+            assert_eq!(step_item(&TypeList::default(), next, true), kind);
         }
-        assert_eq!(step_item("", false), "", "stops at None");
-        assert_eq!(step_item("File bad", true), "File bad", "stops at the top");
+        assert_eq!(step_item(&TypeList::default(), "", false), "", "stops at None");
+        assert_eq!(step_item(&TypeList::default(), "File bad", true), "File bad", "stops at the top");
         // Nothing highlighted (a value the app does not know): ↓ = the first, ↑ = the last.
-        assert_eq!((step_item("Jitter", false), step_item("Jitter", true)), ("File bad", ""));
+        assert_eq!((step_item(&TypeList::default(), "Jitter", false), step_item(&TypeList::default(), "Jitter", true)), ("File bad", ""));
     }
 
     #[test]
     fn the_type_list_opens_under_the_box_or_above_it_and_stays_inside_the_pane() {
-        let size = list_size(112.0);
-        assert!(size.x >= 112.0 + 22.0 && size.y >= type_choices().count() as f32 * ITEM_H, "{size:?}");
+        let size = list_size(112.0, comments::TYPES.len());
+        assert!(size.x >= 112.0 + 22.0 && size.y >= type_choices(&TypeList::default()).count() as f32 * ITEM_H, "{size:?}");
         for w in [380.0, 600.0, 900.0] {
             let room = Rect::from_min_size(pos2(1200.0, 300.0), vec2(w, 400.0));
             let row = |top: f32| Rect::from_min_size(pos2(room.left(), top), vec2(w, ROW_H));
@@ -920,7 +926,7 @@ mod tests {
         let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 400.0))), time: Some(t), events, ..Default::default() };
         let _ = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let input = ListIn { list, file_id: 1, frame: 0, sort: Sort::default(), write: write.clone(), scroll_to: None, picked: None, selection: &crate::comment_selection::CommentSelection::default(), live_markers: None, first: 0, last: 100 };
+                let input = ListIn { types: &TypeList::default(), list, file_id: 1, frame: 0, sort: Sort::default(), write: write.clone(), scroll_to: None, picked: None, selection: &crate::comment_selection::CommentSelection::default(), live_markers: None, first: 0, last: 100 };
                 out = show(ui, input, &mut order, &mut edit);
             });
         });
@@ -987,13 +993,13 @@ mod tests {
         let mut order = Order::default();
         let s = Sort { key: SortKey::Frames, desc: true };
         for _ in 0..100 {
-            assert_eq!(order.get(&comments, 7, s).len(), 2000);
+            assert_eq!(order.get(&comments, 7, s, &TypeList::default()).len(), 2000);
         }
         assert_eq!(order.builds, 1, "100 frames, one sort");
-        order.get(&comments, 7, Sort::default());
-        order.get(&comments, 8, Sort::default());
+        order.get(&comments, 7, Sort::default(), &TypeList::default());
+        order.get(&comments, 8, Sort::default(), &TypeList::default());
         comments.apply(&add(2001));
-        assert_eq!(order.get(&comments, 8, Sort::default()).len(), 2001);
+        assert_eq!(order.get(&comments, 8, Sort::default(), &TypeList::default()).len(), 2001);
         assert_eq!(order.builds, 4, "sort, file and list changes each make it again");
     }
 }
