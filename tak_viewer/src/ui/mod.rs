@@ -26,6 +26,7 @@ pub mod labeling;
 pub mod open_editors;
 pub mod panels;
 pub mod scene;
+pub mod scene_measurement;
 pub mod scrub;
 pub mod ssh_explorer;
 pub mod theme;

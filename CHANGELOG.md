@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.53.0 — 2026-11-18
+
+- Add 3D Shift+click and visible-marker Ctrl+A. Keep click order and restore selection with undo/redo.
+- Show distance for two picks and angle at the second of three. Add saved `보기 → 마커 거리·각도` switch.
+
 ## v0.52.0 — 2026-11-18
 
 - Labeling adds a saved 3D selection link, three increment choices, and row-menu Label Marker. Named and Unlabeled lists show point coverage across the take.

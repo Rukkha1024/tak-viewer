@@ -898,7 +898,7 @@ fn marker_lanes(data: &ViewData, mi: usize) -> Vec<Lane> {
 }
 
 /// Facts about the selected marker (its graph is `graph_pane`).
-pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeSet<usize>, primary: Option<usize>) -> Option<Action> {
+pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeSet<usize>, primary: Option<usize>, measurement: Option<super::scene_measurement::Measurement>) -> Option<Action> {
     let Some(mi) = primary.filter(|m| *m < data.markers.len()) else {
         ui.add_space(4.0);
         ui.label(RichText::new("3D 화면이나 Labeling에서 마커를 클릭하세요.").color(theme::TEXT_DIM));
@@ -914,6 +914,9 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
             ui.label(v);
             ui.end_row();
         };
+        if let Some(value) = measurement {
+            row(ui, value.name(), value.text());
+        }
         ui.label(RichText::new("이름").color(theme::TEXT_DIM));
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
@@ -931,7 +934,10 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
         row(ui, "점 수 / Gaps", format!("{} / {}", m.n_samples, if m.gaps.is_empty() { "0%".into() } else { gaps_text(m.fill_pct) }));
         row(ui, "빈 구간 / 최대", format!("{}개 / {} 프레임", m.gaps.len(), m.max_gap));
         match m.position(frame) {
-            Some(p) => row(ui, "현재 X Y Z (mm)", format!("{:.2}  {:.2}  {:.2}", p.x * 1000.0, p.y * 1000.0, p.z * 1000.0)),
+            Some(p) => {
+                let scale = super::scene_measurement::DISPLAY_MM_PER_UNIT as f32;
+                row(ui, "현재 X Y Z (mm)", format!("{:.2}  {:.2}  {:.2}", p.x * scale, p.y * scale, p.z * scale));
+            }
             None => row(ui, "현재 X Y Z", "없음 (빈 구간)".into()),
         }
     });

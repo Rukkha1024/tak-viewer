@@ -7,6 +7,7 @@
 //! chooses / un-chooses that plate for its floating graph (`graph_float.rs`).
 
 use super::theme;
+use super::scene_measurement::Measurement;
 use crate::camera::{Camera, View};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ pub struct SceneOptions {
     pub asset_names: bool,
     pub history: bool,
     pub marker_colors: bool,
+    pub measurements: bool,
     /// History trail length in frames (Motive default 250).
     pub trail_frames: i64,
     /// Trail for every selected marker instead of the primary one only (captures).
@@ -58,9 +60,30 @@ impl Default for SceneOptions {
             asset_names: true,
             history: true,
             marker_colors: true,
+            measurements: true,
             trail_frames: HISTORY_FRAMES,
             trail_all: false,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkerClick {
+    #[default]
+    Plain,
+    Toggle,
+    Add,
+    Inspect,
+    Ignore,
+}
+
+fn marker_click(modifiers: egui::Modifiers) -> MarkerClick {
+    match (modifiers.ctrl || modifiers.command, modifiers.shift, modifiers.alt) {
+        (false, false, false) => MarkerClick::Plain,
+        (true, false, false) => MarkerClick::Toggle,
+        (false, true, false) => MarkerClick::Add,
+        (false, false, true) => MarkerClick::Inspect,
+        _ => MarkerClick::Ignore,
     }
 }
 
@@ -68,10 +91,11 @@ impl Default for SceneOptions {
 pub struct SceneOutput {
     /// Left click without drag: Some(marker) or None (empty space).
     pub clicked: Option<Option<usize>>,
+    pub marker_click: MarkerClick,
     /// Left drag finished: markers inside the box and the primary one (nearest to where
     /// the mouse was let go).
     pub box_selected: Option<(Vec<usize>, Option<usize>)>,
-    /// Ctrl held: add to the selection instead of replacing it.
+    /// Ctrl held for a box selection: add instead of replacing.
     pub ctrl: bool,
     pub double_clicked: Option<usize>,
     /// Right-click point: select it only if it is not already selected.
@@ -372,6 +396,7 @@ pub fn show(
     opts: &SceneOptions,
     selected: &BTreeSet<usize>,
     primary: Option<usize>,
+    measurement: Option<Measurement>,
     plate: Option<usize>,
     hud_label: &str,
     layers: Layers,
@@ -525,6 +550,10 @@ pub fn show(
             name_tag(&painter, p.pos + vec2(p.radius + 4.0, -7.0), &m.name, color, if sel { 13.0 } else { 11.5 });
         }
     }
+    if let Some(measurement) = measurement.filter(|_| own) {
+        let _span = crate::bench_timing::span("scene.measurement_paint");
+        measurement.paint(&painter, &view);
+    }
 
     // Left drag: selection box (translucent fill + outline) while dragging.
     if let Some((a, b)) = box_drag {
@@ -533,13 +562,14 @@ pub fn show(
         painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, theme::BOX_SELECT_EDGE));
     }
 
-    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-    // A click: the marker there, else (without Ctrl) the plate there.
+    let gesture = ui.input(|i| marker_click(i.modifiers));
+    // A plain click may pick a plate when there is no marker underneath.
     let mut click = |at: Pos2| {
+        if gesture == MarkerClick::Ignore { return; }
         let marker = pick(&projected, at);
         out.clicked = Some(marker);
-        out.plate = if marker.is_none() && !ctrl { pick_plate(&plate_quads, at) } else { None };
-        out.ctrl = ctrl;
+        out.marker_click = gesture;
+        out.plate = if marker.is_none() && gesture == MarkerClick::Plain { pick_plate(&plate_quads, at) } else { None };
     };
     if response.clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
@@ -549,12 +579,12 @@ pub fn show(
     if let (true, Some((a, b))) = (box_done, box_drag) {
         if (b.x - a.x).abs() < BOX_MIN_PX && (b.y - a.y).abs() < BOX_MIN_PX {
             click(b);
-        } else {
+        } else if matches!(gesture, MarkerClick::Plain | MarkerClick::Toggle) {
             out.box_selected = Some(pick_in_box(&projected, a, b));
-            out.ctrl = ctrl;
+            out.ctrl = gesture == MarkerClick::Toggle;
         }
     }
-    if response.double_clicked() {
+    if gesture == MarkerClick::Plain && response.double_clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
             out.double_clicked = pick(&projected, pointer);
         }
@@ -693,7 +723,7 @@ mod tests {
                     state.1 = ui.max_rect();
                     let rect = state.1;
                     state.2 = show(ui, rect, Rect::NOTHING, vec2(0.0, 0.0), &[], Some(&data), 0, &mut state.0,
-                        &SceneOptions::default(), &selected, Some(0), None, "Perspective", Layers { own: true, overlay: None });
+                        &SceneOptions::default(), &selected, Some(0), None, None, "Perspective", Layers { own: true, overlay: None });
                 });
             })
         };

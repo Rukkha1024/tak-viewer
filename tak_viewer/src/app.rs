@@ -1351,7 +1351,9 @@ impl TakViewerApp {
                     }
                     // `--select A,B,C` (v0.27.0, agent pictures): several markers, the last one
                     // found the primary (as Ctrl+click one after another).
-                    window_command::select_markers(v, auto.select.as_deref());
+                    if let Some(shot::ShotSelection::Names(names)) = &auto.select {
+                        window_command::select_markers(v, Some(names));
+                    }
                     v.link_labeling_to_scene(auto.labeling_link);
                     if let Some(want) = &auto.plate {
                         if let Some(p) = v.data.as_ref().and_then(|d| shot::find_plate(&d.plates, want)) {
@@ -1432,6 +1434,11 @@ impl TakViewerApp {
             }
             1 => {
                 theme::install_fonts(ctx);
+                if auto.select == Some(shot::ShotSelection::Visible) {
+                    for &slot in &open {
+                        key_focus::select_visible(&mut self.views[slot], &self.settings.scene);
+                    }
+                }
                 next.stage = 2;
             }
             2..=5 => next.stage += 1,
@@ -2855,6 +2862,7 @@ impl TakViewerApp {
                     ui.checkbox(&mut s.plates, "Force plate");
                     ui.checkbox(&mut s.asset_names, "Asset 이름표");
                     ui.checkbox(&mut s.history, "선택 마커 지나온 길 (250 프레임)");
+                    ui.checkbox(&mut s.measurements, "마커 거리·각도");
                     ui.checkbox(&mut s.marker_colors, "마커 색 (끄면 흰색)");
                     ui.add_enabled(false, egui::Checkbox::new(&mut s.bones, "스켈레톤 뼈 (준비 중)"));
                     ui.separator();
@@ -3097,7 +3105,8 @@ impl TakViewerApp {
             tag_size = tag_size.max(t.area().max - rect.min);
             name_tag = if name_tag.is_positive() { name_tag.union(t.area()) } else { t.area() };
         }
-        key_focus::region(ui, row, key_focus::Target::Markers(slot));
+        key_focus::region(ui, input, key_focus::Target::Scene(slot));
+        key_focus::region(ui, row, key_focus::Target::Scene(slot));
         key_focus::region(ui, name_tag, key_focus::Target::Blocked);
         let chosen = several && slot == self.active && !capturing;
         let hud = match &self.capture {
@@ -3151,33 +3160,41 @@ impl TakViewerApp {
             own: v.shown[0] || v.overlay.is_none(),
             overlay: v.overlay.as_ref().zip(overlay_frame).filter(|_| v.shown[1]).map(|(o, f)| (o.data.as_ref(), f)),
         };
+        let measurement = v.measurement(layers.own && scene_opts.measurements);
         let out = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(input), |ui| {
                 let _span=crate::bench_timing::span_view("scene.build",Some(slot));
-                scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, v.plate, &hud, layers)
+                scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, measurement, v.plate, &hud, layers)
             })
             .inner;
         let quick = quick_available && self.marker_ui[slot].labeling.mode == crate::ui::labeling::LabelingMode::QuickLabel && v.armed_label.is_some();
         if let Some(response) = out.marker_menu {
             self.draw_scene_marker_menu(slot, &response, out.context_clicked);
         }
+        use scene::MarkerClick::{Add, Inspect, Plain, Toggle};
         let v = &mut self.views[slot];
         let quick_edit = quick && (out.clicked.flatten().is_some() || out.double_clicked.is_some())
             && ui.input(|input| input.modifiers == Modifiers::NONE) && !key_focus::keys_blocked(ui.ctx());
         let quick_click = out.clicked.flatten().filter(|_| quick_edit);
+        let selection_click = match (out.clicked, out.marker_click) {
+            (Some(Some(_)), Plain | Inspect | Toggle) => quick_click.is_none(),
+            (Some(Some(index)), Add) => !v.selected.contains(&index),
+            (Some(None), Plain) => out.plate.is_none(),
+            _ => false,
+        };
         let scene_selection = (out.context_clicked.is_some() && self.scene_marker_menu.is_open())
-            || (out.clicked.is_some() && out.plate.is_none() && quick_click.is_none()
-                && (out.clicked != Some(None) || !out.ctrl))
-            || out.box_selected.is_some()
+            || selection_click || out.box_selected.is_some()
             || (out.double_clicked.is_some() && !quick_edit);
         if let Some(index) = quick_click.filter(|_| out.double_clicked.is_none()) {
             if let Some(marker) = v.data.as_ref().and_then(|data| data.markers.get(index)) { self.marker_click = Some((slot, marker.uid)); }
         }
-        match (out.clicked.filter(|_| quick_click.is_none()), out.plate) {
-            (Some(Some(m)), _) => v.select(m, out.ctrl),
+        match (out.clicked.filter(|_| quick_click.is_none()), out.plate, out.marker_click) {
+            (Some(Some(m)), _, Plain | Inspect) => v.select(m, false),
+            (Some(Some(m)), _, Toggle) => v.select(m, true),
+            (Some(Some(m)), _, Add) if !v.selected.contains(&m) => v.select(m, true),
             // On a plate: choose / un-choose it; the marker selection stays (both graphs can be up).
-            (Some(None), Some(p)) => v.toggle_plate(p),
-            (Some(None), None) if !out.ctrl => v.clear_selection(),
+            (Some(None), Some(p), Plain) => v.toggle_plate(p),
+            (Some(None), None, Plain) => v.clear_selection(),
             _ => {}
         }
         if let Some((markers, primary)) = out.box_selected {
@@ -3313,6 +3330,7 @@ impl TakViewerApp {
         // The type strip, over the 3D above the bar (after the graphs: on top for the mouse;
         // nothing moves for it).
         if let (Some((id, buttons)), Some(r)) = (strip, strip_rect) {
+            key_focus::region(ui, r, key_focus::Target::Blocked);
             let type_now = v.comments.list.get(id).map(|c| c.comment_type.clone()).unwrap_or_default();
             let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("type_strip", slot)).max_rect(r));
             if let Some(t) = panels::type_strip(&mut child, &buttons, &type_now) {
@@ -3506,7 +3524,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
         let action = match tab {
             Pane::Selected => {
                 ui.add_space(4.0);
-                panels::selected_pane(ui, d, frame, &v.selected, v.primary)
+                panels::selected_pane(ui, d, frame, &v.selected, v.primary, v.measurement(app.settings.scene.measurements))
             }
             Pane::Graph => {
                 // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
@@ -4029,7 +4047,8 @@ impl TakViewerApp {
             egui::Window::new("조작키").open(&mut open).collapsible(false).show(ctx, |ui| {
                 egui::Grid::new("help").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
                     for (k, v) in [
-                        ("왼쪽 클릭", "마커 선택 (Ctrl+클릭 = 여러 개)"),
+                        ("왼쪽 클릭 / Ctrl+클릭 / Shift+클릭", "마커 선택 / 선택 켜고 끄기 / 선택에 더하기"),
+                        ("3D 화면에서 Ctrl+A", "지금 보이는 마커 모두 선택"),
                         ("왼쪽 드래그", "네모 안 마커 모두 선택 (Ctrl = 기존 선택에 더하기)"),
                         ("3D의 forceplate 클릭", "그 판의 그래프(처음은 Fx · Fy · Fz)를 3D 위에 띄우기 · 다시 누르면 닫기 (마커 선택은 그대로, Devices 패널의 \"3D\"도 같아요)"),
                         ("오른쪽 드래그", "가운데 점을 중심으로 회전"),
@@ -4341,6 +4360,7 @@ mod tests {
     include!("app_key_focus_tests.rs");
     include!("app_merge_tests.rs");
     include!("app_graph_selection_tests.rs");
+    include!("app_scene_selection_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
     include!("app_desktop_drop_tests.rs");

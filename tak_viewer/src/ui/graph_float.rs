@@ -508,6 +508,8 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
     if open {
         if matches!(kind, Kind::Plate { .. }) {
             crate::app::key_focus::region(ui, rect.intersect(clip), crate::app::key_focus::Target::Blocked);
+        } else {
+            crate::app::key_focus::region(ui, hover_rect.intersect(clip), crate::app::key_focus::Target::Markers(slot));
         }
         let lane_h = (rect.height() - graph::NAV_H) / g.lanes.len().max(1) as f32;
         let alpha = (f32::from(opacity.min(100)) * 2.55).round() as u8;

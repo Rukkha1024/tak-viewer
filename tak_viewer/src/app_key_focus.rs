@@ -7,6 +7,7 @@ pub(crate) enum Target {
     #[default]
     Blocked,
     Markers(usize),
+    Scene(usize),
     NamedMarkers(usize),
     UnlabeledMarkers(usize),
     Comments,
@@ -94,6 +95,22 @@ pub(crate) fn keys_blocked(ctx: &egui::Context) -> bool {
     input_priority(ctx) || ctx.data(|data| data.get_temp::<Focus>(id()).is_some_and(|focus| focus.blocked))
 }
 
+pub(super) fn select_visible(view: &mut View, options: &SceneOptions) {
+    let Some(data) = view.data.as_deref() else { return; };
+    let rect = view.scene_rect;
+    if !rect.is_positive() { return; }
+    let markers: Vec<_> = if view.shown[0] || view.overlay.is_none() {
+        // Project with no selected exceptions to the Unlabeled switch.
+        scene::project_markers(&view.cam.view(rect), data, view.pb.frame, options, &Default::default())
+            .into_iter().filter(|p| rect.contains(p.pos)).map(|p| p.marker).collect()
+    } else {
+        Vec::new()
+    };
+    // Projection visits file order. Keep the current Pattern target if still eligible.
+    let primary = view.primary.filter(|p| markers.binary_search(p).is_ok()).or(markers.first().copied());
+    view.select_many(markers, primary, false);
+}
+
 impl TakViewerApp {
     /// Called after list keys: Comments and OPEN EDITORS consume their own Delete/Esc first.
     pub(super) fn marker_focus_keys(&mut self, ctx: &egui::Context) {
@@ -107,7 +124,13 @@ impl TakViewerApp {
             Target::UnlabeledMarkers(slot) => Some((slot, crate::ui::labeling::MarkerList::Unlabeled)),
             _ => None,
         };
-        if let Some((slot, list)) = list {
+        if let Target::Scene(slot) = focus {
+            if exact_key(ctx, Key::A, true, false, false) && self.open_views().contains(&slot) {
+                select_visible(&mut self.views[slot], &self.settings.scene);
+                self.views[slot].link_labeling_to_scene(self.settings.labeling_link);
+                ctx.request_repaint();
+            }
+        } else if let Some((slot, list)) = list {
             if exact_key(ctx, Key::A, true, false, false) && self.open_views().contains(&slot) {
                 self.labeling_select_all(ctx, slot, list);
             }
@@ -115,7 +138,7 @@ impl TakViewerApp {
         if !matches!(focus, Target::Comments | Target::Editors)
             && exact_key(ctx, Key::Delete, false, false, false) {
             let slot = match focus {
-                Target::Markers(slot) | Target::NamedMarkers(slot) | Target::UnlabeledMarkers(slot) => Some(slot),
+                Target::Markers(slot) | Target::Scene(slot) | Target::NamedMarkers(slot) | Target::UnlabeledMarkers(slot) => Some(slot),
                 _ => None,
             };
             if let Some(slot) = slot.filter(|slot| self.open_views().contains(slot)

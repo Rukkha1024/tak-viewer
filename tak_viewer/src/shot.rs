@@ -21,8 +21,7 @@ pub fn parse_edit(s: &str) -> Option<(u64, Field)> {
 pub struct AutoShot {
     pub out: PathBuf,
     pub frame: Option<i64>,
-    /// `--select`: a marker name, or several separated by commas (v0.27.0).
-    pub select: Option<String>,
+    pub select: Option<ShotSelection>,
     /// `--plate`: plate name or number (from 0).
     pub plate: Option<String>,
     /// `--range <a>-<b>`: frame range for every view (ordered and clamped when applied).
@@ -50,6 +49,14 @@ pub struct AutoShot {
     /// marker's curve (`panels::LaneCache::hover_at`).
     pub hover: Option<String>,
     pub stage: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShotSelection {
+    /// `--select`: a marker name, or several separated by commas.
+    Names(String),
+    /// `--select-visible`: the same marker set that 3D Ctrl+A selects.
+    Visible,
 }
 
 /// `--overlay <file>` pairs taken out of `args` (plan step 7; for `--screenshot` and `--bench`):
@@ -147,8 +154,12 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                 i += 2;
             }
             "--select" if i + 1 < args.len() => {
-                select = Some(args[i + 1].clone());
+                select = Some(ShotSelection::Names(args[i + 1].clone()));
                 i += 2;
+            }
+            "--select-visible" => {
+                select = Some(ShotSelection::Visible);
+                i += 1;
             }
             "--plate" if i + 1 < args.len() => {
                 plate = Some(args[i + 1].clone());
@@ -326,7 +337,7 @@ mod tests {
         let (s, rest) = parse(&a);
         let s = s.unwrap();
         assert_eq!(s.frame, Some(12));
-        assert_eq!(s.select.as_deref(), Some("LASI"));
+        assert_eq!(s.select, Some(ShotSelection::Names("LASI".into())));
         assert_eq!(s.plate, None);
         assert!(!s.comments);
         assert_eq!(rest, vec!["x.tak".to_string()]);

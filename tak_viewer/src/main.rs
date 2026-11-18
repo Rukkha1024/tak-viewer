@@ -228,6 +228,7 @@ fn usage() -> String {
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         "Headless Labeling link: --labeling-link with --select NAME",
+        "Headless 3D selection: --select-visible or --select A,B[,C]",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

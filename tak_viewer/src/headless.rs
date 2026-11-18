@@ -154,7 +154,11 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             record.cached_mesh_vertices = counts.1;
             record.output_vertices = output_vertices;
             let details=crate::bench_timing::take_details();
-            if took>=8.0 || phase=="emg" {record.details=details;}
+            record.details = if took >= 8.0 || phase == "emg" {
+                details
+            } else {
+                details.into_iter().filter(|d| matches!(d.name, "scene.measurement_samples" | "scene.measurement_paint")).collect()
+            };
             trace.push(record);
         }
         let st = app.bench_state();
