@@ -1,5 +1,11 @@
 # 변경 사항
 
+## v0.69.4 — 2026-11-18
+
+- Add a WSL release helper (`checks/release.py`): reserve a version, prepare, check, confirm pictures, archive, tag, publish, clean up. Done stages are skipped on rerun. Desktop shortcut update is a separate step.
+- Compile the tests in the public configuration before tagging. Reuse a Windows public check when source, tree, checker and toolchain match.
+- Public snapshot keeps the README Controls and Agent commands sections, `docs/cli-outputs.md` and `checks/compare_png.py`. Links to unpublished guides become plain words.
+
 ## v0.69.3 — 2026-11-18
 
 - Tests for the Tracks wheel, Progress writes and QuickLabel edits wait for the real result. The Tracks wheel test failed about one run in seven under load.
