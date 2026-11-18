@@ -687,10 +687,14 @@ pub fn read_tail(path: &Path) -> Result<Tail> {
 /// The tail read as a comment file (`comments::parse`: header, cut-off last line and bad lines
 /// skipped).
 pub fn read_comments(path: &Path) -> Result<comments::Parsed> {
+    read_comments_with_health(path).map(|(parsed, _)| parsed)
+}
+
+pub(crate) fn read_comments_with_health(path: &Path) -> Result<(comments::Parsed, Option<&'static str>)> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     let index = read_index(&file, len)?;
-    read_comments_at(&file, len, index.tail_start()).map(|(parsed, _)| parsed)
+    read_comments_at(&file, len, index.tail_start())
 }
 
 fn read_comments_at(file: &File, len: u64, start: u64) -> Result<(comments::Parsed, Option<&'static str>)> {

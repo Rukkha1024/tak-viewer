@@ -227,7 +227,7 @@ impl Drop for Registration {
     }
 }
 
-pub fn write_list(dir: Option<&Path>, mut out: impl Write) -> io::Result<()> {
+pub fn write_list(dir: Option<&Path>, mut out: impl Write, envelope: bool) -> io::Result<()> {
     let mut windows = Vec::new();
     if let Some(dir) = dir {
         match fs::read_dir(dir) {
@@ -263,7 +263,11 @@ pub fn write_list(dir: Option<&Path>, mut out: impl Write) -> io::Result<()> {
         }
     }
     windows.sort_unstable_by_key(|window| window.pid);
-    serde_json::to_writer(&mut out, &windows)?;
+    if envelope {
+        serde_json::to_writer(&mut out, &tak_core::cli_json::Envelope::new(1, windows))?;
+    } else {
+        serde_json::to_writer(&mut out, &windows)?;
+    }
     writeln!(out)
 }
 
@@ -374,7 +378,7 @@ mod tests {
         write_snapshot(&live.path.with_extension("json"), &snapshot).unwrap();
 
         let mut out = Vec::new();
-        write_list(Some(&dir), &mut out).unwrap();
+        write_list(Some(&dir), &mut out, false).unwrap();
         let windows: Vec<Value> = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             windows,
@@ -390,8 +394,15 @@ mod tests {
         assert!(dir.join("orphan.json").exists());
 
         out.clear();
-        write_list(Some(&dir.join("missing")), &mut out).unwrap();
+        write_list(Some(&dir.join("missing")), &mut out, false).unwrap();
         assert_eq!(out, b"[]\n");
+        let mut wrapped = Vec::new();
+        write_list(Some(&dir.join("missing")), &mut wrapped, true).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&wrapped).unwrap();
+        assert_eq!(doc, serde_json::json!({
+            "producer":{"name":"tak_viewer","version":crate::version::VERSION},
+            "schema":1,"items":[],
+        }));
         assert!(!dir.join("missing").exists());
     }
 }

@@ -320,3 +320,101 @@ fn cli_exit_codes_output_and_refusals() {
     assert_eq!(report["verdict"], "failed");
     assert_eq!(report["source_unchanged"], false);
 }
+
+#[test]
+fn batch_verification_matches_the_recorded_source_and_returns_all_verdicts() {
+    let (dir, source, first) = converted("verify_batch");
+    let sources = dir.join("sources");
+    std::fs::create_dir(&sources).unwrap();
+    std::fs::rename(&source, sources.join("walk.tak")).unwrap();
+    let second = dir.join("renamed.takm");
+    let tampered = dir.join("tampered.takm");
+    let original = std::fs::read(&first).unwrap();
+    std::fs::write(&second, &original).unwrap();
+    let mut bad = original.clone();
+    bad[HEADER_LEN as usize] ^= 1;
+    std::fs::write(&tampered, &bad).unwrap();
+
+    let resolve = |p: &str| dir.join(p);
+    let execute = |args: &[&str]| {
+        run(
+            &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
+            resolve,
+        )
+    };
+    assert_eq!(
+        execute(&[
+            "walk.takm",
+            "renamed.takm",
+            "tampered.takm",
+            "--source-dir",
+            "sources",
+            "--json",
+            "batch.json"
+        ]),
+        1
+    );
+    let read =
+        |path| serde_json::from_slice::<Value>(&std::fs::read(dir.join(path)).unwrap()).unwrap();
+    let batch = read("batch.json");
+    let items = batch.as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    for item in items {
+        assert_eq!(item["source_selection"], "source_dir");
+        assert_eq!(item["schema"], 1);
+        assert_eq!(item["producer"]["name"], "tak_viewer");
+    }
+    assert_eq!(items[0]["verdict"], "identical");
+    assert_eq!(items[1]["verdict"], "identical");
+    assert_eq!(items[2]["verdict"], "failed");
+    assert_eq!(
+        execute(&[
+            "renamed.takm",
+            "--source-dir",
+            "sources",
+            "--json",
+            "single.json"
+        ]),
+        0
+    );
+    assert_eq!(read("single.json"), items[1]);
+    assert_eq!(
+        execute(&[
+            "renamed.takm",
+            "--source-dir",
+            "sources",
+            "--json",
+            "wrapped.json",
+            "--envelope"
+        ]),
+        0
+    );
+    let wrapped = read("wrapped.json");
+    assert_eq!(wrapped["schema"], 1);
+    assert_eq!(wrapped["items"], serde_json::json!([items[1]]));
+    assert_eq!(
+        execute(&["walk.takm", "renamed.takm", "--source", "x.tak"]),
+        2
+    );
+    assert_eq!(execute(&["walk.takm", "--source-dir", "missing"]), 2);
+    assert_eq!(
+        execute(&["walk.takm", "--source-dir", "sources", "--source", "x.tak"]),
+        2
+    );
+    assert_eq!(execute(&["walk.takm", "--source-dir", "."]), 1);
+    assert_eq!(std::fs::read(&first).unwrap(), original);
+    assert_eq!(std::fs::read(&second).unwrap(), original);
+    assert_eq!(std::fs::read(&tampered).unwrap(), bad);
+}
+
+#[test]
+fn source_directory_refuses_non_basename_names_in_the_takm_table() {
+    let (dir, _, path) = converted("verify_source_dir_traversal");
+    edit_table(&path, |table| {
+        table["source"]["name"] = serde_json::json!("../walk.tak")
+    });
+    let result = verify_with_dir(&path, None, Some(&dir));
+    assert_eq!(result.verdict, Verdict::Failed);
+    assert!(result.source.is_none());
+    assert_eq!(result.checks.source_name.pass, Some(false));
+}

@@ -365,3 +365,180 @@ fn bad_arguments_are_distinct_from_failed_operations() {
     let args = ["--list-comments".into(), "no-such-file.takm".into()];
     assert_eq!(run(&args, |s| PathBuf::from(s), || unreachable!()), 1);
 }
+
+#[test]
+fn batch_preflights_every_file_and_reserves_no_ids_for_invalid_rows() {
+    let (dir, a) = fixture("comment_batch");
+    let b = dir.join("b.takm");
+    let original = fs::read(&a).unwrap();
+    fs::write(&b, &original).unwrap();
+    let valid: Value = serde_json::from_slice(ROW).unwrap();
+    let input = |second| {
+        let bytes = serde_json::to_vec(&json!({"a.takm": valid, "b.takm": second})).unwrap();
+        read_input::<batch::BatchRows>(&bytes, "파일별 객체").unwrap()
+    };
+    let resolve = |file: &str| dir.join(file);
+    let (items, failed) = batch::add(
+        input(json!([{"markers":[],"start":300,"end":300,"text":"bad"}])),
+        resolve,
+        AddOptions::default(),
+        || panic!("must preflight both files"),
+    );
+    let items = serde_json::to_value(items).unwrap();
+    assert!(failed);
+    assert_eq!(items[0]["status"], "not_written");
+    assert!(items[0]["error"].is_null());
+    assert!(items[1]["error"].as_str().unwrap().contains("1번째 행"));
+    for file in [&a, &b] {
+        assert_eq!(fs::read(file).unwrap(), original);
+        let (lock, ledger) = coordination_files(file);
+        assert!(!lock.exists() && !ledger.exists());
+    }
+
+    let (items, failed) = batch::add(input(valid.clone()), resolve, AddOptions::default(), || {
+        TIME.into()
+    });
+    assert!(!failed);
+    let doc = serde_json::to_value(Envelope::new(1, items)).unwrap();
+    for item in doc["items"].as_array().unwrap() {
+        assert_eq!(item["schema"], 1);
+        assert_eq!(item["producer"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(item["added"][0]["id"], 1);
+        assert_eq!(item["live_total"], 1);
+    }
+    assert_eq!(doc["schema"], 1);
+
+    let options = AddOptions {
+        dry_run: true,
+        allow_duplicates: true,
+        ..Default::default()
+    };
+    let (items, failed) = batch::add(input(valid.clone()), resolve, options, || panic!("dry run"));
+    assert!(!failed);
+    let doc = serde_json::to_value(items).unwrap();
+    assert!(doc[0]["added"][0]["id"].is_null());
+    assert_eq!(list(&a).unwrap().comments.len(), 1);
+    assert_eq!(list(&b).unwrap().comments.len(), 1);
+}
+
+#[test]
+fn batch_rejects_duplicate_keys_and_two_paths_to_one_file() {
+    for raw in [br#"{"a.takm":[],"a.takm":[]}"#.as_slice(), b"{}", b"[]"] {
+        assert!(read_input::<batch::BatchRows>(raw, "파일별 객체").is_err());
+    }
+    let (dir, a) = fixture("comment_batch_alias");
+    let alias = dir.join("b.takm");
+    fs::hard_link(&a, &alias).unwrap();
+    let original = fs::read(&a).unwrap();
+    let valid: Value = serde_json::from_slice(ROW).unwrap();
+    let rows = serde_json::to_vec(&json!({"a.takm":valid,"b.takm":valid})).unwrap();
+    let (items, failed) = batch::add(
+        read_input(&rows, "파일별 객체").unwrap(),
+        |p| dir.join(p),
+        AddOptions::default(),
+        || panic!("aliased file"),
+    );
+    assert!(failed);
+    assert_eq!(
+        serde_json::to_value(items).unwrap()[1]["status"],
+        "not_written"
+    );
+    assert_eq!(fs::read(a).unwrap(), original);
+}
+
+#[test]
+fn directory_list_reports_writer_filter_and_tail_damage_without_changing_the_single_shape() {
+    let (dir, a) = fixture("comment_list_batch");
+    let nested = dir.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let b = nested.join("b.TAKM");
+    fs::copy(&a, &b).unwrap();
+    let c = dir.join("c.takm");
+    fs::write(&c, b"broken").unwrap();
+    add_default(&a, ROW).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&a)
+        .unwrap()
+        .write_all(b"bad row\r\ncut")
+        .unwrap();
+    let plain = serde_json::to_value(list(&a).unwrap()).unwrap();
+    assert_eq!(
+        plain,
+        json!({
+            "file": a.display().to_string(),
+            "comments": [{"id":1,"markers":["LKNE","RKNE"],"start":0,"end":299,
+                          "type":"Jitter","text":"check","time":TIME,"by":"agent"}],
+            "skipped_lines":2,"malformed_lines":1,"cut_tail":true,
+        })
+    );
+    assert_eq!(list_by(&a, Some("agent")).unwrap().0.comments.len(), 1);
+    assert_eq!(list_by(&a, Some("viewer")).unwrap().0.comments.len(), 0);
+    assert_eq!(list_by(&a, Some("legacy")).unwrap().0.comments.len(), 0);
+    assert_eq!(
+        batch::discover(&dir, false).unwrap(),
+        [a.clone(), c.clone()]
+    );
+    let (items, failed) = batch::list(batch::discover(&dir, true).unwrap(), Some("viewer"));
+    let doc = serde_json::to_value(Envelope::new(1, items)).unwrap();
+    assert!(failed);
+    assert_eq!(doc["items"][0]["live_count"], 1);
+    assert_eq!(doc["items"][0]["comments"], json!([]));
+    assert_eq!(doc["items"][0]["cut_tail"], true);
+    assert_eq!(doc["items"][1]["file"], c.display().to_string());
+    assert!(doc["items"][1]["error"].is_string());
+    assert!(doc["items"][1]["malformed_lines"].is_null());
+    assert_eq!(doc["items"][2]["file"], b.display().to_string());
+    assert_eq!(doc["items"][2]["live_count"], 0);
+}
+
+#[test]
+fn comment_batch_arguments_accept_both_modes_and_refuse_mixed_modes() {
+    let parse = |words: &[&str]| -> String {
+        let args = words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        format!("{:?}", parse_args(&args).unwrap())
+    };
+    assert!(
+        parse(&["--list-comments", "a.takm", "out.json"]).contains("output: Some(\"out.json\")")
+    );
+    assert!(
+        parse(&["--list-comments", "a.takm", "b.takm", "--json", "out.json"])
+            .contains("files: [\"a.takm\", \"b.takm\"]")
+    );
+    assert!(parse(&[
+        "--list-comments",
+        "--dir",
+        "takes",
+        "--recursive",
+        "--by",
+        "agent",
+        "--envelope"
+    ])
+    .contains("recursive: true"));
+    assert!(parse(&[
+        "--add-comments",
+        "--from",
+        "rows.json",
+        "--dry-run",
+        "--envelope"
+    ])
+    .contains("file: None"));
+    for words in [
+        &["--list-comments", "a.takm", "--recursive"][..],
+        &["--list-comments", "a.takm", "--dir", "takes"],
+        &["--list-comments", "--dir", "takes", "--by", "other"],
+        &["--list-comments", "--dir"],
+        &["--list-comments", "a.takm", "--json"],
+        &["--add-comments", "--from"],
+        &[
+            "--add-comments",
+            "a.takm",
+            "--from",
+            "rows.json",
+            "--envelope",
+        ],
+    ] {
+        let args = words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert!(parse_args(&args).is_err(), "{words:?}");
+    }
+}

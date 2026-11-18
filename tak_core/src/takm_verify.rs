@@ -1,11 +1,13 @@
 //! Read-only verification of a TAKM and, when available, its original TAK.
 
 use super::*;
+use crate::cli_json::{Envelope, Version};
 use serde::Serialize;
 use std::fs::Metadata;
 
 pub const USAGE: &str =
-    "사용법: tak_viewer --verify-takm <파일.takm> [--source <원본.tak>] [out.json]";
+    "사용법: tak_viewer --verify-takm <파일.takm> [--source <원본.tak>] [out.json]
+         tak_viewer --verify-takm <파일.takm> … [--source-dir <폴더>] [--json out.json] [--envelope]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +131,8 @@ pub struct Verification {
     pub checks: Checks,
     pub changed_streams: Vec<ChangedStream>,
     pub comments: CommentTail,
+    #[serde(flatten)]
+    version: Version,
 }
 
 impl Verification {
@@ -162,7 +166,17 @@ impl Verification {
 
 /// Verify the supplied TAK, or look for a same-stem .tak beside the TAKM.
 pub fn verify(path: &Path, explicit_source: Option<&Path>) -> Verification {
-    let (source, source_selection) = if let Some(p) = explicit_source {
+    verify_with_dir(path, explicit_source, None)
+}
+
+fn verify_with_dir(
+    path: &Path,
+    explicit_source: Option<&Path>,
+    source_dir: Option<&Path>,
+) -> Verification {
+    let (source, source_selection) = if source_dir.is_some() {
+        (None, "source_dir")
+    } else if let Some(p) = explicit_source {
         (Some(p.to_path_buf()), "explicit")
     } else {
         let sibling = path.with_extension("tak");
@@ -172,7 +186,7 @@ pub fn verify(path: &Path, explicit_source: Option<&Path>) -> Verification {
             Ok(true) | Err(_) => (Some(sibling), "sibling"),
         }
     };
-    let no_source = if source.is_some() {
+    let no_source = if source.is_some() || source_dir.is_some() {
         "먼저 원본 TAK를 읽어야 해요."
     } else {
         "원본 TAK를 지정하지 않았고 옆에 같은 이름의 TAK도 없어요."
@@ -198,12 +212,22 @@ pub fn verify(path: &Path, explicit_source: Option<&Path>) -> Verification {
         },
         changed_streams: Vec::new(),
         comments: CommentTail::unread(Check::skipped(unreadable)),
+        version: Version::new(1),
     };
 
     let mut buf = vec![0; IO_CHUNK];
     let index = match File::open(path).and_then(|file| Ok((file.metadata()?.len(), file))) {
         Ok((len, file)) => {
             let index = result.check_fixed(&file, len, &mut buf);
+            if let (Some(dir), Some(index)) = (source_dir, &index) {
+                let name = &index.source.name;
+                if name.contains(['/', '\\', ':']) || !is_take_path(Path::new(name)) {
+                    result.checks.source_name =
+                        Check::new(false, "TAKM 표의 원본 이름이 .tak 파일 이름이 아니에요.");
+                } else {
+                    result.source = Some(dir.join(name));
+                }
+            }
             if let Some(source) = result.source.clone() {
                 result.check_source(&file, index.as_ref(), &source, &mut buf);
             }
@@ -220,7 +244,7 @@ pub fn verify(path: &Path, explicit_source: Option<&Path>) -> Verification {
             .iter()
             .all(|c| c.pass == Some(true))
     {
-        result.verdict = if result.source.is_none() {
+        result.verdict = if result.source.is_none() && source_dir.is_none() {
             Verdict::NoSource
         } else if result.source_unchanged == Some(true)
             && result.required_checks()[3..]
@@ -526,40 +550,72 @@ fn check_structure(index: &Index, table_off: u64) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Args<'a> {
-    input: &'a str,
+    inputs: Vec<&'a str>,
     source: Option<&'a str>,
+    source_dir: Option<&'a str>,
     output: Option<&'a str>,
+    envelope: bool,
 }
 
 fn parse_args(args: &[String]) -> std::result::Result<Args<'_>, &'static str> {
-    let path = |s: &&String| !s.is_empty() && !s.starts_with("--");
-    let mut args = args.iter();
-    let input = args
+    let path = |s: &&str| !s.is_empty() && !s.starts_with("--");
+    let mut args = args.iter().map(String::as_str).peekable();
+    let first = args
         .next()
         .filter(path)
-        .ok_or("확인할 TAKM 파일을 넣어 주세요.")?;
+        .ok_or("확인할 .takm 파일을 넣어 주세요.")?;
+    let mut inputs = vec![first];
+    while let Some(input) = args
+        .next_if(|s| path(s) && is_takm_path(Path::new(s.trim().trim_matches(['"', '\'']).trim())))
+    {
+        if inputs.contains(&input) {
+            return Err("같은 TAKM 파일은 한 번만 지정해 주세요.");
+        }
+        inputs.push(input);
+    }
     let mut source = None;
+    let mut source_dir = None;
     let mut output = None;
+    let mut envelope = false;
     while let Some(arg) = args.next() {
-        if arg == "--source" && source.is_none() {
-            source = Some(
-                args.next()
-                    .filter(path)
-                    .ok_or("--source 뒤에 원본 TAK 파일을 넣어 주세요.")?
-                    .as_str(),
-            );
-        } else if path(&arg) && output.is_none() {
-            output = Some(arg.as_str());
-        } else {
-            return Err("옵션과 JSON 저장 경로를 확인해 주세요.");
+        match arg {
+            "--source" if source.is_none() && inputs.len() == 1 => {
+                source = Some(
+                    args.next()
+                        .filter(path)
+                        .ok_or("--source 뒤에 원본 TAK 파일을 넣어 주세요.")?,
+                );
+            }
+            "--source-dir" if source_dir.is_none() => {
+                source_dir = Some(
+                    args.next()
+                        .filter(path)
+                        .ok_or("--source-dir 뒤에 원본 폴더를 넣어 주세요.")?,
+                );
+            }
+            "--json" if output.is_none() => {
+                output = Some(
+                    args.next()
+                        .filter(path)
+                        .ok_or("--json 뒤에 저장할 경로를 넣어 주세요.")?,
+                );
+            }
+            "--envelope" if !envelope => envelope = true,
+            out if path(&out) && output.is_none() && inputs.len() == 1 => output = Some(out),
+            _ => return Err("옵션과 JSON 저장 경로를 확인해 주세요."),
         }
     }
+    if source.is_some() && source_dir.is_some() {
+        return Err("--source와 --source-dir 중 하나만 써 주세요.");
+    }
     Ok(Args {
-        input,
+        inputs,
         source,
+        source_dir,
         output,
+        envelope,
     })
 }
 
@@ -584,30 +640,43 @@ fn check_output(path: &Path) -> std::result::Result<(), String> {
 pub fn run(args: &[String], resolve: impl Fn(&str) -> PathBuf) -> i32 {
     let parsed = (|| {
         let args = parse_args(args)?;
-        let input = resolve(args.input);
-        if !is_takm_path(&input) {
+        let inputs = args.inputs.into_iter().map(&resolve).collect::<Vec<_>>();
+        if inputs.iter().any(|path| !is_takm_path(path)) {
             return Err("확인할 파일은 .takm이어야 해요.".into());
         }
         let source = args.source.map(&resolve);
         if source.as_ref().is_some_and(|p| !is_take_path(p)) {
             return Err("--source로 지정한 원본은 .tak이어야 해요.".into());
         }
+        let source_dir = args.source_dir.map(&resolve);
+        if source_dir.as_ref().is_some_and(|p| !p.is_dir()) {
+            return Err("--source-dir로 기존 폴더를 지정해 주세요.".into());
+        }
         let output = args.output.map(resolve);
         if let Some(p) = &output {
             check_output(p)?;
         }
-        Ok::<_, String>((input, source, output))
+        Ok::<_, String>((inputs, source, source_dir, output, args.envelope))
     })();
-    let (input, source, output) = match parsed {
+    let (inputs, source, source_dir, output, envelope) = match parsed {
         Ok(args) => args,
         Err(e) => {
             eprintln!("{e}\n{USAGE}");
             return 2;
         }
     };
-    let result = verify(&input, source.as_deref());
+    let results = inputs
+        .iter()
+        .map(|input| verify_with_dir(input, source.as_deref(), source_dir.as_deref()))
+        .collect::<Vec<_>>();
     let written = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let mut json = serde_json::to_vec_pretty(&result)?;
+        let mut json = if envelope {
+            serde_json::to_vec_pretty(&Envelope::new(1, &results))
+        } else if let [result] = results.as_slice() {
+            serde_json::to_vec_pretty(result)
+        } else {
+            serde_json::to_vec_pretty(&results)
+        }?;
         json.push(b'\n');
         match output {
             Some(path) => OpenOptions::new()
@@ -623,7 +692,11 @@ pub fn run(args: &[String], resolve: impl Fn(&str) -> PathBuf) -> i32 {
         eprintln!("확인 결과를 쓰지 못했어요. ({e})");
         return 1;
     }
-    i32::from(result.verdict == Verdict::Failed)
+    i32::from(
+        results
+            .iter()
+            .any(|result| result.verdict == Verdict::Failed),
+    )
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tak_core::{tak, takm};
 
 pub const USAGE: &str = "tak_viewer --only [--frame N] [--select A,B] [--comments] [--pick-comment K] <file> [<file2> …] (최대 4개)
-tak_viewer --list-windows";
+tak_viewer --list-windows [--envelope]";
 
 pub const NO_DESKTOP: &str =
     "지금 실행한 곳은 Windows 0번 세션이에요. 화면이 없어 뷰어 창을 열 수 없어요.";
@@ -60,7 +60,9 @@ pub enum Command {
         paths: Vec<PathBuf>,
         startup: StartupView,
     },
-    List,
+    List {
+        envelope: bool,
+    },
 }
 
 pub fn parse(args: &[String]) -> Result<Option<Command>, String> {
@@ -68,8 +70,11 @@ pub fn parse(args: &[String]) -> Result<Option<Command>, String> {
         return Ok(None);
     };
     if first == "--list-windows" {
+        if matches!(rest, [flag] if flag == "--envelope") {
+            return Ok(Some(Command::List { envelope: true }));
+        }
         return if rest.is_empty() {
-            Ok(Some(Command::List))
+            Ok(Some(Command::List { envelope: false }))
         } else {
             Err("--list-windows 뒤에는 다른 옵션이나 파일을 쓸 수 없어요.".into())
         };
@@ -111,7 +116,7 @@ pub fn parse(args: &[String]) -> Result<Option<Command>, String> {
                 );
             }
             flag if flag.starts_with('-') => {
-                return Err(format!("--only에서 쓸 수 없는 옵션이에요. {flag}"))
+                return Err(format!("--only에서 쓸 수 없는 옵션이에요. {flag}"));
             }
             file => {
                 let path = Path::new(file.trim().trim_matches(['"', '\'']).trim());
@@ -184,7 +189,11 @@ mod tests {
         assert_eq!(startup.pick_comment, Some(42));
         assert!(matches!(
             parse(&args(&["--list-windows"])),
-            Ok(Some(Command::List))
+            Ok(Some(Command::List { envelope: false }))
+        ));
+        assert!(matches!(
+            parse(&args(&["--list-windows", "--envelope"])),
+            Ok(Some(Command::List { envelope: true }))
         ));
         assert!(matches!(parse(&args(&["a.tak"])), Ok(None)));
     }

@@ -366,6 +366,11 @@ pub(crate) fn detect_unit_scale(take: &Take) -> f32 {
     }
 }
 
+/// Millimetres by the capture convention, rounded to two decimal places.
+pub fn capture_xyz_mm(xyz_metres: [f32; 3]) -> [f64; 3] {
+    xyz_metres.map(|v| (f64::from(v * 1000.0) * 100.0).round() / 100.0)
+}
+
 impl MarkerView {
     pub fn position(&self, frame: i64) -> Option<Vec3> {
         let (s, e) = self.span?;

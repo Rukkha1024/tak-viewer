@@ -78,6 +78,76 @@ pub struct TakeSummary {
     pub gaps: GapLists,
     pub devices: DeviceSummary,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xyz: Option<Coordinates>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Coordinates {
+    coordinate_units: &'static str,
+    pub trajectories: Vec<CoordinateTrack>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoordinateTrack {
+    pub name: String,
+    pub uid_hex: String,
+    pub kind: &'static str,
+    pub parent_uid_hex: Option<String>,
+    pub slot: Option<i32>,
+    pub samples: Vec<CoordinateSample>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoordinateSample {
+    pub frame: i64,
+    pub present: bool,
+    pub xyz_mm: Option<[f64; 3]>,
+}
+
+impl Coordinates {
+    pub fn read(take: &Take, names: &[String], frames: &[i64]) -> Result<Self, SummaryError> {
+        let scale = view_data::detect_unit_scale(take);
+        let mut trajectories = Vec::new();
+        for name in names {
+            let before = trajectories.len();
+            for track in take.trajectories.iter().filter(|track| &track.name == name) {
+                let samples = frames
+                    .iter()
+                    .map(|&frame| {
+                        let xyz_mm = u32::try_from(frame)
+                            .ok()
+                            .and_then(|frame| track.frames.binary_search(&frame).ok())
+                            .map(|i| track.xyz[i])
+                            .filter(view_data::display_sample_present)
+                            .map(|xyz| view_data::capture_xyz_mm(xyz.map(|v| v * scale)));
+                        CoordinateSample {
+                            frame,
+                            present: xyz_mm.is_some(),
+                            xyz_mm,
+                        }
+                    })
+                    .collect();
+                trajectories.push(CoordinateTrack {
+                    name: track.name.clone(),
+                    uid_hex: uid_hex(&track.uid),
+                    kind: track.kind.as_str(),
+                    parent_uid_hex: track.parent_uid.as_ref().map(uid_hex),
+                    slot: track.slot,
+                    samples,
+                });
+            }
+            if trajectories.len() == before {
+                return Err(SummaryError::Argument(format!(
+                    "파일에 {name:?} 마커가 없어요."
+                )));
+            }
+        }
+        Ok(Self {
+            coordinate_units: "mm by viewer convention (coordinate unit unverified)",
+            trajectories,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +415,7 @@ fn summarize(take: &Take, options: &SummaryOptions) -> Result<TakeSummary, Summa
         gaps,
         devices: devices(take),
         warnings,
+        xyz: None,
     })
 }
 

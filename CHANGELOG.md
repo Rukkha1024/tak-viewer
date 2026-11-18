@@ -1,5 +1,12 @@
 # 변경 사항
 
+## v0.64.0 — 2026-11-18
+
+- `--check` takes the capture picture options: `--size`, `--fit`, `--trail`, `--no-names`, `--no-sheet`, `--ui`.
+- `--summary --xyz A,B [--frames a:b|n,m]` prints stored marker positions. Up to 8 names and 500 frames. Coordinate unit unverified.
+- Several files per call for `--list-comments` (also `--dir`, `--by`), `--verify-takm` (`--source-dir`) and `--add-comments` (file-to-rows JSON, all files checked before the first write).
+- JSON objects carry `producer` and `schema`. `--envelope` wraps array outputs. Shapes → `docs/cli-outputs.md`.
+
 ## v0.63.0 — 2026-11-18
 
 - Screenshot. Accept WSL and Windows output paths and `--size WxH`. Read the PNG back and print both paths. Add `--crop`, `--crop-panel`, `--scale`, `--crop-only` and `--regions`. Capture exits 1 on a missing or bad picture.

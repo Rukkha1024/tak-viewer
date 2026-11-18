@@ -488,7 +488,7 @@ pub fn shot_record(data: &ViewData, frame: i64, view: ViewPreset, file: &str, ca
         .map(|m| m.name.as_str())
         .collect();
     let r2 = |v: f32| (f64::from(v) * 100.0).round() / 100.0;
-    let mm = |p: Vec3| json!([r2(p.x * 1000.0), r2(p.y * 1000.0), r2(p.z * 1000.0)]);
+    let mm = |p: Vec3| tak_core::view_data::capture_xyz_mm([p.x, p.y, p.z]);
     let sel: Vec<Value> = selected
         .iter()
         .map(|&i| {
@@ -713,6 +713,8 @@ impl CaptureRun {
         let after = stat_key(&data.take.path);
         let unchanged = self.tak_before.is_some() && after == self.tak_before;
         let doc = json!({
+            "producer": tak_core::cli_json::PRODUCER,
+            "schema": 1,
             "tool": "tak_viewer --capture (read-only)",
             "tak": data.take.path.to_string_lossy(),
             "tak_wsl": wsl_path,

@@ -114,6 +114,8 @@ pub fn to_json(take: &Take) -> Value {
         })
         .collect();
     let mut out = json!({
+        "producer": crate::cli_json::PRODUCER,
+        "schema": 1,
         "path": take.path.to_string_lossy(),
         "file_size": take.file_size,
         "metadata": metadata,

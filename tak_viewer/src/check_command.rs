@@ -21,6 +21,7 @@ pub const USAGE: &str = "\
 사용법: tak_viewer --check <file.tak|file.takm> [<file2> … 최대 4개] --out <폴더>
   [--roles raw,copy,agent,…] [--frames <캡처 범위>|auto[:N]] [--views persp,top,side,front]
   [--select A,B] [--top N] [--no-pictures]
+  [--size WxH] [--fit frame|take|selected] [--trail N] [--no-names] [--no-sheet] [--ui]
 믿을 기준 파일을 먼저 써 주세요. 라벨링한 복사본이 없으면 원본을 써 주세요.
 마커 세트는 같은 slot끼리, 같은 궤적의 이동과 라벨 변경은 UID끼리 비교해요.
 기본 프레임은 auto:12, 기본 --top은 10이에요.
@@ -50,6 +51,8 @@ struct Options {
     select: Vec<String>,
     top: usize,
     pictures: bool,
+    picture_args: Vec<String>,
+    picture_options: PictureOptions,
 }
 
 #[derive(Debug)]
@@ -80,6 +83,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut select = Vec::new();
     let mut top = 10;
     let mut pictures = true;
+    let mut picture_args = Vec::new();
     while let Some(flag) = args.next() {
         if !flags.insert(flag) {
             return Err(format!("{flag}는 한 번만 쓸 수 있어요."));
@@ -124,9 +128,18 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     .map_err(|_| "--top 뒤에 0 이상의 정수를 써 주세요.")?
             }
             "--no-pictures" => pictures = false,
+            "--size" | "--fit" | "--trail" => {
+                picture_args.extend([flag.to_owned(), value()?.to_owned()]);
+            }
+            "--no-names" | "--no-sheet" | "--ui" => picture_args.push(flag.to_owned()),
             _ => return Err(format!("알 수 없는 확인 옵션이에요. ({flag})")),
         }
     }
+    let capture_args = ["--capture".to_owned(), "file.tak".to_owned()]
+        .into_iter()
+        .chain(picture_args.iter().cloned())
+        .collect::<Vec<_>>();
+    let capture_plan = capture::parse(&capture_args)?.expect("capture flag supplied");
     let out = out.ok_or("--out으로 저장할 폴더를 지정해 주세요.")?;
     let views = views_arg
         .map(capture::parse_views)
@@ -163,6 +176,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         select,
         top,
         pictures,
+        picture_args,
+        picture_options: PictureOptions::from(&capture_plan),
     })
 }
 
@@ -226,8 +241,38 @@ fn validate_output(path: &Path) -> Result<PathBuf, Error> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct PictureOptions {
+    size: [f32; 2],
+    fit: &'static str,
+    trail: Option<i64>,
+    names: bool,
+    sheet: bool,
+    ui: bool,
+}
+
+impl From<&capture::CapturePlan> for PictureOptions {
+    fn from(plan: &capture::CapturePlan) -> Self {
+        Self {
+            size: plan.size,
+            fit: match plan.fit {
+                capture::Fit::Frame => "frame",
+                capture::Fit::Take => "take",
+                capture::Fit::Selected => "selected",
+            },
+            trail: plan.trail,
+            names: plan.names,
+            sheet: plan.sheet,
+            ui: plan.full_ui,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Report {
+    #[serde(flatten)]
+    version: tak_core::cli_json::Version,
+    picture_options: PictureOptions,
     reference_role: String,
     coordinate_units: &'static str,
     frames: Vec<PickedFrame>,
@@ -333,8 +378,11 @@ fn audit_pictures(
                 errors
                     .push("captures.json의 범위, 각도 또는 마커 선택이 확인 요청과 달라요.".into());
             }
-            if manifest.sheet.as_deref() != Some("sheet.png") {
+            if inputs.picture_options.sheet && manifest.sheet.as_deref() != Some("sheet.png") {
                 errors.push("captures.json에 sheet.png 기록이 없어요.".into());
+            }
+            if !inputs.picture_options.sheet && manifest.sheet.is_some() {
+                errors.push("요청하지 않은 sheet.png 기록이 있어요.".into());
             }
             for shot in manifest.shots {
                 if records.insert((shot.frame, shot.view), shot.file).is_some() {
@@ -347,7 +395,7 @@ fn audit_pictures(
         }
         Err(e) => errors.push(format!("captures.json을 읽지 못했어요. ({e})")),
     }
-    if !nonempty_file(&dir.join("sheet.png")) {
+    if inputs.picture_options.sheet && !nonempty_file(&dir.join("sheet.png")) {
         errors.push("sheet.png 파일이 없거나 비어 있어요.".into());
     }
     for frame in expected {
@@ -402,6 +450,7 @@ fn capture_pictures(
     if let Some(views) = &options.views_arg {
         command.args(["--views", views]);
     }
+    command.args(&options.picture_args);
     let child = command
         .output()
         .map_err(|e| format!("캡처를 시작하지 못했어요. ({e})"))?;
@@ -599,6 +648,8 @@ fn execute(
     }
     let complete = files.iter().all(|file| file.errors.is_empty());
     let report = Report {
+        version: tak_core::cli_json::Version::new(1),
+        picture_options: options.picture_options,
         reference_role: options.inputs[0].role.clone(),
         coordinate_units: "mm by viewer convention (coordinate unit unverified)",
         frames,
@@ -1089,6 +1140,85 @@ mod tests {
             file["errors"][0],
             "f000002_top.png 파일이 없거나 비어 있어요."
         );
+    }
+
+    #[test]
+    fn passes_capture_options_through_and_accepts_missing_sheet_on_request() {
+        let temp = TempDir::new("check_picture_options");
+        let source = temp.join("source.tak");
+        fs::write(&source, sample_tak_with_devices()).unwrap();
+        let out = temp.join("out");
+        let picture_args = [
+            "--size",
+            "1200X800",
+            "--fit",
+            "selected",
+            "--trail",
+            "999999",
+            "--no-names",
+            "--no-sheet",
+            "--ui",
+        ];
+        let source_arg = source.to_string_lossy();
+        let out_arg = out.to_string_lossy();
+        let words = [
+            source_arg.as_ref(),
+            "--out",
+            out_arg.as_ref(),
+            "--frames",
+            "2",
+            "--views",
+            "top",
+        ]
+        .into_iter()
+        .chain(picture_args)
+        .collect::<Vec<_>>();
+        let opts = parse(&args(&words)).unwrap();
+        let (_, report) = execute(opts, |input, _, options, out| {
+            assert_eq!(options.picture_args, picture_args);
+            let dir = out.join(&input.folder);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("f000002_top.png"), "shot").unwrap();
+            fs::write(
+                dir.join("captures.json"),
+                serde_json::to_vec(&json!({
+                    "tak_unchanged":true, "start_frame":0, "end_frame":299,
+                    "views":["top"], "select":[], "sheet":null, "notes":[],
+                    "shots":[{"frame":2,"view":"top","file":"f000002_top.png"}],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.exit_code(), 0);
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(out.join("check.json")).unwrap()).unwrap();
+        assert_eq!(
+            receipt["picture_options"],
+            json!({
+                "size":[1200.0,800.0], "fit":"selected", "trail":100000,
+                "names":false, "sheet":false, "ui":true,
+            })
+        );
+        assert_eq!(receipt["schema"], 1);
+        assert_eq!(receipt["producer"]["version"], crate::version::VERSION);
+        for (flag, value) in [
+            ("--size", "399x300"),
+            ("--size", "1200xNaN"),
+            ("--fit", "unknown"),
+            ("--trail", "1.1"),
+        ] {
+            let expected = capture::parse(&args(&["--capture", "a.tak", flag, value])).unwrap_err();
+            assert_eq!(
+                parse(&args(&["a.tak", "--out", "out", flag, value])).err(),
+                Some(expected)
+            );
+        }
+        for flag in ["--size", "--fit", "--trail"] {
+            assert!(parse(&args(&["a.tak", "--out", "out", flag])).is_err());
+        }
     }
 
     #[test]

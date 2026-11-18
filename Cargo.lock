@@ -2848,10 +2848,11 @@ dependencies = [
 
 [[package]]
 name = "tak_core"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "memchr",
  "roxmltree",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -2859,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "tak_viewer"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "eframe",
  "egui_dock",

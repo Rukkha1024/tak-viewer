@@ -1,5 +1,6 @@
 //! Local TAKM Comment commands. The viewer supplies path resolution and its Comment clock.
 
+use crate::cli_json::{Envelope, Version};
 use crate::comments::{self, Comment, Event, Kind};
 use crate::tak::{fast_read::read_take_fast, is_take_path, MarkerKind, Take};
 use crate::takm;
@@ -14,7 +15,10 @@ use std::{
 
 pub const USAGE: &str = "\
 tak_viewer --add-comments <file.takm> --from <rows.json> [--dry-run] [--allow-unknown-markers] [--allow-duplicates]
-tak_viewer --list-comments <file.takm> [out.json]";
+tak_viewer --add-comments --from <batch.json> [--dry-run] [--allow-unknown-markers] [--allow-duplicates] [--envelope]
+tak_viewer --list-comments <file.takm> [out.json]
+tak_viewer --list-comments <file.takm> … [--json out.json] [--by agent|viewer|legacy] [--envelope]
+tak_viewer --list-comments --dir <폴더> [--recursive] [--json out.json] [--by agent|viewer|legacy] [--envelope]";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AddOptions {
@@ -94,6 +98,8 @@ pub struct AddResult {
     live_total: usize,
     fixed_unchanged: bool,
     dry_run: bool,
+    #[serde(flatten)]
+    version: Version,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,13 +138,13 @@ fn target(path: &Path, writing: bool) -> Result<PathBuf, String> {
     Ok(actual)
 }
 
-fn input_rows(bytes: &[u8]) -> Result<Vec<Value>, String> {
+fn read_input<T: serde::de::DeserializeOwned>(bytes: &[u8], shape: &str) -> Result<T, String> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "Comment 목록을 UTF-8로 저장해 주세요.".to_owned())?;
     serde_json::from_str(text).map_err(|e| {
         format!(
-            "Comment 목록을 JSON 배열로 읽지 못했어요. ({}번째 줄, {}번째 칸)",
+            "Comment 목록을 JSON {shape}로 읽지 못했어요. ({}번째 줄, {}번째 칸)",
             e.line(),
             e.column()
         )
@@ -265,6 +271,147 @@ fn validate_rows(rows: &[Value], take: &Take, allow_unknown: bool) -> Result<Vec
     }
 }
 
+struct PreparedAdd {
+    path: PathBuf,
+    actual: PathBuf,
+    before: (u64, [u8; 32]),
+    rows: Vec<Row>,
+}
+
+fn read_error(e: impl std::fmt::Display) -> String {
+    format!(".takm을 읽지 못했어요. ({e})")
+}
+
+impl PreparedAdd {
+    fn new(path: PathBuf, rows: &[Value], options: AddOptions) -> Result<Self, String> {
+        let actual = target(&path, true)?;
+        let before = takm::verify_fixed_seal(&actual).map_err(read_error)?;
+        let take = read_take_fast(&actual, false).map_err(read_error)?.take;
+        let rows = validate_rows(rows, &take, options.allow_unknown_markers)?;
+        if !rows.is_empty() {
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&actual)
+                .map_err(|e| format!(".takm에 Comment를 쓸 수 없어요. ({e})"))?;
+        }
+        Ok(Self {
+            path,
+            actual,
+            before,
+            rows,
+        })
+    }
+
+    fn lock(&self) -> Result<fs::File, String> {
+        takm::lock_path(&self.actual).map_err(|e| format!(".takm을 잠그지 못했어요. ({e})"))
+    }
+
+    fn plan(&mut self, options: AddOptions) -> Result<AddResult, String> {
+        if takm::fixed_seal(&self.actual).map_err(read_error)? != self.before {
+            return Err(
+                ".takm 고정 부분이 읽는 동안 바뀌었어요. 명령을 다시 실행해 주세요.".into(),
+            );
+        }
+        let current = takm::read_comments(&self.actual)
+            .map_err(read_error)?
+            .comments();
+        let mut result = AddResult {
+            file: self.path.display().to_string(),
+            added: Vec::new(),
+            skipped_existing: Vec::new(),
+            live_total: current.len(),
+            fixed_unchanged: true,
+            dry_run: options.dry_run,
+            version: Version::new(1),
+        };
+        let rows = std::mem::take(&mut self.rows);
+        let mut seen = HashMap::new();
+        if !options.allow_duplicates {
+            for c in current.list() {
+                seen.entry(Row::from_comment(c).duplicate_key())
+                    .or_insert(Some(c.id));
+            }
+        }
+        for (index, content) in rows.into_iter().enumerate() {
+            if !options.allow_duplicates {
+                match seen.entry(content.duplicate_key()) {
+                    std::collections::hash_map::Entry::Occupied(previous) => {
+                        result.skipped_existing.push(Skipped {
+                            row: index + 1,
+                            id: *previous.get(),
+                            content,
+                        });
+                        continue;
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(None);
+                    }
+                }
+            }
+            result.added.push(Added { id: None, content });
+        }
+        Ok(result)
+    }
+
+    fn reserve(&self, result: &mut AddResult) -> Result<(), String> {
+        if result.dry_run || result.added.is_empty() {
+            return Ok(());
+        }
+        let ids = comments::reserve_takm_ids_locked(&self.actual, result.added.len() as u64)
+            .map_err(|e| format!("Comment 번호를 확보하지 못했어요. ({e})"))?;
+        for (row, id) in result.added.iter_mut().zip(ids) {
+            row.id = Some(id);
+        }
+        Ok(())
+    }
+
+    fn append(&self, result: &mut AddResult, time: &str) -> Result<(), String> {
+        let label = comments::file_label(&self.path, self.before.0);
+        let mut events = Vec::with_capacity(result.added.len());
+        for added in &result.added {
+            let id = added.id.expect("reserved ID");
+            let mut event = Event::of(
+                Kind::Add,
+                &added.content.clone().into_comment(id),
+                time.to_owned(),
+                label.clone(),
+            );
+            // Mark the writer: result extraction must not take an agent's note for a user interval.
+            event.operation = Some(format!(
+                "{}{}",
+                comments::AGENT_OPERATION_PREFIX,
+                comments::new_operation_token()
+            ));
+            events.push(event);
+        }
+        let (conflict, _) = takm::append_events_locked(&self.actual, &events, None)
+            .map_err(|e| format!("Comment를 저장하지 못했어요. ({e})"))?;
+        if conflict.is_some() {
+            return Err("다른 창에서 Comment가 바뀌었어요. 명령을 다시 실행해 주세요.".into());
+        }
+
+        let saved = takm::read_comments(&self.actual)
+            .map_err(|e| format!("저장한 Comment를 다시 읽지 못했어요. ({e})"))?
+            .comments();
+        for added in &result.added {
+            let id = added.id.expect("reserved ID");
+            if saved.id_is_ambiguous(id)
+                || saved.get(id).map(Row::from_comment).as_ref() != Some(&added.content)
+            {
+                return Err(format!("저장한 Comment {id}의 내용이 요청과 달라요."));
+            }
+        }
+        let after = takm::verify_fixed_seal(&self.actual)
+            .map_err(|e| format!("저장 뒤 .takm 고정 부분을 확인하지 못했어요. ({e})"))?;
+        if after != self.before {
+            return Err("저장 뒤 .takm 고정 부분의 SHA-256이 달라요.".into());
+        }
+        result.live_total = saved.len();
+        Ok(())
+    }
+}
+
 /// Validate and append one batch, using the same lock, ID ledger, and events as a window.
 pub fn add(
     path: &Path,
@@ -272,143 +419,67 @@ pub fn add(
     options: AddOptions,
     now: impl FnOnce() -> String,
 ) -> Result<AddResult, String> {
-    let actual = target(path, true)?;
-    let read_error = |e| format!(".takm을 읽지 못했어요. ({e})");
-    let before = takm::verify_fixed_seal(&actual).map_err(read_error)?;
-    let rows = input_rows(json)?;
-    let take = read_take_fast(&actual, false).map_err(read_error)?.take;
-    let rows = validate_rows(&rows, &take, options.allow_unknown_markers)?;
-    if !rows.is_empty() {
-        OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&actual)
-            .map_err(|e| format!(".takm에 Comment를 쓸 수 없어요. ({e})"))?;
+    let rows: Vec<Value> = read_input(json, "배열")?;
+    let mut prepared = PreparedAdd::new(path.to_path_buf(), &rows, options)?;
+    // Dry runs never create a lock. Real adds keep lookup and append under the same lock.
+    let _lock = (!options.dry_run && !prepared.rows.is_empty())
+        .then(|| prepared.lock())
+        .transpose()?;
+    let mut result = prepared.plan(options)?;
+    prepared.reserve(&mut result)?;
+    if !result.dry_run && !result.added.is_empty() {
+        prepared.append(&mut result, &now())?;
     }
-    // A dry run must not create even a lock file. Real adds keep the lookup and append
-    // together so two command processes cannot both accept the same new row.
-    let _lock = if options.dry_run || rows.is_empty() {
-        None
-    } else {
-        Some(takm::lock_path(&actual).map_err(|e| format!(".takm을 잠그지 못했어요. ({e})"))?)
-    };
-    if takm::fixed_seal(&actual).map_err(read_error)? != before {
-        return Err(".takm 고정 부분이 읽는 동안 바뀌었어요. 명령을 다시 실행해 주세요.".into());
-    }
-
-    let current = takm::read_comments(&actual).map_err(read_error)?.comments();
-    let mut result = AddResult {
-        file: path.display().to_string(),
-        added: Vec::new(),
-        skipped_existing: Vec::new(),
-        live_total: current.len(),
-        fixed_unchanged: true,
-        dry_run: options.dry_run,
-    };
-    let mut seen = HashMap::new();
-    if !options.allow_duplicates {
-        for c in current.list() {
-            seen.entry(Row::from_comment(c).duplicate_key())
-                .or_insert(Some(c.id));
-        }
-    }
-    for (index, content) in rows.into_iter().enumerate() {
-        if !options.allow_duplicates {
-            match seen.entry(content.duplicate_key()) {
-                std::collections::hash_map::Entry::Occupied(previous) => {
-                    result.skipped_existing.push(Skipped {
-                        row: index + 1,
-                        id: *previous.get(),
-                        content,
-                    });
-                    continue;
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(None);
-                }
-            }
-        }
-        result.added.push(Added { id: None, content });
-    }
-    if options.dry_run || result.added.is_empty() {
-        return Ok(result);
-    }
-
-    let ids = comments::reserve_takm_ids_locked(&actual, result.added.len() as u64)
-        .map_err(|e| format!("Comment 번호를 확보하지 못했어요. ({e})"))?;
-    let time = now();
-    let label = comments::file_label(path, before.0);
-    let mut events = Vec::with_capacity(result.added.len());
-    for (added, id) in result.added.iter_mut().zip(ids) {
-        added.id = Some(id);
-        let mut event = Event::of(
-            Kind::Add,
-            &added.content.clone().into_comment(id),
-            time.clone(),
-            label.clone(),
-        );
-        // Mark the writer: result extraction must not take an agent's note for a user interval.
-        event.operation = Some(format!(
-            "{}{}",
-            comments::AGENT_OPERATION_PREFIX,
-            comments::new_operation_token()
-        ));
-        events.push(event);
-    }
-    let (conflict, _) = takm::append_events_locked(&actual, &events, None)
-        .map_err(|e| format!("Comment를 저장하지 못했어요. ({e})"))?;
-    if conflict.is_some() {
-        return Err("다른 창에서 Comment가 바뀌었어요. 명령을 다시 실행해 주세요.".into());
-    }
-
-    let saved = takm::read_comments(&actual)
-        .map_err(|e| format!("저장한 Comment를 다시 읽지 못했어요. ({e})"))?
-        .comments();
-    for added in &result.added {
-        let id = added.id.expect("reserved ID");
-        if saved.id_is_ambiguous(id)
-            || saved.get(id).map(Row::from_comment).as_ref() != Some(&added.content)
-        {
-            return Err(format!("저장한 Comment {id}의 내용이 요청과 달라요."));
-        }
-    }
-    let after = takm::verify_fixed_seal(&actual)
-        .map_err(|e| format!("저장 뒤 .takm 고정 부분을 확인하지 못했어요. ({e})"))?;
-    if after != before {
-        return Err("저장 뒤 .takm 고정 부분의 SHA-256이 달라요.".into());
-    }
-    result.live_total = saved.len();
     Ok(result)
 }
 
+mod batch;
+
 /// Read live rows with timestamps, including legacy rows with duplicate IDs.
 pub fn list(path: &Path) -> Result<ListResult, String> {
+    list_by(path, None).map(|(result, _, _)| result)
+}
+
+fn list_by(
+    path: &Path,
+    by: Option<&str>,
+) -> Result<(ListResult, usize, Option<&'static str>), String> {
     let actual = target(path, false)?;
     let read_error = |e| format!(".takm을 읽지 못했어요. ({e})");
     takm::verify_fixed(&actual).map_err(read_error)?;
-    let parsed = takm::read_comments(&actual).map_err(read_error)?;
+    let (parsed, note) = takm::read_comments_with_health(&actual).map_err(read_error)?;
     let (live, sources) = parsed.comments_with_sources();
     let comments = live
         .list()
         .iter()
         .zip(sources)
-        .map(|(c, source)| Listed {
-            id: c.id,
-            content: Row::from_comment(c),
-            time: source.time.clone(),
-            by: comments::writer_of(source),
+        .filter_map(|(c, source)| {
+            let writer = comments::writer_of(source);
+            if by.is_some_and(|by| by != writer) {
+                return None;
+            }
+            Some(Listed {
+                id: c.id,
+                content: Row::from_comment(c),
+                time: source.time.clone(),
+                by: writer,
+            })
         })
         .collect();
-    Ok(ListResult {
-        file: path.display().to_string(),
-        comments,
-        skipped_lines: parsed.skipped + usize::from(parsed.cut),
-        malformed_lines: parsed.skipped,
-        cut_tail: parsed.cut,
-    })
+    Ok((
+        ListResult {
+            file: path.display().to_string(),
+            comments,
+            skipped_lines: parsed.skipped + usize::from(parsed.cut),
+            malformed_lines: parsed.skipped,
+            cut_tail: parsed.cut,
+        },
+        live.len(),
+        note,
+    ))
 }
 
-fn check_output(path: &Path) -> Result<(), String> {
+fn check_output(path: &Path) -> Result<PathBuf, String> {
     let actual = takm::canonical_target(path)
         .map_err(|e| format!("JSON을 저장할 경로를 확인하지 못했어요. ({e})"))?;
     if [path, &actual]
@@ -417,54 +488,101 @@ fn check_output(path: &Path) -> Result<(), String> {
     {
         return Err("JSON을 .tak나 .takm 파일에 저장할 수 없어요.".into());
     }
-    if takm::in_input(path) {
+    if takm::in_input(path) || takm::in_input(&actual) {
         return Err("input/ 폴더에는 JSON을 저장하지 않아요.".into());
     }
-    Ok(())
+    Ok(actual)
 }
 
 #[derive(Debug)]
 enum Command<'a> {
     Add {
-        file: &'a str,
+        file: Option<&'a str>,
         from: &'a str,
         options: AddOptions,
+        envelope: bool,
     },
-    List {
-        file: &'a str,
-        output: Option<&'a str>,
-    },
+    List(ListArgs<'a>),
+}
+
+#[derive(Debug, Default)]
+struct ListArgs<'a> {
+    files: Vec<&'a str>,
+    dir: Option<&'a str>,
+    recursive: bool,
+    output: Option<&'a str>,
+    by: Option<&'a str>,
+    envelope: bool,
+}
+
+fn is_arg_path(s: &&str) -> bool {
+    !s.starts_with('-') && !s.trim().is_empty()
 }
 
 fn parse_args(args: &[String]) -> Result<Command<'_>, String> {
-    fn path(s: &str) -> bool {
-        !s.starts_with('-') && !s.trim().is_empty()
-    }
-    let [mode, file, rest @ ..] = args else {
-        return Err(".takm 파일을 지정해 주세요.".into());
-    };
-    if !path(file) {
-        return Err(".takm 파일을 지정해 주세요.".into());
-    }
-    match mode.as_str() {
-        "--list-comments" => match rest {
-            [] => Ok(Command::List { file, output: None }),
-            [out] if path(out) => Ok(Command::List {
-                file,
-                output: Some(out),
-            }),
-            _ => Err("--list-comments에는 JSON 저장 경로를 하나만 지정할 수 있어요.".into()),
-        },
-        "--add-comments" => {
+    let mut args = args.iter().map(String::as_str).peekable();
+    match args.next() {
+        Some("--list-comments") => {
+            let mut list = ListArgs::default();
+            // The first positional argument keeps the old single-file error contract.
+            if let Some(file) = args.next_if(is_arg_path) {
+                list.files.push(file);
+            }
+            while let Some(file) = args.next_if(|p| {
+                is_arg_path(p)
+                    && takm::is_takm_path(Path::new(p.trim().trim_matches(['"', '\'']).trim()))
+            }) {
+                list.files.push(file);
+            }
+            if list.files.len() == 1 {
+                list.output = args.next_if(is_arg_path);
+            }
+            while let Some(arg) = args.next() {
+                match arg {
+                    "--dir" if list.dir.is_none() && list.files.is_empty() => {
+                        list.dir = Some(
+                            args.next()
+                                .filter(is_arg_path)
+                                .ok_or("--dir 뒤에 폴더를 지정해 주세요.")?,
+                        );
+                    }
+                    "--json" if list.output.is_none() => {
+                        list.output = Some(
+                            args.next()
+                                .filter(is_arg_path)
+                                .ok_or("--json 뒤에 저장할 경로를 지정해 주세요.")?,
+                        );
+                    }
+                    "--by" if list.by.is_none() => {
+                        list.by = Some(
+                            args.next()
+                                .filter(|by| matches!(*by, "agent" | "viewer" | "legacy"))
+                                .ok_or("--by 뒤에 agent, viewer, legacy 중 하나를 써 주세요.")?,
+                        );
+                    }
+                    "--recursive" if !list.recursive => list.recursive = true,
+                    "--envelope" if !list.envelope => list.envelope = true,
+                    _ => return Err(format!("이 옵션은 쓸 수 없어요. ({arg})")),
+                }
+            }
+            if list.dir.is_none() && (list.recursive || list.files.is_empty()) {
+                return Err(
+                    "--recursive는 --dir과 함께 써 주세요. 파일이나 폴더를 지정해 주세요.".into(),
+                );
+            }
+            Ok(Command::List(list))
+        }
+        Some("--add-comments") => {
+            let file = args.next_if(is_arg_path);
             let mut options = AddOptions::default();
             let mut from = None;
-            let mut args = rest.iter().map(String::as_str);
+            let mut envelope = false;
             while let Some(arg) = args.next() {
                 match arg {
                     "--from" if from.is_none() => {
                         from = Some(
                             args.next()
-                                .filter(|s| path(s))
+                                .filter(is_arg_path)
                                 .ok_or("--from 뒤에 JSON 파일을 지정해 주세요.")?,
                         );
                     }
@@ -475,6 +593,7 @@ fn parse_args(args: &[String]) -> Result<Command<'_>, String> {
                     "--allow-duplicates" if !options.allow_duplicates => {
                         options.allow_duplicates = true
                     }
+                    "--envelope" if !envelope && file.is_none() => envelope = true,
                     _ => return Err(format!("이 옵션은 쓸 수 없어요. ({arg})")),
                 }
             }
@@ -483,6 +602,7 @@ fn parse_args(args: &[String]) -> Result<Command<'_>, String> {
                 file,
                 from,
                 options,
+                envelope,
             })
         }
         _ => Err("Comment 명령을 확인해 주세요.".into()),
@@ -494,7 +614,7 @@ fn json_output(value: &impl Serialize, output: Option<&Path>) -> Result<(), Stri
         serde_json::to_vec_pretty(value).map_err(|e| format!("JSON을 만들지 못했어요. ({e})"))?;
     json.push(b'\n');
     match output {
-        Some(path) => fs::write(path, json),
+        Some(path) => crate::cli_json::replace_file(path, &json),
         None => io::stdout().lock().write_all(&json),
     }
     .map_err(|e| format!("JSON을 쓰지 못했어요. ({e})"))
@@ -517,25 +637,56 @@ pub fn run(
             file,
             from,
             options,
+            envelope,
         } => fs::read(resolve(from))
             .map_err(|e| format!("Comment 목록 JSON을 읽지 못했어요. ({e})"))
-            .and_then(|rows| add(&resolve(file), &rows, options, now))
-            .and_then(|report| json_output(&report, None)),
-        Command::List { file, output } => {
-            let output = output.map(&resolve);
-            output
+            .and_then(|rows| match file {
+                Some(file) => {
+                    json_output(&add(&resolve(file), &rows, options, now)?, None).map(|()| false)
+                }
+                None => {
+                    let rows: batch::BatchRows = read_input(&rows, "파일별 객체")?;
+                    let (report, failed) = batch::add(rows, &resolve, options, now);
+                    batch_output(&report, envelope, None).map(|()| failed)
+                }
+            }),
+        Command::List(list) => (|| {
+            let output = list
+                .output
+                .map(&resolve)
                 .as_deref()
-                .map_or(Ok(()), check_output)
-                .and_then(|()| list(&resolve(file)))
-                .and_then(|report| json_output(&report, output.as_deref()))
-        }
+                .map(check_output)
+                .transpose()?;
+            if list.dir.is_none() && !list.envelope && list.files.len() == 1 {
+                let (report, _, _) = list_by(&resolve(list.files[0]), list.by)?;
+                return json_output(&report, output.as_deref()).map(|()| false);
+            }
+            let paths = match list.dir {
+                Some(dir) => batch::discover(&resolve(dir), list.recursive)?,
+                None => list.files.into_iter().map(&resolve).collect(),
+            };
+            let (report, failed) = batch::list(paths, list.by);
+            batch_output(&report, list.envelope, output.as_deref()).map(|()| failed)
+        })(),
     };
     match result {
-        Ok(()) => 0,
+        Ok(failed) => i32::from(failed),
         Err(reason) => {
             eprintln!("{reason}");
             1
         }
+    }
+}
+
+fn batch_output(
+    items: &[impl Serialize],
+    envelope: bool,
+    out: Option<&Path>,
+) -> Result<(), String> {
+    if envelope {
+        json_output(&Envelope::new(1, items), out)
+    } else {
+        json_output(&items, out)
     }
 }
 

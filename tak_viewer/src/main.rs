@@ -73,10 +73,10 @@ fn main() -> eframe::Result<()> {
             let paths = window_command::resolve_files(&paths).unwrap_or_else(|error| cli_exit(1, &error));
             return run_window(paths, None, None, [1600.0, 960.0], Some(startup));
         }
-        Some(window_command::Command::List) => {
+        Some(window_command::Command::List { envelope }) => {
             let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
             let dir = instances::registry_dir(data.as_deref());
-            if let Err(error) = instances::write_list(dir.as_deref(), std::io::stdout().lock()) {
+            if let Err(error) = instances::write_list(dir.as_deref(), std::io::stdout().lock(), envelope) {
                 cli_exit(1, &format!("뷰어 창 목록을 읽을 수 없어요. {error}"));
             }
             return Ok(());
