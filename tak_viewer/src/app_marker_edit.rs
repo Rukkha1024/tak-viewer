@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc};
 use tak_core::edit::delete::{delete_samples, DeleteRequest};
 use tak_core::edit::fill::{FillMethod, FillRequest, FillScope as CoreFillScope, NumericalFill};
 use tak_core::edit::label::{
-    CreationStreams, LabelEditor, LabelRequest, LabelScope, MergeRequest, UnlabelRequest,
+    CreationStreams, LabelEditor, LabelRequest, LabelScope, UnlabelRequest,
 };
 use tak_core::edit::save::{self, FileVersion, SaveOutcome, SaveRequest, TakmSave};
 use tak_core::edit::smooth::{NumericalSmooth, SmoothRequest, SmoothScope as CoreSmoothScope};
@@ -95,7 +95,6 @@ pub(super) struct PreparedSession {
 #[derive(Clone)]
 enum MarkerCommand {
     Label { request: LabelRequest, keep_armed: bool },
-    Merge(MergeRequest),
     Unlabel(UnlabelRequest),
     Delete(DeleteRequest),
     Fill {
@@ -117,7 +116,6 @@ impl MarkerCommand {
     fn selection(&self) -> &EditSelection {
         match self {
             Self::Label { request, .. } => &request.selection,
-            Self::Merge(r) => &r.selection,
             Self::Unlabel(r) => &r.selection,
             Self::Delete(r) => &r.selection,
             Self::Fill { selection, .. } | Self::Smooth { selection, .. } => selection,
@@ -252,15 +250,6 @@ fn run_marker_command(
     command: MarkerCommand,
 ) -> Result<(Option<EditPatch>, String), String> {
     match command {
-        MarkerCommand::Merge(request) => {
-            let patch = LabelEditor::new().merge_keys(snapshot, &request).map_err(|error| match error {
-                EditError::InvalidRange => "Invalid frame range".into(),
-                EditError::Other(message) => message,
-                _ => "Can't merge in this file".into(),
-            })?;
-            let message = patch.result.message.clone();
-            Ok((Some(patch), message))
-        }
         MarkerCommand::Delete(request) => {
             let outcome = delete_samples(snapshot, &request).map_err(edit_error)?;
             Ok((outcome.patch, outcome.result.message))
@@ -1306,7 +1295,7 @@ impl TakViewerApp {
         }
     }
 
-    pub(super) fn marker_command_block(&self, slot: usize, allow_capture: bool, legacy_notice: bool) -> Option<&'static str> {
+    fn marker_command_block(&self, slot: usize, allow_capture: bool, legacy_notice: bool) -> Option<&'static str> {
         let view = &self.views[slot];
         if view.edit_document.is_none() || view.data.is_none() {
             return Some("Can't edit this file");
@@ -1338,19 +1327,12 @@ impl TakViewerApp {
         None
     }
 
-    pub(super) fn merge_selected_keys(&mut self, ctx: &egui::Context, slot: usize, request: MergeRequest) {
-        self.start_marker_command(ctx, slot, MarkerCommand::Merge(request));
-    }
-
     fn start_marker_command(&mut self, ctx: &egui::Context, slot: usize, command: MarkerCommand) {
         self.views[slot].sync_shared();
         let now = ctx.input(|i| i.time);
-        let allow_capture = match &command {
-            MarkerCommand::Label { .. } => self.label_shot_in_progress(slot),
-            MarkerCommand::Merge(_) => slot == self.active && self.merge_keys_capture(),
-            _ => false,
-        };
-        let legacy_notice = !matches!(command, MarkerCommand::Label { .. } | MarkerCommand::Merge(_));
+        let is_label = matches!(command, MarkerCommand::Label { .. });
+        let allow_capture = is_label && self.label_shot_in_progress(slot);
+        let legacy_notice = !is_label;
         if let Some(reason) = self.marker_command_block(slot, allow_capture, legacy_notice) {
             self.takm_note = Some((reason.into(), now));
             return;
@@ -1457,7 +1439,6 @@ impl TakViewerApp {
             return;
         };
         let selection = command.selection().clone();
-        let prepare_tracks = matches!(&command, MarkerCommand::Merge(_));
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
@@ -1473,9 +1454,6 @@ impl TakViewerApp {
                         ),
                         None => None,
                     };
-                    if let Some(view) = new_view.as_ref().filter(|_| prepare_tracks) {
-                        view.prepare_marker_order();
-                    }
                     trace_timing("edit view rebuild", rebuilding);
                     Ok(EditDone {
                         patch,

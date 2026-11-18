@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.66.0 — 2026-11-18
+
+- Remove Merge Keys Up and Down from Tracks. Keep row selection, range drag and Zoom Fit.
+
 ## v0.65.1 — 2026-11-18
 
 - One reference for agent commands: syntax in the viewer README "Agent commands", outputs in `docs/cli-outputs.md`. Other guides link to them.

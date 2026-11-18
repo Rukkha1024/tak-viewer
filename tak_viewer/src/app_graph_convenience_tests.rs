@@ -141,16 +141,14 @@ fn graph_value_drag_changes_only_the_pressed_lane_and_toolbar_resets_it() {
 }
 
 #[test]
-fn tracks_toolbar_keeps_merge_keys_and_zoom_fit_in_both_graph_positions() {
+fn tracks_toolbar_shows_zoom_fit_in_both_graph_positions() {
     for detached in [false, true] {
         let ctx = egui::Context::default();
         let mut app = graph_selection_setup(&ctx, detached);
         app.settings.graph_layout = graph::tracks::Layout::Tracks;
         app.views[0].set_range(3, 5);
         let out = frame_with(&ctx, &mut app, vec![]);
-        for control in ["Zoom Fit", "Merge Keys Up", "Merge Keys Down"] {
-            assert_eq!(text_rects(&out, control).len(), 1, "{control}, detached {detached}");
-        }
+        assert_eq!(text_rects(&out, "Zoom Fit").len(), 1, "detached {detached}");
     }
 }
 

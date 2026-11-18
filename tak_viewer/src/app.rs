@@ -1459,8 +1459,6 @@ impl TakViewerApp {
                 }
                 next.stage = 2;
             }
-            2 if self.start_merge_keys_capture(ctx) => {}
-            3 if self.wait_merge_keys_capture() => {}
             2..=5 => next.stage += 1,
             // Verification of the menu capture: wait until it has finished.
             6 if self.capture.is_some() => {}
@@ -4434,7 +4432,6 @@ mod tests {
     include!("app_graph_selection_tests.rs");
     include!("app_scene_selection_tests.rs");
     include!("app_graph_tracks_tests.rs");
-    include!("app_merge_keys_tests.rs");
     include!("app_graph_convenience_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");

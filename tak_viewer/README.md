@@ -203,7 +203,6 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --working-range A-B | Set green playback bounds in every view. Combine with --range for yellow edit selection |
 | --reverse-playing | Set reverse and show playback active at its start position from --frame; pin clock for screenshot |
 | --menu-capture | Exercise menu capture and screenshot completion dialog |
-| --merge-keys preview\|up\|down | Headless Tracks screenshot only. With `--graph-layout tracks` and two `--select` names, show ready buttons or run one in-memory merge. `--range` scopes the move |
 | --drop-preview x,y incoming… | Headless screenshot only. Put last. Preview a drop at egui window points without opening incoming files |
 
 Use one crop selector. Native window pixels follow display scale. Crop points map to full-image pixels. Clip to the image and round minimum edges down and maximum edges up. Names ignore case: EXPLORER, Labeling, Edit Tools, Selected Marker (`선택 마커`), Devices, COMMENTS, GRAPH, Layout Tabs, footer, timeline, timeline N, 3D view N. N is view slot 1–4. Plain timeline uses the active view. `--comments`, `--edit-tools`, `--labeling-link` and `--graph-layout channels` can bring panels forward.
@@ -364,3 +363,4 @@ tak_viewer.exe --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot o
 - For local screenshot fixtures, `--ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux` uses fake state without SSH. Ready/top scene needs a local sample.
 
 [SSH outputs](../docs/cli-outputs.md#diagnostic-outputs)
+

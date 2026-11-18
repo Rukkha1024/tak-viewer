@@ -106,22 +106,6 @@ impl State {
             .flatten()
     }
 
-    /// Two selected marker indices, top to bottom. Merge Keys uses this row order.
-    pub(crate) fn selected_pair(
-        &self,
-        data: &ViewData,
-        selected: &BTreeSet<usize>,
-    ) -> Option<[usize; 2]> {
-        if selected.len() != 2 {
-            return None;
-        }
-        let order = self.order(data)?;
-        let mut selected = selected.iter().copied();
-        let [a, b] = [selected.next()?, selected.next()?];
-        let (ra, rb) = (order.row(a)?, order.row(b)?);
-        Some(if ra <= rb { [a, b] } else { [b, a] })
-    }
-
     pub(crate) fn select(
         &mut self,
         data: &ViewData,

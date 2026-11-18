@@ -11,10 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[path = "merge_keys.rs"]
-mod merge_keys;
-pub use merge_keys::MergeRequest;
-
 /// The selected inclusive edit range, or the complete take when no range is set.
 #[derive(Clone, Debug)]
 pub enum LabelScope {
@@ -606,17 +602,12 @@ fn select_samples(
     }
     Ok((moved, retained))
 }
-struct Overlap {
-    first: u32,
-    count: usize,
-}
-
-fn merge_sorted_samples(
+fn merge_assignment_samples(
     existing: &[RawSample],
     moved: &[RawSample],
-    mut collision: impl FnMut(RawSample, RawSample) -> Option<RawSample>,
-) -> Vec<RawSample> {
+) -> (Vec<RawSample>, Vec<RawSample>) {
     let mut result = Vec::with_capacity(existing.len() + moved.len());
+    let mut displaced = Vec::new();
     let (mut a, mut b) = (0, 0);
     while a < existing.len() && b < moved.len() {
         match existing[a].frame().cmp(&moved[b].frame()) {
@@ -629,7 +620,8 @@ fn merge_sorted_samples(
                 b += 1;
             }
             std::cmp::Ordering::Equal => {
-                result.extend(collision(existing[a], moved[b]));
+                displaced.push(existing[a]);
+                result.push(moved[b]);
                 a += 1;
                 b += 1;
             }
@@ -637,28 +629,7 @@ fn merge_sorted_samples(
     }
     result.extend_from_slice(&existing[a..]);
     result.extend_from_slice(&moved[b..]);
-    result
-}
-
-fn merge_assignment_samples(
-    existing: &[RawSample],
-    moved: &[RawSample],
-) -> (Vec<RawSample>, Vec<RawSample>) {
-    let mut displaced = Vec::new();
-    let samples = merge_sorted_samples(existing, moved, |old, new| {
-        displaced.push(old);
-        Some(new)
-    });
-    (samples, displaced)
-}
-
-fn merged_samples(existing: &[RawSample], moved: &[RawSample]) -> Result<Vec<RawSample>, Overlap> {
-    let mut overlap = None;
-    let samples = merge_sorted_samples(existing, moved, |old, _| {
-        overlap.get_or_insert(Overlap { first: old.frame(), count: 0 }).count += 1;
-        None
-    });
-    overlap.map_or(Ok(samples), Err)
+    (result, displaced)
 }
 
 fn next_unlabeled_name(used_names: &HashSet<String>) -> String {
@@ -1232,10 +1203,8 @@ mod assignment_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::{DeclaredLabel, DocumentInput, EditDocument, PreparedInput, StreamRef};
+    use crate::edit::{DeclaredLabel, DocumentInput, EditDocument, StreamRef};
     use std::path::PathBuf;
-
-    include!("merge_keys_tests.rs");
 
     fn uid(n: u8) -> Uid {
         [n; 16]

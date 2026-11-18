@@ -92,16 +92,8 @@ fn tracks_named_order_precedes_unlabeled_and_modifier_clicks_share_selection() {
     assert_eq!(selected, [2]);
     let selected = state.select(&data, &selected, second).unwrap();
     assert_eq!(selected, [2, 1]);
-    assert_eq!(
-        state.selected_pair(&data, &selected.iter().copied().collect()),
-        Some([2, 1])
-    );
     let selected = state.select(&data, &selected, last).unwrap();
     assert_eq!(selected, [1, 0, 3]);
-    assert_eq!(
-        state.selected_pair(&data, &selected.iter().copied().collect()),
-        None
-    );
     let stale = ViewData::build(data.take.clone());
     assert!(state.select(&stale, &selected, top).is_none());
 }

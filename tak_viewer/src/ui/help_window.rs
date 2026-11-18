@@ -127,7 +127,6 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("Graph right drag / Auto Extents", "Zoom the values where you drag / reset the value scale."),
         ("F / Shift+F in a graph", "Click the graph first. Fit the edit range / the whole file."),
         ("Zoom Fit / Lock Selection", "Fit the edit range / hold or free the marker picks in Channels and Combined."),
-        ("Merge Keys Up / Merge Keys Down", "Move points from the lower / upper Tracks row to the other row. The move stops if both have a point on the same frame."),
         ("Drag a graph tag or corner in 3D", "Drag the tag to move it or a corner to resize it. Double-click the tag to fold or open it."),
         ("3D graph click or drag / Wheel", "Go to a frame / zoom time."),
         ("Point at a graph in 3D", "Fold or open it. Send marker graphs to Graph (Below 3D). Pick lines or close a plate graph."),
