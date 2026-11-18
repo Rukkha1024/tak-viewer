@@ -38,8 +38,8 @@ fn graph_selection_fill_rects(out: &egui::FullOutput, fill: egui::Color32) -> Ve
 }
 
 /// Optional review artifact from an actual GRAPH drag. Normal test runs never write files.
-fn graph_selection_capture(ctx: &egui::Context, app: &mut TakViewerApp) {
-    let Some(path) = std::env::var_os("TAK_GRAPH_SELECTION_CAPTURE") else { return };
+fn graph_selection_capture(ctx: &egui::Context, app: &mut TakViewerApp, env: &str) {
+    let Some(path) = std::env::var_os(env) else { return };
     ctx.set_fonts(egui::FontDefinitions::default());
     frame_with(ctx, app, vec![]);
     theme::install_fonts(ctx);
@@ -75,7 +75,7 @@ fn graph_selection_docked_drag_is_live_shared_with_band_and_one_undo_action() {
     assert_eq!(app.history.kinds(), vec!["Range"], "release records just the range, no frame or marker movement");
     assert_eq!(app.views[0].ordered_selection(), selected, "multi-marker selection remains intact");
     assert_eq!(app.views[0].lanes.drew().solid, 6, "both selected markers remain in all three lanes");
-    graph_selection_capture(&ctx, &mut app);
+    graph_selection_capture(&ctx, &mut app, "TAK_GRAPH_SELECTION_CAPTURE");
     undo_key(&ctx, &mut app);
     assert_eq!((app.views[0].range, app.views[0].pb.frame), (Some((1, 3)), 5));
     redo_key(&ctx, &mut app);

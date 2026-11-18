@@ -98,9 +98,15 @@ fn merge_keys_buttons_move_by_row_order_and_use_one_history_action() {
     assert_eq!(steps(&app, 0), history);
     assert_base(&snapshot(&app));
 
-    app.views[0].range = Some((100, 139));
     app.views[0].pb.set_frame(50, 0.0);
     app.quiet();
+    let (body, band) = tracks_body_and_band(&wait(&mut app, &settled));
+    let data = app.view().data.as_ref().unwrap();
+    let point = |f| egui::pos2(tracks_frame_x(band, data.start_frame, data.end_frame, f), body.top() + 9.5);
+    let (from, to) = (point(100), point(139));
+    drag(&ctx, &mut app, from, to);
+    assert_eq!(app.view().range, Some((100, 139)));
+    assert_eq!(app.view().edit_selection_state().order, [r, l]);
     let history = steps(&app, 0).0;
     let out = wait(&mut app, &settled);
     click_at(&ctx, &mut app, button(&out, "Merge Keys Down"));

@@ -1291,6 +1291,12 @@ pub fn show_select(
 const RANGE_DRAG_THRESHOLD: f32 = 4.0;
 
 #[derive(Clone, Copy)]
+enum RangeDragAxis {
+    Any,
+    Horizontal,
+}
+
+#[derive(Clone, Copy)]
 struct RangeDrag {
     origin: Pos2,
     first: i64,
@@ -1303,7 +1309,7 @@ struct RangeDrag {
 /// endpoint. Egui does not own a complete press/move/release within one frame, so those
 /// unrecognized gestures stay ignored rather than bypassing popup / widget precedence.
 #[allow(clippy::too_many_arguments)]
-fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, frame_at: impl Fn(f32) -> i64, first: i64, last: i64, range: &mut Option<(i64, i64)>) -> (bool, bool) {
+fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, axis: RangeDragAxis, frame_at: impl Fn(f32) -> i64, first: i64, last: i64, range: &mut Option<(i64, i64)>) -> (bool, bool) {
     let id = id.with("range_drag");
     if !ui.is_enabled() {
         ui.data_mut(|data| { data.remove::<RangeDrag>(id); });
@@ -1327,7 +1333,11 @@ fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, frame_at:
                 }
                 egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
                     if let Some(drag) = &mut drag {
-                        drag.selecting |= drag.origin.distance(*pos) > RANGE_DRAG_THRESHOLD;
+                        let distance = match axis {
+                            RangeDragAxis::Any => drag.origin.distance(*pos),
+                            RangeDragAxis::Horizontal => (pos.x - drag.origin.x).abs(),
+                        };
+                        drag.selecting |= distance > RANGE_DRAG_THRESHOLD;
                         selecting |= drag.selecting;
                         if drag.selecting {
                             *range = Some(super::panels::ordered_range(drag.first, frame_at(pos.x), first, last));
@@ -1341,8 +1351,8 @@ fn select_drag(ui: &mut Ui, resp: &egui::Response, id: Id, plot: Rect, frame_at:
         i.pointer.primary_down()
     });
     ui.data_mut(|d| {
-        if down {
-            if let Some(drag) = drag { d.insert_temp(id, drag); }
+        if let Some(drag) = drag.filter(|_| down) {
+            d.insert_temp(id, drag);
         } else {
             d.remove::<RangeDrag>(id);
         }
@@ -1399,7 +1409,7 @@ fn show_inner(
         }
     }
     let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
-        select_drag(ui, &resp, id, plot, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
+        select_drag(ui, &resp, id, plot, RangeDragAxis::Any, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
     });
     if !selecting && resp.double_clicked() {
         vr = full;

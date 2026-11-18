@@ -1,7 +1,7 @@
 //! Tracks shows sample presence using the display model's prepared marker runs.
 use super::{
     paint_selection, paint_spans, select_drag, theme, DecorationGeometry, Decorations,
-    NavDecorationKey, ViewRange, NAV_H,
+    NavDecorationKey, RangeDragAxis, ViewRange, NAV_H,
 };
 use crate::ui::panels::{self, ListSelectionState, SelectionGesture, SpanCache};
 use eframe::egui::{self, pos2, vec2, Color32, FontId, Id, Rect, Sense, Stroke, Ui};
@@ -348,6 +348,7 @@ pub(crate) fn show(
         &range_strip,
         id.with("tracks_range"),
         band,
+        RangeDragAxis::Any,
         frame_at,
         first,
         last,
@@ -356,9 +357,21 @@ pub(crate) fn show(
     if !selecting && range_strip.clicked() {
         *range = None;
     }
+    let (_, selecting_rows) = select_drag(
+        ui,
+        &rows,
+        rows.id,
+        plot,
+        RangeDragAxis::Horizontal,
+        frame_at,
+        first,
+        last,
+        range,
+    );
     if let (Some(order), Some(p)) = (
         order,
-        rows.interact_pointer_pos().filter(|_| rows.clicked()),
+        rows.interact_pointer_pos()
+            .filter(|_| !selecting_rows && rows.clicked_by(egui::PointerButton::Primary)),
     ) {
         action.click = hit(order, p.y - top, ui.input(|i| i.modifiers));
     }
