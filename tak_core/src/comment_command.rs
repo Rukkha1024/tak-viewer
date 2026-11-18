@@ -73,7 +73,10 @@ fn known_type(text: &str) -> Option<&'static str> {
     comments::TYPES
         .iter()
         .copied()
-        .chain(["Needs visual check", "Marker swap"])
+        .chain([
+            "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
+            "Needs visual check", "Marker swap",
+        ])
         .find(|kind| kind.eq_ignore_ascii_case(text))
 }
 

@@ -146,7 +146,7 @@ impl Comment {
 // ───────────────────────────── Types (Comment plan step 5) ─────────────────────────────
 
 /// Current choices in UI, cycle and sort order. Names are also the stored values.
-pub const TYPES: &[&str] = &["Jitter", "Jump", "Visual check", "File bad", "Agree", "No problem", "Keep this only"];
+pub const TYPES: &[&str] = &["File bad", "Range OK", "Range bad", "File OK"];
 
 /// Type cell label, including retired and unknown stored text.
 pub fn type_short(t: &str) -> &str {
@@ -1724,7 +1724,10 @@ mod tests {
         // Comment plan step 5: the type is the readable name in the existing `comment_type`
         // column; empty = none; a value the app does not know is kept as it is.
         let base = Comment { id: 3, markers: vec!["LKNE".into()], start: 10, end: 20, comment_type: String::new(), text: "n".into() };
-        for t in ["", "Marker swap", "Jitter", "Needs visual check", "Ghost, \"later\" type"] {
+        for t in TYPES.iter().copied().chain([
+            "", "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
+            "Needs visual check", "Marker swap", "Ghost, \"later\" type",
+        ]) {
             let c = Comment { comment_type: t.into(), ..base.clone() };
             let add = Event::of(Kind::Add, &c, "t".into(), "a.tak|1".into());
             // Another field edited later: the type stays (an edit line is the whole comment).
@@ -1752,7 +1755,7 @@ mod tests {
 
     #[test]
     fn current_types_use_the_approved_order_for_labels_sort_and_cycle() {
-        assert_eq!(TYPES, ["Jitter", "Jump", "Visual check", "File bad", "Agree", "No problem", "Keep this only"]);
+        assert_eq!(TYPES, ["File bad", "Range OK", "Range bad", "File OK"]);
         assert_eq!(type_rank(""), 0);
         let mut now = "";
         for (index, next) in TYPES.iter().copied().enumerate() {
@@ -1762,7 +1765,10 @@ mod tests {
             assert_eq!(now, next);
         }
         assert_eq!(step_type(now), "");
-        for other in ["Needs visual check", "Marker swap", "Ghost"] {
+        for other in [
+            "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
+            "Needs visual check", "Marker swap", "Ghost",
+        ] {
             assert_eq!(type_short(other), other);
             assert_eq!(type_rank(other), TYPES.len() + 1);
             assert_eq!(step_type(other), "");

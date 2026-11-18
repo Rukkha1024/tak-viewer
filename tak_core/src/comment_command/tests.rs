@@ -5,7 +5,7 @@ use serde_json::json;
 
 const TIME: &str = "2026-11-18T12:00:00+09:00";
 const ROW: &[u8] =
-    br#"[{"markers":["LKNE","RKNE"],"start":0,"end":299,"type":"jItTeR","text":"check"}]"#;
+    br#"[{"markers":["LKNE","RKNE"],"start":0,"end":299,"type":"rAnGe BaD","text":"check"}]"#;
 
 fn fixture(name: &str) -> (TempDir, PathBuf) {
     let dir = TempDir::new(name);
@@ -60,7 +60,11 @@ fn parses_bom_optional_type_and_korean_csv_fields() {
 #[test]
 fn accepts_current_and_retired_types_and_lists_only_current_choices_in_refusal() {
     let (_dir, path) = fixture("comment_command_types");
-    let expected = comments::TYPES.iter().copied().chain(["Needs visual check", "Marker swap"]);
+    let retired = [
+        "Jitter", "Jump", "Visual check", "Agree", "No problem", "Keep this only",
+        "Needs visual check", "Marker swap",
+    ];
+    let expected = comments::TYPES.iter().copied().chain(retired);
     let rows: Vec<_> = expected.clone().enumerate().map(|(frame, kind)| {
         json!({"markers": [], "start": frame, "end": frame, "type": kind.to_ascii_lowercase(), "text": ""})
     }).collect();
@@ -71,7 +75,7 @@ fn accepts_current_and_retired_types_and_lists_only_current_choices_in_refusal()
     let before = fs::read(&path).unwrap();
     let error = add_default(&path, br#"[{"markers":[],"start":1,"end":1,"type":"Other","text":""}]"#).unwrap_err();
     assert!(error.contains(&comments::TYPES.join(", ")), "{error}");
-    assert!(!error.contains("Needs visual check") && !error.contains("Marker swap"), "{error}");
+    assert!(retired.iter().all(|name| !error.contains(name)), "{error}");
     assert_eq!(fs::read(path).unwrap(), before);
 }
 
@@ -170,8 +174,8 @@ fn refuses_missing_tak_non_takm_obsolete_corrupt_and_repo_input() {
 fn skips_live_and_batch_duplicates_and_can_append_them_explicitly() {
     let (_dir, path) = fixture("comment_command_duplicates");
     let rows = br#"[
-        {"markers":["LKNE","RKNE"],"start":0,"end":299,"type":"jitter","text":"check"},
-        {"markers":["RKNE","LKNE"],"start":0,"end":299,"type":"Jitter","text":"check"}
+        {"markers":["LKNE","RKNE"],"start":0,"end":299,"type":"range bad","text":"check"},
+        {"markers":["RKNE","LKNE"],"start":0,"end":299,"type":"Range bad","text":"check"}
     ]"#;
     let first = add_default(&path, rows).unwrap();
     assert_eq!(first.added.len(), 1);
@@ -486,7 +490,7 @@ fn directory_list_reports_writer_filter_and_tail_damage_without_changing_the_sin
         json!({
             "file": a.display().to_string(),
             "comments": [{"id":1,"markers":["LKNE","RKNE"],"start":0,"end":299,
-                          "type":"Jitter","text":"check","time":TIME,"by":"agent"}],
+                          "type":"Range bad","text":"check","time":TIME,"by":"agent"}],
             "skipped_lines":2,"malformed_lines":1,"cut_tail":true,
         })
     );

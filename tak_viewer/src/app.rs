@@ -2139,7 +2139,7 @@ impl TakViewerApp {
         }
         // A type picked in the list (type-combo): the same path as the strip and `T` (one
         // `edit` line, one action that merges with type changes of this comment in a row, the
-        // short note `Comment 2 · Jitter`; the same type = nothing).
+        // short note `Comment 2 · File bad`; the same type = nothing).
         if e.field == Field::Type {
             self.set_comment_type(ctx, e.slot, e.id, &e.choice);
             return;
@@ -6678,7 +6678,7 @@ mod tests {
         tail_append(&path, &[Event::of(EventKind::Add, &a, "t".into(), String::new()), Event::of(EventKind::Add, &b, "t".into(), String::new())]).unwrap();
         let mut app = comment_app(&ctx, &dir, false);
         assert_eq!(app.views[0].comments.list.len(), 2);
-        assert!(!app.set_comment_type(&ctx, 0, 1, "Jitter"));
+        assert!(!app.set_comment_type(&ctx, 0, 1, "File bad"));
         assert_eq!(app.views[0].comments.list.len(), 2);
         assert!(app.notice.as_deref().is_some_and(|text| text.contains("Comment 번호가 겹쳐서")));
     }
@@ -9272,7 +9272,7 @@ mod tests {
         let cell = comment_list::type_cell(row);
         assert!(width("Type ▼", 12.5) + 6.0 <= cell.width(), "Type ▼ fits: {}", cell.width());
         let tbox = comment_list::type_box_of(row);
-        for s in comments::TYPES.iter().copied().chain(["—", "Needs visual check", "Marker swap"]) {
+        for s in comments::TYPES.iter().copied().chain(["—", "Needs visual check", "Marker swap", "Keep this only"]) {
             assert!(width(s, 9.0) + 4.0 + 13.0 <= tbox.width(), "{s} fits the Type box: {}", tbox.width());
         }
         // The type list: its items have no hover text either, and the list fits ~380 pt.
@@ -9376,7 +9376,8 @@ mod tests {
     fn one_click_types_an_existing_agent_comment_and_keeps_the_legacy_tail() {
         let ctx = egui::Context::default();
         let dir = comment_dir("type_agent_legacy_tail");
-        typed_on_disk(&dir, &[(1, 2, "Needs visual check"), (2, 3, "Marker swap"), (3, 4, "Custom type")]);
+        let retired = [(1, 2, "Jitter"), (2, 3, "Marker swap"), (3, 4, "No problem"), (4, 5, "Keep this only")];
+        typed_on_disk(&dir, &retired);
         let path = dir.join("a.takm");
         let added = tak_core::comment_command::add(
             &path,
@@ -9399,9 +9400,9 @@ mod tests {
             }
         };
         open(&mut app);
-        let [_, _, note_cell, _] = cells_of(&ctx, &mut app, 1);
+        let [_, _, note_cell, _] = cells_of(&ctx, &mut app, 4);
         tap(&ctx, &mut app, note_cell);
-        assert_eq!((picked(&app), type_of(&app, 1).as_str()), (Some(1), "Needs visual check"));
+        assert_eq!((picked(&app), type_of(&app, 4).as_str()), (Some(4), "Keep this only"));
         app.close_view(0);
         assert_eq!(std::fs::read(&path).unwrap(), original, "open, pick and close are byte-identical");
 
@@ -9428,7 +9429,7 @@ mod tests {
         assert_eq!(type_of(&app, agent), last_kind);
         until_saved(&ctx, &mut app);
         let parsed = tak_core::takm::read_comments(&path).unwrap();
-        for (id, kind) in [(1, "Needs visual check"), (2, "Marker swap"), (3, "Custom type")] {
+        for (id, _, kind) in retired {
             assert_eq!(parsed.comments().get(id).unwrap().comment_type, kind);
             assert_eq!(parsed.events.iter().filter(|event| event.id == id).count(), 1);
         }
@@ -9439,20 +9440,23 @@ mod tests {
     #[test]
     fn post_create_type_buttons_wrap_and_fit_the_narrow_playback_bar() {
         let ctx = egui::Context::default();
-        let deck = egui::Rect::from_min_size(egui::pos2(20.0, 400.0), egui::vec2(220.0, 60.0));
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let buttons = panels::type_strip_rects(ctx, deck);
-            let strip = panels::type_strip_rect(&buttons);
-            assert_eq!(buttons.len(), comments::TYPES.len());
-            assert!(strip.left() >= deck.left() && strip.right() <= deck.right());
-            assert!(strip.bottom() <= deck.top() && buttons.last().unwrap().top() > buttons[0].top());
             let font = egui::FontId::proportional(13.0);
-            for (kind, r) in comments::TYPES.iter().zip(&buttons) {
-                let width = ctx.fonts(|f| f.layout_no_wrap((*kind).to_owned(), font.clone(), egui::Color32::WHITE).size().x);
-                assert!(r.width() > width && strip.contains_rect(*r), "{kind} fits its button");
-            }
-            for (index, a) in buttons.iter().enumerate() {
-                assert!(buttons[index + 1..].iter().all(|b| !a.intersects(*b)));
+            for (width, wraps) in [(220.0, true), (362.0, false)] {
+                let deck = egui::Rect::from_min_size(egui::pos2(20.0, 400.0), egui::vec2(width, 60.0));
+                let buttons = panels::type_strip_rects(ctx, deck);
+                let strip = panels::type_strip_rect(&buttons);
+                assert_eq!(buttons.len(), comments::TYPES.len());
+                assert!(strip.left() >= deck.left() && strip.right() <= deck.right());
+                assert!(strip.bottom() <= deck.top());
+                assert_eq!(buttons.last().unwrap().top() > buttons[0].top(), wraps, "{width} pt");
+                for (kind, r) in comments::TYPES.iter().zip(&buttons) {
+                    let label_width = ctx.fonts(|f| f.layout_no_wrap((*kind).to_owned(), font.clone(), egui::Color32::WHITE).size().x);
+                    assert!(r.width() > label_width && strip.contains_rect(*r), "{kind} fits its button");
+                }
+                for (index, a) in buttons.iter().enumerate() {
+                    assert!(buttons[index + 1..].iter().all(|b| !a.intersects(*b)));
+                }
             }
         });
     }
@@ -9501,25 +9505,25 @@ mod tests {
         // T (the keyboard path, the new comment is the selected one): the next type, the strip
         // stays open and marks it.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Jitter", Some(1)));
-        // A click on Jump: that type, one edit line; the strip closes. With the T just
+        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("File bad", Some(1)));
+        // A click on Range OK: that type, one edit line; the strip closes. With the T just
         // before it is one action (type changes of one comment in a row).
         let at = strip_button(&ctx, &mut app, 1);
         tap(&ctx, &mut app, at);
-        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Jump", None));
-        assert_eq!(note(&app), "Comment 1 · Jump");
+        assert_eq!((type_of(&app, 1).as_str(), strip_for(&app)), ("Range OK", None));
+        assert_eq!(note(&app), "Comment 1 · Range OK");
         assert_eq!(app.history.kinds().len(), kinds.len() + 1);
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment"));
         file_matches_memory(&ctx, &mut app, &dir);
         let ev = file_events(&dir);
         let types: Vec<(comments::Kind, &str)> = ev[lines..].iter().map(|e| (e.kind, e.comment_type.as_str())).collect();
-        assert_eq!(types, vec![(comments::Kind::Edit, "Jitter"), (comments::Kind::Edit, "Jump")]);
+        assert_eq!(types, vec![(comments::Kind::Edit, "File bad"), (comments::Kind::Edit, "Range OK")]);
         assert_eq!(app.views[0].selected, BTreeSet::from([0]), "the click on the strip did not reach the 3D");
         // Ctrl+Z / Ctrl+Y: the type goes and comes back (edit lines).
         undo_key(&ctx, &mut app);
         assert_eq!((type_of(&app, 1).as_str(), note(&app).as_str()), ("", "Undo · Comment 1 edited"));
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 1), "Jump");
+        assert_eq!(type_of(&app, 1), "Range OK");
         file_matches_memory(&ctx, &mut app, &dir);
         // M held over frames: the strip comes when M goes up.
         app.views[0].pb.set_frame(2, 0.0);
@@ -9575,7 +9579,7 @@ mod tests {
         // `--type-strip` (pictures): drawn, but a click on it writes nothing.
         app.type_strip = Some(TypeStrip { slot: 0, file_id: app.views[0].file_id, id: 1, rect: egui::Rect::NOTHING, buttons: Vec::new(), shot: true });
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, "Visual check").len(), 1, "shown for the picture");
+        assert_eq!(text_rects(&out, "Range bad").len(), 1, "shown for the picture");
         let at = strip_button(&ctx, &mut app, 0);
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 1), "");
@@ -9592,11 +9596,11 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("t_key");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 2, "Needs visual check"), (2, 7, "")]);
+        typed_on_disk(&dir, &[(1, 2, "Keep this only"), (2, 7, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         // Nothing selected: T does nothing.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), ("Needs visual check".into(), String::new(), 2));
+        assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), ("Keep this only".into(), String::new(), 2));
         assert!(app.history.kinds().is_empty());
         // Comment 2 selected (a row click): T goes round; back at none the presses cancel out.
         let [_, at, _, _] = cells_of(&ctx, &mut app, 2);
@@ -9605,7 +9609,7 @@ mod tests {
         for want in comment_list::type_choices() {
             run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
             assert_eq!(type_of(&app, 2), want);
-            assert_eq!(type_of(&app, 1), "Needs visual check", "only the selected one");
+            assert_eq!(type_of(&app, 1), "Keep this only", "only the selected one");
         }
         assert_eq!(app.history.kinds(), kinds, "a full cycle removes the undo action");
         until_saved(&ctx, &mut app);
@@ -9613,36 +9617,36 @@ mod tests {
         // Two presses: one action, its note; the tab shows the short form.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("Jump", "Comment 2 · Jump"));
+        assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("Range OK", "Comment 2 · Range OK"));
         assert_eq!(app.history.kinds().len(), kinds.len() + 1);
         let out = frame_with(&ctx, &mut app, vec![]);
         let cell = comment_list::type_cell(app.comment_rows.iter().find(|r| r.0 == 2).unwrap().1);
-        assert_eq!(text_rects(&out, "Jump").iter().filter(|t| cell.contains(t.center())).count(), 1, "stored name in the Type box");
+        assert_eq!(text_rects(&out, "Range OK").iter().filter(|t| cell.contains(t.center())).count(), 1, "stored name in the Type box");
         // One Ctrl+Z takes both presses back; Ctrl+Y does them again.
         undo_key(&ctx, &mut app);
         assert_eq!(type_of(&app, 2), "");
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 2), "Jump");
+        assert_eq!(type_of(&app, 2), "Range OK");
         // After a frame move the next press is a new action.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowRight)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "Visual check");
+        assert_eq!(type_of(&app, 2), "Range bad");
         let k = app.history.kinds();
         assert_eq!(k[k.len() - 2..].to_vec(), vec!["Frame".to_owned(), "Comment".to_owned()]);
         // A held T repeats (egui marks the presses while it is down): only the real press counts.
         key_down(&ctx, &mut app, Key::T);
-        assert_eq!(type_of(&app, 2), "File bad");
+        assert_eq!(type_of(&app, 2), "File OK");
         for _ in 0..3 {
             frame_with(&ctx, &mut app, vec![key_event(Key::T, true, Modifiers::NONE)]);
         }
         key_up(&ctx, &mut app, Key::T);
-        assert_eq!(type_of(&app, 2), "File bad", "the auto-repeat did nothing");
+        assert_eq!(type_of(&app, 2), "File OK", "the auto-repeat did nothing");
         // During a cell edit (here the note box has the keys): T does nothing.
         let [_, _, note_cell, _] = cells_of(&ctx, &mut app, 2);
         double_click(&ctx, &mut app, note_cell);
         assert_eq!(app.comment_edit.as_ref().map(|e| e.field), Some(Field::Text));
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "File bad");
+        assert_eq!(type_of(&app, 2), "File OK");
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         // The type list open (type-combo; no text box): T and M do nothing, the list stays.
         let t = comment_list::type_point(row_of(&ctx, &mut app, 2));
@@ -9654,7 +9658,7 @@ mod tests {
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::M)]);
         frame_with(&ctx, &mut app, vec![]);
-        assert_eq!((type_of(&app, 2).as_str(), ids(&app), line_count(&dir)), ("File bad", vec![1, 2], lines));
+        assert_eq!((type_of(&app, 2).as_str(), ids(&app), line_count(&dir)), ("File OK", vec![1, 2], lines));
         assert_eq!(app.comment_edit.as_ref().map(|e| (e.id, e.field)), Some((2, Field::Type)), "still open");
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         assert!(app.comment_edit.is_none());
@@ -9664,16 +9668,16 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         assert!(ctx.wants_keyboard_input());
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 2), "File bad");
+        assert_eq!(type_of(&app, 2), "File OK");
         app.path_input = None;
         let [_, at, _, _] = cells_of(&ctx, &mut app, 1);
         tap(&ctx, &mut app, at);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
         assert_eq!(type_of(&app, 1), "");
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::T)]);
-        assert_eq!(type_of(&app, 1), "Jitter");
+        assert_eq!(type_of(&app, 1), "File bad");
         undo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 1), "Needs visual check");
+        assert_eq!(type_of(&app, 1), "Keep this only");
         file_matches_memory(&ctx, &mut app, &dir);
     }
 
@@ -9712,14 +9716,14 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("tab_type");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "Marker swap"), (5, 5, "Later kind"), (6, 6, "Jump")]);
+        typed_on_disk(&dir, &[(1, 1, "File bad"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "Marker swap"), (5, 5, "Keep this only"), (6, 6, "Range OK")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let place = place_of(&app, Pane::Comments);
         // Every row: its box with the short form (`—` for none, an unknown value as written).
         let out = frame_with(&ctx, &mut app, vec![]);
         let rows = app.comment_rows.clone();
         assert_eq!(rows.len(), 6);
-        for (id, short) in [(1, "Jitter"), (2, "—"), (3, "Needs visual check"), (4, "Marker swap"), (5, "Later kind"), (6, "Jump")] {
+        for (id, short) in [(1, "File bad"), (2, "—"), (3, "Needs visual check"), (4, "Marker swap"), (5, "Keep this only"), (6, "Range OK")] {
             let b = comment_list::type_box_of(rows.iter().find(|r| r.0 == id).unwrap().1);
             assert!(text_in_box(&out, short, b), "{short} in the box of row {id}");
         }
@@ -9757,7 +9761,7 @@ mod tests {
         for name in comment_list::type_choices().map(comment_list::item_name) {
             assert!(text_rects(&out, name).iter().any(|t| list.contains(t.center())), "{name} in the list");
         }
-        assert_eq!(highlighted(&app).as_deref(), Some("Jump"), "the current one highlighted");
+        assert_eq!(highlighted(&app).as_deref(), Some("Range OK"), "the current one highlighted");
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), lines, "opening writes nothing");
         // A click elsewhere in a row (not on the box) is a plain row click: the list closes and
@@ -9790,51 +9794,51 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("type_pick");
         let dir = _dir_guard.to_path_buf();
-        typed_on_disk(&dir, &[(1, 1, "Jitter"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "")]);
+        typed_on_disk(&dir, &[(1, 1, "File bad"), (2, 2, ""), (3, 3, "Needs visual check"), (4, 4, "")]);
         let mut app = comments_tab_app(&ctx, &dir, false);
         let f0 = app.views[0].pb.frame;
         open_type_list(&ctx, &mut app, 2);
         assert_eq!(highlighted(&app).as_deref(), Some(""), "none: None highlighted");
         let (lines, kinds, rev) = (line_count(&dir), app.history.kinds().len(), app.views[0].comments.list.revision());
-        // Jump: saved at once (one edit line, one action), the list closes; the click
+        // Range OK: saved at once (one edit line, one action), the list closes; the click
         // does not reach the row under the list.
-        let at = item_at(&ctx, &mut app, "Jump");
+        let at = item_at(&ctx, &mut app, "Range OK");
         tap(&ctx, &mut app, at);
-        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, "Jump"));
+        assert_eq!((list_open(&app), type_of(&app, 2).as_str()), (None, "Range OK"));
         assert_eq!((picked(&app), app.views[0].pb.frame), (Some(2), f0), "the row under the list got nothing");
-        assert_eq!(note(&app), "Comment 2 · Jump");
+        assert_eq!(note(&app), "Comment 2 · Range OK");
         assert_eq!(app.history.kinds().len(), kinds + 1);
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Comment"));
         assert!(app.views[0].comments.list.revision() != rev, "the list and the band are made again");
         until_saved(&ctx, &mut app);
         assert_eq!(line_count(&dir), lines + 1);
         let last = file_events(&dir).pop().unwrap();
-        assert_eq!((last.kind, last.id, last.comment_type.as_str()), (comments::Kind::Edit, 2, "Jump"));
+        assert_eq!((last.kind, last.id, last.comment_type.as_str()), (comments::Kind::Edit, 2, "Range OK"));
         file_matches_memory(&ctx, &mut app, &dir);
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert!(text_in_box(&out, "Jump", comment_list::type_box_of(row_of(&ctx, &mut app, 2))), "the box shows it");
+        assert!(text_in_box(&out, "Range OK", comment_list::type_box_of(row_of(&ctx, &mut app, 2))), "the box shows it");
         // Ctrl+Z / Ctrl+Y.
         undo_key(&ctx, &mut app);
         assert_eq!((type_of(&app, 2).as_str(), note(&app).as_str()), ("", "Undo · Comment 2 edited"));
         redo_key(&ctx, &mut app);
-        assert_eq!(type_of(&app, 2), "Jump");
+        assert_eq!(type_of(&app, 2), "Range OK");
         file_matches_memory(&ctx, &mut app, &dir);
         // The same type again: no line, no action; the list closes.
         open_type_list(&ctx, &mut app, 2);
         let (lines, kinds) = (line_count(&dir), app.history.kinds().len());
-        let at = item_at(&ctx, &mut app, "Jump");
+        let at = item_at(&ctx, &mut app, "Range OK");
         tap(&ctx, &mut app, at);
         until_saved(&ctx, &mut app);
         assert_eq!((list_open(&app), line_count(&dir), app.history.kinds().len()), (None, lines, kinds));
-        // None takes the type off; Jitter on another comment.
+        // None takes the type off; File bad on another comment.
         open_type_list(&ctx, &mut app, 3);
         let at = item_at(&ctx, &mut app, "");
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 3), "");
         open_type_list(&ctx, &mut app, 4);
-        let at = item_at(&ctx, &mut app, "Jitter");
+        let at = item_at(&ctx, &mut app, "File bad");
         tap(&ctx, &mut app, at);
-        assert_eq!(type_of(&app, 4), "Jitter");
+        assert_eq!(type_of(&app, 4), "File bad");
         file_matches_memory(&ctx, &mut app, &dir);
     }
 
@@ -9880,10 +9884,10 @@ mod tests {
         assert_eq!((type_of(&app, 3).as_str(), line_count(&dir)), ("Later kind", lines));
         open_type_list(&ctx, &mut app, 3);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowDown)]);
-        assert_eq!(highlighted(&app).as_deref(), Some("Jitter"));
-        let at = item_at(&ctx, &mut app, "Visual check");
+        assert_eq!(highlighted(&app).as_deref(), Some("File bad"));
+        let at = item_at(&ctx, &mut app, "Range bad");
         tap(&ctx, &mut app, at);
-        assert_eq!(type_of(&app, 3), "Visual check");
+        assert_eq!(type_of(&app, 3), "Range bad");
         // With the list closed, ↑ ↓ step frames as always.
         let f = app.views[0].pb.frame;
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::ArrowUp)]);
@@ -9918,10 +9922,10 @@ mod tests {
         open_type_list(&ctx, &mut app, 1);
         frame_with(&ctx, &mut app, vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 1.0), modifiers: Modifiers::NONE }]);
         assert_eq!(list_open(&app), None);
-        // Another box (not under the list): closed, then that one's list opens.
-        open_type_list(&ctx, &mut app, 1);
+        // Another box above the list: close this list and open that one's.
         open_type_list(&ctx, &mut app, 2);
-        assert_eq!((list_open(&app), picked(&app)), (Some(2), Some(2)));
+        open_type_list(&ctx, &mut app, 1);
+        assert_eq!((list_open(&app), picked(&app)), (Some(1), Some(1)));
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Escape)]);
         until_saved(&ctx, &mut app);
         assert_eq!((type_of(&app, 1), type_of(&app, 2), line_count(&dir)), (String::new(), String::new(), lines), "nothing written");
@@ -9959,9 +9963,9 @@ mod tests {
         assert!(place.contains_rect(list), "inside the tab: {list:?} in {place:?}");
         assert!(list.bottom() <= bx.top() + 0.5 && list.bottom() >= bx.top() - 6.0, "right above the box: {list:?} / {bx:?}");
         // Its items can be clicked there.
-        let at = item_at(&ctx, &mut app, "Jitter");
+        let at = item_at(&ctx, &mut app, "File bad");
         tap(&ctx, &mut app, at);
-        assert_eq!(type_of(&app, id), "Jitter");
+        assert_eq!(type_of(&app, id), "File bad");
     }
 
     #[test]
@@ -9969,6 +9973,7 @@ mod tests {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("type_off");
         let dir = _dir_guard.to_path_buf();
+        // Keep a retired type on disk to check its stored label in the read-only view.
         typed_on_disk(&dir, &[(1, 3, "Jitter"), (2, 5, "")]);
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         let mut app = comments_tab_app(&ctx, &dir, true);
@@ -9992,7 +9997,7 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         frame_with(&ctx, &mut app, vec![]);
         assert_eq!(app.type_items.len(), comments::TYPES.len() + 1, "shown for the picture");
-        let at = item_at(&ctx, &mut app, "Jump");
+        let at = item_at(&ctx, &mut app, "Range OK");
         tap(&ctx, &mut app, at);
         assert_eq!(type_of(&app, 1), "Jitter");
         assert!(app.comment_writer.is_none());

@@ -310,14 +310,14 @@ Existing TAKM outside repo input for adds. WSL and Windows paths work. No window
 
 ```json
 [
-  {"markers": ["LTHI", "LKNE"], "start": 1073, "end": 1073, "type": "Visual check", "text": "한 줄 설명"},
+  {"markers": ["LTHI", "LKNE"], "start": 1073, "end": 1073, "type": "Range bad", "text": "한 줄 설명"},
   {"markers": [], "start": 1080, "end": 1090, "text": ""}
 ]
 ```
 
-Frames inclusive, in the viewer's numbering. `type` optional. Text may be empty. Without a positional file, supply a JSON object mapping each TAKM path to its row array. Relative paths start at the working directory. Validate every file and row before appending to any file.
+Frames inclusive, in the viewer's numbering. Omit `type` for None. Text may be empty. Without a positional file, supply a JSON object mapping each TAKM path to its row array. Relative paths start at the working directory. Validate every file and row before appending to any file.
 
-Current types in order: `Jitter`, `Jump`, `Visual check`, `File bad`, `Agree`, `No problem`, `Keep this only`. `Needs visual check` and `Marker swap` are retired, still accepted. Add stores the matching name. List returns the stored type, including retired and unknown values. `--by` filters by writer.
+Current types in order: `File bad`, `Range OK`, `Range bad`, `File OK`. See [Comment](#comment) for meanings. Retired, still accepted: `Jitter`, `Jump`, `Visual check`, `Agree`, `No problem`, `Keep this only`, `Needs visual check`, `Marker swap`. Add stores the matching name. List returns the stored type, including retired and unknown values. `--by` filters by writer.
 
 `--dry-run` validates and plans without reserving IDs or writing. `--allow-unknown-markers` skips exact labeled-name validation. `--allow-duplicates` appends matching rows again. Without it, live matches and in-batch repeats are skipped after comparing marker lists without regard to order. Type names match without regard to case. Text stays one line, with tabs replaced by spaces.
 

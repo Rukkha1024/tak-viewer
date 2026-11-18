@@ -850,13 +850,18 @@ mod tests {
     #[test]
     fn the_type_column_sorts_in_the_fixed_order_none_first_unknown_last_by_text() {
         let t = |id: u64, ty: &str| Comment { comment_type: ty.into(), ..c(id, &[], id as i64, id as i64, "") };
-        let mut list = vec![t(1, "Jitter"), t(2, ""), t(3, "zeta later"), t(4, "Needs visual check"), t(5, "Marker swap"), t(6, "Alpha later"), t(7, "Jitter"), t(8, "")];
-        list.extend(comments::TYPES.iter().copied().enumerate().skip(1).rev().map(|(i, kind)| t(8 + i as u64, kind)));
+        let mut list = vec![
+            t(1, "File bad"), t(2, ""), t(3, "zeta later"), t(4, "Needs visual check"),
+            t(5, "Marker swap"), t(6, "Alpha later"), t(7, "File bad"), t(8, ""),
+            t(9, "Keep this only"), t(10, "Jitter"), t(11, "Jump"), t(12, "Visual check"),
+            t(13, "Agree"), t(14, "No problem"),
+        ];
+        list.extend(comments::TYPES.iter().copied().enumerate().skip(1).rev().map(|(i, kind)| t(14 + i as u64, kind)));
         let ids = |sort: Sort| sorted(&list, sort).iter().map(|&i| list[i].id).collect::<Vec<_>>();
         let up = Sort { key: SortKey::Type, desc: false };
         let expected = [2, 8, 1, 7].into_iter()
-            .chain((1..comments::TYPES.len() as u64).map(|i| 8 + i))
-            .chain([6, 5, 4, 3]).collect::<Vec<_>>();
+            .chain((1..comments::TYPES.len() as u64).map(|i| 14 + i))
+            .chain([13, 6, 10, 11, 9, 5, 4, 14, 12, 3]).collect::<Vec<_>>();
         assert_eq!(ids(up), expected, "none, current in order, then other values by text; ties by id");
         let mut back = ids(up);
         back.reverse();
@@ -873,9 +878,9 @@ mod tests {
             assert_eq!(step_item(next, true), kind);
         }
         assert_eq!(step_item("", false), "", "stops at None");
-        assert_eq!(step_item("Jitter", true), "Jitter", "stops at the top");
+        assert_eq!(step_item("File bad", true), "File bad", "stops at the top");
         // Nothing highlighted (a value the app does not know): ↓ = the first, ↑ = the last.
-        assert_eq!((step_item("Later kind", false), step_item("Later kind", true)), ("Jitter", ""));
+        assert_eq!((step_item("Jitter", false), step_item("Jitter", true)), ("File bad", ""));
     }
 
     #[test]

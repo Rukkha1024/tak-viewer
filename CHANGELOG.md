@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.69.7 — 2026-11-18
+
+- Comment types are now four: `File bad`, `Range OK`, `Range bad`, `File OK`. Older types stay as stored in files and the Comment command still takes them.
+
 ## v0.69.6 — 2026-11-18
 
 - Fix two file-list tests that failed only in the public check. No change in the viewer window.
