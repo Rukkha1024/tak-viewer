@@ -50,6 +50,57 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
+pub(crate) fn run_help_shot(request: &crate::help_shot::Request) -> i32 {
+    let ctx = egui::Context::default();
+    let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+    app.show_help_for_shot();
+    let [width, height] = request.pixels;
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(width as f32, height as f32) / request.scale);
+    let mut textures = Textures::default();
+    let mut draw = |frame: u32, events| {
+        let mut raw = frame_input(screen, Instant::now(), events);
+        raw.time = Some(f64::from(frame) * 0.1);
+        raw.predicted_dt = 0.1;
+        raw.viewports.get_mut(&ViewportId::ROOT).unwrap().native_pixels_per_point = Some(request.scale);
+        ctx.run(raw, |ctx| app.frame(ctx))
+    };
+    // Measure, position and finish the window's fade-in before painting.
+    for frame in 0..3 {
+        let out = draw(frame, vec![]);
+        textures.set(&out.textures_delta);
+        textures.free(&out.textures_delta);
+    }
+    let mut frame = 3;
+    if request.bottom {
+        let out = draw(frame, vec![
+            Event::PointerMoved(screen.center()),
+            Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -6000.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        textures.set(&out.textures_delta);
+        textures.free(&out.textures_delta);
+        frame += 1;
+    }
+    let out = draw(frame, vec![]);
+    textures.set(&out.textures_delta);
+    let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+    let image = soft_render::paint(&prims, &textures, request.pixels, out.pixels_per_point, CLEAR);
+    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+    match crate::shot::save_png(&request.out, width, height, &rgba) {
+        Ok(()) => {
+            println!("screenshot saved: {} ({width}x{height})", request.out.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("그림을 저장할 수 없어요. {error}");
+            1
+        }
+    }
+}
+
 /// `--bench-select N` (v0.27.0, agent-only): the bench plays with the first N markers of the
 /// LABELS list selected (the graph of several markers), instead of the first marker alone.
 pub static BENCH_SELECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);

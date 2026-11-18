@@ -43,3 +43,74 @@ tak_viewer.exe --to-takm sample.tak
 Ctrl+S로 편집을 `.takm`에 저장해요. 저장하지 않은 내용이 있을 때 닫거나 다른 파일로 바꾸면 저장 여부를 물어요. GRAPH에서 끌어 편집 구간을 고를 수 있고 Ctrl+W로 화면을 닫아요.
 
 Windows의 EXPLORER에서 SSH 연결을 설정해 서버 파일을 읽을 수 있어요. 원격 파일은 메모리에서 읽으며 원격 파일 편집과 주석 저장은 지원하지 않아요.
+
+## Controls
+
+`도움말 → 조작키` shows grouped shortcuts. Move or resize the window. Scroll its body for more.
+
+Exact modifiers required; focused text/popup/edit/held-M/capture priority → input rules.
+
+| Input | Action |
+|---|---|
+| Left click / Ctrl+click / Shift+click | Select / toggle / add marker. Plain blank click clears. |
+| 3D Alt+click | Inspect one marker without QuickLabel or plate picking. |
+| 3D Ctrl+A | Select visible markers in the last-clicked 3D view at its current frame. |
+| `보기 → Distance / Angle` | Toggle the readout for two or three selected markers. Select the angle vertex second. |
+| Left drag / Ctrl+drag | Box-select / add box; nearest release marker primary |
+| Right drag / middle drag / wheel | Orbit / pan / zoom |
+| Ctrl+B / Ctrl+J / Ctrl+Alt+B | Toggle left / bottom / right panels |
+| Right-click 3D point | Selected Markers count, Marker Info, Label Marker, Unlabel Marker(s), Remove Marker. Keep existing selection on any selected point |
+| 3D double-click / F / Shift+F | Double-click fits the selected marker. With GRAPH outside key focus, F fits selected and Shift+F fits all in the 3D view under the pointer |
+| Plate click / device `3D` | Toggle chosen plate graph |
+| Space | Play/stop |
+| Reverse | Toggle reverse direction at same speed; Space plays/stops chosen direction |
+| →/←, ↑/↓, Home/End | ±1, ±10, first/last frame |
+| D / Q | QuickLabel↔Select mode / 3D selection tool |
+| QuickLabel plain 3D click | Assign armed label to named or Unlabeled point. Move colliding points to Unlabeled. Same label shows status only |
+| S / A | Next/previous visible label |
+| Unlabel / Shift+D | Remove label over configured scope |
+| Delete / Remove Marker | Remove selected samples in edit range/current frame; focused list may own Delete |
+| C / Shift+C | Cubic / Pattern Based fill |
+| X / Shift+X / Ctrl+Alt+X | Smooth selected-range / all-markers-range / all-markers-full-take |
+| Z / Shift+Z | Selected markers' next-gap start / previous-gap end |
+| V or [ / B or ] | Range start / end |
+| Shift+B / Shift+V | Clear range / full range |
+| Shift+[ / Shift+] / `Reset` | Reset working range to full file |
+| G / `보기 → Follow Selected (G)` | Toggle tracking in focused scene / active view |
+| `보기 → View Direction` | Perspective / Front / Back / Left / Right / Top / Bottom |
+| L / `보기 → Marker Names (L)` | Toggle 3D marker names. Off keeps pointer-hover name only |
+| Ctrl+O / Ctrl+Shift+O / Ctrl+L | Open file / add folder / open by path |
+| Ctrl+T / Ctrl+Shift+T / Ctrl+W | New tab / reopen closed view or tab / close focused view |
+| Ctrl+Tab / Ctrl+PageDown | Next tab |
+| Ctrl+Shift+Tab / Ctrl+PageUp | Previous tab |
+| F2 | Rename active tab. Enter commits, Esc cancels |
+| PageDown / PageUp | Next / previous file from the same folder |
+| Ctrl+Shift+S | Save screen captures |
+| Ctrl+S | Save active edit document |
+| Ctrl+Z or Ctrl+Alt+Z / Ctrl+Y | Undo / redo; Ctrl+Shift+Z disabled |
+| List Ctrl+click / Shift+click / Ctrl+A | Toggle / range / all; last-clicked list focus |
+| Frame number drag | Up/right positive, down/left negative; Shift fast; click types number |
+| Upper timeline / floating-graph click/drag | Seek frame |
+| GRAPH curve click / drag>4 pt | Seek / inclusive edit range, current frame unchanged |
+| GRAPH curve right-drag up/down | Zoom value scale of pressed lane in/out. `Auto Extents` resets it |
+| F / Shift+F after click in GRAPH | Fit yellow range / whole take and reset value zoom. No range = F does nothing |
+| `Zoom Fit` / `Lock Selection` | Fit yellow range / pin or release markers shown in Channels or Combined |
+| GRAPH red gap bar drag | Seek |
+| Tracks row click / Ctrl+click / Shift+click / Ctrl+Shift+click | Select / toggle / select through anchor / add anchor range. Keeps edit range |
+| Tracks row left-drag >4 pt horizontally | Pick edit range. Start right of names. Keeps selected rows and frame |
+| Tracks `Merge Keys Up` / `Merge Keys Down` | Move lower row into upper / upper into lower. Two rows, edit range or whole take. No shortcut |
+| Tracks frame strip click/drag | Seek |
+| Lower band drag / blank click | Pick / clear range |
+| Green handles / `Working Range` `Start` and `End` numbers | Set playback bounds; Enter/blur commits valid frame, Esc cancels |
+| Esc | Cancel higher-priority operation; then range/selection rules |
+| Enter in Comment edit | Save draft |
+| M hold / tap, Comment button | Held interval / picked range or current frame |
+| T | Cycle representative Comment type |
+| Timeline Comment click / right-click | Jump/select / delete single |
+| 1 / 2 or overlay tags | Toggle primary/overlay visibility |
+
+Follow and projection per view. Right drag leaves orthographic mode. `보기` trail switch draws up to eight selected markers. 3D behavior.
+
+Pattern Based: select references first, target last; check Fill Target then Fill Selected/All or Shift+C. Two-reference failure cases → editing contract. Undo coverage/merge/exclusions → undo table.
+
+In Labeling, enable `Link to 3D Selection` to follow the 3D pick's group. Choose `Increment` after assignment. Right-click a named row → `Label Marker` to assign its label to the single selected 3D point. `%` shows the take share with a point.

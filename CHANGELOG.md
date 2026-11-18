@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.60.3 — 2026-11-18
+
+- Keep the `조작키` title and close button visible at small sizes and higher display scales. Wrap both columns and scroll grouped controls.
+- Refresh selection, playback, marker editing, GRAPH and Comment instructions. Use the labels shown in the viewer. Capture either end of help at a chosen size and scale.
+
 ## v0.60.2 — 2026-11-18
 
 - Drag across Tracks rows to pick the yellow edit range. Keep selected rows and frame. Click still selects a row.

@@ -22,6 +22,7 @@ pub mod edit_tools;
 pub mod empty;
 pub mod graph;
 pub mod graph_float;
+pub(crate) mod help_window;
 pub mod labeling;
 pub mod open_editors;
 pub mod panels;

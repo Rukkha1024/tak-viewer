@@ -32,6 +32,7 @@ mod comment_selection;
 mod capture;
 mod check_command;
 mod headless;
+mod help_shot;
 mod instances;
 mod merge_keys;
 mod shot;
@@ -56,6 +57,9 @@ fn main() -> eframe::Result<()> {
     if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
         println!("{}", usage());
         std::process::exit(0);
+    }
+    if let Some(request) = help_shot::parse(&args[1..]).unwrap_or_else(|error| cli_exit(2, error)) {
+        std::process::exit(headless::run_help_shot(&request));
     }
     match window_command::parse(&args[1..]).unwrap_or_else(|error| cli_exit(2, &error)) {
         Some(window_command::Command::Only { paths, startup }) => {
@@ -253,6 +257,7 @@ fn usage() -> String {
         capture::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
+        help_shot::USAGE,
         "Headless Labeling link: --labeling-link with --select NAME",
         "Headless 3D selection: --select-visible or --select A,B[,C]",
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",

@@ -601,6 +601,11 @@ impl TakViewerApp {
         self.no_persist = true;
     }
 
+    pub(crate) fn show_help_for_shot(&mut self) {
+        self.set_command_run();
+        self.show_help = true;
+    }
+
     /// Look for other open windows every few seconds; move a new window off the first one.
     fn watch_other_windows(&mut self, ctx: &egui::Context) {
         if let Some(r) = &self.registration {
@@ -4072,65 +4077,7 @@ impl TakViewerApp {
             self.show_settings = open;
         }
         if self.show_help {
-            let mut open = true;
-            egui::Window::new("조작키").open(&mut open).collapsible(false).show(ctx, |ui| {
-                egui::Grid::new("help").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                    for (k, v) in [
-                        ("Click / Ctrl+click / Shift+click", "Select / toggle / add marker"),
-                        ("Ctrl+A in 3D", "Select visible markers"),
-                        ("왼쪽 드래그", "네모 안 마커 모두 선택 (Ctrl = 기존 선택에 더하기)"),
-                        ("3D의 forceplate 클릭", "그 판의 그래프(처음은 Fx · Fy · Fz)를 3D 위에 띄우기 · 다시 누르면 닫기 (마커 선택은 그대로, Devices 패널의 \"3D\"도 같아요)"),
-                        ("오른쪽 드래그", "가운데 점을 중심으로 회전"),
-                        ("가운데(휠) 드래그", "화면 이동"),
-                        ("휠 굴리기", "확대 / 축소"),
-                        ("패널 제목 끌기", "패널 옮기기 · 다른 패널과 탭으로 겹치기 · 떠 있는 창으로 떼기"),
-                        ("Ctrl+B / Ctrl+J / Ctrl+Alt+B", "왼쪽 / 아래 / 오른쪽 패널 전체 켜고 끄기 (오른쪽 위 버튼 3개와 같음)"),
-                        ("3D 위 그래프의 이름표 끌기", "그래프 옮기기 (3D 화면 안 어디든). 두 번 누르면 접기 / 펴기"),
-                        ("3D 위 그래프의 가장자리 · 모서리 끌기", "그래프 크기 바꾸기. 마우스를 올리면 버튼: 마커 그래프 = 아래 Graph 패널로 · 접기, forceplate 그래프 = 줄 · 접기 · 닫기(✕)"),
-                        ("forceplate 그래프의 \"줄\" 버튼", "보일 줄을 골라요: 힘 Fx · Fy · Fz, 모멘트 Mx · My · Mz (누를 때마다 바로 바뀌고, 하나는 꼭 남아요. 다른 곳을 누르거나 Esc = 목록 닫기)"),
-                        ("3D 위 그래프 안 클릭 · 드래그 / 휠", "프레임 이동 / 가로 확대 (바탕 진하기는 보기 → 설정…)"),
-                        ("더블클릭 / F", "선택 마커로 확대 (회전 중심)"),
-                        ("Shift+F", "전체 보기"),
-                        ("Z / Shift+Z", "선택 마커의 다음 / 이전 빈 구간으로"),
-                        ("Space", "재생 / 정지"),
-                        ("→ / ←", "다음 / 이전 1 프레임"),
-                        ("↑ / ↓", "다음 / 이전 10 프레임"),
-                        ("Home / End", "처음 / 끝"),
-                        ("재생 막대 위 칸 누르기 · 끌기", "그 프레임으로 이동"),
-                        ("재생 막대 아래 띠 끌기 / 누르기", "구간 잡기 (주황 점선, 프레임은 그대로) / 구간 풀기"),
-                        ("[ / ]", "지금 프레임을 구간 시작 / 끝으로 (구간이 없으면 지금 프레임 한 장)"),
-                        ("Esc", "Comment를 고치는 중이면 취소. 아니면 구간 풀기 (구간이 없으면 마커 선택과 고른 Comment 해제). M을 누르고 있는 중이면 그 Comment 취소"),
-                        ("M 누르고 있기", "Comment: 누른 프레임 ~ 뗀 프레임 + 누를 때 고른 마커(없어도 돼요)를 바로 저장 (재생 · 이동하면서 누르고 있기, TAK 옆 <이름>.comments.csv)"),
-                        ("M 짧게", "Comment: 구간(없으면 지금 프레임) + 고른 마커(없어도 돼요)를 바로 저장 (재생 막대의 Comment 버튼과 같아요)"),
-                        ("유형 버튼 3개 / T", "Comment를 만든 바로 뒤 재생 막대 위에 Jitter · Marker swap · Needs visual check 버튼이 떠요: 누르면 그 유형이 붙어요 (다른 키 · 다른 곳 누르기 = 그냥 닫힘). T = 고른 Comment의 유형을 차례로 바꾸기: 없음 → Jitter → Marker swap → Needs visual check → 없음"),
-                        ("재생 막대 띠의 주황 칸 누르기 / 오른쪽 클릭", "그 Comment의 첫 프레임으로 + 그 마커 선택 (마커 없는 Comment는 프레임만) / 바로 지우기"),
-                        ("COMMENTS 탭", "보기 메뉴 · 상태 줄 Comments N으로 열기. 줄 누르기 = 그 Comment와 마커 고르기(프레임 · 재생은 그대로) · # 두 번 누르기 = 그 Comment 첫 프레임으로 · 칸 두 번 누르기 = 고치기(Markers: 3D · Labeling에서 마커를 고르고 Enter, Frames · Comment: 쓰고 Enter; 프레임은 그대로), Esc = 취소 · Type ▼ 상자 한 번 누르기 = 유형 목록(누르면 바로 저장, ↑ ↓ Enter, Esc · 다른 곳 = 닫기) · ✕ = 지우기 · 칸 이름 = 정렬 (한 번 더 = 거꾸로)"),
-                        ("Ctrl+Z / Ctrl+Y", "한 번 = 동작 하나 되돌리기 / 다시 하기: 프레임 · 시점 · 선택 · 구간 · Comment · 설정 · 패널 · 파일 열기 · 폴더를 한 일의 차례대로 (앱 전체, 이어진 움직임은 하나, 최근 동작 500개까지, 글 칸에 커서가 있으면 그 글의 되돌리기)"),
-                        ("Ctrl+O", "파일 열기 (창에 끌어다 놓아도 됨)"),
-                        ("Ctrl+T / Ctrl+Shift+T", "빈 탭 만들기 / 마지막으로 닫은 화면 또는 탭 다시 열기"),
-                        ("Ctrl+Tab / Ctrl+Shift+Tab", "다음 / 이전 탭"),
-                        ("Ctrl+PageDown / Ctrl+PageUp", "다음 / 이전 탭"),
-                        ("F2", "현재 탭 이름 바꾸기 (Enter 확정, Esc 취소)"),
-                        ("Ctrl+W", "선택한 3D 화면 닫기 (마지막 화면이면 탭 닫기)"),
-                        ("Explorer 클릭 / Ctrl+클릭", "지금 화면에 열기 / 옆 화면에 열기 (3D 화면 최대 4개, 2×2까지)"),
-                        ("Explorer 파일 오른쪽 클릭 → 이 화면에 얹기", "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 = 같은 메뉴 또는 이름표 2의 ✕. 서로 다른 파일은 전체에서 12개까지"),
-                        ("1 / 2 (이름표 1 / 2 누르기)", "얹은 화면에서 처음 파일 / 얹은 파일의 마커 숨기기 · 다시 보이기"),
-                        ("3D 화면 누르기 · 탭 ✕", "그 화면 고르기 (탭이 밝아지고 파란 테두리, 패널·재생 막대·키가 그 화면 기준) · 그 화면 닫기"),
-                        ("Ctrl+Shift+O", "폴더 추가 → Explorer 트리 (최대 10개, 펼칠 때만 그 폴더를 읽음)"),
-                        ("저장 폴더 연필 / 오른쪽 클릭", "이름 바꾸기 (보이는 이름만, 폴더는 그대로). Enter = 저장, Esc = 취소"),
-                        ("Ctrl+L", "경로로 열기 (WSL 경로 /home/…, /mnt/c/… 가능)"),
-                        ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),
-                        ("G", "Toggle Follow Selected in 3D"),
-                        ("L", "Toggle marker names in 3D (hover still shows names)"),
-                        ("Ctrl+Shift+S", "화면 캡처 저장 (지금 각도 + 위·옆·앞, repo 안)"),
-                    ] {
-                        ui.label(RichText::new(k).strong());
-                        ui.label(v);
-                        ui.end_row();
-                    }
-                });
-            });
-            self.show_help = open;
+            crate::ui::help_window::show(ctx, &mut self.show_help, area);
         }
         if !self.desktop_hover.paths.is_empty() { self.paint_desktop_drop(ctx); }
         // Current click geometry and higher-priority widgets settle before destructive keys.
