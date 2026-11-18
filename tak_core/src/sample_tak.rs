@@ -236,6 +236,35 @@ pub fn sample_tak() -> Vec<u8> {
     ])
 }
 
+/// Two structurally labeled points with one gap in A and no preexisting Unlabeled donor.
+pub fn sample_tak_for_label_assignments() -> Vec<u8> {
+    let mut nodes = vec![2, 2, 0, 0, 0];
+    for (name, uid) in [("A", 1u8), ("B", 2)] {
+        let mut node = marker_node(name, uid);
+        let words = u16::from_le_bytes([node[8], node[9]]) as usize;
+        let property_end = 10 + 2 * words;
+        let suffix = r#",{"name":"NodeVisible","value":"true"}]}"#;
+        node.splice(property_end - 4..property_end, utf16(suffix));
+        let updated_words = (words - 2 + suffix.encode_utf16().count()) as u16;
+        node[8..10].copy_from_slice(&updated_words.to_le_bytes());
+        let size = node.len();
+        node[size - 20..size - 4].fill(90);
+        node[size - 4..].copy_from_slice(&i32::from(uid).to_le_bytes());
+        nodes.extend(node);
+    }
+    let mut channels = CHANNELS_HEADER.to_vec();
+    channels.extend(2u32.to_le_bytes());
+    channels.extend(translation(1, (0..=12).filter(|&frame| frame != 6)));
+    channels.extend(translation(2, (0..=12).filter(|&frame| frame != 4)));
+    let mut meta = vec![0; 6];
+    meta.extend(utf16(
+        "<properties><property><name>StartFrame</name><value>0</value></property>\
+         <property><name>EndFrame</name><value>12</value></property>\
+         <property><name>FrameRate</name><value>100</value></property></properties>",
+    ));
+    cfb(&[("Nodes.dat", nodes), ("Channels.dat", channels), ("MetaData.dat", meta)])
+}
+
 /// Deterministic synthetic recording with a force plate and an embedded skeleton.
 /// This is fabricated test data, not a captured Motive compatibility reference.
 pub fn sample_tak_with_devices() -> Vec<u8> {

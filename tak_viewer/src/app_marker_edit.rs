@@ -255,21 +255,26 @@ fn run_marker_command(
             Ok((outcome.patch, outcome.result.message))
         }
         MarkerCommand::Label(request) => {
-            let outcome = if snapshot.track_uids_for_label(&request.target).is_empty() {
-                let proof = session.creation.verify(snapshot).map_err(edit_error)?;
-                LabelEditor::with_creation(&proof)
-                    .label_with_outcome(snapshot, &request)
-                    .map_err(edit_error)?
-            } else {
-                LabelEditor::new()
-                    .label_with_outcome(snapshot, &request)
-                    .map_err(edit_error)?
-            };
+            let outcome = LabelEditor::with_creation_streams(&session.creation)
+                .label_with_outcome(snapshot, &request)
+                .map_err(|error| match error {
+                    EditError::AmbiguousLabel => "마커가 여러 개여서 라벨을 붙일 수 없어요.".into(),
+                    EditError::MissingDeclaration => "붙일 라벨을 찾을 수 없어요.".into(),
+                    EditError::UnsupportedLayout => "이 마커 기록의 형식은 편집할 수 없어요.".into(),
+                    EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
+                    other => edit_error(other),
+                })?;
             let message = outcome
                 .patch
                 .as_ref()
                 .map(|p| p.result.message.clone())
-                .unwrap_or_else(|| "Label · No samples in scope".into());
+                .unwrap_or_else(|| {
+                    if outcome.already_assigned {
+                        "이미 이 라벨이에요.".into()
+                    } else {
+                        "선택한 범위에 바꿀 점이 없어요.".into()
+                    }
+                });
             Ok((outcome.patch, message))
         }
         MarkerCommand::Unlabel(request) => {
@@ -1275,7 +1280,8 @@ impl TakViewerApp {
         self.views[slot].sync_shared();
         let now = ctx.input(|i| i.time);
         let view = &self.views[slot];
-        if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()))
+        let local_label_shot = matches!(&command, MarkerCommand::Label(_)) && self.label_shot_in_progress(slot);
+        if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !local_label_shot)
             || self.dirty_prompt.is_some()
             || self.hold.is_some()
             || self.comment_edit.is_some()
@@ -2060,12 +2066,22 @@ impl TakViewerApp {
     }
 
     pub(super) fn label_sample(&mut self, ctx: &egui::Context, slot: usize, source: Uid) {
+        if let Some(target) = self.views[slot].armed_label {
+            self.assign_label_to_point(ctx, slot, source, target);
+        }
+    }
+
+    pub(super) fn assign_label_to_point(&mut self, ctx: &egui::Context, slot: usize, source: Uid, target: LabelKey) {
         self.refresh_marker_ui(slot);
         let view = &self.views[slot];
         let ui = &self.marker_ui[slot].labeling;
-        let Some(target) = view.armed_label else {
+        if view.data.as_ref().is_some_and(|data| data.markers.iter().any(|marker| {
+            marker.uid == source && marker.parent == Some(target.parent) && marker.slot == Some(target.slot)
+                && marker.present(view.pb.frame)
+        })) {
+            self.takm_note = Some(("이미 이 라벨이에요.".into(), ctx.input(|i| i.time)));
             return;
-        };
+        }
         let Ok(current_frame) = u32::try_from(view.pb.frame) else {
             return;
         };

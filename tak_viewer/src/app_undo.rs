@@ -1177,7 +1177,9 @@ impl TakViewerApp {
     /// never call `History::push`; selection is carried inside the same patch.
     pub(super) fn commit_marker_edit(&mut self, slot: usize, patch: Arc<EditPatch>) -> Result<(), EditError> {
         let explicit_remote_probe=self.remote_write_probe && self.views.get(slot).is_some_and(|view|view.remote.is_some());
-        if self.no_persist && !explicit_remote_probe { return Err(EditError::Other("명령 실행에서는 편집할 수 없어요".into())); }
+        if self.no_persist && !explicit_remote_probe && !self.label_shot_in_progress(slot) {
+            return Err(EditError::Other("명령 실행에서는 편집할 수 없어요".into()));
+        }
         self.observe(true);
         let file = self.views.get(slot).and_then(View::path).ok_or(EditError::NotLoaded)?.to_path_buf();
         self.views[slot].apply_marker_patch(&patch, true)?;

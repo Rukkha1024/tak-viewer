@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.50.0 — 2026-11-18
+
+- QuickLabel reassigns named and Unlabeled points. Preserve old samples in a new Unlabeled track on overlapping frames. One undo per click. Status shows both frame counts.
+
 ## v0.41.0 — 2026-11-18
 
 - **TAKM verification:** `--verify-takm <file.takm> [--source <file.tak>] [out.json]` proves a TAKM against its source TAK: source size/SHA-256, every retained stream byte-equal at its original stream index (never by name), the one dropped camera record by index/size/SHA-256, fixed seal and table. Verdict `identical` / `edited` (lists `changed_streams`; only marker streams an edited save may replace) / `no_source` / `failed`. Comment tail health reported separately. `source_unchanged` from before/after size + mtime.

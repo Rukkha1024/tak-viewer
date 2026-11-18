@@ -170,6 +170,10 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(headless::bench(files, overlays, frames.unwrap_or(300), [1600.0, 960.0]));
     }
+    if let Err(error) = app::label_shot::take_probe(&mut args, headless) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     let no_desktop = !headless && instances::no_desktop();
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
@@ -187,6 +191,10 @@ fn main() -> eframe::Result<()> {
         Some(c) => vec![c.tak.clone()],
         None => rest.iter().map(PathBuf::from).collect(),
     };
+    if app::label_shot::enabled() && (initial.len() != 1 || auto.is_none()) {
+        eprintln!("--shot-label requires one local take and --screenshot");
+        std::process::exit(2);
+    }
     let size = capture.as_ref().map_or([1600.0, 960.0], |c| c.size);
     let command_run = capture.is_some() || auto.is_some();
     if no_desktop {
@@ -210,7 +218,16 @@ fn main() -> eframe::Result<()> {
 
 /// Usage of every command, one place (each new command adds its text here).
 fn usage() -> String {
-    [capture::USAGE, comment_command::USAGE, window_command::USAGE, summary_command::USAGE, tak_core::takm::USAGE, tak_core::takm::verify::USAGE].join("\n\n")
+    [
+        capture::USAGE,
+        "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
+        comment_command::USAGE,
+        window_command::USAGE,
+        summary_command::USAGE,
+        tak_core::takm::USAGE,
+        tak_core::takm::verify::USAGE,
+    ]
+    .join("\n\n")
 }
 
 fn cli_exit(code: i32, message: &str) -> ! {

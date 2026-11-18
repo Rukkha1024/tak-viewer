@@ -40,6 +40,8 @@ mod editor_batch;
 mod remote_ui;
 #[path = "app_marker_edit.rs"]
 mod marker_edit;
+#[path = "app_label_shot.rs"]
+pub(super) mod label_shot;
 #[path = "app_tabs.rs"]
 mod layout_tabs;
 #[path = "app_layout_tabs.rs"]
@@ -443,6 +445,7 @@ pub struct TakViewerApp {
     /// A view's floating graph asked for the GRAPH pane this frame (applied after drawing).
     graph_to_panel: bool,
     auto: Option<AutoShot>,
+    label_shot: label_shot::Progress,
     workspace: Workspace,
     ssh: crate::ssh::SshManager,
     ssh_sources: std::collections::HashMap<PathBuf, crate::ssh::RemoteLocation>,
@@ -670,6 +673,7 @@ impl TakViewerApp {
             show_settings: false,
             graph_to_panel: false,
             auto,
+            label_shot: label_shot::Progress::default(),
             workspace: Workspace::new(ctx.clone()),
             ssh: { let mut ssh = crate::ssh::SshManager::new(ctx, settings_ssh); ssh.python_settings = settings_python; ssh },
             ssh_sources: Default::default(),
@@ -1422,6 +1426,7 @@ impl TakViewerApp {
             2..=5 => next.stage += 1,
             // Verification of the menu capture: wait until it has finished.
             6 if self.capture.is_some() => {}
+            6 if self.drive_label_shot(ctx) => {}
             6 => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
                 next.stage = 7;
@@ -3145,9 +3150,9 @@ impl TakViewerApp {
             if !v.selected.contains(&index) { v.select(index, false); }
         }
         if out.remove_marker { self.marker_delete = Some(slot); }
-        let is_unlabeled = |index: usize| v.data.as_ref().and_then(|d| d.markers.get(index)).is_some_and(|m| m.kind == tak_core::tak::MarkerKind::Unlabeled);
-        let quick_click = out.clicked.flatten().filter(|&index| quick && is_unlabeled(index));
-        let quick_double = out.double_clicked.is_some_and(|index| quick && is_unlabeled(index));
+        let quick_edit = quick && (out.clicked.flatten().is_some() || out.double_clicked.is_some())
+            && ui.input(|input| input.modifiers == Modifiers::NONE) && !key_focus::keys_blocked(ui.ctx());
+        let quick_click = out.clicked.flatten().filter(|_| quick_edit);
         if let Some(index) = quick_click.filter(|_| out.double_clicked.is_none()) {
             if let Some(marker) = v.data.as_ref().and_then(|data| data.markers.get(index)) { self.marker_click = Some((slot, marker.uid)); }
         }
@@ -3161,7 +3166,7 @@ impl TakViewerApp {
         if let Some((markers, primary)) = out.box_selected {
             v.select_many(markers, primary, out.ctrl);
         }
-        if let Some(m) = out.double_clicked.filter(|_| !quick_double) {
+        if let Some(m) = out.double_clicked.filter(|_| !quick_edit) {
             v.select(m, false);
             v.focus_selected();
         }
@@ -4321,6 +4326,7 @@ mod tests {
     include!("app_hidden_work_tests.rs");
     include!("app_remote_workspace_tests.rs");
     include!("app_window_launch_tests.rs");
+    include!("app_label_assignment_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.

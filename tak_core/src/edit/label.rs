@@ -79,6 +79,7 @@ pub struct LabelOutcome {
     pub patch: Option<EditPatch>,
     pub increment: IncrementResult,
     pub skipped: Vec<SkippedTrack>,
+    pub already_assigned: bool,
 }
 
 /// No wrap; duplicate identities or an absent current identity are an invalid visible list.
@@ -115,6 +116,7 @@ pub trait LabelOperations {
 /// Proof for creating nodes, obtained off-thread from this document's exact original streams.
 /// Phase 1 retains record fragments but does not retain or prove the complete node suffix, so
 /// creation is refused unless the caller supplies and validates both complete source streams.
+#[derive(Clone, Copy)]
 pub struct VerifiedCreation<'a> {
     document_id: DocumentId,
     nodes: &'a [u8],
@@ -600,11 +602,12 @@ fn select_samples(
     }
     Ok((moved, retained))
 }
-fn merged_samples(
+fn merge_assignment_samples(
     existing: &[RawSample],
     moved: &[RawSample],
-) -> Result<Vec<RawSample>, EditError> {
+) -> (Vec<RawSample>, Vec<RawSample>) {
     let mut result = Vec::with_capacity(existing.len() + moved.len());
+    let mut displaced = Vec::new();
     let (mut a, mut b) = (0, 0);
     while a < existing.len() && b < moved.len() {
         match existing[a].frame().cmp(&moved[b].frame()) {
@@ -617,13 +620,23 @@ fn merged_samples(
                 b += 1;
             }
             std::cmp::Ordering::Equal => {
-                return Err(other("대상 마커에 같은 프레임의 점이 이미 있어요."))
+                displaced.push(existing[a]);
+                result.push(moved[b]);
+                a += 1;
+                b += 1;
             }
         }
     }
     result.extend_from_slice(&existing[a..]);
     result.extend_from_slice(&moved[b..]);
-    Ok(result)
+    (result, displaced)
+}
+
+fn next_unlabeled_name(used_names: &HashSet<String>) -> String {
+    (1u64..)
+        .map(|n| format!("Unlabeled {n}"))
+        .find(|name| !used_names.contains(name))
+        .expect("available marker name")
 }
 // A malformed, provably different LabelGroup must not block creation for an unrelated parent.
 // A malformed group with an unreadable identity or the requested identity remains a rejection.
@@ -811,8 +824,10 @@ fn common_marker(t: &RawTrack) -> bool {
         && props[1].get("value").and_then(|v| v.as_str()) == Some("true")
 }
 fn replace_selection(selection: &mut EditSelection, old: Uid, new: Uid) {
-    if selection.selected.remove(&old) {
-        selection.selected.insert(new);
+    if selection.selected.remove(&old) && !selection.selected.insert(new) {
+        // Both selected: preserve the primary point's place in the order.
+        let duplicate = if selection.primary == Some(old) { new } else { old };
+        selection.order.retain(|id| *id != duplicate);
     }
     if selection.primary == Some(old) {
         selection.primary = Some(new);
@@ -827,24 +842,35 @@ fn replace_selection(selection: &mut EditSelection, old: Uid, new: Uid) {
 #[derive(Default)]
 pub struct LabelEditor<'a> {
     creation: Option<&'a VerifiedCreation<'a>>,
+    streams: Option<&'a CreationStreams>,
 }
 impl<'a> LabelEditor<'a> {
     pub fn new() -> Self {
-        Self { creation: None }
+        Self::default()
     }
     pub fn with_creation(proof: &'a VerifiedCreation<'a>) -> Self {
         Self {
             creation: Some(proof),
+            streams: None,
+        }
+    }
+    /// Defer verification until this edit needs to create a trajectory.
+    pub fn with_creation_streams(streams: &'a CreationStreams) -> Self {
+        Self {
+            creation: None,
+            streams: Some(streams),
         }
     }
     fn proof(
         &self,
         input: &DocumentSnapshot,
         additional: usize,
-    ) -> Result<&VerifiedCreation<'a>, EditError> {
-        let proof = self
-            .creation
-            .ok_or_else(|| other("원본 기록 전체를 확인하지 않아 새 마커를 만들 수 없어요."))?;
+    ) -> Result<VerifiedCreation<'a>, EditError> {
+        let proof = match (self.creation, self.streams) {
+            (Some(proof), _) => *proof,
+            (None, Some(streams)) => streams.verify(input)?,
+            _ => return Err(other("원본 기록 전체를 확인하지 않아 새 마커를 만들 수 없어요.")),
+        };
         proof.check_document(input, additional)?;
         Ok(proof)
     }
@@ -864,10 +890,6 @@ impl<'a> LabelEditor<'a> {
             .track(&request.source)
             .ok_or_else(|| other("선택한 마커가 없어요."))?
             .clone();
-        strict_track(&source)?;
-        if source.label.is_some() {
-            return Err(other("이름이 없는 마커를 선택해 주세요."));
-        }
         if source
             .samples
             .binary_search_by_key(&request.current_frame, |s| s.frame())
@@ -875,6 +897,15 @@ impl<'a> LabelEditor<'a> {
         {
             return Err(other("현재 프레임에 선택한 점이 없어요."));
         }
+        if source.label == Some(request.target) {
+            return Ok(LabelOutcome {
+                patch: None,
+                increment: IncrementResult::NotApplied,
+                skipped: vec![],
+                already_assigned: true,
+            });
+        }
+        strict_track(&source)?;
         let destinations = input.track_uids_for_label(&request.target);
         if destinations.len() > 1 {
             return Err(EditError::AmbiguousLabel);
@@ -895,6 +926,7 @@ impl<'a> LabelEditor<'a> {
                 patch: None,
                 increment: IncrementResult::NotApplied,
                 skipped: vec![],
+                already_assigned: false,
             });
         }
         let increment = if request.increment {
@@ -919,13 +951,15 @@ impl<'a> LabelEditor<'a> {
         source_after.samples = retained.into();
         // Newly created empty unlabeled tracks have no on-disk identity to preserve.
         // Removing them in the same patch keeps both undo and later saves exact.
-        let remove_empty_created = source_after.samples.is_empty()
+        let remove_empty_created = source_after.label.is_none()
+            && source_after.samples.is_empty()
             && input.input().is_some_and(|original| !original.tracks.iter().any(|t| t.uid == source.uid));
         let mut changes = vec![TrackChange {
             uid: source.uid,
             before: Some(source.clone()),
             after: (!remove_empty_created).then(|| Arc::new(source_after)),
         }];
+        let mut displaced_count = 0;
         let (destination_uid, destination_name) = if let Some(uid) = destinations.first() {
             let destination = input
                 .track(uid)
@@ -933,7 +967,22 @@ impl<'a> LabelEditor<'a> {
                 .clone();
             strict_track(&destination)?;
             let mut after = (*destination).clone();
-            after.samples = merged_samples(&destination.samples, &moved)?.into();
+            let (samples, displaced) = merge_assignment_samples(&destination.samples, &moved);
+            after.samples = samples.into();
+            displaced_count = displaced.len();
+            if !displaced.is_empty() {
+                let proof = self.proof(input, 1)?;
+                let donor = input.track_order().iter().filter_map(|id| input.track(id))
+                    .find(|track| track.label.is_none() && strict_track(track).is_ok())
+                    .map(Arc::as_ref)
+                    .or_else(|| common_marker(&destination).then_some(destination.as_ref()))
+                    .ok_or_else(|| other("이름 없는 마커 기록을 만들 수 없어요."))?;
+                let name = next_unlabeled_name(&input.tracks().map(|t| t.name.clone()).collect());
+                let uid = new_uid(&proof, input, &HashSet::new());
+                let created = new_track(donor, uid, name, None, displaced)?;
+                strict_track(&created)?;
+                changes.push(TrackChange { uid, before: None, after: Some(Arc::new(created)) });
+            }
             changes.push(TrackChange {
                 uid: *uid,
                 before: Some(destination.clone()),
@@ -942,8 +991,8 @@ impl<'a> LabelEditor<'a> {
             (*uid, destination.name.clone())
         } else {
             let proof = self.proof(input, 1)?;
-            let (donor, name) = missing_label_donor(input, proof, request.target)?;
-            let uid = new_uid(proof, input, &HashSet::new());
+            let (donor, name) = missing_label_donor(input, &proof, request.target)?;
+            let uid = new_uid(&proof, input, &HashSet::new());
             let created = new_track(
                 donor,
                 uid,
@@ -965,21 +1014,15 @@ impl<'a> LabelEditor<'a> {
             IncrementResult::Next(key) => key,
             _ => request.target,
         });
-        let message = if increment == IncrementResult::NoNextLabel {
-            format!(
-                "Label · No next label · {destination_name} · {}–{} · {} frames",
-                affected.first,
-                affected.last,
-                moved.len()
-            )
-        } else {
-            format!(
-                "Label · {destination_name} · {}–{} · {} frames",
-                affected.first,
-                affected.last,
-                moved.len()
-            )
-        };
+        let mut message = format!(
+            "Label · {destination_name} · {}–{} · {}프레임 이름 변경 · {displaced_count}프레임 Unlabeled",
+            affected.first,
+            affected.last,
+            moved.len()
+        );
+        if increment == IncrementResult::NoNextLabel {
+            message.push_str(" · 다음 라벨 없음");
+        }
         let result = EditResult {
             tracks: 1,
             samples: moved.len(),
@@ -998,6 +1041,7 @@ impl<'a> LabelEditor<'a> {
             patch: Some(patch),
             increment,
             skipped: vec![],
+            already_assigned: false,
         })
     }
     pub fn unlabel_with_outcome(
@@ -1056,6 +1100,7 @@ impl<'a> LabelEditor<'a> {
                 patch: None,
                 increment: IncrementResult::NotApplied,
                 skipped,
+                already_assigned: false,
             });
         }
         let proof = self.proof(input, work.len())?;
@@ -1078,12 +1123,9 @@ impl<'a> LabelEditor<'a> {
             first = first.min(moved[0].frame());
             last = last.max(moved[moved.len() - 1].frame());
             samples += moved.len();
-            let number = (1u64..)
-                .find(|n| !used_names.contains(&format!("Unlabeled {n}")))
-                .expect("available marker name");
-            let name = format!("Unlabeled {number}");
+            let name = next_unlabeled_name(&used_names);
             used_names.insert(name.clone());
-            let uid = new_uid(proof, input, &pending);
+            let uid = new_uid(&proof, input, &pending);
             pending.insert(uid);
             let created = new_track(donor, uid, name, None, moved)?;
             strict_track(&created)?;
@@ -1131,6 +1173,7 @@ impl<'a> LabelEditor<'a> {
             patch: Some(patch),
             increment: IncrementResult::NotApplied,
             skipped,
+            already_assigned: false,
         })
     }
 }
@@ -1150,6 +1193,10 @@ impl LabelOperations for LabelEditor<'_> {
         Ok(self.unlabel_with_outcome(input, request)?.patch)
     }
 }
+
+#[cfg(test)]
+#[path = "label_assignment_tests.rs"]
+mod assignment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1440,7 +1487,7 @@ mod tests {
         assert_eq!(o.increment, IncrementResult::NoNextLabel);
         let p = o.patch.unwrap();
         assert_eq!(p.selection_after.armed_label, Some(key(1)));
-        assert!(p.result.message.starts_with("Label · No next label"));
+        assert!(p.result.message.ends_with("다음 라벨 없음"));
         assert_eq!(
             next_label_in_order(&[key(1), key(1)], key(1)),
             Err(EditError::AmbiguousLabel)
@@ -1448,7 +1495,7 @@ mod tests {
         assert!(next_label_in_order(&[key(2)], key(1)).is_err());
     }
     #[test]
-    fn collisions_unknown_records_and_invalid_requests_reject_atomically() {
+    fn unverified_creation_unknown_records_and_invalid_requests_reject_atomically() {
         let (d, _, _) = fixture();
         let s = d.snapshot();
         let mut r = request();
