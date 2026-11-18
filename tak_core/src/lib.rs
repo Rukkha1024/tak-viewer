@@ -24,6 +24,8 @@ pub mod playback;
 /// Read-only per-device signal processing for display graphs.
 pub mod signal;
 pub mod shared_vec;
+pub mod summary;
+pub mod summary_command;
 /// Memory-only read-only SSH access; connects only when explicitly requested.
 pub mod remote;
 #[doc(hidden)]

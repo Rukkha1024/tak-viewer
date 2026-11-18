@@ -45,11 +45,12 @@ mod workspace;
 
 use std::path::PathBuf;
 use tak_core::comment_command;
+use tak_core::summary_command;
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
-        println!("{}\n\n{}\n\n{}", capture::USAGE, comment_command::USAGE, window_command::USAGE);
+        println!("{}", usage());
         std::process::exit(0);
     }
     match window_command::parse(&args[1..]).unwrap_or_else(|error| cli_exit(2, &error)) {
@@ -70,6 +71,9 @@ fn main() -> eframe::Result<()> {
     }
     if matches!(args.get(1).map(String::as_str), Some("--add-comments" | "--list-comments")) {
         std::process::exit(comment_command::run(&args[1..], workspace::resolve_path, capture::local_iso_time));
+    }
+    if args.get(1).map(String::as_str) == Some("--summary") {
+        std::process::exit(summary_command::run(&args[2..], workspace::resolve_path));
     }
     if let Err(error) = desktop_drop::take_preview(&mut args) { eprintln!("{error}"); std::process::exit(2); }
     if args.get(1).map(String::as_str)==Some("--dump-device-signal") {
@@ -167,7 +171,7 @@ fn main() -> eframe::Result<()> {
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
-            println!("{}\n\n{}\n\n{}", capture::USAGE, comment_command::USAGE, window_command::USAGE);
+            println!("{}", usage());
             std::process::exit(0);
         }
         Err(e) => {
@@ -199,6 +203,11 @@ fn main() -> eframe::Result<()> {
         std::process::exit(headless::run(initial, auto, capture, size));
     }
     run_window(initial, auto, capture, size, None)
+}
+
+/// Usage of every command, one place (each new command adds its text here).
+fn usage() -> String {
+    [capture::USAGE, comment_command::USAGE, window_command::USAGE, summary_command::USAGE].join("\n\n")
 }
 
 fn cli_exit(code: i32, message: &str) -> ! {

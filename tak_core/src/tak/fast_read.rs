@@ -71,6 +71,14 @@ fn unchanged(path: &Path, before: (u64, Option<SystemTime>), grows: bool) -> Res
 /// have the expected layout; the result is then exactly `read_take`'s.
 /// A `.takm` path (`crate::takm::is_takm_path`) is read through its stream table.
 pub fn read_take_fast(path: &Path, sha: bool) -> Result<FastRead> {
+    read_take_fast_with_fallback(path, sha, |reason| {
+        eprintln!("selective analog fallback ({}): {reason}", path.display());
+    })
+}
+
+pub(crate) fn read_take_fast_with_fallback(
+    path: &Path, sha: bool, on_fallback: impl FnOnce(String),
+) -> Result<FastRead> {
     let t0 = Instant::now();
     let first = if crate::takm::is_takm_path(path) { markers_first_takm(path, sha) } else { markers_first(path, sha) };
     match first {
@@ -80,7 +88,7 @@ pub fn read_take_fast(path: &Path, sha: bool) -> Result<FastRead> {
                 Err(e) => e.to_string(),
                 _ => "unsupported container or marker layout".into(),
             };
-            eprintln!("selective analog fallback ({}): {reason}", path.display());
+            on_fallback(reason);
             let take = super::read_take(path)?;
             Ok(FastRead {
                 take,

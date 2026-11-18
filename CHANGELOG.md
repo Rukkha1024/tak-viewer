@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.40.0 — 2026-11-18
+
+- **Take summary:** `--summary <file> [<file2> …] [--markers A,B] [--frames a:b] [--top N] [--json [out.json]]` prints a short Korean text (or JSON) per TAK/TAKM: Progress, frame range/rate/duration, marker counts by structural kind, marker-set coverage (min/median present, frames with all present, missing cells), markers with gaps (count, total, longest with range), devices, and for TAKM seal + live Comment count + source name. No window.
+- **Denominator:** marker-set count = template trajectories recorded in that file (raw may hold fewer than the set size).
+- **Check:** `checks/check_summary.py` re-derives the same numbers from `--dump` JSON.
+- **Speed:** 122 MiB take ≈ 0.2 s from WSL path, ≈ 0.1 s Windows-local (marker-first read, analog payload skipped).
+- `tak_core::summary::read_summary` = reusable per-file facts. Usage text of all commands now joined in one place (`main.rs::usage`).
+
 ## v0.39.0 — 2026-11-18
 
 - **Show named files only:** `--only [--frame N] [--select A,B] [--comments] [--pick-comment K] <file> …` opens a window with exactly the 1–4 named files in one fresh tab. Saved panels/options still apply; saved views are not restored. That window never writes settings, so the user's saved views and layout stay as they were. Prints its PID.
