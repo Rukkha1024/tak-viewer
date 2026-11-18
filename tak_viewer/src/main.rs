@@ -39,6 +39,7 @@ mod soft_render;
 mod ui;
 mod version;
 mod views;
+mod window_command;
 mod work_queue;
 mod workspace;
 
@@ -48,8 +49,24 @@ use tak_core::comment_command;
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
-        println!("{}\n\n{}", capture::USAGE, comment_command::USAGE);
+        println!("{}\n\n{}\n\n{}", capture::USAGE, comment_command::USAGE, window_command::USAGE);
         std::process::exit(0);
+    }
+    match window_command::parse(&args[1..]).unwrap_or_else(|error| cli_exit(2, &error)) {
+        Some(window_command::Command::Only { paths, startup }) => {
+            if instances::no_desktop() { cli_exit(2, window_command::NO_DESKTOP); }
+            let paths = window_command::resolve_files(&paths).unwrap_or_else(|error| cli_exit(1, &error));
+            return run_window(paths, None, None, [1600.0, 960.0], Some(startup));
+        }
+        Some(window_command::Command::List) => {
+            let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
+            let dir = instances::registry_dir(data.as_deref());
+            if let Err(error) = instances::write_list(dir.as_deref(), std::io::stdout().lock()) {
+                cli_exit(1, &format!("뷰어 창 목록을 읽을 수 없어요. {error}"));
+            }
+            return Ok(());
+        }
+        None => {}
     }
     if matches!(args.get(1).map(String::as_str), Some("--add-comments" | "--list-comments")) {
         std::process::exit(comment_command::run(&args[1..], workspace::resolve_path, capture::local_iso_time));
@@ -150,7 +167,7 @@ fn main() -> eframe::Result<()> {
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
-            println!("{}\n\n{}", capture::USAGE, comment_command::USAGE);
+            println!("{}\n\n{}\n\n{}", capture::USAGE, comment_command::USAGE, window_command::USAGE);
             std::process::exit(0);
         }
         Err(e) => {
@@ -167,12 +184,7 @@ fn main() -> eframe::Result<()> {
     let command_run = capture.is_some() || auto.is_some();
     if no_desktop {
         if !command_run {
-            eprintln!(
-                "화면이 없는 곳(Windows 0번 세션)이라 창을 띄울 수 없어요. 창은 보이지 않은 채 멈춰 있게 돼요.\n\
-                 그림은 --headless와 --capture나 --screenshot으로 찍어요.\n\n{}",
-                capture::USAGE
-            );
-            std::process::exit(2);
+            cli_exit(2, window_command::NO_DESKTOP);
         }
         eprintln!("화면이 없는 곳이라 --headless로 찍어요.");
         headless = true;
@@ -186,29 +198,57 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(headless::run(initial, auto, capture, size));
     }
+    run_window(initial, auto, capture, size, None)
+}
+
+fn cli_exit(code: i32, message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(code);
+}
+
+fn run_window(
+    initial: Vec<PathBuf>,
+    auto: Option<shot::AutoShot>,
+    capture: Option<capture::CapturePlan>,
+    size: [f32; 2],
+    startup: Option<window_command::StartupView>,
+) -> eframe::Result<()> {
+    let command_run = capture.is_some() || auto.is_some();
+    let only = startup.is_some();
+    let data = if command_run { None } else {
+        instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error))
+    };
+    let registry = if command_run { None } else { instances::registry_dir(data.as_deref()) };
+    let registration = registry.and_then(|dir| match instances::register(&dir, only) {
+        Ok(entry) => Some(entry),
+        Err(error) if only => cli_exit(1, &format!("뷰어 창 목록에 이 창을 등록할 수 없어요. {error}")),
+        Err(_) => None,
+    });
+    if only && registration.is_none() { cli_exit(1, "뷰어 창 목록 폴더를 찾을 수 없어요."); }
+    let others_at_start = registration.as_ref().is_some_and(|r| r.others_alive());
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(version::window_title(None))
             .with_inner_size(size)
             .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true),
-        persist_window: !command_run,
+        persistence_path: data.map(|dir| dir.join("app.ron")),
+        persist_window: !command_run && !only,
         ..Default::default()
     };
-    // A window the user works in joins the open-window list (settings rule in `app.rs`).
-    // Command line runs do not: they never save settings.
-    let registration = if command_run { None } else { instances::default_dir().and_then(|d| instances::register(&d)) };
-    let others_at_start = registration.as_ref().is_some_and(|r| r.others_alive());
     eframe::run_native(
         "tak_viewer",
         options,
         Box::new(move |cc| {
-            let mut app = app::TakViewerApp::new(cc, initial, auto, capture);
+            let mut app = app::TakViewerApp::new(cc, initial, auto, capture, startup);
             app.set_registration(registration, others_at_start);
             // WORKSPACE follows the disk in the user's window only; command runs
             // (`--screenshot`, `--capture`) never start the folder watcher.
             if !command_run {
                 app.start_folder_watch();
+            }
+            if only {
+                println!("{}", std::process::id());
             }
             Ok(Box::new(app))
         }),

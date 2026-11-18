@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.39.0 — 2026-11-18
+
+- **Show named files only:** `--only [--frame N] [--select A,B] [--comments] [--pick-comment K] <file> …` opens a window with exactly the 1–4 named files in one fresh tab. Saved panels/options still apply; saved views are not restored. That window never writes settings, so the user's saved views and layout stay as they were. Prints its PID.
+- **Window list:** `--list-windows` prints live viewer windows as JSON (PID, Windows session, interactive desktop or not, version, `only`, files per tab/view). No window, no cleanup of stale locks.
+- **Session 0:** no desktop → exit 2 with a plain Korean reason before any window is made.
+- **Isolated runs:** `TAK_VIEWER_DATA_DIR` moves settings + window registry for one process (tests, agent checks).
+- Replaces agent-side regex edits of `app.ron` and PowerShell title checks.
+
 ## v0.38.0 — 2026-11-18
 
 - **Comment commands:** `--add-comments <file.takm> --from rows.json` adds a validated batch to existing TAKM, `--list-comments` prints live Comments as JSON. No window, no settings. Shares window path lock, ID ledger and appender; fixed part SHA-256 checked before/after.

@@ -16,7 +16,7 @@ egui_dock = { version = "0.14", features = ["serde"] }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging"] }
 
 # WSL/Linux builds (tests) need a windowing backend feature.
 [target.'cfg(target_os = "linux")'.dependencies]

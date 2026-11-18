@@ -16,6 +16,7 @@ use crate::ui::panels::{self, Action, CommentBar, DeckAction};
 use crate::ui::scene::{self, SceneOptions};
 use crate::ui::theme;
 use crate::views::{self, Change, Loaded, Spot, View, MAX_VIEWS};
+use crate::window_command::{self, StartupView};
 
 #[path = "app_key_focus.rs"]
 pub(crate) mod key_focus;
@@ -47,6 +48,8 @@ mod layout_controller;
 mod hidden_work;
 #[path = "app_desktop_drop.rs"]
 mod desktop_drop;
+#[path = "app_window_launch.rs"]
+mod window_launch;
 use crate::workspace::{self, AddRoot, Workspace, MAX_ROOTS};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use egui_dock::{DockArea, DockState};
@@ -535,6 +538,10 @@ pub struct TakViewerApp {
     pub graph_put_off: bool,
     /// This window in the open-window list (`instances.rs`). None for command line runs.
     registration: Option<Registration>,
+    registry_checked: Option<Instant>,
+    /// Named-file launches read settings but never write back their temporary layout.
+    only: bool,
+    startup_views: Option<window_launch::StartupViews>,
     /// Another viewer window is open: no periodic save; the last window to close saves.
     others_open: bool,
     /// When `others_open` was last checked.
@@ -546,8 +553,8 @@ pub struct TakViewerApp {
 }
 
 impl TakViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>, auto: Option<AutoShot>, capture_plan: Option<CapturePlan>) -> Self {
-        let mut app = Self::build(&cc.egui_ctx, cc.storage, initial, auto, capture_plan);
+    pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>, auto: Option<AutoShot>, capture_plan: Option<CapturePlan>, startup: Option<StartupView>) -> Self {
+        let mut app = Self::build_window(&cc.egui_ctx, cc.storage, initial, auto, capture_plan, startup);
         #[cfg(windows)] app.desktop_hover.set_window(cc);
         app
     }
@@ -603,6 +610,17 @@ impl TakViewerApp {
         initial: Vec<PathBuf>,
         auto: Option<AutoShot>,
         capture_plan: Option<CapturePlan>,
+    ) -> Self {
+        Self::build_window(ctx, storage, initial, auto, capture_plan, None)
+    }
+
+    fn build_window(
+        ctx: &egui::Context,
+        storage: Option<&dyn eframe::Storage>,
+        initial: Vec<PathBuf>,
+        auto: Option<AutoShot>,
+        capture_plan: Option<CapturePlan>,
+        startup: Option<StartupView>,
     ) -> Self {
         theme::install_fonts(ctx);
         theme::apply(ctx);
@@ -707,6 +725,9 @@ impl TakViewerApp {
             failed: false,
             graph_put_off: false,
             registration: None,
+            registry_checked: None,
+            only: startup.is_some(),
+            startup_views: None,
             others_open: false,
             others_checked: None,
             shift_window: false,
@@ -725,20 +746,39 @@ impl TakViewerApp {
                 app.explorer.expand(&mut app.workspace, &r);
             }
         }
-        app.restore_layout_tabs(ctx);
+        if app.only {
+            // Replace the saved editor tree and keep its surrounding panels.
+            let slots: Vec<_> = (0..initial.len() as u8).collect();
+            let editor = dock::editor_layout(&dock::default_layout_for(&slots));
+            dock::set_editor_layout(&mut app.dock, &editor);
+        } else {
+            app.restore_layout_tabs(ctx);
+        }
         if app.capture.is_none() { dock::ensure_layout_strip(&mut app.dock, app.active as u8); }
         // Command line: a folder is added to the saved folders; files open directly, the first
         // in the active view, the others next to it (WSL paths OK).
-        let args: Vec<PathBuf> = initial.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect();
-        if let Some(d) = args.iter().find(|p| p.is_dir()).cloned() {
-            app.open_workspace(d);
-        }
-        for (k, f) in args.into_iter().filter(|p| !p.is_dir()).enumerate() {
-            if k == 0 {
+        let files = if app.only {
+            initial
+        } else {
+            let mut args: Vec<_> = initial.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect();
+            if let Some(d) = args.iter().find(|p| p.is_dir()).cloned() {
+                app.open_workspace(d);
+            }
+            args.retain(|p| !p.is_dir());
+            args
+        };
+        for (k, f) in files.into_iter().enumerate() {
+            if app.only {
+                app.activate(k);
+                app.open(ctx, f);
+            } else if k == 0 {
                 app.open(ctx, f);
             } else {
                 app.open_side(ctx, f);
             }
+        }
+        if let Some(startup) = startup {
+            app.set_startup_views(startup);
         }
         // `--screenshot … --overlay <b.tak>`: the n-th one laid over the n-th view.
         if let Some(list) = app.auto.as_ref().map(|a| a.overlays.clone()).filter(|l| !l.is_empty()) {
@@ -1301,16 +1341,7 @@ impl TakViewerApp {
                     }
                     // `--select A,B,C` (v0.27.0, agent pictures): several markers, the last one
                     // found the primary (as Ctrl+click one after another).
-                    if let Some(names) = &auto.select {
-                        let mut first = true;
-                        for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                            let found = v.data.as_ref().and_then(|d| d.markers.iter().position(|m| m.name == name));
-                            if let Some(i) = found {
-                                v.select(i, !first);
-                                first = false;
-                            }
-                        }
-                    }
+                    window_command::select_markers(v, auto.select.as_deref());
                     if let Some(want) = &auto.plate {
                         if let Some(p) = v.data.as_ref().and_then(|d| shot::find_plate(&d.plates, want)) {
                             v.plate = Some(p);
@@ -3654,6 +3685,7 @@ impl TakViewerApp {
         self.poll_overlay_marker_work(ctx);
         self.poll_hidden_marker_work(ctx);
         for slot in self.open_views() { self.views[slot].sync_shared(); }
+        self.apply_startup_views(now);
         self.poll_exit_wait(ctx);
 
         self.apply_ssh_demo(ctx);
@@ -4030,6 +4062,7 @@ impl TakViewerApp {
         // Last: what a person changed this frame becomes an undo action (`app_undo.rs`).
         self.graph_in_one_place();
         self.observe_frame(ctx);
+        self.publish_window(ctx);
     }
 
 }
@@ -4214,11 +4247,10 @@ impl eframe::App for TakViewerApp {
         self.frame(ctx);
     }
 
-    /// Several windows share one settings file. Called when the window closes and, while it
-    /// is the only open window, every `AUTO_SAVE`. Every call writes the file (`SAVED_KEY`),
-    /// so the window that closes last leaves its settings.
+    /// A normal window saves on close and every `AUTO_SAVE` while alone. Each save writes
+    /// the file (`SAVED_KEY`), so the last normal window to close leaves its settings.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if !self.no_persist {
+        if self.persist_egui_memory() {
             self.sync_settings();
             eframe::set_value(storage, eframe::APP_KEY, &self.settings);
             self.saves += 1;
@@ -4227,20 +4259,18 @@ impl eframe::App for TakViewerApp {
         }
     }
 
-    /// No periodic save while another window is open: windows would overwrite each other
-    /// every 30 s. Command line runs never save.
+    /// Periodic saves run only in a normal window while it is alone.
     fn auto_save_interval(&self) -> Duration {
-        if self.no_persist || self.others_open {
+        if !self.persist_egui_memory() || self.others_open {
             Duration::MAX
         } else {
             AUTO_SAVE
         }
     }
 
-    /// Command line runs leave the settings file untouched (eframe would otherwise write its
-    /// own UI memory, together with the settings read at start, back into the shared file).
+    /// Only normal windows write the app's settings and eframe's UI memory.
     fn persist_egui_memory(&self) -> bool {
-        !self.no_persist
+        !self.no_persist && !self.only
     }
 }
 
@@ -4290,6 +4320,7 @@ mod tests {
     include!("app_freshness_tests.rs");
     include!("app_hidden_work_tests.rs");
     include!("app_remote_workspace_tests.rs");
+    include!("app_window_launch_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.
