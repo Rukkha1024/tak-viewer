@@ -552,8 +552,9 @@ impl TakViewerApp {
                         arrived.push(path);
                     }
                     Err(reason) => {
+                        view.comments_rx = None;
                         self.error = Some(format!("{}\n\n{}", path.display(), reason));
-                        failed.push(path);
+                        failed.push((tab, slot, path, reason));
                     }
                 }
             }
@@ -572,7 +573,10 @@ impl TakViewerApp {
                 self.promote_shared_waiter(ctx, &path);
             }
         }
-        for path in failed { self.fail_shared_waiters(&path); }
+        for (tab, slot, path, reason) in failed {
+            self.record_window_failure(tab, slot, &path, &reason);
+            self.fail_shared_waiters(&path);
+        }
     }
 
     /// A marker/save worker started in a tab can finish after that tab is hidden. Visit only

@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.65.0 — 2026-11-18
+
+- Open named review tabs with `--only --tab` or `--only --from tabs.json`. One to four files per tab, 30 distinct files in all.
+- `--list-windows --wait <pid> [--timeout s]` waits until every startup file is read. Exit 0 ready, 1 failed or timed out, 2 no such window.
+
 ## v0.64.0 — 2026-11-18
 
 - `--check` takes the capture picture options: `--size`, `--fit`, `--trail`, `--no-names`, `--no-sheet`, `--ui`.

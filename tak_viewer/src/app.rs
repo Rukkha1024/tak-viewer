@@ -17,7 +17,7 @@ use crate::ui::panels::{self, Action, CommentBar, DeckAction};
 use crate::ui::scene::{self, SceneOptions};
 use crate::ui::theme;
 use crate::views::{self, Change, Loaded, Spot, View, MAX_VIEWS};
-use crate::window_command::{self, StartupView};
+use crate::window_command::{self, StartupTab};
 
 #[path = "app_key_focus.rs"]
 pub(crate) mod key_focus;
@@ -566,7 +566,8 @@ pub struct TakViewerApp {
     registry_checked: Option<Instant>,
     /// Named-file launches read settings but never write back their temporary layout.
     only: bool,
-    startup_views: Option<window_launch::StartupViews>,
+    launch: Option<window_launch::LaunchProgress>,
+    window_failures: BTreeMap<(layout_tabs::TabId, usize), crate::instances::WindowView>,
     /// Another viewer window is open: no periodic save; the last window to close saves.
     others_open: bool,
     /// When `others_open` was last checked.
@@ -578,7 +579,7 @@ pub struct TakViewerApp {
 }
 
 impl TakViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>, auto: Option<AutoShot>, capture_plan: Option<CapturePlan>, startup: Option<StartupView>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>, auto: Option<AutoShot>, capture_plan: Option<CapturePlan>, startup: Option<Vec<StartupTab>>) -> Self {
         let mut app = Self::build_window(&cc.egui_ctx, cc.storage, initial, auto, capture_plan, startup);
         #[cfg(windows)] app.desktop_hover.set_window(cc);
         app
@@ -650,8 +651,9 @@ impl TakViewerApp {
         initial: Vec<PathBuf>,
         auto: Option<AutoShot>,
         capture_plan: Option<CapturePlan>,
-        startup: Option<StartupView>,
+        startup: Option<Vec<StartupTab>>,
     ) -> Self {
+        let launch_started = startup.as_ref().map(|_| Instant::now());
         theme::install_fonts(ctx);
         theme::apply(ctx);
         // Screenshot / capture runs use default settings so the picture is reproducible.
@@ -754,14 +756,15 @@ impl TakViewerApp {
             #[cfg(test)]
             type_items: Vec::new(),
             #[cfg(test)]
-            hold_loads: false,
+            hold_loads: startup.is_some(),
             failed: false,
             native_command_result: None,
             graph_put_off: false,
             registration: None,
             registry_checked: None,
             only: startup.is_some(),
-            startup_views: None,
+            launch: None,
+            window_failures: BTreeMap::new(),
             others_open: false,
             others_checked: None,
             shift_window: false,
@@ -780,39 +783,21 @@ impl TakViewerApp {
                 app.explorer.expand(&mut app.workspace, &r);
             }
         }
-        if app.only {
-            // Replace the saved editor tree and keep its surrounding panels.
-            let slots: Vec<_> = (0..initial.len() as u8).collect();
-            let editor = dock::editor_layout(&dock::default_layout_for(&slots));
-            dock::set_editor_layout(&mut app.dock, &editor);
+        if let Some((tabs, started)) = startup.zip(launch_started) {
+            app.prepare_launch_tabs(ctx, tabs, started);
+            if app.capture.is_none() { dock::ensure_layout_strip(&mut app.dock, app.active as u8); }
         } else {
             app.restore_layout_tabs(ctx);
-        }
-        if app.capture.is_none() { dock::ensure_layout_strip(&mut app.dock, app.active as u8); }
-        // Command line: a folder is added to the saved folders; files open directly, the first
-        // in the active view, the others next to it (WSL paths OK).
-        let files = if app.only {
-            initial
-        } else {
+            if app.capture.is_none() { dock::ensure_layout_strip(&mut app.dock, app.active as u8); }
+            // A folder joins the saved workspace. Open other arguments as files beside it.
             let mut args: Vec<_> = initial.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect();
             if let Some(d) = args.iter().find(|p| p.is_dir()).cloned() {
                 app.open_workspace(d);
             }
             args.retain(|p| !p.is_dir());
-            args
-        };
-        for (k, f) in files.into_iter().enumerate() {
-            if app.only {
-                app.activate(k);
-                app.open(ctx, f);
-            } else if k == 0 {
-                app.open(ctx, f);
-            } else {
-                app.open_side(ctx, f);
+            for (k, f) in args.into_iter().enumerate() {
+                if k == 0 { app.open(ctx, f); } else { app.open_side(ctx, f); }
             }
-        }
-        if let Some(startup) = startup {
-            app.set_startup_views(startup);
         }
         // `--screenshot … --overlay <b.tak>`: the n-th one laid over the n-th view.
         if let Some(list) = app.auto.as_ref().map(|a| a.overlays.clone()).filter(|l| !l.is_empty()) {
@@ -1117,6 +1102,7 @@ impl TakViewerApp {
             return;
         }
         let pending_identity = self.known_identity(&path);
+        if let Some(tab) = self.layout_tabs.active_id() { self.window_failures.remove(&(tab, slot)); }
         if creating_tab { self.observe(true); }
         self.ensure_open_view(slot);
         self.remember(slot);
@@ -1281,6 +1267,7 @@ impl TakViewerApp {
                 self.views[slot].set_fresh_open_candidate(None);
                 self.views[slot].comments_rx = None;
                 self.error = Some(format!("{}\n\n{}", path.display(), e));
+                if let Some(tab) = self.layout_tabs.active_id() { self.record_window_failure(tab, slot, &path, &e); }
                 self.fail_shared_waiters(&path);
                 // A new view whose file cannot be read closes again. (Not an action: the undo
                 // history takes the layout as it is.)
@@ -3831,6 +3818,7 @@ impl TakViewerApp {
             self.ssh.cancel_all();
         }
         // Background loads: markers ready? Then force plates / EMG.
+        self.start_next_launch_tab(ctx);
         self.poll_loads(ctx);
         for path in std::mem::take(&mut self.pending_shared_promotions) { self.promote_shared_waiter(ctx, &path); }
         self.poll_hidden_file_work(ctx);
@@ -4183,6 +4171,7 @@ impl TakViewerApp {
                 || v.waiting_shared_path().is_some()) || self.hidden_file_work_pending();
             self.explorer.progress.finish_frame(ctx, minimized || opening);
         }
+        self.finish_launch_frame(ctx);
         self.publish_window(ctx);
     }
 

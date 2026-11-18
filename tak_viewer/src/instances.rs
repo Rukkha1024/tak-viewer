@@ -7,18 +7,57 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowTab {
     pub name: String,
     pub views: Vec<WindowView>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowView {
     pub slot: usize,
     pub file: String,
     pub overlay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<LoadState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markers_ms: Option<f64>,
+}
+
+impl WindowView {
+    pub fn new(slot: usize, file: String, overlay: Option<String>) -> Self {
+        Self {
+            slot,
+            file,
+            overlay,
+            state: None,
+            error: None,
+            markers_ms: None,
+        }
+    }
+
+    pub fn with_state(mut self, state: LoadState) -> Self {
+        self.state = Some(state);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadState {
+    Loading,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowLoadSnapshot {
+    pub tabs: Vec<WindowTab>,
+    pub first_tab_draw_ms: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -26,6 +65,7 @@ struct Snapshot {
     version: String,
     only: bool,
     tabs: Vec<WindowTab>,
+    loads: Option<WindowLoadSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -36,13 +76,17 @@ struct Window {
     version: Option<String>,
     only: Option<bool>,
     tabs: Option<Vec<WindowTab>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_tab_draw_ms: Option<f64>,
 }
+
+type Update = (Vec<WindowTab>, WindowLoadSnapshot);
 
 /// One window's entry. Hold the lock until the snapshot worker has stopped.
 pub struct Registration {
     path: PathBuf,
     file: Option<File>,
-    updates: Option<Sender<Vec<WindowTab>>>,
+    updates: Option<Sender<Update>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -90,22 +134,28 @@ pub fn register(dir: &Path, only: bool) -> io::Result<Registration> {
         version: crate::version::VERSION.to_owned(),
         only,
         tabs: Vec::new(),
+        loads: None,
     };
     if let Err(err) = write_snapshot(&snapshot_path, &initial) {
         remove_snapshot(&registration.path);
         return if only { Err(err) } else { Ok(registration) };
     }
-    let (tx, rx) = mpsc::channel::<Vec<WindowTab>>();
+    let (tx, rx) = mpsc::channel::<Update>();
     let worker = thread::Builder::new()
         .name("viewer_registry".into())
         .spawn(move || {
             let mut published = initial;
-            while let Ok(tabs) = rx.recv() {
-                let tabs = rx.try_iter().last().unwrap_or(tabs);
-                if published.tabs != tabs {
-                    let previous = std::mem::replace(&mut published.tabs, tabs);
-                    if write_snapshot(&snapshot_path, &published).is_err() {
-                        published.tabs = previous;
+            while let Ok(update) = rx.recv() {
+                let (tabs, loads) = rx.try_iter().last().unwrap_or(update);
+                if published.tabs != tabs || published.loads.as_ref() != Some(&loads) {
+                    let next = Snapshot {
+                        version: published.version.clone(),
+                        only,
+                        tabs,
+                        loads: Some(loads),
+                    };
+                    if write_snapshot(&snapshot_path, &next).is_ok() {
+                        published = next;
                     }
                 }
             }
@@ -175,9 +225,9 @@ fn entry_pid(path: &Path) -> Option<u32> {
 }
 
 impl Registration {
-    pub fn publish(&self, tabs: Vec<WindowTab>) {
+    pub fn publish(&self, tabs: Vec<WindowTab>, loads: WindowLoadSnapshot) {
         if let Some(tx) = &self.updates {
-            let _ = tx.send(tabs);
+            let _ = tx.send((tabs, loads));
         }
     }
 
@@ -227,35 +277,44 @@ impl Drop for Registration {
     }
 }
 
+fn read_entry(path: &Path) -> Option<(u32, Option<Snapshot>)> {
+    let pid = entry_pid(path).filter(|_| locked(path))?;
+    let snapshot = fs::read(path.with_extension("json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    locked(path).then_some((pid, snapshot))
+}
+
+fn window(pid: u32, snapshot: Option<Snapshot>, with_loads: bool) -> Window {
+    let session_id = session_id(pid);
+    let interactive_desktop = session_id.and_then(interactive_desktop);
+    let (version, only, tabs, first_tab_draw_ms) = snapshot.map_or((None, None, None, None), |s| {
+        let (tabs, time) = match s.loads.filter(|_| with_loads) {
+            Some(loads) => (loads.tabs, loads.first_tab_draw_ms),
+            None => (s.tabs, None),
+        };
+        (Some(s.version), Some(s.only), Some(tabs), time)
+    });
+    Window {
+        pid,
+        session_id,
+        interactive_desktop,
+        version,
+        only,
+        tabs,
+        first_tab_draw_ms,
+    }
+}
+
 pub fn write_list(dir: Option<&Path>, mut out: impl Write, envelope: bool) -> io::Result<()> {
     let mut windows = Vec::new();
     if let Some(dir) = dir {
         match fs::read_dir(dir) {
             Ok(entries) => {
                 for entry in entries {
-                    let path = entry?.path();
-                    let Some(pid) = entry_pid(&path).filter(|_| locked(&path)) else {
-                        continue;
-                    };
-                    let snapshot: Option<Snapshot> = fs::read(path.with_extension("json"))
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-                    let session_id = session_id(pid);
-                    let interactive_desktop = session_id.and_then(interactive_desktop);
-                    if !locked(&path) {
-                        continue;
+                    if let Some((pid, snapshot)) = read_entry(&entry?.path()) {
+                        windows.push(window(pid, snapshot, false));
                     }
-                    let (version, only, tabs) = snapshot.map_or((None, None, None), |s| {
-                        (Some(s.version), Some(s.only), Some(s.tabs))
-                    });
-                    windows.push(Window {
-                        pid,
-                        session_id,
-                        interactive_desktop,
-                        version,
-                        only,
-                        tabs,
-                    });
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -269,6 +328,55 @@ pub fn write_list(dir: Option<&Path>, mut out: impl Write, envelope: bool) -> io
         serde_json::to_writer(&mut out, &windows)?;
     }
     writeln!(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wait {
+    Ready,
+    Failed,
+    Timeout,
+    Missing,
+}
+
+pub fn write_wait(
+    dir: Option<&Path>,
+    pid: u32,
+    timeout: Duration,
+    mut out: impl Write,
+) -> io::Result<Wait> {
+    const POLL: Duration = Duration::from_millis(100);
+    let Some(path) = dir.map(|dir| dir.join(format!("{pid}.lock"))) else {
+        return Ok(Wait::Missing);
+    };
+    let started = Instant::now();
+    loop {
+        let Some((_, snapshot)) = read_entry(&path) else {
+            return Ok(Wait::Missing);
+        };
+        let loads = snapshot.as_ref().and_then(|s| s.loads.as_ref());
+        let states = || {
+            loads
+                .into_iter()
+                .flat_map(|loads| &loads.tabs)
+                .flat_map(|tab| &tab.views)
+                .map(|view| view.state)
+        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let result = if states().any(|state| state == Some(LoadState::Failed)) {
+            Wait::Failed
+        } else if loads.is_some() && states().all(|state| state == Some(LoadState::Ready)) {
+            Wait::Ready
+        } else if remaining.is_zero() {
+            Wait::Timeout
+        } else {
+            thread::sleep(remaining.min(POLL));
+            continue;
+        };
+        serde_json::to_writer(&mut out, &window(pid, snapshot, true))?;
+        writeln!(out)?;
+        out.flush()?;
+        return Ok(result);
+    }
 }
 
 #[cfg(windows)]
@@ -368,12 +476,9 @@ mod tests {
             only: true,
             tabs: vec![WindowTab {
                 name: "tab1".into(),
-                views: vec![WindowView {
-                    slot: 0,
-                    file: "한 글.tak".into(),
-                    overlay: None,
-                }],
+                views: vec![WindowView::new(0, "한 글.tak".into(), None)],
             }],
+            loads: None,
         };
         write_snapshot(&live.path.with_extension("json"), &snapshot).unwrap();
 
@@ -404,5 +509,105 @@ mod tests {
             "schema":1,"items":[],
         }));
         assert!(!dir.join("missing").exists());
+    }
+    #[test]
+    fn wait_reports_all_tabs_and_preserves_the_plain_list_shape() {
+        let dir = temp_dir("wait");
+        let pid = std::process::id();
+        let live = lock_entry(&dir, pid).unwrap();
+        let path = live.path.with_extension("json");
+        let first = WindowView::new(0, "first.tak".into(), None);
+        let second = WindowView::new(0, "한 글.takm".into(), None);
+        let mut snapshot = Snapshot {
+            version: crate::version::VERSION.into(),
+            only: true,
+            tabs: vec![
+                WindowTab {
+                    name: "tab1".into(),
+                    views: vec![first.clone()],
+                },
+                WindowTab {
+                    name: "비교".into(),
+                    views: vec![],
+                },
+            ],
+            loads: None,
+        };
+        let old = check_wait(&dir, pid, &path, &snapshot, Wait::Timeout);
+        assert_eq!(old["tabs"][0]["views"][0], json!(first));
+        let mut loads = WindowLoadSnapshot {
+            tabs: vec![
+                WindowTab {
+                    name: "tab1".into(),
+                    views: vec![first.clone().with_state(LoadState::Ready)],
+                },
+                WindowTab {
+                    name: "비교".into(),
+                    views: vec![second.clone().with_state(LoadState::Loading)],
+                },
+            ],
+            first_tab_draw_ms: Some(52.0),
+        };
+        for (status, outcome) in [
+            (LoadState::Loading, Wait::Timeout),
+            (LoadState::Ready, Wait::Ready),
+            (LoadState::Failed, Wait::Failed),
+        ] {
+            loads.tabs[1].views[0].state = Some(status);
+            loads.tabs[1].views[0].error =
+                (status == LoadState::Failed).then(|| "읽기 실패".into());
+            snapshot.loads = Some(WindowLoadSnapshot {
+                tabs: loads.tabs.clone(),
+                first_tab_draw_ms: loads.first_tab_draw_ms,
+            });
+            let entry = check_wait(&dir, pid, &path, &snapshot, outcome);
+            assert_eq!(entry["tabs"][1]["views"][0]["file"], second.file);
+            assert_eq!(entry["tabs"][1]["views"][0]["state"], json!(status));
+            assert_eq!(entry["first_tab_draw_ms"], 52.0);
+            if status == LoadState::Failed {
+                assert_eq!(entry["tabs"][1]["views"][0]["error"], "읽기 실패");
+            }
+        }
+        let mut out = Vec::new();
+        write_list(Some(&dir), &mut out, false).unwrap();
+        let list: Vec<Value> = serde_json::from_slice(&out).unwrap();
+        assert_eq!(list[0]["tabs"], json!(snapshot.tabs));
+        assert!(list[0].get("first_tab_draw_ms").is_none());
+    }
+
+    fn check_wait(dir: &Path, pid: u32, path: &Path, snapshot: &Snapshot, expected: Wait) -> Value {
+        write_snapshot(path, snapshot).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            write_wait(Some(dir), pid, Duration::ZERO, &mut out).unwrap(),
+            expected
+        );
+        let entry: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(entry["pid"], pid);
+        entry
+    }
+
+    #[test]
+    fn wait_distinguishes_a_live_legacy_lock_from_a_dead_pid() {
+        let dir = temp_dir("wait_missing");
+        let pid = std::process::id();
+        let live = lock_entry(&dir, pid).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            write_wait(Some(&dir), pid, Duration::ZERO, &mut out).unwrap(),
+            Wait::Timeout
+        );
+        let entry: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(entry["pid"], pid);
+        assert_eq!(entry["tabs"], Value::Null);
+        drop(live);
+        fs::write(dir.join(format!("{pid}.lock")), b"").unwrap();
+        out.clear();
+        assert_eq!(
+            write_wait(Some(&dir), pid, Duration::ZERO, &mut out).unwrap(),
+            Wait::Missing
+        );
+        assert!(out.is_empty());
+        assert!(dir.join(format!("{pid}.lock")).exists());
     }
 }

@@ -68,10 +68,10 @@ fn main() -> eframe::Result<()> {
         std::process::exit(headless::run_help_shot(&request));
     }
     match window_command::parse(&args[1..]).unwrap_or_else(|error| cli_exit(2, &error)) {
-        Some(window_command::Command::Only { paths, startup }) => {
+        Some(window_command::Command::Only(tabs)) => {
             if instances::no_desktop() { cli_exit(2, window_command::NO_DESKTOP); }
-            let paths = window_command::resolve_files(&paths).unwrap_or_else(|error| cli_exit(1, &error));
-            return run_window(paths, None, None, [1600.0, 960.0], Some(startup));
+            let tabs = window_command::resolve_tabs(tabs).unwrap_or_else(|(code, error)| cli_exit(code, &error));
+            return run_window(Vec::new(), None, None, [1600.0, 960.0], Some(tabs));
         }
         Some(window_command::Command::List { envelope }) => {
             let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
@@ -80,6 +80,18 @@ fn main() -> eframe::Result<()> {
                 cli_exit(1, &format!("뷰어 창 목록을 읽을 수 없어요. {error}"));
             }
             return Ok(());
+        }
+        Some(window_command::Command::Wait { pid, timeout }) => {
+            let data = instances::data_dir_override().unwrap_or_else(|error| cli_exit(2, &error));
+            let dir = instances::registry_dir(data.as_deref());
+            let result = instances::write_wait(dir.as_deref(), pid, timeout, std::io::stdout().lock());
+            match result {
+                Ok(instances::Wait::Ready) => return Ok(()),
+                Ok(instances::Wait::Failed) => cli_exit(1, "뷰어에서 파일을 읽지 못했어요."),
+                Ok(instances::Wait::Timeout) => cli_exit(1, "뷰어가 파일을 여는 동안 기다리는 시간이 지나갔어요."),
+                Ok(instances::Wait::Missing) => cli_exit(2, "해당 PID의 뷰어 창을 찾을 수 없어요."),
+                Err(error) => cli_exit(1, &format!("뷰어 창 목록을 읽을 수 없어요. {error}")),
+            }
         }
         None => {}
     }
@@ -311,7 +323,7 @@ fn run_window(
     auto: Option<shot::AutoShot>,
     capture: Option<capture::CapturePlan>,
     size: [f32; 2],
-    startup: Option<window_command::StartupView>,
+    startup: Option<Vec<window_command::StartupTab>>,
 ) -> eframe::Result<()> {
     let command_run = capture.is_some() || auto.is_some();
     let only = startup.is_some();
