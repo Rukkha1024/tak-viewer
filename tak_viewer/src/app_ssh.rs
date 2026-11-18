@@ -274,7 +274,7 @@ impl TakViewerApp {
         serde_json::to_writer(&mut writer,&result).map_err(|e|e.to_string())?;
         writer.flush().map_err(|e|e.to_string())
     }
-    pub fn ssh_probe_capture(&mut self, auto: crate::shot::AutoShot) { self.auto = Some(auto); }
+    pub fn start_headless_screenshot(&mut self, auto: crate::shot::AutoShot) { self.auto = Some(auto); }
     pub fn ssh_probe_disconnect(&mut self, alias: &str) { self.ssh.disconnect(alias); }
     pub fn ssh_probe_workers_running(&self) -> bool { self.ssh.workers_running() }
 
@@ -1003,20 +1003,20 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         let first = RemoteLocation { host: "host".into(), path: "/0.takm".into() };
-        for tab in 0..3 {
-            if tab > 0 { next_tab(&mut app); }
-            for slot in 0..4 {
+        for start in (0..MAX_OPEN_FILES).step_by(MAX_VIEWS) {
+            if start > 0 { next_tab(&mut app); }
+            for slot in 0..(MAX_OPEN_FILES - start).min(MAX_VIEWS) {
                 app.ensure_open_view(slot);
                 if !app.open_views().contains(&slot) { dock::add_view(&mut app.dock, slot as u8, dock::NOMINAL_AREA); }
-                let location = RemoteLocation { host: "host".into(), path: format!("/{}.takm", tab * 4 + slot) };
+                let location = RemoteLocation { host: "host".into(), path: format!("/{}.takm", start + slot) };
                 let key = location.memory_key();
                 app.show_remote(&ctx, slot, location, Arc::new(views::sample_data(key.to_str().unwrap(), &["M"])), comments::Comments::default());
             }
         }
         next_tab(&mut app);
-        let extra = RemoteLocation { host: "host".into(), path: "/thirteenth.takm".into() };
+        let extra = RemoteLocation { host: "host".into(), path: "/source_31.takm".into() };
         app.open_remote_in(&ctx, 0, extra.clone(), false);
-        assert!(app.notice.as_ref().unwrap().contains("12"));
+        assert!(app.notice.as_ref().unwrap().contains("30개까지"));
         assert!(app.views[0].data.is_none() && app.ssh_reads.is_empty());
         app.open_remote_in(&ctx, 0, first.clone(), false);
         assert_eq!(app.views[0].remote.as_ref(), Some(&first));

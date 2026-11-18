@@ -7,11 +7,11 @@ use std::collections::HashSet;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refusal { Views, Files, Center }
 impl Refusal {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Views => "max 4 views",
-            Self::Files => "max 12 files",
-            Self::Center => "Drop multiple files on an edge or tab strip",
+            Self::Views => format!("max {MAX_VIEWS} views"),
+            Self::Files => format!("max {MAX_OPEN_FILES} files"),
+            Self::Center => "Drop multiple files on an edge or tab strip".into(),
         }
     }
 }
@@ -74,13 +74,13 @@ impl TakViewerApp {
             bound(&self.views).or_else(|| self.layout_tabs.tabs().iter()
                 .filter_map(|t| t.layout.as_ref()).find_map(|r| bound(&r.views))).unwrap_or_else(|| path.clone())
         }));
-        (ids.len() > 12).then_some(Refusal::Files)
+        (ids.len() > MAX_OPEN_FILES).then_some(Refusal::Files)
     }
 
     fn refuse_desktop_drop(&mut self, refusal: Refusal, path: &Path) {
         match refusal {
             Refusal::Views => self.full_notice(path),
-            Refusal::Files => self.notice = Some("서로 다른 파일은 전체에서 12개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 여세요.".into()),
+            Refusal::Files => self.notice_open_file_limit(),
             Refusal::Center => self.notice = Some("여러 파일은 화면 가장자리나 맨 위 탭 줄에 놓으세요. 가운데는 파일 하나만 바꿀 수 있어요.".into()),
         }
     }
@@ -168,7 +168,7 @@ impl TakViewerApp {
         let fill = if refusal.is_some() { egui::Color32::from_black_alpha(100) } else { theme::DROP_FILL };
         painter.rect_filled(rect, 0.0, fill);
         painter.rect_stroke(rect.shrink(1.0), 0.0, egui::Stroke::new(2.0_f32, edge));
-        let label = if let Some(refusal) = refusal { refusal.label().to_owned() } else {
+        let label = if let Some(refusal) = refusal { refusal.label() } else {
             match target {
                 Target::NewTab => "Open in new tab".into(),
                 Target::View(slot, DropZone::Center) if !self.desktop_empty() => {

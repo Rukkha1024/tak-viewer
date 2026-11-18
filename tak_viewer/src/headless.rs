@@ -434,11 +434,16 @@ pub fn run(initial: Vec<PathBuf>, auto: Option<AutoShot>, capture: Option<Captur
 pub fn run_ssh(probe: crate::ssh_probe::Probe, auto: Option<AutoShot>) -> i32 {
     run_with_probe(vec![], auto, None, [1600.0, 960.0], Some(probe), None)
 }
-fn run_with_probe(initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Option<CapturePlan>, size: [f32; 2], mut probe: Option<crate::ssh_probe::Probe>, mut tab_shot: Option<crate::app::tab_shot::TabShot>) -> i32 {
+fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Option<CapturePlan>, size: [f32; 2], mut probe: Option<crate::ssh_probe::Probe>, mut tab_shot: Option<crate::app::tab_shot::TabShot>) -> i32 {
     let ctx = egui::Context::default();
-    let initial_auto = if probe.is_some() { None } else { auto.take() };
+    let tab_files = if tab_shot.is_some() { std::mem::take(&mut initial) } else { Vec::new() };
+    let initial_auto = if probe.is_some() || tab_shot.is_some() { None } else { auto.take() };
     let mut app = TakViewerApp::build(&ctx, None, initial, initial_auto, capture);
-    if let Some(shot) = &tab_shot { shot.seed(&mut app); }
+    if let Some(shot) = &tab_shot {
+        app.set_command_run();
+        app.open_shot_tabs(&ctx, &tab_files);
+        shot.seed(&mut app);
+    }
     if let Some(p) = &mut probe { if let Err(e) = p.start(&mut app, &ctx) { eprintln!("{e}"); return 1; } }
     let mut textures = Textures::default();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(size[0], size[1]));
@@ -451,16 +456,25 @@ fn run_with_probe(initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture: Op
         }
         let mut raw = frame_input(screen, start, std::mem::take(&mut events));
         crate::desktop_drop::inject_preview(&mut raw);
-        if let Some(shot) = &mut tab_shot {
-            shot.inject(&app, &mut raw);
-            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        if let Some(shot) = tab_shot.as_mut().filter(|_| auto.is_some()) {
+            if let Some(error) = app.bench_state().error {
+                eprintln!("screenshot: {error}");
+                return 1;
+            }
+            if app.shot_tabs_ready(tab_files.len()) {
+                shot.inject(&app, &mut raw);
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                if !shot.wheel_pending() {
+                    app.start_headless_screenshot(auto.take().unwrap());
+                }
+            }
         }
         let out = ctx.run(raw, |ctx| app.frame(ctx));
         events.extend(app.scene_menu_shot_hover().map(Event::PointerMoved));
         if let Some(p) = &mut probe {
             match p.tick(&mut app, &ctx) {
                 crate::ssh_probe::Step::Escape => events.push(Event::Key { key:egui::Key::Escape, physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }),
-                crate::ssh_probe::Step::Capture => { if let Some(auto) = auto.take() { app.ssh_probe_capture(auto); } },
+                crate::ssh_probe::Step::Capture => { if let Some(auto) = auto.take() { app.start_headless_screenshot(auto); } },
                 crate::ssh_probe::Step::Done(mut code) => {
                     // Errors and cancellation still produce reviewable evidence of the live view.
                     if let Some(auto) = auto.take() {

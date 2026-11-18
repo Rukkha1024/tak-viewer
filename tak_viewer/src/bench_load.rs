@@ -1,4 +1,4 @@
-//! Load-only benchmark: retain up to twelve independent display models without creating UI
+//! Load-only benchmark: retain independent display models up to the app cap without creating UI
 //! views. The real UI allows four views per layout tab (`--bench` measures one layout).
 //! Memory is the OS process resident/working set, never a sum of Rust buffer estimates.
 
@@ -12,8 +12,11 @@ use tak_core::tak::fast_read::{read_take_fast, AnalogJob};
 use tak_core::tak::{AnalogDevice, Take};
 use tak_core::view_data::{AnalogPart, AnalogTarget, ViewData};
 
-pub const USAGE: &str = "tak_viewer --bench-load <a.tak|a.takm> [more files …] (1–12 files; load only, maximum 4 views per layout tab)";
-const MAX_FILES: usize = 12;
+use crate::{views::MAX_VIEWS, MAX_OPEN_FILES};
+
+pub fn usage() -> String {
+    format!("tak_viewer --bench-load <a.tak|a.takm> [more files …] (1–{MAX_OPEN_FILES} files; load only, maximum {MAX_VIEWS} views per layout tab)")
+}
 const TIMEOUT: Duration = Duration::from_secs(600);
 
 /// All values are bytes. The peak is the OS high-water mark for this process's lifetime,
@@ -100,8 +103,8 @@ pub fn parse(args: &[String]) -> Result<Vec<PathBuf>, String> {
             _ => files.push(PathBuf::from(arg)),
         }
     }
-    if !seen || files.is_empty() || files.len() > MAX_FILES {
-        return Err("--bench-load에는 파일을 1개부터 12개까지 넣어요.".to_owned());
+    if !seen || files.is_empty() || files.len() > MAX_OPEN_FILES {
+        return Err(format!("--bench-load에는 파일을 1개부터 {MAX_OPEN_FILES}개까지 넣어요."));
     }
     if let Some(path) = files.iter().find(|p| !tak_core::tak::is_take_path(p) && !tak_core::takm::is_takm_path(p)) {
         return Err(format!("TAK 또는 TAKM 파일을 넣어요: {}", path.display()));
@@ -109,9 +112,9 @@ pub fn parse(args: &[String]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-pub fn validate_ui_count(files: usize, overlays: usize) -> Result<(), &'static str> {
-    if files == 0 || files > 4 || overlays > files {
-        Err("--bench는 3D 화면을 4개까지 열고 화면마다 파일 하나를 겹쳐 볼 수 있어요. 12개 동시 읽기는 --bench-load를 써요.")
+pub fn validate_ui_count(files: usize, overlays: usize) -> Result<(), String> {
+    if files == 0 || files > MAX_VIEWS || overlays > files {
+        Err(format!("--bench는 3D 화면을 {MAX_VIEWS}개까지 열고 화면마다 파일 하나를 겹쳐 볼 수 있어요. 최대 {MAX_OPEN_FILES}개 동시 읽기는 --bench-load를 써요."))
     } else { Ok(()) }
 }
 
@@ -256,7 +259,7 @@ pub fn run(files: Vec<PathBuf>) -> i32 {
     let reports: Vec<FileReport> = reports.into_iter().flatten().collect();
     let all_markers_ms = reports.iter().map(|r| r.markers_ready_ms).fold(0.0, f64::max);
     let all_forceplates_ms = reports.iter().map(|r| r.forceplates_ready_ms).fold(0.0, f64::max);
-    println!("bench-load: {} of {count} file(s) retained concurrently; no UI rendered; 3D UI maximum 4", retained.len());
+    println!("bench-load: {} of {count} file(s) retained concurrently; no UI rendered; {MAX_VIEWS} views per tab, {MAX_OPEN_FILES} files across tabs", retained.len());
     println!("  memory: actual whole-process resident/working set; readiness samples overlap across files, not individual file allocation sizes");
     println!("  baseline (no files, before workers): {}", ProcessMemory::describe(baseline));
     for report in &reports {
@@ -275,7 +278,8 @@ pub fn run(files: Vec<PathBuf>) -> i32 {
     }
     println!("bench-load-json: {}", serde_json::json!({
         "schema": 1, "requested_files": count, "retained_files": retained.len(), "ui_rendered": false,
-        "ui_file_cap": 4, "memory_semantics": "whole-process resident snapshots; peak is process lifetime high-water; per-file snapshots overlap",
+        "ui_file_cap": MAX_VIEWS, "memory_semantics": "whole-process resident snapshots; peak is process lifetime high-water; per-file snapshots overlap",
+        "app_file_cap": MAX_OPEN_FILES,
         "all_markers_ready_ms": all_markers_ms, "all_forceplates_ready_ms": all_forceplates_ms,
         "baseline_memory": baseline, "final_memory": final_memory, "resident_delta_bytes": resident_delta.map(|n| n as i64),
         "retained_marker_count": retained.iter().map(|r| r.data.markers.len()).sum::<usize>(),
@@ -290,12 +294,12 @@ mod tests {
     fn args(values: &[&str]) -> Vec<String> { values.iter().map(|s| (*s).to_owned()).collect() }
 
     #[test]
-    fn load_parse_accepts_twelve_files_and_takm_without_a_window() {
+    fn load_parse_accepts_thirty_files_and_takm_without_a_window() {
         let mut input = args(&["--headless", "--bench-load", "a.TAKM"]);
-        input.extend((1..12).map(|n| format!("file {n}.tak")));
-        assert_eq!(parse(&input).unwrap().len(), 12);
-        input.push("thirteen.tak".to_owned());
-        assert!(parse(&input).is_err());
+        input.extend((1..30).map(|n| format!("file {n}.tak")));
+        assert_eq!(parse(&input).unwrap().len(), 30);
+        input.push("source 31.tak".to_owned());
+        assert!(parse(&input).unwrap_err().contains("30개까지"));
     }
 
     #[test]

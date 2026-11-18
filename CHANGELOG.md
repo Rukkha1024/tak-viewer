@@ -1,5 +1,11 @@
 # 변경 사항
 
+## v0.62.0 — 2026-11-18
+
+- Raise the viewer-wide limit from 12 to 30 distinct sources across tabs. Count overlays and pending reads. Repeated views share one source count.
+- Keep four 3D views per tab. Refuse source 31 before reading. Count displayed and pending sources on reopen.
+- Show the cap in help and drag feedback. Retain up to 30 models in `--bench-load`. Capture grouped files and tab wheel positions with one headless option.
+
 ## v0.61.0 — 2026-11-18
 
 - Scroll the top layout tabs with the mouse wheel, sideways touchpad or Shift+wheel. Wheel down reveals later tabs. Keep the selected tab and active rename draft.

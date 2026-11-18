@@ -5,11 +5,12 @@ fn hidden_work_idle_hidden_tabs_receive_zero_work_visits_across_600_frames() {
     let ctx = egui::Context::default();
     let mut app = one_view(&ctx);
     let mut hidden = Vec::new();
-    for index in 0..3 {
+    for index in 0..MAX_OPEN_FILES / 2 {
         app.views[0].overlay = Some(views::Overlay::from_data(
             format!("idle_overlay_{index}.tak").into(),
             views::sample_data(&format!("idle_overlay_{index}.tak"), &["M"]),
         ));
+        if index + 1 == MAX_OPEN_FILES / 2 { break; }
         app.views[0].pb.set_frame(4, 0.0);
         app.views[0].pb.playing = true;
         hidden.push(app.layout_tabs.active_id().unwrap());
@@ -24,6 +25,7 @@ fn hidden_work_idle_hidden_tabs_receive_zero_work_visits_across_600_frames() {
         );
         app.ensure_open_view(0);
     }
+    assert_eq!(app.open_file_identities(None).len(), MAX_OPEN_FILES);
     for _ in 0..8 {
         frame_with(&ctx, &mut app, vec![]);
     }
@@ -96,7 +98,7 @@ fn hidden_work_idle_hidden_tabs_receive_zero_work_visits_across_600_frames() {
             frame
         );
     }
-    eprintln!("hidden scheduler: 3 idle tabs with overlays, 600 frames, 0 hidden runtime visits");
+    eprintln!("hidden scheduler: {MAX_OPEN_FILES} open files, {} idle tabs, 600 frames, 0 hidden runtime visits", hidden.len());
 }
 
 #[test]

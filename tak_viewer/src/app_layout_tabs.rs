@@ -4,8 +4,6 @@ use crate::ui::dock::EditorLayout;
 use layout_tabs::{ClosedItem, TabId};
 use std::collections::HashSet;
 
-const MAX_OPEN_FILES: usize = 12;
-
 #[cfg(test)]
 thread_local! { static FILE_IDENTITY_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -21,6 +19,25 @@ fn file_identity(path: &Path) -> PathBuf {
 }
 
 impl TakViewerApp {
+    pub(super) fn notice_open_file_limit(&mut self) {
+        self.notice = Some(format!("서로 다른 파일은 전체에서 {MAX_OPEN_FILES}개까지 열 수 있어요. 다른 파일을 닫고 다시 시도해 주세요."));
+    }
+
+    pub(crate) fn open_shot_tabs(&mut self, ctx: &egui::Context, files: &[PathBuf]) {
+        for (index, group) in files.chunks(MAX_VIEWS).enumerate() {
+            if index != 0 { self.new_layout_tab(); }
+            for file in group {
+                self.open_side(ctx, workspace::resolve_path(&file.to_string_lossy()));
+            }
+        }
+    }
+
+    pub(crate) fn shot_tabs_ready(&self, count: usize) -> bool {
+        self.views.iter().chain(self.layout_tabs.tabs().iter()
+            .filter_map(|tab| tab.layout.as_ref()).flat_map(|runtime| runtime.views.iter()))
+            .filter(|view| view.data.is_some()).count() == count
+    }
+
     /// A fresh open resolves its requested path once. Bound views are identified by the
     /// canonical path captured by their reader, so a later symlink change is never hidden
     /// behind a process-wide path cache.
@@ -74,23 +91,20 @@ impl TakViewerApp {
         // no frames elapse for a tab that was not drawn.
         for slot in playing { self.views[slot].pb.playing = true; }
     }
+    pub(super) fn add_view_file_identities(view: &View, files: &mut HashSet<PathBuf>) {
+        // The displayed source and pending replacement both count until the switch completes.
+        if let Some(path) = view.path() { files.insert(Self::bound_primary_identity(view, path)); }
+        if let Some(path) = view.shared_target() { files.insert(Self::bound_primary_identity(view, &path)); }
+        if let Some(path) = view.overlay_path() { files.insert(Self::bound_overlay_identity(view, path)); }
+        if let Some(path) = view.overlay_shared_target() { files.insert(Self::bound_overlay_identity(view, &path)); }
+        if let Some(load) = &view.overlay_load { files.insert(Self::bound_overlay_identity(view, &load.path)); }
+    }
+
     pub(super) fn open_file_identities(&self, _exclude_active_slot: Option<usize>) -> HashSet<PathBuf> {
-        fn add(views: &[View; MAX_VIEWS], files: &mut HashSet<PathBuf>) {
-            for view in views {
-                // A previous file remains displayed while a replacement is loading. Both
-                // it and the pending target count until the transition completes.
-                if let Some(path) = view.path() { files.insert(TakViewerApp::bound_primary_identity(view, path)); }
-                if let Some(path) = view.shared_target() { files.insert(TakViewerApp::bound_primary_identity(view, &path)); }
-                if let Some(path) = view.overlay_path() { files.insert(TakViewerApp::bound_overlay_identity(view, path)); }
-                if let Some(path) = view.overlay_shared_target() { files.insert(TakViewerApp::bound_overlay_identity(view, &path)); }
-                if let Some(load) = &view.overlay_load { files.insert(TakViewerApp::bound_overlay_identity(view, &load.path)); }
-            }
-        }
         let mut files = HashSet::new();
-        add(&self.views, &mut files);
-        for tab in self.layout_tabs.tabs() {
-            if let Some(runtime) = &tab.layout { add(&runtime.views, &mut files); }
-        }
+        let hidden = self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref())
+            .flat_map(|runtime| runtime.views.iter());
+        for view in self.views.iter().chain(hidden) { Self::add_view_file_identities(view, &mut files); }
         if let Some((_, destination)) = self.takm_reserved_replacement() { files.insert(destination); }
         files
     }
@@ -104,7 +118,7 @@ impl TakViewerApp {
         files.insert(self.admit_identity(path));
         if files.len() <= MAX_OPEN_FILES { return true; }
         self.discard_identity_candidate();
-        self.notice = Some(format!("서로 다른 파일은 전체에서 {MAX_OPEN_FILES}개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 여세요."));
+        self.notice_open_file_limit();
         false
     }
 
@@ -113,7 +127,7 @@ impl TakViewerApp {
         files.extend(paths.iter().map(|path| self.admit_identity(path)));
         if files.len() <= MAX_OPEN_FILES { return true; }
         self.discard_identity_candidate();
-        self.notice = Some(format!("서로 다른 파일은 전체에서 {MAX_OPEN_FILES}개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 여세요."));
+        self.notice_open_file_limit();
         false
     }
 
@@ -610,14 +624,10 @@ impl TakViewerApp {
             _ => None,
         }) else { return false };
         if let Some(runtime) = &closed.tab.layout {
-            for view in &runtime.views {
-                if let Some(path) = view.shared_target() { files.insert(Self::bound_primary_identity(view, &path)); }
-                if let Some(path) = view.overlay_shared_target() { files.insert(Self::bound_overlay_identity(view, &path)); }
-                if let Some(load) = &view.overlay_load { files.insert(Self::bound_overlay_identity(view, &load.path)); }
-            }
+            for view in &runtime.views { Self::add_view_file_identities(view, &mut files); }
         }
         if files.len() <= MAX_OPEN_FILES { return true; }
-        self.notice = Some(format!("서로 다른 파일은 전체에서 {MAX_OPEN_FILES}개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 여세요."));
+        self.notice_open_file_limit();
         false
     }
 
@@ -627,7 +637,7 @@ impl TakViewerApp {
         let mut files = self.open_file_identities(None);
         files.extend(paths.iter().map(|path| self.known_identity(path)));
         if files.len() > MAX_OPEN_FILES {
-            self.notice = Some(format!("서로 다른 파일은 전체에서 {MAX_OPEN_FILES}개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 여세요."));
+            self.notice_open_file_limit();
             return false;
         }
         self.stash_layout_runtime();
@@ -951,15 +961,13 @@ impl TakViewerApp {
 
     pub(super) fn reopen_layout_item_with_context(&mut self, ctx: &egui::Context) {
         if matches!(self.layout_tabs.last_closed(), Some(ClosedItem::Batch { .. })) { self.reopen_editor_batch(ctx); return; }
-        enum Item { Tab(TabId), View(TabId, Vec<PathBuf>) }
+        enum Item { Tab(TabId), View(TabId, HashSet<PathBuf>) }
         let Some(item) = self.layout_tabs.last_closed().map(|item| match item {
             ClosedItem::Tab(closed) => Item::Tab(closed.tab.id),
             ClosedItem::View { tab_id, view, .. } => {
-                let mut paths = Vec::new();
-                if let Some(path) = view.view.shared_target() { paths.push(path); }
-                if let Some(path) = view.view.overlay_shared_target() { paths.push(path); }
-                if let Some(load) = &view.view.overlay_load { paths.push(load.path.clone()); }
-                Item::View(*tab_id, paths)
+                let mut files = self.open_file_identities(None);
+                Self::add_view_file_identities(&view.view, &mut files);
+                Item::View(*tab_id, files)
             },
             ClosedItem::Batch { .. } => unreachable!("batch dispatched above"),
         }) else { return };
@@ -979,8 +987,8 @@ impl TakViewerApp {
                     }
                 }
             }
-            Item::View(id, paths) => {
-                if !self.allow_open_files(&paths, None) { return; }
+            Item::View(id, files) => {
+                if files.len() > MAX_OPEN_FILES { self.notice_open_file_limit(); return; }
                 if self.layout_tabs.tab(id).is_none() {
                     self.notice = Some("먼저 이 화면이 속한 탭을 다시 열어 주세요.".into());
                     return;

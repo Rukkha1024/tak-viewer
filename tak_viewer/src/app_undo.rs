@@ -773,7 +773,7 @@ impl TakViewerApp {
     /// Check the exact retained runtimes native restore will consume, without taking any
     /// leaf out of its recent batch. A later refusal must not split the batch or open an
     /// earlier tab. Native marker/save ownership and adoption checks stay authoritative.
-    fn editor_batch_restore_ready(&self, desired: &[TabSnapshot]) -> bool {
+    fn editor_batch_restore_ready(&self, desired: &[TabSnapshot], files: &mut HashSet<PathBuf>) -> bool {
         for snapshot in desired {
             let Some(tab) = snapshot.layout.tab else { continue };
             let live = self.layout_tabs.tab(tab);
@@ -790,6 +790,7 @@ impl TakViewerApp {
                         runtime.marker_ui[slot].has_pending_work() || !self.retained_view_ready(view)) {
                         return false;
                     }
+                    for view in &runtime.views { Self::add_view_file_identities(view, files); }
                     Some(&runtime.views)
                 } else { None }
             };
@@ -803,8 +804,10 @@ impl TakViewerApp {
                             && view.view.target() == Some(path) => Some(view),
                     _ => None,
                 });
-                if retained.is_some_and(|closed| closed.marker_ui.has_pending_work()
-                    || !self.retained_view_ready(&closed.view)) { return false; }
+                if let Some(closed) = retained {
+                    if closed.marker_ui.has_pending_work() || !self.retained_view_ready(&closed.view) { return false; }
+                    Self::add_view_file_identities(&closed.view, files);
+                }
             }
         }
         true
@@ -878,11 +881,13 @@ impl TakViewerApp {
             }
             desired.push(wanted);
         }
-        if !self.editor_batch_restore_ready(&desired) {
+        let mut files = self.open_file_identities(None);
+        if !self.editor_batch_restore_ready(&desired, &mut files) {
             self.notice = Some("닫은 파일 묶음의 읽기·편집·저장이 아직 끝나지 않았어요. 작업을 마친 뒤 다시 열어 주세요.".into());
             return false;
         }
-        if !self.allow_open_files(&paths, None) { return false; }
+        files.extend(paths.iter().map(|path| self.known_identity(path)));
+        if files.len() > MAX_OPEN_FILES { self.notice_open_file_limit(); return false; }
         self.observe(true);
         let saved_undo = std::mem::take(&mut self.history.undo);
         let saved_redo = std::mem::take(&mut self.history.redo);
@@ -2369,7 +2374,7 @@ mod marker_edit_tests {
     }
 
     #[test]
-    fn evicted_tab_undo_at_the_twelve_file_cap_keeps_the_action_and_live_documents() {
+    fn evicted_tab_undo_at_the_file_cap_keeps_the_action_and_live_documents() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
         let first = app.layout_tabs.active_id().unwrap();
@@ -2388,24 +2393,26 @@ mod marker_edit_tests {
             id: first, before_open: true, after_open: false,
             before_active: Some(first), after_active: Some(anchor), snapshot,
         }]);
-        for group in 0..3 {
-            if group > 0 { another_tab(&mut app); }
-            for slot in 0..MAX_VIEWS {
+        for start in (0..MAX_OPEN_FILES).step_by(MAX_VIEWS) {
+            if start > 0 { another_tab(&mut app); }
+            for slot in 0..(MAX_OPEN_FILES - start).min(MAX_VIEWS) {
                 if !app.open_views().contains(&slot) { dock::add_view(&mut app.dock, slot as u8, dock::NOMINAL_AREA); }
-                let index = group * MAX_VIEWS + slot;
+                let index = start + slot;
                 show(&mut app, slot, &format!("live_cap_fixture_{index}.tak"), 100 + index);
             }
             app.observe(false);
         }
         let active = app.layout_tabs.active_id();
+        let tab_count = app.layout_tabs.tabs().len();
+        assert_eq!(app.open_file_identities(None).len(), MAX_OPEN_FILES);
         app.undo_redo(&ctx, false);
-        assert_eq!(app.layout_tabs.tabs().len(), 3);
+        assert_eq!(app.layout_tabs.tabs().len(), tab_count);
         assert_eq!(app.layout_tabs.active_id(), active);
         assert!(app.layout_tabs.tab(first).is_none());
         assert_eq!(app.history.undo.len(), 1);
         assert!(app.history.redo.is_empty());
-        assert_eq!(app.open_views(), [0, 1, 2, 3]);
-        assert!(app.views.iter().all(|view| view.data.is_some()));
+        assert_eq!(app.open_views(), [0, 1]);
+        assert!(app.open_views().iter().all(|&slot| app.views[slot].data.is_some()));
         std::fs::remove_file(path).unwrap();
     }
 

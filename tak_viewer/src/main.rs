@@ -13,7 +13,7 @@
 //! `--headless` (with `--capture` or `--screenshot`) runs the same app without a window and paints
 //! the pictures on the CPU (`headless.rs`, `soft_render.rs`): works without a desktop.
 //! `--version` prints the program version (`version.rs`) and exits.
-//! `--bench-load <file.tak|file.takm>…` retains up to twelve marker/forceplate display models
+//! `--bench-load <file.tak|file.takm>…` retains marker/forceplate display models up to the app cap
 //! without rendering; reports phase times and native process memory (`bench_load.rs`).
 //! Several copies may run at once (the user's windows next to agent runs, `instances.rs`).
 //! Where no window can be shown (Windows session 0), `--capture`/`--screenshot` run headless by
@@ -51,6 +51,8 @@ mod workspace;
 use std::path::PathBuf;
 use tak_core::comment_command;
 use tak_core::summary_command;
+
+const MAX_OPEN_FILES: usize = 30;
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
@@ -143,7 +145,7 @@ fn main() -> eframe::Result<()> {
         let files = match bench_load::parse(&args[1..]) {
             Ok(files) => files.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect(),
             Err(error) => {
-                eprintln!("{error}\n{}", bench_load::USAGE);
+                eprintln!("{error}\n{}", bench_load::usage());
                 std::process::exit(2);
             }
         };
@@ -228,12 +230,14 @@ fn main() -> eframe::Result<()> {
         Some(c) => vec![c.tak.clone()],
         None => rest.iter().map(PathBuf::from).collect(),
     };
+    if tab_shot.is_some() && (auto.is_none() || !(1..=MAX_OPEN_FILES).contains(&initial.len())
+        || initial.iter().any(|p| !desktop_drop::supported(p))
+        || auto.as_ref().is_some_and(|shot| !shot.overlays.is_empty())) {
+        cli_exit(2, &format!("--shot-tabs에는 TAK 또는 TAKM 파일을 1개부터 {MAX_OPEN_FILES}개까지 넣어요. --overlay는 함께 쓸 수 없어요."));
+    }
     if app::label_shot::enabled() && (initial.len() != 1 || auto.is_none()) {
         eprintln!("--shot-label requires one local take and --screenshot");
         std::process::exit(2);
-    }
-    if tab_shot.is_some() && (initial.len() != 1 || auto.is_none()) {
-        cli_exit(2, "--shot-tabs는 --screenshot과 파일 하나를 함께 넣어 주세요.");
     }
     let size = capture.as_ref().map_or([1600.0, 960.0], |c| c.size);
     let command_run = capture.is_some() || auto.is_some();
@@ -263,7 +267,7 @@ fn usage() -> String {
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         help_shot::USAGE,
-        "Headless layout tabs: --shot-tabs N[:POINTS] with --screenshot and one take",
+        "Headless layout tabs: --shot-tabs [N[:POINTS]] with --screenshot and 1–30 local TAK/TAKM files",
         "Headless Labeling link: --labeling-link with --select NAME",
         "Headless 3D selection: --select-visible or --select A,B[,C]",
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",

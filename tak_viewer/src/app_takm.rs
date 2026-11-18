@@ -401,8 +401,8 @@ impl TakViewerApp {
             if let Some(load) = &view.overlay_load { files.insert(path_identity(&load.path, identities)); }
         }
         files.insert(path_identity(out, identities));
-        if files.len() <= 12 { return true; }
-        self.notice = Some("서로 다른 파일은 전체에서 12개까지 열 수 있어요. 다른 파일을 닫은 뒤 다시 바꿔 주세요.".into());
+        if files.len() <= MAX_OPEN_FILES { return true; }
+        self.notice_open_file_limit();
         false
     }
 

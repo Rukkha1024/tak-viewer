@@ -5,6 +5,7 @@ use super::theme;
 const DEFAULT_BODY: [f32; 2] = [610.0, 540.0];
 const KEY_WIDTH: f32 = 154.0;
 const COLUMN_GAP: f32 = 12.0;
+const OVERLAY_INPUT: &str = "Explorer 파일 오른쪽 클릭 → 이 화면에 얹기";
 
 pub(crate) fn show(ctx: &egui::Context, open: &mut bool, workspace: Rect) -> Option<egui::Response> {
     let bounds = workspace.shrink(8.0);
@@ -49,10 +50,15 @@ fn draw_sections(ui: &mut egui::Ui) {
         ui.label(RichText::new(*title).strong().color(theme::ACCENT));
         ui.add_space(3.0);
         for &(input, action) in *rows {
+            let description = if input == OVERLAY_INPUT {
+                RichText::new(format!("{action} 서로 다른 파일은 전체에서 {}개까지", crate::MAX_OPEN_FILES))
+            } else {
+                RichText::new(action)
+            };
             ui.horizontal_top(|ui| {
                 for (width, text) in [
                     (key_width, RichText::new(input).strong()),
-                    (description_width, RichText::new(action)),
+                    (description_width, description),
                 ] {
                     ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
                         ui.set_width(width);
@@ -104,7 +110,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("Ctrl+W", "선택한 3D 화면 닫기. 마지막 화면이면 탭 닫기"),
         ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),
         ("Explorer 클릭 / Ctrl+클릭", "지금 화면에 열기 / 옆 화면에 열기 (3D 화면 최대 4개, 2×2까지)"),
-        ("Explorer 파일 오른쪽 클릭 → 이 화면에 얹기", "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 메뉴 또는 이름표 2의 ×로 제거. 서로 다른 파일은 전체에서 12개까지"),
+        (OVERLAY_INPUT, "그 파일의 마커를 고른 화면 위에 흰 고리로 겹쳐 보기 (같은 프레임, 프레임 수 · 속도가 같은 파일만). 얹은 파일 내리기 메뉴 또는 이름표 2의 ×로 제거."),
         ("1 / 2 또는 이름표", "처음 파일 / 얹은 파일의 마커 숨기기·다시 보이기"),
         ("3D 화면 클릭 / 화면 탭 닫기", "키와 패널이 따를 화면 고르기 / 그 화면 닫기"),
         ("저장 폴더 연필 / 오른쪽 클릭", "Explorer에서 폴더에 보이는 이름 바꾸기"),

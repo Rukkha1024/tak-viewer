@@ -102,25 +102,35 @@ fn layout_tabs_shortcuts_and_rename_text_focus_take_precedence() {
 }
 
 #[test]
-fn layout_tabs_limit_is_twelve_distinct_files_not_twelve_views() {
+fn layout_tabs_limit_counts_thirty_distinct_files_across_views() {
     let ctx = egui::Context::default();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.hold_loads = true;
-    for tab in 0..3 {
-        if tab > 0 { app.new_layout_tab(); }
-        for i in 0..4 {
-            let path = PathBuf::from(format!("tab_limit_{}.tak", tab * 4 + i));
-            if i == 0 { app.open(&ctx, path); } else { app.open_side(&ctx, path); }
-        }
-        assert_eq!(app.open_views().len(), 4);
+    for index in 0..30 {
+        if index > 0 && index % MAX_VIEWS == 0 { app.new_layout_tab(); }
+        let path = PathBuf::from(format!("tab_limit_{index}.tak"));
+        app.explorer_action(&ctx, if index % MAX_VIEWS == 0 { WsAction::Open(path) } else { WsAction::OpenSide(path) });
+    }
+    assert_eq!(app.open_file_identities(None).len(), 30);
+    let views = app.open_views();
+    let active = app.active;
+    let live = app.open_file_identities(None);
+    let target = app.views[active].target().map(Path::to_path_buf);
+    for action in [WsAction::Open("tab_limit_30.tak".into()), WsAction::OpenSide("tab_limit_30.tak".into()),
+                   WsAction::OpenNewTab("tab_limit_30.tak".into())] {
+        let tabs = app.layout_tabs.tabs().len();
+        app.explorer_action(&ctx, action);
+        assert_eq!(app.open_views(), views);
+        assert_eq!(app.layout_tabs.tabs().len(), tabs);
+        assert_eq!(app.active, active);
+        assert_eq!(app.open_file_identities(None), live, "no reader reserves a source after refusal");
+        assert_eq!(app.views[active].target(), target.as_deref());
+        assert!(app.notice.take().is_some_and(|notice| notice.contains("30개까지")));
     }
     app.new_layout_tab();
-    app.open(&ctx, PathBuf::from("tab_limit_12.tak"));
-    assert!(app.open_views().is_empty());
-    assert!(app.notice.as_deref().is_some_and(|s| s.contains("12")));
-    app.notice = None;
     app.open(&ctx, PathBuf::from("tab_limit_0.tak"));
-    assert_eq!(app.open_views().len(), 1, "a second view of the same file is not a 13th file");
+    assert_eq!(app.open_views().len(), 1);
+    assert_eq!(app.open_file_identities(None).len(), 30);
     assert_eq!(app.views[0].waiting_shared_path(), Some(Path::new("tab_limit_0.tak")));
 }
 
@@ -129,26 +139,24 @@ fn layout_tabs_limit_counts_displayed_files_during_replacement() {
     let ctx = egui::Context::default();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.hold_loads = true;
-    for tab in 0..3 {
-        if tab > 0 { app.new_layout_tab(); }
-        for slot in 0..4 {
-            let path = PathBuf::from(format!("strict_limit_{}.tak", tab * 4 + slot));
-            if slot == 0 { app.open(&ctx, path); } else { app.open_side(&ctx, path); }
-        }
+    for index in 0..MAX_OPEN_FILES {
+        if index > 0 && index % MAX_VIEWS == 0 { app.new_layout_tab(); }
+        app.open_side(&ctx, PathBuf::from(format!("strict_limit_{index}.tak")));
     }
-    arrive(&ctx, &mut app, 3);
-    let displayed = PathBuf::from("strict_limit_11.tak");
-    let thirteenth = PathBuf::from("strict_limit_12.tak");
-    assert_eq!(app.views[3].path(), Some(displayed.as_path()));
-    assert!(!app.allow_open_file(&thirteenth, Some(3)), "a displayed file counts while replacing it");
-    assert!(!app.allow_replace_overlay(&thirteenth, 3), "an overlay replacement cannot start a thirteenth file");
+    let slot = app.active;
+    arrive(&ctx, &mut app, slot);
+    let displayed = PathBuf::from("strict_limit_29.tak");
+    let extra = PathBuf::from("strict_limit_30.tak");
+    assert_eq!(app.views[slot].path(), Some(displayed.as_path()));
+    assert!(!app.allow_open_file(&extra, Some(slot)), "a displayed file counts while replacing it");
+    assert!(!app.allow_replace_overlay(&extra, slot), "an overlay replacement must pass the cap");
 
     // Replacing by a source already being opened elsewhere is allowed, but its old
     // displayed file still counts until the shared waiter actually attaches.
-    app.open_in(&ctx, 3, PathBuf::from("strict_limit_0.tak"));
-    assert_eq!(app.views[3].path(), Some(displayed.as_path()));
-    assert_eq!(app.views[3].waiting_shared_path(), Some(Path::new("strict_limit_0.tak")));
-    assert!(!app.allow_open_file(&thirteenth, None), "a waiting replacement must not hide its displayed source from the cap");
+    app.open_in(&ctx, slot, PathBuf::from("strict_limit_0.tak"));
+    assert_eq!(app.views[slot].path(), Some(displayed.as_path()));
+    assert_eq!(app.views[slot].waiting_shared_path(), Some(Path::new("strict_limit_0.tak")));
+    assert!(!app.allow_open_file(&extra, None), "a waiting replacement must not hide its displayed source from the cap");
 }
 
 #[test]
@@ -156,26 +164,24 @@ fn layout_tabs_cap_and_share_checks_reuse_bound_identities() {
     let ctx = egui::Context::default();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.hold_loads = true;
-    for tab in 0..3 {
-        if tab > 0 { app.new_layout_tab(); }
-        for slot in 0..4 {
-            let path = PathBuf::from(format!("identity_bound_{}.tak", tab * 4 + slot));
-            if slot == 0 { app.open(&ctx, path); } else { app.open_side(&ctx, path); }
-        }
+    for index in 0..MAX_OPEN_FILES {
+        if index > 0 && index % MAX_VIEWS == 0 { app.new_layout_tab(); }
+        app.open_side(&ctx, PathBuf::from(format!("identity_bound_{index}.tak")));
     }
-    // Three layouts include hidden pending readers; the last view becomes displayed.
-    arrive(&ctx, &mut app, 3);
+    // Hidden layouts retain pending readers. The last view becomes displayed.
+    let slot = app.active;
+    arrive(&ctx, &mut app, slot);
     let overlay = PathBuf::from("identity_bound_0.tak");
-    app.start_overlay(&ctx, 3, overlay.clone(), false);
-    assert_eq!(app.views[3].overlay_target(), Some(overlay.as_path()));
+    app.start_overlay(&ctx, slot, overlay.clone(), false);
+    assert_eq!(app.views[slot].overlay_target(), Some(overlay.as_path()));
     layout_controller::reset_identity_fallbacks();
-    assert_eq!(app.open_file_identities(None).len(), 12);
-    assert!(app.file_is_loading_elsewhere(&overlay, 3));
-    assert!(app.find_shared_file(&overlay, 3).is_none());
+    assert_eq!(app.open_file_identities(None).len(), MAX_OPEN_FILES);
+    assert!(app.file_is_loading_elsewhere(&overlay, slot));
+    assert!(app.find_shared_file(&overlay, slot).is_none());
     assert_eq!(layout_controller::identity_fallbacks(), 0,
         "loaded, pending, hidden and overlay sources already have canonical identities");
 
-    assert!(!app.allow_open_file(Path::new("identity_bound_12.tak"), None));
+    assert!(!app.allow_open_file(Path::new("identity_bound_30.tak"), None));
     assert_eq!(layout_controller::identity_fallbacks(), 1,
         "only the newly requested candidate may resolve through the filesystem");
 }
@@ -591,12 +597,17 @@ fn layout_tabs_make_review_shots_when_requested() {
     assert_eq!(source_before.modified().unwrap(), source_after.modified().unwrap(), "screenshot input was modified");
 }
 
-/// Optional real-file 12-source/3-tab timing. Inputs are read only; no screenshots or TAKs
+/// Optional real-file tab timing. Inputs are read only; no screenshots or TAKs
 /// are written. Timings cover the UI and tessellation on the CPU, not GPU presentation.
 #[test]
-fn layout_tabs_measure_twelve_files_when_requested() {
-    let Some(folder) = std::env::var_os("TAK_TABS_BENCH_DIR") else { return };
-    let folder = PathBuf::from(folder);
+fn layout_tabs_measure_open_files_when_requested() {
+    let files: Vec<PathBuf> = if let Some(list) = std::env::var_os("TAK_TABS_BENCH_LIST") {
+        std::fs::read_to_string(list).unwrap().lines().filter(|line| !line.is_empty()).map(PathBuf::from).collect()
+    } else if let Some(folder) = std::env::var_os("TAK_TABS_BENCH_DIR") {
+        (1..=12).map(|n| PathBuf::from(&folder).join(format!("gait_{n}.tak"))).collect()
+    } else { return };
+    let count = files.len();
+    assert!((1..=MAX_OPEN_FILES).contains(&count));
     let ctx = egui::Context::default();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.set_command_run();
@@ -604,15 +615,15 @@ fn layout_tabs_measure_twelve_files_when_requested() {
     let mut tabs = Vec::new();
     let mut timing = Vec::new();
     let mut memory = Vec::new();
-    for n in 1..=12 {
-        if (n - 1) % 4 == 0 {
+    for (index, file) in files.into_iter().enumerate() {
+        let n = index + 1;
+        if index % MAX_VIEWS == 0 {
             if n > 1 { app.new_layout_tab(); }
             tabs.push(app.layout_tabs.active_id().unwrap());
         }
-        let file = folder.join(format!("gait_{n}.tak"));
         assert!(file.is_file(), "missing benchmark input {}", file.display());
         let began = Instant::now();
-        if (n - 1) % 4 == 0 { app.open(&ctx, file.clone()); } else { app.open_side(&ctx, file.clone()); }
+        if index % MAX_VIEWS == 0 { app.open(&ctx, file.clone()); } else { app.open_side(&ctx, file.clone()); }
         let slot = app.active;
         loop {
             frame_with(&ctx, &mut app, vec![]);
@@ -622,7 +633,7 @@ fn layout_tabs_measure_twelve_files_when_requested() {
         }
         let visible_ms = began.elapsed().as_secs_f64() * 1000.0;
         timing.push((n, app.views[slot].markers_ms.unwrap_or(visible_ms), visible_ms));
-        if [1, 4, 8, 12].contains(&n) {
+        if [1, 4, 8, 12, count].contains(&n) {
             // Sample after forceplate reads have settled in all tabs. EMG remains lazy.
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
@@ -639,6 +650,7 @@ fn layout_tabs_measure_twelve_files_when_requested() {
             memory.push((n, crate::bench_load::ProcessMemory::sample()));
         }
     }
+    assert_eq!(app.open_file_identities(None).len(), count);
     for &id in &tabs {
         app.switch_layout_tab_internal(id);
         for slot in app.open_views() {
@@ -665,9 +677,10 @@ fn layout_tabs_measure_twelve_files_when_requested() {
     println!("initial memory: {}", crate::bench_load::ProcessMemory::describe(start_memory));
     for (n, markers_ms, visible_ms) in timing { println!("file {n}: markers {markers_ms:.2} ms, first UI frame {visible_ms:.2} ms"); }
     for (n, mem) in memory { println!("after {n} files, forceplates settled: {}", crate::bench_load::ProcessMemory::describe(mem)); }
-    println!("3 tabs, 12 files, 600 frames, switch every 3 frames: average {avg:.2} ms, max {max:.2} ms");
+    println!("{} tabs, {count} files, 600 frames, switch every 3 frames: average {avg:.2} ms, max {max:.2} ms", tabs.len());
     let switch_avg = switch_times.iter().sum::<f64>() / switch_times.len() as f64;
     let switch_max = switch_times.iter().copied().fold(0.0_f64, f64::max);
     let over_budget = times.iter().filter(|&&ms| ms > 16.0).count();
-    println!("200 tab switches: average {switch_avg:.3} ms, max {switch_max:.3} ms; frames over 16 ms: {over_budget}/600");
+    let over_limit = times.iter().filter(|&&ms| ms > 20.0).count();
+    println!("200 tab switches: average {switch_avg:.3} ms, max {switch_max:.3} ms; frames over 16 ms: {over_budget}/600; over 20 ms: {over_limit}/600");
 }

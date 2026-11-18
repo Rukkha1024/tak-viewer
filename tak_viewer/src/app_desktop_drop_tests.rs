@@ -100,18 +100,25 @@ fn desktop_full_layout_refuses_edge_atomically_but_center_still_works() {
 }
 
 #[test]
-fn desktop_twelve_files_count_hidden_tabs_and_pending_and_refuse_entire_batch() {
+fn desktop_file_cap_counts_hidden_tabs_and_pending_and_refuses_entire_batch() {
     use crate::desktop_drop::Target;
     let ctx=egui::Context::default(); let mut app=one_view(&ctx); app.hold_loads=true;
-    for i in 1..12 {
-        if i%4==0 { app.new_layout_tab(); }
+    for i in 1..MAX_OPEN_FILES - 1 {
+        if i%MAX_VIEWS==0 { app.new_layout_tab(); }
         app.open_side(&ctx,PathBuf::from(format!("cap_{i}.tak")));
     }
+    let last = vec![PathBuf::from("source_30.tak")];
+    assert_eq!(app.desktop_refusal(Target::NewTab, &last, None), None);
+    app.desktop_drop_files(&ctx, Target::NewTab, last);
+    assert_eq!(app.open_file_identities(None).len(), MAX_OPEN_FILES);
     frame_with(&ctx,&mut app,vec![]); let count=app.layout_tabs.tabs().len(); let pushed=app.history.pushed;
-    let paths=vec![PathBuf::from("thirteenth.tak"),PathBuf::from("fourteenth.takm")];
+    let paths=vec![PathBuf::from("source_31.tak"),PathBuf::from("source_32.takm")];
+    assert_eq!(app.desktop_refusal(Target::NewTab,&paths[..1],None),Some(desktop_drop::Refusal::Files));
     assert_eq!(app.desktop_refusal(Target::NewTab,&paths,None),Some(desktop_drop::Refusal::Files));
+    let file_id = app.next_file_id;
     app.desktop_drop_files(&ctx,Target::NewTab,paths);
-    assert_eq!(app.layout_tabs.tabs().len(),count); assert_eq!(app.history.pushed,pushed); assert!(app.notice.as_ref().unwrap().contains("12"));
+    assert_eq!(app.next_file_id, file_id);
+    assert_eq!(app.layout_tabs.tabs().len(),count); assert_eq!(app.history.pushed,pushed); assert!(app.notice.as_ref().unwrap().contains("30개까지"));
     let repeated=vec![app.views[app.active].target().unwrap().to_path_buf()];
     assert_eq!(app.desktop_refusal(Target::NewTab,&repeated,None),None);
     app.notice=None; app.desktop_drop_files(&ctx,Target::NewTab,repeated);

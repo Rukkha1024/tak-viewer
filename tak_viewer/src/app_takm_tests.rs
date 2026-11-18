@@ -309,7 +309,7 @@ fn cap_uses_final_distinct_set_and_refuses_without_partial_switch() {
     app.views[0].start_shared_overlay(source.into(), shared, false);
     let (_, overlay, _) = app.views[0].poll_overlay().unwrap();
     app.views[0].overlay = Some(overlay.unwrap());
-    for n in 0..11 {
+    for n in 0..MAX_OPEN_FILES - 1 {
         if n % 4 == 0 { app.new_layout_tab(); }
         shown(&mut app, n % 4, &PathBuf::from(format!("cap_other_{n}.tak")));
     }
@@ -321,12 +321,12 @@ fn cap_uses_final_distinct_set_and_refuses_without_partial_switch() {
     assert_eq!(app.views[0].path(), Some(source));
     assert!(app.takm_job.is_none());
     assert_eq!(app.history.undo.len(), count);
-    assert!(app.notice.as_ref().unwrap().contains("12"));
+    assert!(app.notice.as_ref().unwrap().contains("30개까지"));
     // An already-open destination changes no distinct-file count.
     let last = app.layout_tabs.tabs().last().unwrap().id;
     app.switch_layout_tab_internal(last);
-    shown(&mut app, 2, output);
-    let destination = app.views[2].document_id();
+    shown(&mut app, 0, output);
+    let destination = app.views[0].document_id();
     app.switch_layout_tab_internal(first);
     app.observe(false);
     app.notice = None;
@@ -475,7 +475,7 @@ fn destination_already_loading_in_a_hidden_tab_is_joined_after_its_one_reader_ar
 }
 
 #[test]
-fn strict_cap_refuses_new_takm_while_twelve_sources_are_still_displayed() {
+fn strict_cap_refuses_new_takm_while_thirty_sources_are_still_displayed() {
     let ctx = egui::Context::default();
     let _dir_guard = fixture("strict_cap");
     let dir = _dir_guard.to_path_buf();
@@ -484,17 +484,18 @@ fn strict_cap_refuses_new_takm_while_twelve_sources_are_still_displayed() {
     std::fs::write(&source, &bytes).unwrap();
     let mut app = app(&ctx, &source);
     let first = app.layout_tabs.active_id().unwrap();
-    for n in 0..11 {
-        if n % 4 == 0 { app.new_layout_tab(); }
-        shown(&mut app, n % 4, &PathBuf::from(format!("strict_cap_other_{n}.tak")));
+    for n in 0..MAX_OPEN_FILES - 1 {
+        if n % MAX_VIEWS == 0 { app.new_layout_tab(); }
+        shown(&mut app, n % MAX_VIEWS, &PathBuf::from(format!("strict_cap_other_{n}.tak")));
     }
     app.switch_layout_tab_internal(first);
     app.observe(false);
     let count = app.history.undo.len();
     app.save_takm(&ctx, source.clone());
     finish(&ctx, &mut app);
-    assert!(app.takm_job.is_none(), "the thirteenth pending source is refused before any worker writes");
+    assert!(app.takm_job.is_none(), "source 31 is refused before any worker writes");
     assert!(!dir.join("source.takm").exists());
+    assert!(app.notice.take().is_some_and(|s| s.contains("30개까지")));
     assert_eq!(app.history.undo.len(), count);
     assert_eq!(app.views[0].path(), Some(source.as_path()));
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
@@ -554,7 +555,7 @@ fn canonical_source_alias_is_checked_for_dirty_edits_before_conversion_worker_wr
 
 #[cfg(unix)]
 #[test]
-fn existing_destination_alias_at_twelve_sources_reuses_the_open_document() {
+fn existing_destination_alias_at_the_file_cap_reuses_the_open_document() {
     let ctx = egui::Context::default();
     let _dir_guard = fixture("alias_at_cap");
     let dir = _dir_guard.to_path_buf();
@@ -571,7 +572,7 @@ fn existing_destination_alias_at_twelve_sources_reuses_the_open_document() {
     shown(&mut app, 1, &output);
     let first = app.layout_tabs.active_id().unwrap();
     let destination = app.views[1].edit_document.clone().unwrap();
-    for n in 0..10 {
+    for n in 0..MAX_OPEN_FILES - 2 {
         if n % 4 == 0 { app.new_layout_tab(); }
         shown(&mut app, n % 4, &PathBuf::from(format!("alias_cap_other_{n}.tak")));
     }
@@ -580,7 +581,7 @@ fn existing_destination_alias_at_twelve_sources_reuses_the_open_document() {
     let count = app.history.undo.len();
     app.save_takm(&ctx, alias.join("source.tak"));
     finish(&ctx, &mut app);
-    assert!(app.notice.is_none(), "an alias to the existing destination is never a thirteenth file");
+    assert!(app.notice.is_none(), "an alias to the existing destination counts once");
     assert!(Arc::ptr_eq(app.views[0].edit_document.as_ref().unwrap(), &destination));
     assert_eq!(app.views[0].path(), Some(output.as_path()));
     assert_eq!(app.history.undo.len(), count + 1);

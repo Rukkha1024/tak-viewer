@@ -4,6 +4,7 @@
 //! the side panes, status bar, title, keys and captures follow the active view.
 
 use crate::camera::Camera;
+use crate::MAX_OPEN_FILES;
 use crate::capture::{self, CapturePlan, CaptureRun, Fit, FrameSpec, ViewPreset};
 use crate::instances::Registration;
 use crate::shot::{self, AutoShot};
@@ -4371,6 +4372,7 @@ mod tests {
     include!("app_close_tests.rs");
     include!("app_desktop_drop_tests.rs");
     include!("app_layout_tabs_tests.rs");
+    include!("app_open_file_limit_tests.rs");
     include!("app_tab_input_tests.rs");
     include!("app_freshness_tests.rs");
     include!("app_hidden_work_tests.rs");
@@ -10729,11 +10731,11 @@ mod tests {
     }
 
     #[test]
-    fn four_views_with_overlays_obey_the_app_wide_twelve_distinct_file_limit() {
+    fn four_views_with_overlays_obey_the_app_wide_file_limit() {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("overlay_four");
         let dir = _dir_guard.to_path_buf();
-        let names: Vec<String> = (0..13).map(|i| format!("source_{i}.tak")).collect();
+        let names: Vec<String> = (0..=MAX_OPEN_FILES).map(|i| format!("source_{i}.tak")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let (mut app, f) = overlay_app(&ctx, &dir, &names);
         let first_tab = app.layout_tabs.active_id().unwrap();
@@ -10763,17 +10765,22 @@ mod tests {
         assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
         assert!(app.notice.take().is_some_and(|n| n.contains("4개까지")));
 
-        // Hidden pending primary reads also reserve distinct sources, bringing the total to 12.
-        app.new_layout_tab();
-        for (i, path) in f[8..12].iter().enumerate() {
-            if i == 0 { app.open(&ctx, path.clone()); } else { app.open_side(&ctx, path.clone()); }
+        // Hidden pending primary reads also reserve distinct sources.
+        for group in f[8..MAX_OPEN_FILES - 1].chunks(MAX_VIEWS) {
+            app.new_layout_tab();
+            for path in group { app.open_side(&ctx, path.clone()); }
+            assert_eq!(app.open_views().len(), group.len());
+            assert!(app.open_views().iter().all(|&slot| app.views[slot].loading.is_some()));
         }
-        assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
-        assert!(app.views.iter().all(|view| view.loading.is_some()));
+        let slot = app.active;
+        arrive(&ctx, &mut app, slot);
+        lay_over(&ctx, &mut app, &f[MAX_OPEN_FILES - 1]);
+        assert!(app.views[slot].overlay_load.is_some());
+        assert_eq!(app.open_file_identities(None).len(), MAX_OPEN_FILES);
         app.new_layout_tab();
-        app.open(&ctx, f[12].clone());
-        assert!(app.open_views().is_empty(), "the thirteenth source must not create a view");
-        assert!(app.notice.take().is_some_and(|n| n.contains("12개까지")));
+        app.open(&ctx, f[MAX_OPEN_FILES].clone());
+        assert!(app.open_views().is_empty(), "source 31 must not create a view");
+        assert!(app.notice.take().is_some_and(|n| n.contains("30개까지")));
 
         // Repeated sources still open at the cap, including a ready overlay and a pending read.
         app.open(&ctx, f[3].clone());
@@ -10782,9 +10789,9 @@ mod tests {
         app.open_side(&ctx, f[8].clone());
         assert_eq!(app.views[1].waiting_shared_path(), Some(f[8].as_path()));
         app.activate(0);
-        lay_over(&ctx, &mut app, &f[12]);
+        lay_over(&ctx, &mut app, &f[MAX_OPEN_FILES]);
         assert!(app.views[0].overlay_load.is_none() && app.views[0].overlay.is_none());
-        assert!(app.notice.take().is_some_and(|n| n.contains("12개까지")));
+        assert!(app.notice.take().is_some_and(|n| n.contains("30개까지")));
         app.switch_layout_tab(first_tab);
         assert_eq!(app.open_views(), vec![0, 1, 2, 3]);
         assert_eq!(app.file_count(), 8, "refused opens leave existing views and overlays intact");

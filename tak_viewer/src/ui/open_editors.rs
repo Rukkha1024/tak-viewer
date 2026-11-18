@@ -282,6 +282,7 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool, 
 
 fn group_header(ui: &mut Ui, group: &Group) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), GROUP_H), Sense::hover());
+    if !ui.is_rect_visible(r) { return; }
     let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
     let y = r.center().y + 1.0;
     let shown = p.text(pos2(r.left() + 20.0, y), Align2::LEFT_CENTER, group_title(group), FontId::proportional(11.5), if group.active { CHOSEN } else { FG });
@@ -292,6 +293,7 @@ fn group_header(ui: &mut Ui, group: &Group) {
 
 fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &EditorSelection) -> Option<EditorAction> {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    if !ui.is_rect_visible(rect) { return None; }
     let selected = selection.selected.contains(&g.row_id(j));
     let cy = rect.center().y;
     // × and `폴더 추가` are registered after the row, so they get their clicks.
@@ -344,9 +346,7 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &E
         right = r.left() - 6.0;
     }
 
-    if ui.is_rect_visible(rect) {
-        right = crate::take_progress::paint(ui, rect, rect.left() + NAME_X, right, e.progress, FG_DIM);
-    }
+    let right = crate::take_progress::paint(ui, rect, rect.left() + NAME_X, right, e.progress, FG_DIM);
     // Name, then the folder dim. Too narrow: the folder goes, then the name is cut in the middle
     // with its ending kept (`fit`); × and button stay.
     let (name, suffix, folder) = row_parts(e);
