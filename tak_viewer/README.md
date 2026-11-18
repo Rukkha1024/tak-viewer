@@ -115,3 +115,252 @@ Pattern Based: select references first, target last; check Fill Target then Fill
 
 In Labeling, enable `Link to 3D Selection` to follow the 3D pick's group. Choose `Increment` after assignment. Right-click a named row → `Label Marker` to assign its label to the single selected 3D point. `%` shows the take share with a point.
 
+## Agent commands
+
+Run `tak_viewer.exe --help` (alias `-h`) for built-in help. `--version` (alias `-V`) prints the app version. With positional paths alone, open the GUI.
+
+Use `--headless` for automated screenshots and captures. Same app, CPU renderer. [CLI outputs](../docs/cli-outputs.md)
+
+### Show named files in a window
+
+```text
+tak_viewer.exe --only [--frame N] [--select A,B] [--comments | --no-comments] [--pick-comment K] <file> [<file2> …]
+tak_viewer.exe --only [shared options] [files …] --tab [--name NAME] [tab options] <file> … [--tab …]
+tak_viewer.exe --only --from tabs.json
+tak_viewer.exe --list-windows [--envelope]
+tak_viewer.exe --list-windows --wait PID [--timeout SECONDS]
+```
+
+One to four TAK/TAKM files per tab, at most thirty distinct canonical files. Place shared options before the first `--tab` and overrides inside each tab. Shared options also apply to files before the first separator. Omit names for unused `tabN` names. Names must be unique. `--no-comments` cancels inherited foregrounding. An explicit frame or selection overrides the Comment jump's frame or selection.
+
+For a WSL desktop example, set `VIEWER` to the exe, `RAW` and `EDITED` to two takes, and `TAK_VIEWER_DATA_DIR` to an existing empty absolute directory. Use the directory's Windows spelling, e.g. `$(wslpath -w "$TEMP_DIR")`. Both commands use the same exported value.
+
+~~~bash
+export TAK_VIEWER_DATA_DIR
+export WSLENV="TAK_VIEWER_DATA_DIR${WSLENV:+:$WSLENV}"
+coproc REVIEW_WINDOW {
+  exec "$VIEWER" --only --tab --name Raw --frame 1 "$RAW" --tab --name Review --frame 1 "$EDITED"
+}
+if IFS= read -r VIEWER_PID <&"${REVIEW_WINDOW[0]}"; then
+  "$VIEWER" --list-windows --wait "$VIEWER_PID"
+fi
+~~~
+
+Use the PID printed by the window. Close only that window when done. First tab active. Agent windows leave saved settings untouched. Session 0 has no desktop.
+
+Manifest example. Relative paths start at the JSON file's folder.
+
+```json
+[
+  {"name":"원본","files":["raw.tak"],"frame":600,"select":"LASI,LKNE"},
+  {"name":"편집","files":["edited.takm"],"comments":true,"pick_comment":3}
+]
+```
+
+Wait defaults to 120 s. Use `--envelope` with the list form. Result shapes and exit codes → [live windows](../docs/cli-outputs.md#live-windows).
+
+### Screenshot options
+
+```text
+tak_viewer.exe --headless --screenshot out.png --frame 600 --select LASI,LKNE --plate 0 --range 300-900 file.takm
+```
+
+Default up to four positional files. Native or headless render. In Windows Session 0, screenshot and capture switch to headless automatically. `--frame`, `--select`, `--select-visible` and `--plate` apply to every shown view. Pass one positional folder alongside the files to expand it in WORKSPACE and wait for visible progress. Ordinary headless time limit 600 s. Same screenshot conditions → deterministic bytes; inspect PNG.
+
+WSL and Windows output paths work. Create the parent folder first. For paths printed and files produced, see [screenshot outputs](../docs/cli-outputs.md#screenshots-and-png-comparison).
+
+| Option | Meaning |
+|---|---|
+| --shot-tabs [N[:POINTS]] | Headless screenshot only. Open 1–30 local TAK/TAKM files in groups of four. Show the last populated tab after all markers load. Optional N pads to at least N tabs with empty tabs, 0–30. Optional signed POINTS moves the strip. Positive reveals later tabs. Pair with `--drop-preview` to show the cap |
+| --frame N / --select A,B | Jump to viewer frame N, or select exact comma-separated marker names |
+| --size WxH | Window size in points, default 1600x960. Width 400–8000, height 300–8000. Headless uses one pixel per point |
+| --crop x,y,w,h | Crop in window points from upper left after layout. Clip to the image |
+| --crop-panel NAME | Visible panel body. See names below. Quote names with spaces |
+| --scale N | Enlarge crop by positive integer N, nearest neighbor. Limit 64 million output pixels |
+| --crop-only | Save only the crop. Without it, also save the full-size screenshot |
+| --regions | Save full-image pixel rectangles to `<stem>.regions.json` |
+| --select-visible | Select current visible markers as 3D Ctrl+A does. Use `--select A,B` for distance or `--select A,B,C` for angle, with B as vertex. |
+| --plate index/name | Zero-based plate, exact name preferred |
+| --scene-view perspective\|front\|back\|left\|right\|top\|bottom | Set direction in all screenshot views |
+| --scene-follow | Enable Follow Selected in all screenshot views |
+| --range a-b | Clamp/sort endpoints; malformed warns, never filename |
+| --shot-label SOURCE=TARGET | Headless screenshot only. Repeat in order, one local file. Exact unique names. Apply assignments in memory at --frame/--range, then show status and Labeling |
+| --shot-marker-menu menu\|info\|label | Headless screenshot only. Use --select and --frame to pick visible points in the active view. Open the 3D marker menu alone or with Marker Info / Label Marker expanded. Label submenu needs one selected point. Read/write no settings or take data |
+| --shot-help | Use with `--headless --screenshot out.png`, without a take. Open `Controls`. Default 1600×960 px at 100%. Optional `--shot-help-size 1920x1080@1.5` sets pixel size and scale. Add `--shot-help-bottom` to capture the last rows |
+| --comments | Bring COMMENTS forward |
+| --pick-comment ID | Jump/select; explicit --frame wins |
+| --edit-comment ID[:markers\|frames\|comment\|type] | Show draft only; also jumps unlike actual field double-click |
+| --type-strip ID | Show post-create strip only |
+| --edit-tools / --edit-pattern | Foreground tools / Pattern selection |
+| --edit-split / --edit-bottom | Tools below Labeling / above GRAPH |
+| --labeling-link | Show Labeling with 3D link on. `--select` drives the linked group. Settings untouched |
+| --overlay file | Nth overlay assigned Nth view; repeat option |
+| --hide 1\|2 | Hide corresponding layer in overlaid views |
+| --hover NAME | Force marker hover, Y lane at cursor+12 pt; absent marker warns; screenshot only, not capture |
+| --graph-zoom A-B | Set graph time bounds with a graph layout |
+| --graph-layout channels\|tracks\|combined | Dock GRAPH. Also works with `--bench` |
+| --graph-fit-range / --graph-y-zoom N / --graph-lock NAME[,NAME…] | With `--graph-layout`, fit the yellow range, set value magnification for all plotted lanes, or pin named markers while `--select` sets scene selection. Lock and value zoom need Channels or Combined |
+| --working-range A-B | Set green playback bounds in every view. Combine with --range for yellow edit selection |
+| --reverse-playing | Set reverse and show playback active at its start position from --frame; pin clock for screenshot |
+| --menu-capture | Exercise menu capture and screenshot completion dialog |
+| --merge-keys preview\|up\|down | Headless Tracks screenshot only. With `--graph-layout tracks` and two `--select` names, show ready buttons or run one in-memory merge. `--range` scopes the move |
+| --drop-preview x,y incoming… | Headless screenshot only. Put last. Preview a drop at egui window points without opening incoming files |
+
+Use one crop selector. Native window pixels follow display scale. Crop points map to full-image pixels. Clip to the image and round minimum edges down and maximum edges up. Names ignore case: EXPLORER, Labeling, Edit Tools, Selected Marker (`선택 마커`), Devices, COMMENTS, GRAPH, Layout Tabs, footer, timeline, timeline N, 3D view N. N is view slot 1–4. Plain timeline uses the active view. `--comments`, `--edit-tools`, `--labeling-link` and `--graph-layout channels` can bring panels forward.
+
+If text clips in the panel, increase `--size` to give it more room before scaling.
+
+Set `VIEWER` to the exe, `SHOT` to a PNG path in an existing temp folder, and `TAKE` to a TAK/TAKM file.
+
+~~~bash
+"$VIEWER" --headless --screenshot "$SHOT" --size 1400x860 --comments --crop-panel COMMENTS --scale 3 --regions "$TAKE"
+~~~
+
+### Capture several frames and views
+
+~~~text
+tak_viewer.exe --capture <file.tak|file.takm> --headless [options]
+tak_viewer.exe --capture file.takm --headless --frames 600,900 --views persp,top,side,front --select LKNE
+~~~
+
+| Option | Meaning |
+|---|---|
+| `--frames` | Viewer frames. Single `600`, list `100,200`, range `100:200`, stepped range `100:1000:100`, or `even:5` (default). Ranges intersect the take. Single or listed frames clamp to the take. Up to 60 frames and 120 shots per run |
+| `--views` or `--view` | Comma-separated angles. Default `persp,top,side,front`. Also `bottom` (alias `down`), `+x`, `-x`, `+z`, `-z`, `all`. Side looks across the walking direction. Front looks along it. Fixed views use a narrow 12° lens |
+| `--fit frame\|take\|selected` | Frame the current frame (default), the whole take, or selected markers |
+| `--select A,B` | Highlight exact names. Last selected is cyan and others yellow |
+| `--trail N` | Set the trail length in frames. Integer clamped to 1–100,000. Default 250 frames for the last selected marker |
+| `--size WxH` | Window points, default 1600×1000. Same bounds as screenshot. PNG size follows the cropped view |
+| `--ui`, `--no-names`, `--no-sheet` | Keep side panels, hide marker names, or omit the sheet |
+| `--out DIR` | Explicit capture folder. Default = new folder under `experiments/tak_captures/` when the repo is found. Set it explicitly for out-of-repo checks. Standalone public build can default to a temp folder |
+
+Reports the output folder, shots, optional sheet and capture manifest. Paths and fields → [capture outputs](../docs/cli-outputs.md#capture).
+
+### Compare PNGs
+
+~~~bash
+python3 -B checks/compare_png.py before.png after.png --ignore footer --out diff.png --json
+~~~
+
+Pillow from WSL Python user site. Python adds `--ignore` (repeatable). Use `footer` for the union of matching full-image footer regions or `x,y,w,h` for known pixel rectangles. Use `--ignore=x,y,w,h` for a negative start. Use `--out` for a diff PNG. Comparison works on decoded RGBA. Receipt and exit codes → [screenshots and PNG comparison](../docs/cli-outputs.md#screenshots-and-png-comparison).
+
+### Conversion and dumps
+
+```text
+tak_viewer.exe --to-takm a.tak b.tak --out-dir destination --verify
+tak_viewer.exe --verify-takm destination/a.takm --source a.tak out.json
+tak_viewer.exe --verify-takm destination/a.takm destination/b.takm --source-dir originals --json batch.json
+tak_viewer.exe --dump file.takm out.json
+tak_viewer.exe --dump-fast file.takm out.json
+```
+
+`--to-takm` accepts multiple TAK inputs. Omit `--out-dir` for sibling output. Both dump modes accept one input and one output. `tak_dump` also exports reader JSON. Fast/full parity required. [TAKM storage](../docs/takm.md) · [CLI outputs](../docs/cli-outputs.md)
+
+- `--verify-takm` defaults to a same-stem sibling `.tak` if present. With one input, `--source FILE` selects an explicit source and a bare final path selects the JSON output. With one or more inputs, use `--source-dir DIR` to resolve each recorded source basename and `--json FILE` for a named output. Choose one source override. Use `--envelope` for a versioned array wrapper.
+- `--to-takm --verify` checks each conversion against its actual source. Result fields and verdicts → [CLI outputs](../docs/cli-outputs.md#takm-verification).
+
+### Summarize takes
+
+```text
+tak_viewer.exe --summary <file.tak|file.takm> [<file2> …] [--markers A,B,…] [--frames a:b] [--top N] [--json [out.json] [--envelope]]
+tak_viewer.exe --summary file.tak --markers LKNE,LTHI --frames 100:300 --json
+tak_viewer.exe --summary file.takm --xyz LFHD,C7 --frames 205:215 --json
+```
+
+List files first. WSL and Windows paths work. Default Korean text. Use `--summary --help` for command help. With `--json`, omit the path for stdout. `--envelope` requires JSON.
+
+- `--frames a:b` adds window coverage and limits the gap search. Reject reversed or out-of-file ranges.
+- `--markers A,B` lists all gap ranges for exact names in each take, including every duplicate name and gapless matches. Unknown names fail. Whole-file counts and coverage stay in the result.
+- `--top N` caps the default template and extra gap lists separately. Default 10. Use 0 to suppress rows. Gap order = missing frames descending, name then UID ascending.
+- `--xyz` queries one take and up to 8 exact names. Includes every same-name trajectory. Supply an inclusive range or frame list of up to 500 frames. A single frame number works too. Omit frames for a take of at most 500 frames.
+
+Set `TAKE` to a take with exact marker name C7, `FRAME` to a frame in that take, and `VIEWER` to the exe.
+
+~~~bash
+"$VIEWER" --summary "$TAKE" --xyz C7 --frames "$FRAME" --json
+~~~
+
+[Take summary fields](../docs/cli-outputs.md#take-summary)
+
+### Check takes with numbers and pictures
+
+```text
+tak_viewer.exe --check copy.tak agent.takm raw.tak --out review --roles copy,agent,raw --views persp,top --select LKNE,RKNE --size 1200x800 --no-names --trail 100
+tak_viewer.exe --check copy.tak agent.takm --out numbers --no-pictures
+```
+
+Put the trusted take first, usually the labeled copy. Use raw when copy is unavailable. Slot comparison follows each marker-set role in a shared template. UID comparison follows the recorded trajectory and shows relabeling.
+
+One to four files. Roles default to `file1`…`file4`. Give one role per file when using `--roles`. Use `--frames auto[:N]` (default 12) or capture syntax, e.g. `600,900`, `100:1000:100`, `even:5`. Capture limits apply per file. Use `--top N` for distance rankings and UID observations (default 10). Views default to `persp,top,side,front`. Picture options match capture: `--size WxH`, `--fit frame|take|selected`, `--trail N`, `--no-names`, `--no-sheet`, `--ui`.
+
+Use `--check --help` for command help. Use `--select` to highlight names in every picture. `--no-pictures` runs the same numeric comparison and source check without rendering. Use a new or empty output folder for `--out`. [Check outputs](../docs/cli-outputs.md#take-check)
+
+### Add and list Comments
+
+```text
+tak_viewer.exe --add-comments file.takm --from rows.json [--dry-run] [--allow-unknown-markers] [--allow-duplicates]
+tak_viewer.exe --add-comments --from batch.json [--dry-run] [--allow-unknown-markers] [--allow-duplicates] [--envelope]
+tak_viewer.exe --list-comments file.takm [out.json]
+tak_viewer.exe --list-comments a.takm b.takm [--json out.json] [--by agent|viewer|legacy] [--envelope]
+tak_viewer.exe --list-comments --dir folder [--recursive] [--json out.json] [--by agent|viewer|legacy] [--envelope]
+```
+
+Existing TAKM outside repo input for adds. WSL and Windows paths work. No window or settings. Refused rows reported to stderr with 1-based row numbers. JSON input UTF-8, optional BOM.
+
+```json
+[
+  {"markers": ["LTHI", "LKNE"], "start": 1073, "end": 1073, "type": "Needs visual check", "text": "한 줄 설명"},
+  {"markers": [], "start": 1080, "end": 1090, "text": ""}
+]
+```
+
+Frames inclusive, in the viewer's numbering. `type` optional. Text may be empty. Without a positional file, supply a JSON object mapping each TAKM path to its row array. Relative paths start at the working directory. Validate every file and row before appending to any file.
+
+`--dry-run` validates and plans without reserving IDs or writing. `--allow-unknown-markers` skips exact labeled-name validation. `--allow-duplicates` appends matching rows again. Without it, live matches and in-batch repeats are skipped after comparing marker lists without regard to order. Type names match without regard to case. Text stays one line, with tabs replaced by spaces.
+
+Directory lists sort by path. `--recursive` descends without following directory links. `--by` filters by last writer, including in single-file lists. `--json FILE` writes the receipt to a file. `--envelope` gives versioned batch output and selects the batch shape for a single listed file. [Comment receipts](../docs/cli-outputs.md#comments)
+
+### Benchmarks
+
+~~~text
+tak_viewer.exe --bench [frames] file.takm [more files …] [--overlay file …] [--bench-select N] [--bench-hover] [--bench-emg] [--bench-trace] [--bench-workspace DIR]
+tak_viewer.exe --bench-load file1.tak file2.takm …
+tak_viewer.exe --bench-progress file.tak file.takm …
+~~~
+
+- `--bench` runs up to four views without a window. Default 300 playing frames. Add one overlay per view in view order. `--bench-select N` selects the first N markers. `--bench-hover` alternates curves and outside every two frames. `--bench-emg` includes demand loading and device graphs. `--bench-trace` records per-frame wall and main-thread CPU time. `--bench-workspace DIR` lists one local folder before timing normal file open. Combine graph layout and device hooks when measuring those panels.
+- `--bench-load` retains 1–30 file models concurrently without views. Memory samples overlap across the whole process.
+- `--bench-progress` reads only saved Progress. All benchmark commands leave settings untouched. [Output fields](../docs/cli-outputs.md#diagnostic-outputs)
+
+### Device filter and grid hooks
+
+| Option | Check |
+|---|---|
+| `--device-chain "1=bp:20:450:4,rect,lp:6:4"` | Zero-based device index or title. Repeat for multiple devices |
+| `--device-open 1` | Expand device. Screenshot hook places pane right, full-height, 36% width |
+| `--device-bypass` | Keep configured chain and show raw |
+| `--dump-device-signal FILE DEVICE CHANNEL CHAIN OUT.json` | Export a channel. Device = zero-based index or title. Channel = zero-based index |
+| `--device-grid 3x3` | Widen Devices and fold other helper panels. Grid sizes 1×1–4×4 |
+| `--device-cells "plate:0,plate:1,ch:3:0,empty,missing"` | Explicit cells. `plate:0:2` means plate 0 Fz only |
+| `--device-list folded` | Fold list |
+| `--device-fill 3` | Fill up to the first 16 channels of device 3 in the smallest square |
+| `--channel-names "3:0=L TA,3:1=R TA"` | In-memory names |
+| `--device-drag 3:2` | Simulate whole-device drag preview at cell 2 without release |
+| `--device-pane-size 389x302` | Set small test pane size |
+
+Stages = `demean`, `rect`, `rms:50`, `lp:6:4`, `hp:20:4`, `bp:20:450:4`, `bs:59:61:4`. Comma sequence, suffix `:c` for causal. Use device hooks with screenshot or bench. For demand loading in a benchmark, use `--bench-emg`.
+
+### SSH options
+
+~~~text
+tak_viewer.exe --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]
+tak_viewer.exe --headless --ssh-open ALIAS --ssh-path FILE --screenshot out.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]
+tak_viewer.exe --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot out.png [--ssh-platform linux|windows] [--ssh-workspace-expand] [--ssh-python COMMAND]
+~~~
+
+- Default platform is `linux`, including macOS hosts. Omit `--ssh-python` for discovery. Pass empty `--ssh-path` to list top-level drives or `/`. Open requires a file and screenshot, lists its parent, then attaches marker and analog results.
+- For open, `--ssh-cancel-after-ms N` sends Escape after N ms from open. `--ssh-stall-cancel-after-ms N` tests no-byte cancellation. `--ssh-dump OUT.json` exports the loaded data. `--ssh-markers-only` keeps received markers and ends deferred analog reads. Use it without timed cancellation.
+- Open edit hooks `--ssh-comment TEXT` and `--ssh-label unlabel` require `--ssh-save` and exercise the normal server write path. Workspace restart is in-memory. Add `--ssh-workspace-expand` for explicit real connect/list.
+- For local screenshot fixtures, `--ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux` uses fake state without SSH. Ready/top scene needs a local sample.
+
+[SSH outputs](../docs/cli-outputs.md#diagnostic-outputs)

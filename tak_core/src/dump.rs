@@ -136,7 +136,8 @@ pub fn to_json(take: &Take) -> Value {
     out
 }
 
-const USAGE: &str = "usage: --dump <file.tak|file.takm> <out.json>   (--dump-fast: same output through the viewer's markers-first read)";
+pub const USAGE: &str = "usage: tak_viewer --dump <file.tak|file.takm> <out.json>
+       tak_viewer --dump-fast <file.tak|file.takm> <out.json>   (same output through the viewer's markers-first read)";
 
 /// `args` = `["--dump", "<file.tak>", "<out.json>"]`. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {

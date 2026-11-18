@@ -31,6 +31,8 @@ mod device_grid;
 mod comment_selection;
 mod capture;
 mod check_command;
+#[cfg(test)]
+mod cli_docs_tests;
 mod headless;
 mod help_shot;
 mod instances;
@@ -54,6 +56,7 @@ use tak_core::comment_command;
 use tak_core::summary_command;
 
 const MAX_OPEN_FILES: usize = 30;
+const BENCH_USAGE: &str = "tak_viewer --bench [frames] <file.tak|file.takm> [more files …] [--overlay FILE …] [--bench-select N] [--bench-hover] [--bench-emg] [--bench-trace] [--bench-workspace DIR] (up to 4 views, one overlay per view)";
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
@@ -210,7 +213,7 @@ fn main() -> eframe::Result<()> {
         let files: Vec<PathBuf> =
             rest.iter().skip(usize::from(frames.is_some())).map(|a| workspace::resolve_path(a)).collect();
         if files.is_empty() {
-            eprintln!("usage: tak_viewer --bench [frames] <file.tak> [more.tak …] [--overlay <b.tak> …] [--bench-select N] [--bench-hover] [--bench-emg] [--bench-trace] (up to 4 views, one overlay per view)");
+            eprintln!("usage: {BENCH_USAGE}");
             std::process::exit(2);
         }
         if let Err(error) = bench_load::validate_ui_count(files.len(), overlays.len()) {
@@ -287,7 +290,9 @@ fn main() -> eframe::Result<()> {
 
 /// Usage of every command, one place (each new command adds its text here).
 fn usage() -> String {
+    let bench_load_usage = bench_load::usage();
     [
+        "tak_viewer [file.tak|file.takm …]\ntak_viewer --help (-h)\ntak_viewer --version (-V)",
         capture::USAGE,
         shot_output::USAGE,
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
@@ -303,12 +308,18 @@ fn usage() -> String {
         "Headless Tracks merge: --merge-keys preview|up|down with --graph-layout tracks and --select A,B",
         "Headless playback: --working-range A-B and --reverse-playing",
         "GRAPH screenshot: --graph-fit-range, --graph-y-zoom N and --graph-lock NAME[,NAME…] with --graph-layout",
+        "Headless drop preview: --drop-preview x,y <incoming files …> last, with --screenshot",
+        BENCH_USAGE,
+        &bench_load_usage,
+        "tak_viewer --dump-device-signal FILE DEVICE CHANNEL CHAIN OUT.json\nDevice screenshot or benchmark: --device-chain DEVICE=CHAIN (repeat) --device-open DEVICE --device-bypass\nDevice grid: --device-grid CxR --device-cells CELLS --device-list folded --device-fill DEVICE --channel-names NAMES --device-drag DEVICE:CELL --device-pane-size WxH",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,
         tak_core::takm::USAGE,
         tak_core::takm::verify::USAGE,
         check_command::USAGE,
+        tak_core::dump::USAGE,
+        "tak_viewer --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]\ntak_viewer --headless --ssh-open ALIAS --ssh-path FILE --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]\n  --ssh-cancel-after-ms N   --ssh-stall-cancel-after-ms N   --ssh-dump OUT.json\n  --ssh-markers-only   --ssh-comment TEXT   --ssh-label unlabel   --ssh-save\ntak_viewer --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--ssh-workspace-expand]\nLocal SSH demo screenshot: --ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux",
     ]
     .join("\n\n")
 }

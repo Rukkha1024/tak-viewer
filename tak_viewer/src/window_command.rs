@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tak_core::{tak, takm};
 
-pub const USAGE: &str = "tak_viewer --only [--frame N] [--select A,B] [--comments] [--pick-comment K] <file> [<file2> …]
-tak_viewer --only [공통 옵션] --tab [--name 이름] [탭 옵션] <file> … [--tab …] (탭마다 최대 4개, 전체에서 서로 다른 파일 최대 30개)
+pub const USAGE: &str = "tak_viewer --only [--frame N] [--select A,B] [--comments | --no-comments] [--pick-comment K] <file> [<file2> …]
+tak_viewer --only [공통 옵션] [file …] --tab [--name 이름] [탭 옵션] <file> … [--tab …] (탭마다 최대 4개, 전체에서 서로 다른 파일 최대 30개)
 tak_viewer --only --from <tabs.json>
 tak_viewer --list-windows [--envelope]
 tak_viewer --list-windows --wait <pid> [--timeout 초]";

@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.65.1 — 2026-11-18
+
+- One reference for agent commands: syntax in the viewer README "Agent commands", outputs in `docs/cli-outputs.md`. Other guides link to them.
+- `--help` lists every option the parsers take. A unit test fails when help, README and the outputs table drift apart.
+
 ## v0.65.0 — 2026-11-18
 
 - Open named review tabs with `--only --tab` or `--only --from tabs.json`. One to four files per tab, 30 distinct files in all.

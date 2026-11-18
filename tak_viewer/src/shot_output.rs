@@ -18,6 +18,10 @@ pub const USAGE: &str =
   --scale N           자른 그림을 정수 배로 확대
   --crop-only         전체 PNG 생략. 자른 그림은 OUT.crop.png
   --regions           영역 좌표를 OUT.regions.json에 저장
+  --frame N   --select A,B   --select-visible   --plate INDEX|NAME   --range A-B
+  --overlay FILE (repeat)   --hide 1|2   --hover NAME
+  --comments   --pick-comment ID   --edit-comment ID[:markers|frames|comment|type]   --type-strip ID
+  --edit-tools   --edit-pattern   --edit-split   --edit-bottom   --menu-capture
 종료 코드: 0 완료, 1 실패, 2 인자 오류.";
 
 const PANELS: &[&str] = &[

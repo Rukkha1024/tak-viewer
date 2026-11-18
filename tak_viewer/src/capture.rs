@@ -12,9 +12,9 @@ use tak_core::tak::MarkerKind;
 use tak_core::view_data::ViewData;
 
 pub const USAGE: &str = "\
-tak_viewer --capture <file.tak> [options]      (WSL paths are fine)
-  --frames 600 | 100,200,300 | 100:1000:100 | even:5    frames (default even:5)
-  --views persp,top,side,front   angles (default). Also: bottom (= down), +x, -x, +z, -z, all
+tak_viewer --capture <file.tak|file.takm> [options]      (WSL paths are fine)
+  --frames 600 | 100,200,300 | 100:1000 | 100:1000:100 | even:5    frames (default even:5)
+  --views persp,top,side,front   angles (default). Alias: --view. Also: bottom (= down), +x, -x, +z, -z, all
           side  = looks across the walking direction (long horizontal axis of the whole take)
           front = looks along the walking direction; top / bottom = from above / below
   --select LKNE,RKNE   highlight markers (cyan = last, yellow = others)
