@@ -103,7 +103,6 @@ impl State {
     }
 
     /// Two selected marker indices, top to bottom. Merge Keys uses this row order.
-    #[allow(dead_code)]
     pub(crate) fn selected_pair(
         &self,
         data: &ViewData,
@@ -115,7 +114,7 @@ impl State {
         let order = self.order(data)?;
         let mut selected = selected.iter().copied();
         let [a, b] = [selected.next()?, selected.next()?];
-        let (ra, rb) = (order.row_by_marker.get(a)?, order.row_by_marker.get(b)?);
+        let (ra, rb) = (order.row(a)?, order.row(b)?);
         Some(if ra <= rb { [a, b] } else { [b, a] })
     }
 
@@ -269,10 +268,7 @@ pub(crate) fn show(
     let offset = match (primary, order) {
         (Some(m), Some(order)) if state.last_primary != primary_uid => {
             state.last_primary = primary_uid;
-            order
-                .row_by_marker
-                .get(m)
-                .and_then(|&row| reveal_offset(row, state.offset, height))
+            order.row(m).and_then(|row| reveal_offset(row, state.offset, height))
         }
         (None, _) => {
             state.last_primary = None;

@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.57.0 — 2026-11-18
+
+- GRAPH Tracks adds Merge Keys Up and Down. Move points between two selected rows in the edit range or whole take. Any shared frame blocks the move and shows count plus first frame. One undo restores both rows.
+
 ## v0.56.0 — 2026-11-18
 
 - GRAPH adds saved Channels / Tracks layouts. Tracks shows marker presence and gaps, links row picks to 3D and Labeling, and shares time controls and undo.

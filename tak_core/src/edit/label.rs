@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "merge_keys.rs"]
+mod merge_keys;
+pub use merge_keys::MergeRequest;
+
 /// The selected inclusive edit range, or the complete take when no range is set.
 #[derive(Clone, Debug)]
 pub enum LabelScope {
@@ -602,12 +606,17 @@ fn select_samples(
     }
     Ok((moved, retained))
 }
-fn merge_assignment_samples(
+struct Overlap {
+    first: u32,
+    count: usize,
+}
+
+fn merge_sorted_samples(
     existing: &[RawSample],
     moved: &[RawSample],
-) -> (Vec<RawSample>, Vec<RawSample>) {
+    mut collision: impl FnMut(RawSample, RawSample) -> Option<RawSample>,
+) -> Vec<RawSample> {
     let mut result = Vec::with_capacity(existing.len() + moved.len());
-    let mut displaced = Vec::new();
     let (mut a, mut b) = (0, 0);
     while a < existing.len() && b < moved.len() {
         match existing[a].frame().cmp(&moved[b].frame()) {
@@ -620,8 +629,7 @@ fn merge_assignment_samples(
                 b += 1;
             }
             std::cmp::Ordering::Equal => {
-                displaced.push(existing[a]);
-                result.push(moved[b]);
+                result.extend(collision(existing[a], moved[b]));
                 a += 1;
                 b += 1;
             }
@@ -629,7 +637,28 @@ fn merge_assignment_samples(
     }
     result.extend_from_slice(&existing[a..]);
     result.extend_from_slice(&moved[b..]);
-    (result, displaced)
+    result
+}
+
+fn merge_assignment_samples(
+    existing: &[RawSample],
+    moved: &[RawSample],
+) -> (Vec<RawSample>, Vec<RawSample>) {
+    let mut displaced = Vec::new();
+    let samples = merge_sorted_samples(existing, moved, |old, new| {
+        displaced.push(old);
+        Some(new)
+    });
+    (samples, displaced)
+}
+
+fn merged_samples(existing: &[RawSample], moved: &[RawSample]) -> Result<Vec<RawSample>, Overlap> {
+    let mut overlap = None;
+    let samples = merge_sorted_samples(existing, moved, |old, _| {
+        overlap.get_or_insert(Overlap { first: old.frame(), count: 0 }).count += 1;
+        None
+    });
+    overlap.map_or(Ok(samples), Err)
 }
 
 fn next_unlabeled_name(used_names: &HashSet<String>) -> String {
@@ -637,6 +666,19 @@ fn next_unlabeled_name(used_names: &HashSet<String>) -> String {
         .map(|n| format!("Unlabeled {n}"))
         .find(|name| !used_names.contains(name))
         .expect("available marker name")
+}
+
+fn source_change(input: &DocumentSnapshot, source: Arc<RawTrack>, retained: Vec<RawSample>) -> TrackChange {
+    let mut after = (*source).clone();
+    after.samples = retained.into();
+    // Original records must survive saving. A new empty Unlabeled track can be removed.
+    let remove = after.samples.is_empty() && source.label.is_none()
+        && input.input().is_some_and(|original| !original.tracks.iter().any(|t| t.uid == source.uid));
+    TrackChange {
+        uid: source.uid,
+        before: Some(source),
+        after: (!remove).then(|| Arc::new(after)),
+    }
 }
 // A malformed, provably different LabelGroup must not block creation for an unrelated parent.
 // A malformed group with an unreadable identity or the requested identity remains a rejection.
@@ -947,18 +989,7 @@ impl<'a> LabelEditor<'a> {
             first: moved[0].frame(),
             last: moved[moved.len() - 1].frame(),
         };
-        let mut source_after = (*source).clone();
-        source_after.samples = retained.into();
-        // Newly created empty unlabeled tracks have no on-disk identity to preserve.
-        // Removing them in the same patch keeps both undo and later saves exact.
-        let remove_empty_created = source_after.label.is_none()
-            && source_after.samples.is_empty()
-            && input.input().is_some_and(|original| !original.tracks.iter().any(|t| t.uid == source.uid));
-        let mut changes = vec![TrackChange {
-            uid: source.uid,
-            before: Some(source.clone()),
-            after: (!remove_empty_created).then(|| Arc::new(source_after)),
-        }];
+        let mut changes = vec![source_change(input, source, retained)];
         let mut displaced_count = 0;
         let (destination_uid, destination_name) = if let Some(uid) = destinations.first() {
             let destination = input
@@ -1201,8 +1232,10 @@ mod assignment_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::{DeclaredLabel, DocumentInput, EditDocument, StreamRef};
+    use crate::edit::{DeclaredLabel, DocumentInput, EditDocument, PreparedInput, StreamRef};
     use std::path::PathBuf;
+
+    include!("merge_keys_tests.rs");
 
     fn uid(n: u8) -> Uid {
         [n; 16]

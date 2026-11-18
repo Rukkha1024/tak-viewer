@@ -249,8 +249,12 @@ pub struct MarkerOrder {
 
 impl MarkerOrder {
     fn build(data: &ViewData) -> Self {
-        let indices: Vec<_> = data.groups.iter().flat_map(|group| group.members.iter().copied()).collect();
-        let mut row_by_marker = vec![0; data.markers.len()];
+        let indices: Vec<_> = data.groups.iter().flat_map(|group| group.members.iter().copied())
+            .filter(|&index| {
+                let marker = &data.markers[index];
+                marker.kind != MarkerKind::Unlabeled || marker.n_samples != 0
+            }).collect();
+        let mut row_by_marker = vec![usize::MAX; data.markers.len()];
         let mut marker_by_uid = HashMap::with_capacity(indices.len());
         let mut uids = Vec::with_capacity(indices.len());
         for (row, &marker) in indices.iter().enumerate() {
@@ -260,6 +264,10 @@ impl MarkerOrder {
             uids.push(uid);
         }
         Self { indices, uids, row_by_marker, marker_by_uid }
+    }
+
+    pub fn row(&self, marker: usize) -> Option<usize> {
+        self.row_by_marker.get(marker).copied().filter(|&row| row != usize::MAX)
     }
 }
 

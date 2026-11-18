@@ -32,6 +32,7 @@ mod comment_selection;
 mod capture;
 mod headless;
 mod instances;
+mod merge_keys;
 mod shot;
 mod label_increment;
 mod ssh;
@@ -123,6 +124,10 @@ fn main() -> eframe::Result<()> {
         args.retain(|a| a != "--headless");
     }
     if let Err(error) = ui::graph::tracks::parse_probe(&mut args) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
+    if let Err(error) = merge_keys::parse_probe(&mut args, headless) {
         eprintln!("{error}");
         std::process::exit(2);
     }
@@ -250,6 +255,7 @@ fn usage() -> String {
         "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         "GRAPH screenshot or benchmark: --graph-layout channels|tracks and --graph-zoom A-B",
+        "Headless Tracks merge: --merge-keys preview|up|down with --graph-layout tracks and --select A,B",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

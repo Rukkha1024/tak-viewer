@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc};
 use tak_core::edit::delete::{delete_samples, DeleteRequest};
 use tak_core::edit::fill::{FillMethod, FillRequest, FillScope as CoreFillScope, NumericalFill};
 use tak_core::edit::label::{
-    CreationStreams, LabelEditor, LabelRequest, LabelScope, UnlabelRequest,
+    CreationStreams, LabelEditor, LabelRequest, LabelScope, MergeRequest, UnlabelRequest,
 };
 use tak_core::edit::save::{self, FileVersion, SaveOutcome, SaveRequest, TakmSave};
 use tak_core::edit::smooth::{NumericalSmooth, SmoothRequest, SmoothScope as CoreSmoothScope};
@@ -95,6 +95,7 @@ pub(super) struct PreparedSession {
 #[derive(Clone)]
 enum MarkerCommand {
     Label { request: LabelRequest, keep_armed: bool },
+    Merge(MergeRequest),
     Unlabel(UnlabelRequest),
     Delete(DeleteRequest),
     Fill {
@@ -116,6 +117,7 @@ impl MarkerCommand {
     fn selection(&self) -> &EditSelection {
         match self {
             Self::Label { request, .. } => &request.selection,
+            Self::Merge(r) => &r.selection,
             Self::Unlabel(r) => &r.selection,
             Self::Delete(r) => &r.selection,
             Self::Fill { selection, .. } | Self::Smooth { selection, .. } => selection,
@@ -250,6 +252,15 @@ fn run_marker_command(
     command: MarkerCommand,
 ) -> Result<(Option<EditPatch>, String), String> {
     match command {
+        MarkerCommand::Merge(request) => {
+            let patch = LabelEditor::new().merge_keys(snapshot, &request).map_err(|error| match error {
+                EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
+                EditError::Other(message) => message,
+                _ => "이 파일의 마커 기록을 합칠 수 없어요.".into(),
+            })?;
+            let message = patch.result.message.clone();
+            Ok((Some(patch), message))
+        }
         MarkerCommand::Delete(request) => {
             let outcome = delete_samples(snapshot, &request).map_err(edit_error)?;
             Ok((outcome.patch, outcome.result.message))
@@ -1295,12 +1306,12 @@ impl TakViewerApp {
         }
     }
 
-    fn start_marker_command(&mut self, ctx: &egui::Context, slot: usize, command: MarkerCommand) {
-        self.views[slot].sync_shared();
-        let now = ctx.input(|i| i.time);
+    pub(super) fn marker_command_block(&self, slot: usize, allow_capture: bool) -> Option<&'static str> {
         let view = &self.views[slot];
-        let local_label_shot = matches!(&command, MarkerCommand::Label { .. }) && self.label_shot_in_progress(slot);
-        if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !local_label_shot)
+        if view.edit_document.is_none() || view.data.is_none() {
+            return Some("이 파일은 편집할 수 없어요.");
+        }
+        if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !allow_capture)
             || self.dirty_prompt.is_some()
             || self.hold.is_some()
             || self.comment_edit.is_some()
@@ -1311,13 +1322,31 @@ impl TakViewerApp {
             || self.marker_job_running(slot)
             || self.marker_saving(slot)
         {
-            self.takm_note = Some(("지금은 마커를 편집할 수 없어요.".into(), now));
-            return;
+            return Some("지금은 마커를 편집할 수 없어요.");
         }
         if view.analog_rx.is_some() || view.data.as_ref().is_some_and(|data| data.analog_pending) {
-            self.takm_note = Some(("파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요.".into(), now));
+            return Some("파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요.");
+        }
+        None
+    }
+
+    pub(super) fn merge_selected_keys(&mut self, ctx: &egui::Context, slot: usize, request: MergeRequest) {
+        self.start_marker_command(ctx, slot, MarkerCommand::Merge(request));
+    }
+
+    fn start_marker_command(&mut self, ctx: &egui::Context, slot: usize, command: MarkerCommand) {
+        self.views[slot].sync_shared();
+        let now = ctx.input(|i| i.time);
+        let allow_capture = match &command {
+            MarkerCommand::Label { .. } => self.label_shot_in_progress(slot),
+            MarkerCommand::Merge(_) => slot == self.active && self.merge_keys_capture(),
+            _ => false,
+        };
+        if let Some(reason) = self.marker_command_block(slot, allow_capture) {
+            self.takm_note = Some((reason.into(), now));
             return;
         }
+        let view = &self.views[slot];
         let Some(document) = view.edit_document.clone() else {
             return;
         };
@@ -1419,6 +1448,7 @@ impl TakViewerApp {
             return;
         };
         let selection = command.selection().clone();
+        let prepare_tracks = matches!(&command, MarkerCommand::Merge(_));
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
@@ -1434,6 +1464,9 @@ impl TakViewerApp {
                         ),
                         None => None,
                     };
+                    if let Some(view) = new_view.as_ref().filter(|_| prepare_tracks) {
+                        view.prepare_marker_order();
+                    }
                     trace_timing("edit view rebuild", rebuilding);
                     Ok(EditDone {
                         patch,
