@@ -52,9 +52,11 @@ fn delete_focus_clicked_graph_keeps_delete_when_pointer_moves_to_workspace() {
     let mut app = delete_focus_app(&ctx);
     let graph = app.views[0].graph_rect.unwrap().center();
     frame_with(&ctx, &mut app, delete_focus_click(graph));
+    let clicked = key_focus::target(&ctx);
     let workspace = place_of(&app, Pane::Explorer).center();
     frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(workspace), delete_focus_event()]);
-    assert!(app.marker_job_running(0), "clicked floating marker graph must own Delete across pointer movement");
+    assert!(app.marker_job_running(0), "clicked floating marker graph must own Delete across pointer movement (clicked: {clicked:?}, retained: {:?}, selected: {:?}, note: {:?})",
+        key_focus::target(&ctx), app.views[0].selected, app.takm_note);
 }
 
 #[test]

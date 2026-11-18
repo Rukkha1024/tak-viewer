@@ -20,6 +20,8 @@ use crate::window_command::{self, StartupView};
 
 #[path = "app_key_focus.rs"]
 pub(crate) mod key_focus;
+#[path = "app_graph_conveniences.rs"]
+mod graph_conveniences;
 
 #[path = "app_undo.rs"]
 mod undo;
@@ -2638,18 +2640,6 @@ impl TakViewerApp {
         if edit_keys_allowed && !key_focus::keys_blocked(ctx) && scene_modes::plain_scene_press(ctx, Key::L) {
             self.settings.scene.names = !self.settings.scene.names;
         }
-        let pointer = ctx.input(|input| input.pointer.hover_pos());
-        let fit_all = edit_keys_allowed && exact_key(ctx, Key::F, false, true, false);
-        let fit_selected = edit_keys_allowed && exact_key(ctx, Key::F, false, false, false);
-        if fit_all || fit_selected {
-            let slot = pointer.and_then(|p| self.open_views().into_iter().find(|&slot| {
-                let view = &self.views[slot];
-                view.scene_rect.contains(p) && !view.graph_rect.is_some_and(|r| r.contains(p)) && !view.plate_rect.is_some_and(|r| r.contains(p))
-            }));
-            if let Some(slot) = slot {
-                if fit_all { self.views[slot].fit_pending = true; } else { self.views[slot].focus_selected(); }
-            }
-        }
         let v = &mut self.views[self.active];
         // Consume keys before widgets so a focused button/slider never steals Space or arrows.
         let pressed = |key: Key| exact_key(ctx, key, false, false, false);
@@ -3301,7 +3291,7 @@ impl TakViewerApp {
             // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
             let (graphed, total) = panels::graphed(d, &v.selected, mi);
             // Plan step 9: the file laid over the view, dashed in the same lanes.
-            v.lanes.prepare_arc(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown, ui.ctx());
+            v.lanes.prepare_arc(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown, ui.ctx(), false);
             let (lanes, gaps, drawn) = v.lanes.get(d, v.file_id, &graphed);
             let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
             let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
@@ -3457,7 +3447,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
         if app.dirty_prompt.is_some() { ui.disable(); }
         let key_target = match *tab {
             Pane::View(slot) => key_focus::Target::Markers(usize::from(slot)),
-            Pane::Graph => key_focus::Target::Markers(app.active),
+            Pane::Graph => key_focus::Target::Graph(app.active),
             Pane::Comments => key_focus::Target::Comments,
             _ => key_focus::Target::Blocked,
         };
@@ -3566,24 +3556,10 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 panels::selected_pane(ui, d, frame, &v.selected, v.primary, v.measurement(app.settings.scene.measurements))
             }
             Pane::Graph => {
-                if graph::tracks::selector(ui, &mut app.settings.graph_layout) {
-                    self.action = Some(Action::GraphOver3d);
-                    return;
+                if let Some(action) = app.graph_tab(ui) {
+                    self.action = Some(action);
                 }
-                if app.settings.graph_layout == graph::tracks::Layout::Tracks {
-                    if let Some(action) = app.graph_tracks_tab(ui) {
-                        self.action = Some(action);
-                    }
-                    return;
-                }
-                // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
-                let (graphed, total) = v.primary.filter(|m| *m < d.markers.len()).map_or((vec![], 0), |mi| panels::graphed(d, &v.selected, mi));
-                // Plan step 9: the file laid over the view, dashed in the same lanes.
-                v.lanes.prepare_arc(d, v.file_id, &graphed, v.overlay.as_ref().map(|o| (o.path.as_path(), &o.data)), v.shown, ui.ctx());
-                // The Comment bands of the graphed markers (step 6).
-                let names: Vec<&str> = graphed.iter().map(|&k| d.markers[k].name.as_str()).collect();
-                let spans = v.comments.spans.get_many(&v.comments.list, v.file_id, &names, v.picked);
-                panels::graph_pane(ui, d, frame, &graphed, total, v.file_id, &mut v.lanes, spans, &mut v.range)
+                return;
             }
             Pane::Devices => {
                 ui.add_space(4.0);
@@ -4159,6 +4135,7 @@ impl TakViewerApp {
         if !self.desktop_hover.paths.is_empty() { self.paint_desktop_drop(ctx); }
         // Current click geometry and higher-priority widgets settle before destructive keys.
         key_focus::finish_frame(ctx);
+        self.graph_fit_keys(ctx);
         self.comment_list_keys(ctx);
         self.editor_list_keys(ctx);
         self.marker_focus_keys(ctx);
@@ -4434,6 +4411,7 @@ mod tests {
     include!("app_scene_selection_tests.rs");
     include!("app_graph_tracks_tests.rs");
     include!("app_merge_keys_tests.rs");
+    include!("app_graph_convenience_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
     include!("app_desktop_drop_tests.rs");

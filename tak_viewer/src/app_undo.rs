@@ -280,6 +280,11 @@ pub(super) enum Part {
     Range { file: PathBuf, before: Range, after: Range },
     PlaybackControls { file: PathBuf, before: PlaybackControls, after: PlaybackControls },
     Plate { file: PathBuf, before: Option<usize>, after: Option<usize> },
+    GraphLock {
+        file: PathBuf,
+        before: Option<crate::ui::graph::conveniences::LockedSelection>,
+        after: Option<crate::ui::graph::conveniences::LockedSelection>,
+    },
     Speed { file: PathBuf, before: f64, after: f64 },
     Folds { file: PathBuf, before: HashSet<FoldKey>, after: HashSet<FoldKey> },
     Channels { file: PathBuf, before: HashMap<usize, usize>, after: HashMap<usize, usize> },
@@ -337,6 +342,7 @@ impl Part {
             | Part::Range { file, .. }
             | Part::PlaybackControls { file, .. }
             | Part::Plate { file, .. }
+            | Part::GraphLock { file, .. }
             | Part::Speed { file, .. }
             | Part::Folds { file, .. }
             | Part::DeviceGrid { file, .. } | Part::Channels { file, .. }
@@ -533,6 +539,7 @@ impl History {
             Part::Range { .. } => "Range",
             Part::PlaybackControls { .. } => "PlaybackControls",
             Part::Plate { .. } => "Plate",
+            Part::GraphLock { .. } => "GraphLock",
             Part::Speed { .. } => "Speed",
             Part::Folds { .. } => "Folds",
             Part::Channels { .. } => "Channels",
@@ -637,7 +644,7 @@ impl TakViewerApp {
             for part in action {
                 match part.inner_mut() {
                     Part::Frame { file, .. } | Part::Camera { file, .. } | Part::Selection { file, .. } | Part::PanelSetting { file, .. }
-                    | Part::Range { file, .. } | Part::Plate { file, .. } | Part::Speed { file, .. }
+                    | Part::Range { file, .. } | Part::Plate { file, .. } | Part::GraphLock { file, .. } | Part::Speed { file, .. }
                     | Part::Folds { file, .. } | Part::DeviceGrid { file, .. } | Part::Channels { file, .. } | Part::Comment { file, .. } => {
                         if file == old { *file = new.to_path_buf(); }
                     }
@@ -1738,6 +1745,12 @@ impl TakViewerApp {
                     Some(p) => format!("Plate {}", p.name),
                     None => "Plate none".into(),
                 }
+            }
+            Part::GraphLock { before, after, .. } => {
+                let lock = pick(redo, before, after).clone();
+                let words = if lock.is_some() { "그래프 마커 고정" } else { "그래프 마커 고정 해제" };
+                self.views[k].graph_view.lock = lock;
+                words.into()
             }
             Part::Speed { before, after, .. } => {
                 let v = &mut self.views[k];

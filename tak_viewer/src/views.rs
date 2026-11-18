@@ -492,6 +492,7 @@ pub struct View {
     /// Lanes of the selected marker's graph and of the chosen plate's graph.
     pub lanes: LaneCache,
     pub(crate) tracks: crate::ui::graph::tracks::State,
+    pub(crate) graph_view: crate::ui::graph::conveniences::State,
     pub plate_lanes: PlateCache,
     /// Red marks of this view's timeline (playback bar).
     pub heat: HeatCache,
@@ -591,6 +592,7 @@ impl Default for View {
             comments_rx: None,
             labels: LabelsState::default(),
             tracks: Default::default(),
+            graph_view: Default::default(),
             devices: DevicesState::default(),
             filters: Arc::default(),
             lanes: LaneCache::default(),
@@ -1465,6 +1467,7 @@ impl View {
         self.comments = CommentState::default();
         self.fresh = true;
         self.file_id = file_id;
+        self.graph_view = Default::default();
         let path = &data.take.path;
         let restored = self.restore_edit_document.take().filter(|session| verified_restore || session.lock().ok().is_some_and(|doc| doc.source_path() == path || doc.save_path() == Some(path.as_path())));
         let restored_selection = if restored.is_some() { self.restore_edit_selection.take() } else { self.restore_edit_selection = None; None };

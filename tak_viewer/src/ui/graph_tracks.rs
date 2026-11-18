@@ -22,6 +22,7 @@ pub enum Layout {
     #[default]
     Channels,
     Tracks,
+    Combined,
 }
 
 impl Layout {
@@ -29,13 +30,14 @@ impl Layout {
         match self {
             Self::Channels => "Channels",
             Self::Tracks => "Tracks",
+            Self::Combined => "Combined",
         }
     }
 }
 
-pub(crate) fn selector(ui: &mut Ui, layout: &mut Layout) -> bool {
+pub(crate) fn selector(ui: &mut Ui, layout: &mut Layout, controls: impl FnOnce(&mut Ui, Layout)) -> bool {
     let mut over_3d = false;
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         if *layout == Layout::Tracks {
             over_3d = panels::over_3d_button(ui);
         }
@@ -44,12 +46,14 @@ pub(crate) fn selector(ui: &mut Ui, layout: &mut Layout) -> bool {
                 .width(95.0)
                 .selected_text(layout.name())
                 .show_ui(ui, |ui| {
-                    for choice in [Layout::Channels, Layout::Tracks] {
+                    for choice in [Layout::Channels, Layout::Tracks, Layout::Combined] {
                         ui.selectable_value(layout, choice, choice.name());
                     }
                 });
+            controls(ui, *layout);
         });
     });
+    crate::app::key_focus::region(ui, row.response.rect, crate::app::key_focus::Target::Blocked);
     over_3d
 }
 
@@ -69,7 +73,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn prepare(&mut self, data: &Arc<ViewData>, file_id: usize, ui: &Ui) {
+    pub(super) fn prepare(&mut self, data: &Arc<ViewData>, file_id: usize, ui: &Ui) {
         if self.file_id != Some(file_id) {
             self.file_id = Some(file_id);
             self.selection = ListSelectionState::default();
@@ -95,7 +99,7 @@ impl State {
         }
     }
 
-    fn order(&self, data: &ViewData) -> Option<&MarkerOrder> {
+    pub(super) fn order(&self, data: &ViewData) -> Option<&MarkerOrder> {
         let handle = self.order.as_ref()?;
         Arc::ptr_eq(handle, data.marker_order_handle())
             .then(|| handle.get())
@@ -479,14 +483,17 @@ pub(crate) fn show(
 pub(crate) struct Probe {
     pub layout: Layout,
     pub zoom: Option<(i64, i64)>,
+    pub fit_range: bool,
+    pub magnification: f64,
+    pub lock: Option<String>,
 }
 
 pub(crate) static PROBE: OnceLock<Probe> = OnceLock::new();
 
 pub(crate) fn parse_probe(args: &mut Vec<String>) -> Result<(), &'static str> {
     let Some(index) = args.iter().position(|a| a == "--graph-layout") else {
-        return if args.iter().any(|a| a == "--graph-zoom") {
-            Err("--graph-zoom은 --graph-layout과 함께 써요.")
+        return if args.iter().any(|a| matches!(a.as_str(), "--graph-zoom" | "--graph-fit-range" | "--graph-y-zoom" | "--graph-lock")) {
+            Err("그래프 확인 옵션은 --graph-layout과 함께 써요.")
         } else {
             Ok(())
         };
@@ -497,7 +504,8 @@ pub(crate) fn parse_probe(args: &mut Vec<String>) -> Result<(), &'static str> {
     let layout = match args.get(index + 1).map(String::as_str) {
         Some("channels") => Layout::Channels,
         Some("tracks") => Layout::Tracks,
-        _ => return Err("--graph-layout 뒤에 channels 또는 tracks를 써요."),
+        Some("combined") => Layout::Combined,
+        _ => return Err("--graph-layout 뒤에 channels, tracks, combined 중 하나를 써요."),
     };
     args.drain(index..index + 2);
     let zoom = if let Some(index) = args.iter().position(|a| a == "--graph-zoom") {
@@ -510,13 +518,39 @@ pub(crate) fn parse_probe(args: &mut Vec<String>) -> Result<(), &'static str> {
     } else {
         None
     };
-    let _ = PROBE.set(Probe { layout, zoom });
+    let fit_range = args.iter().position(|a| a == "--graph-fit-range").map(|index| args.remove(index)).is_some();
+    let magnification = if let Some(index) = args.iter().position(|a| a == "--graph-y-zoom") {
+        let by = args.get(index + 1).and_then(|a| a.parse::<f64>().ok())
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .ok_or("--graph-y-zoom 뒤에 0보다 큰 배율을 써요.")?;
+        args.drain(index..index + 2);
+        Some(by)
+    } else {
+        None
+    };
+    let lock = if let Some(index) = args.iter().position(|a| a == "--graph-lock") {
+        let names = args.get(index + 1).filter(|a| !a.starts_with("--") && !a.trim().is_empty())
+            .ok_or("--graph-lock 뒤에 마커 이름을 써요.")?.clone();
+        args.drain(index..index + 2);
+        Some(names)
+    } else {
+        None
+    };
+    if layout == Layout::Tracks && (magnification.is_some() || lock.is_some()) {
+        return Err("값 확대와 마커 고정은 Channels와 Combined에서 써요.");
+    }
+    let _ = PROBE.set(Probe { layout, zoom, fit_range, magnification: magnification.unwrap_or(1.0), lock });
     Ok(())
 }
 
 pub(crate) fn set_zoom(ctx: &egui::Context, file_id: usize, (a, b): (i64, i64), data: &ViewData) {
     let (a, b) = panels::ordered_range(a, b, data.start_frame, data.end_frame);
     ctx.data_mut(|d| d.insert_temp(graph_id(file_id), ViewRange::full(a, b)));
+}
+
+#[cfg(test)]
+pub(crate) fn zoom_extent(ctx: &egui::Context, file_id: usize) -> Option<(f64, f64)> {
+    ctx.data(|d| d.get_temp::<ViewRange>(graph_id(file_id))).map(|vr| (vr.lo, vr.hi))
 }
 
 #[cfg(test)]

@@ -49,6 +49,7 @@ impl TakViewerApp {
         if let (Some(zoom), Some(data)) = (probe.zoom, &self.view().data) {
             tracks::set_zoom(ctx, self.view().file_id, zoom, data);
         }
+        self.apply_graph_convenience_probe(ctx, probe);
     }
 
     pub(super) fn merge_keys_capture(&self) -> bool {

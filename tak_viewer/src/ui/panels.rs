@@ -305,6 +305,7 @@ struct MarkerJobKey {
     file_id: usize,
     source: usize,
     revision: Option<tak_core::edit::Revision>,
+    combined: bool,
     markers: Vec<usize>,
     overlay: Option<(PathBuf, usize)>,
 }
@@ -356,6 +357,7 @@ impl LaneCache {
         over: Option<(&Path, &std::sync::Arc<ViewData>)>,
         shown: [bool; 2],
         ctx: &egui::Context,
+        combined: bool,
     ) {
         if markers.is_empty() || markers.iter().any(|&mi| mi >= data.markers.len()) {
             return;
@@ -364,6 +366,7 @@ impl LaneCache {
             file_id,
             source: data.take.trajectories.first().map_or(std::sync::Arc::as_ptr(data) as usize, |t|t.xyz.as_ptr() as usize),
             revision: data.edit_revision,
+            combined,
             markers: markers.to_vec(),
             overlay: over.map(|(path, source)| {
                 (path.to_path_buf(), std::sync::Arc::as_ptr(source) as usize)
@@ -442,11 +445,25 @@ impl LaneCache {
                 } else {
                     data.markers[key.markers[0]].gaps.clone()
                 };
-                let names = key
+                let mut names: Vec<_> = key
                     .markers
                     .iter()
                     .map(|&mi| data.markers[mi].name.clone())
                     .collect();
+                if key.combined {
+                    let mut curves = graph::conveniences::combine(std::iter::once(lanes).chain(more));
+                    lanes = curves.next().unwrap();
+                    more = curves.collect();
+                    if let Some(p) = &mut pair {
+                        let mut curves = graph::conveniences::combine(
+                            std::iter::once(std::mem::take(&mut p.lanes)).chain(more_pairs),
+                        );
+                        p.lanes = curves.next().unwrap();
+                        more_pairs = curves.collect();
+                    }
+                    lanes[0].letter.clear();
+                    names = names.into_iter().flat_map(|name| [name.clone(), name.clone(), name]).collect();
+                }
                 let _ = tx.send(PreparedMarkers {
                     key,
                     lanes,
@@ -498,7 +515,6 @@ impl LaneCache {
             }
         }
         self.drawn.set_shown(shown);
-        self.drawn.set_hover_force(self.hover_at);
     }
 
     /// Includes both topology and the subsequent pixel-column thinning worker. The caller
@@ -592,7 +608,8 @@ impl LaneCache {
 
     pub fn get(&mut self, data: &ViewData, file_id: usize, markers: &[usize]) -> (&[Lane], &[(i64, i64)], &mut graph::Drawn) {
         if self.async_mode {
-            self.drawn.set_hover_force(self.hover_at);
+            let combined = self.async_key.as_ref().is_some_and(|key| key.combined);
+            self.drawn.set_hover_force(self.hover_at.map(|i| if combined { i * 3 + 1 } else { i }));
             return (&self.lanes, &self.gaps, &mut self.drawn);
         }
         let several = markers.len() > 1;
@@ -958,7 +975,7 @@ pub(super) fn over_3d_button(ui: &mut Ui) -> bool {
 /// colours; the mouse over a curve shows its marker's name, `graph::show`), and
 /// "선택 N개 중 8개" when some are left out.
 #[allow(clippy::too_many_arguments)]
-pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], total: usize, file_id: usize, cache: &mut LaneCache, spans: &[graph::Span], selection: &mut Option<(i64, i64)>) -> Option<Action> {
+pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], total: usize, file_id: usize, cache: &mut LaneCache, spans: &[graph::Span], selection: &mut Option<(i64, i64)>, combined: bool, zoom: Option<&mut graph::conveniences::ValueZoom>) -> Option<Action> {
     let Some(mi) = markers.first().copied().filter(|m| *m < data.markers.len()) else {
         ui.add_space(4.0);
         let mut over = false;
@@ -971,13 +988,16 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
     let m = &data.markers[mi];
     let (lanes, gaps, drawn) = cache.get(data, file_id, markers);
     const HINT_H: f32 = 22.0;
-    let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lanes.len().max(1) as f32).clamp(34.0, 140.0);
+    let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lanes.len().max(1) as f32).clamp(34.0, if combined { 420.0 } else { 140.0 });
     let look = Look::pane();
-    let goto = graph::show_select(ui, graph::tracks::graph_id(file_id), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection);
+    let goto = graph::show_select(ui, graph::tracks::graph_id(file_id), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection, zoom);
     let mut over = false;
     let keys = graph_keys(data, markers, frame);
     let footer = ui.horizontal(|ui| {
         over = over_3d_button(ui);
+        if combined {
+            graph::conveniences::axis_legend(ui);
+        }
         let color = if m.present(frame) { theme::LABEL_TRACKED } else { theme::LABEL_UNTRACKED };
         if keys.is_empty() {
             ui.label(RichText::new(&m.name).small().strong().color(color));
@@ -992,7 +1012,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
         if total > markers.len() {
             ui.label(RichText::new(left_out_text(markers.len(), total)).small().color(theme::TEXT));
         }
-        ui.label(RichText::new("· 선 위에 마우스 = 마커 이름 · 클릭 = 프레임 이동 · 드래그 = 구간 선택 · 휠 = 확대 · 가운데 드래그 = 옆으로 · 더블클릭 = 전체 · 아래 빨간 칸 = 빈 구간").small().color(theme::TEXT_DIM));
+        ui.label(RichText::new("· 드래그 = 구간 선택 · 오른쪽 드래그 = 값 확대 · 휠 = 시간 확대").small().color(theme::TEXT_DIM));
     });
     crate::app::key_focus::region(ui, footer.response.rect, crate::app::key_focus::Target::Blocked);
     if over {
@@ -2174,13 +2194,13 @@ mod deck_tests {
         let expected_pair = expected.pair_now().unwrap().lanes.clone();
         let ctx = egui::Context::default();
         let mut actual = LaneCache::default();
-        actual.prepare_arc(&data, 7, &order[..1], Some((path, &other)), [true, true], &ctx);
-        actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx);
+        actual.prepare_arc(&data, 7, &order[..1], Some((path, &other)), [true, true], &ctx, false);
+        actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx, false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while actual.built() != (3, 3) {
             assert!(std::time::Instant::now() < deadline, "marker worker must publish");
             std::thread::sleep(std::time::Duration::from_millis(1));
-            actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx);
+            actual.prepare_arc(&data, 7, &order, Some((path, &other)), [true, false], &ctx, false);
         }
         let (lanes, gaps, drawn) = actual.get(&data, 7, &order);
         assert_eq!(gaps, expected_gaps);

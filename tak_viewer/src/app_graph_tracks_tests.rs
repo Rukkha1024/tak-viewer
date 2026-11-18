@@ -119,7 +119,7 @@ fn tracks_row_click_moves_ctrl_a_focus_out_of_the_3d_view() {
     let green = egui::Color32::from_rgb(0x48, 0xb4, 0x67);
     let row = graph_selection_fill_rects(&out, green)[0].center();
     click_at(&ctx, &mut app, row);
-    assert_eq!(key_focus::target(&ctx), key_focus::Target::Markers(0));
+    assert_eq!(key_focus::target(&ctx), key_focus::Target::Graph(0));
     assert_eq!(app.views[0].ordered_selection(), [1]);
     frame_with(&ctx, &mut app, vec![key_event(Key::A, true, ctrl())]);
     assert_eq!(app.views[0].ordered_selection(), [1]);

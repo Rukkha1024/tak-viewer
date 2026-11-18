@@ -8,6 +8,7 @@ pub(crate) enum Target {
     Blocked,
     Scene(usize),
     Markers(usize),
+    Graph(usize),
     NamedMarkers(usize),
     UnlabeledMarkers(usize),
     Comments,
@@ -138,7 +139,7 @@ impl TakViewerApp {
         if !matches!(focus, Target::Comments | Target::Editors)
             && exact_key(ctx, Key::Delete, false, false, false) {
             let slot = match focus {
-                Target::Markers(slot) | Target::Scene(slot) | Target::NamedMarkers(slot) | Target::UnlabeledMarkers(slot) => Some(slot),
+                Target::Markers(slot) | Target::Scene(slot) | Target::Graph(slot) | Target::NamedMarkers(slot) | Target::UnlabeledMarkers(slot) => Some(slot),
                 _ => None,
             };
             if let Some(slot) = slot.filter(|slot| self.open_views().contains(slot)

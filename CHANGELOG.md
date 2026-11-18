@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.59.0 — 2026-11-18
+
+- GRAPH. Right-drag to zoom a lane’s values. `Auto Extents` resets the scale. `Zoom Fit` or `F` fits the yellow range. `Shift+F` fits the whole take.
+- Add `Combined` for X/Y/Z on one scale and `Lock Selection` to pin the marker set while inspecting other markers.
+
 ## v0.58.0 — 2026-11-18
 
 - Add per-view green playback bounds. Drag or type endpoints. Reset with `전체 구간` or Shift+either bracket. Keep yellow edit range and plain brackets.

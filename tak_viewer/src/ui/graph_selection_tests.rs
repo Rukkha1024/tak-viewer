@@ -11,7 +11,7 @@ impl HoverGraph {
         let mut goto = None;
         let out = self.ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                goto = super::show_select(ui, egui::Id::new("g"), &self.lanes, 0, 3999, 2000, &[], 100.0, &super::Look::pane(), Some(&mut self.drawn), &[], range);
+                goto = super::show_select(ui, egui::Id::new("g"), &self.lanes, 0, 3999, 2000, &[], 100.0, &super::Look::pane(), Some(&mut self.drawn), &[], range, None);
             });
             if let Some(cover) = cover {
                 egui::Area::new(egui::Id::new("graph_cover")).order(egui::Order::Foreground).fixed_pos(cover.min).show(ctx, |ui| {

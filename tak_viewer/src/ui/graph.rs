@@ -4,6 +4,8 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, Se
 
 #[path = "graph_tracks.rs"]
 pub(crate) mod tracks;
+#[path = "graph_conveniences.rs"]
+pub(crate) mod conveniences;
 
 #[derive(Clone)]
 pub struct Lane {
@@ -1261,7 +1263,7 @@ pub fn show(
     cache: Option<&mut Drawn>,
     spans: &[Span],
 ) -> Option<i64> {
-    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, None)
+    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, None, None)
 }
 
 /// GRAPH panel, including its detached window: a click moves the frame; a primary drag
@@ -1281,8 +1283,9 @@ pub fn show_select(
     cache: Option<&mut Drawn>,
     spans: &[Span],
     range: &mut Option<(i64, i64)>,
+    value_zoom: Option<&mut conveniences::ValueZoom>,
 ) -> Option<i64> {
-    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, Some(range))
+    show_inner(ui, id, lanes, first, last, frame, gaps, lane_h, look, cache, spans, Some(range), value_zoom)
 }
 
 const RANGE_DRAG_THRESHOLD: f32 = 4.0;
@@ -1361,6 +1364,7 @@ fn show_inner(
     cache: Option<&mut Drawn>,
     spans: &[Span],
     mut range: Option<&mut Option<(i64, i64)>>,
+    mut value_zoom: Option<&mut conveniences::ValueZoom>,
 ) -> Option<i64> {
     let full = ViewRange::full(first, last);
     let mut vr = ViewRange::load(ui, id, full);
@@ -1384,6 +1388,16 @@ fn show_inner(
     });
     let pan = if resp.dragged_by(egui::PointerButton::Middle) { resp.drag_delta().x } else { 0.0 };
     vr.navigate(full, plot, zoom, pan);
+    if let Some(zoom) = value_zoom.as_deref_mut().filter(|_|
+        ui.is_enabled() && resp.dragged_by(egui::PointerButton::Secondary)
+            && ui.input(|i| i.modifiers.is_none()) && !crate::app::key_focus::keys_blocked(ui.ctx())) {
+        if let Some(origin) = ui.input(|i| i.pointer.press_origin()).filter(|p| plot.contains(*p)) {
+            let lane = ((origin.y - plot.top()) / lane_h) as usize;
+            if lane < lanes.len() {
+                zoom.drag(lane, resp.drag_delta().y);
+            }
+        }
+    }
     let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
         select_drag(ui, &resp, id, plot, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
     });
@@ -1467,7 +1481,10 @@ fn show_inner(
     // Each lane's place, its value range and where its frames and values are on screen (`Map`),
     // worked out before painting: the hover (v0.29.0) needs them first.
     let lane_rect = |li: usize| Rect::from_min_size(pos2(plot.left(), plot.top() + li as f32 * lane_h), vec2(plot.width(), lane_h));
-    let ranges: Vec<(f64, f64)> = (0..lanes.len().min(drawn.lanes.len())).map(|li| lane_range(drawn, li)).collect();
+    let ranges: Vec<(f64, f64)> = (0..lanes.len().min(drawn.lanes.len())).map(|li| {
+        let bounds = lane_range(drawn, li);
+        value_zoom.as_ref().map_or(bounds, |zoom| zoom.bounds(li, bounds))
+    }).collect();
     let maps: Vec<Option<Map>> = ranges
         .iter()
         .enumerate()
