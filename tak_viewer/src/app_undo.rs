@@ -175,6 +175,7 @@ fn layout_range(v: &View, shown: Range) -> Range {
 pub(super) struct Options {
     scene: SceneOptions,
     graph_float: bool,
+    graph_layout: crate::ui::graph::tracks::Layout,
     opacity: u8,
     graph_boxes: Vec<GraphBox>,
     plate_boxes: Vec<GraphBox>,
@@ -190,6 +191,7 @@ impl Options {
         Options {
             scene: s.scene.clone(),
             graph_float: s.graph_float,
+            graph_layout: s.graph_layout,
             opacity: s.graph_opacity,
             graph_boxes: s.graph_boxes.clone(),
             plate_boxes: s.plate_boxes.clone(),
@@ -204,6 +206,7 @@ impl Options {
     fn same(&self, s: &Settings) -> bool {
         self.scene == s.scene
             && self.graph_float == s.graph_float
+            && self.graph_layout == s.graph_layout
             && self.opacity == s.graph_opacity
             && self.graph_boxes == s.graph_boxes
             && self.plate_boxes == s.plate_boxes
@@ -1644,6 +1647,7 @@ impl TakViewerApp {
                 if from.device_layouts != to.device_layouts { s.device_layouts = to.device_layouts.clone(); }
                 if from.scene != to.scene { s.scene = to.scene.clone(); }
                 if from.graph_float != to.graph_float { s.graph_float = to.graph_float; }
+                if from.graph_layout != to.graph_layout { s.graph_layout = to.graph_layout; }
                 if from.opacity != to.opacity { s.graph_opacity = to.opacity; }
                 if from.graph_boxes != to.graph_boxes { s.graph_boxes = to.graph_boxes.clone(); }
                 if from.plate_boxes != to.plate_boxes { s.plate_boxes = to.plate_boxes.clone(); }

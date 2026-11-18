@@ -56,6 +56,8 @@ mod desktop_drop;
 mod window_launch;
 #[path = "app_scene_modes.rs"]
 mod scene_modes;
+#[path = "app_graph_tracks.rs"]
+mod graph_tracks;
 use crate::workspace::{self, AddRoot, Workspace, MAX_ROOTS};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use egui_dock::{DockArea, DockState};
@@ -199,6 +201,7 @@ pub struct Settings {
     pub channel_names: crate::device_grid::ChannelNames,
     pub(crate) labeling_increment: crate::label_increment::IncrementMode,
     pub(crate) labeling_link: bool,
+    pub graph_layout: graph::tracks::Layout,
 }
 
 impl Default for Settings {
@@ -231,6 +234,7 @@ impl Default for Settings {
             channel_names: Default::default(),
             labeling_increment: Default::default(),
             labeling_link: false,
+            graph_layout: graph::tracks::Layout::default(),
         }
     }
 }
@@ -1432,6 +1436,7 @@ impl TakViewerApp {
                 if auto.menu_capture {
                     self.start_menu_capture();
                 }
+                self.apply_graph_probe(ctx);
                 // Text drawn while several files load depends on timing and decides where later
                 // glyphs sit in the font atlas, which moves edge pixels of text by 1/255. Now that
                 // every file is in, the atlas is made again (plain fonts for one frame, then ours),
@@ -2838,7 +2843,7 @@ impl TakViewerApp {
                         (Pane::Selected, "선택 마커"),
                         (Pane::Devices, "Devices"),
                         (Pane::Comments, "Comments 목록"),
-                        (Pane::Graph, "Graph 패널 (선택 마커 X·Y·Z, 3D 아래)"),
+                        (Pane::Graph, "Graph 패널 (마커 그래프, 3D 아래)"),
                     ] {
                         let mut on = dock::has(&self.dock, pane);
                         if ui.checkbox(&mut on, label).changed() {
@@ -3541,6 +3546,16 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 panels::selected_pane(ui, d, frame, &v.selected, v.primary, v.measurement(app.settings.scene.measurements))
             }
             Pane::Graph => {
+                if graph::tracks::selector(ui, &mut app.settings.graph_layout) {
+                    self.action = Some(Action::GraphOver3d);
+                    return;
+                }
+                if app.settings.graph_layout == graph::tracks::Layout::Tracks {
+                    if let Some(action) = app.graph_tracks_tab(ui) {
+                        self.action = Some(action);
+                    }
+                    return;
+                }
                 // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
                 let (graphed, total) = v.primary.filter(|m| *m < d.markers.len()).map_or((vec![], 0), |mi| panels::graphed(d, &v.selected, mi));
                 // Plan step 9: the file laid over the view, dashed in the same lanes.
@@ -4394,6 +4409,7 @@ mod tests {
     include!("app_merge_tests.rs");
     include!("app_graph_selection_tests.rs");
     include!("app_scene_selection_tests.rs");
+    include!("app_graph_tracks_tests.rs");
     include!("app_empty_ui_tests.rs");
     include!("app_close_tests.rs");
     include!("app_desktop_drop_tests.rs");
@@ -11881,8 +11897,7 @@ mod tests {
         app.views[0].select_many((0..12).collect(), Some(11), false);
         for float in [true, false] {
             app.set_graph_float(float);
-            frame_with(&ctx, &mut app, vec![]);
-            frame_with(&ctx, &mut app, vec![]);
+            wait_marker_graphs(&ctx, &mut app);
             let d = app.views[0].lanes.drew().clone();
             assert_eq!(d.colors, vec![vec![theme::AXIS_X; 8], vec![theme::AXIS_Y; 8], vec![theme::AXIS_Z; 8]], "float {float}");
             let (lo, hi) = d.ranges[0];

@@ -122,6 +122,10 @@ fn main() -> eframe::Result<()> {
     if headless {
         args.retain(|a| a != "--headless");
     }
+    if let Err(error) = ui::graph::tracks::parse_probe(&mut args) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     if args.iter().any(|a| a == "--bench-load") {
         let files = match bench_load::parse(&args[1..]) {
             Ok(files) => files.iter().map(|p| workspace::resolve_path(&p.to_string_lossy())).collect(),
@@ -245,6 +249,7 @@ fn usage() -> String {
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",
         "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
+        "GRAPH screenshot or benchmark: --graph-layout channels|tracks and --graph-zoom A-B",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

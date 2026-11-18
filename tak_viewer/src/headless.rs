@@ -227,6 +227,7 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         if markers.is_some() && !st.analog_pending && !st.overlay_pending {
             analog = Some(ms(opened));
             plate_views = app.bench_play(start.elapsed().as_secs_f64());
+            app.apply_graph_probe(&ctx);
             if BENCH_EMG.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Err(reason) = require_deferred_emg(&st) {
                     eprintln!("bench: {reason}");
@@ -246,6 +247,9 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     let st = app.bench_state();
     let stats = |v: &[f64]| (v.iter().sum::<f64>() / v.len().max(1) as f64, v.iter().cloned().fold(0.0, f64::max));
     println!("bench: {} file(s), window {}x{}", st.views.len(), size[0], size[1]);
+    if let Some(probe) = crate::ui::graph::tracks::PROBE.get() {
+        println!("  docked GRAPH layout: {:?}", probe.layout);
+    }
     if crate::device_grid::PROBE.get().is_some_and(|p|p.size.is_some()) {
         let (cells, filtered) = app.bench_grid_cells();
         println!("  device grid: {cells} graph cells prepared, {filtered} with completed filter output");
@@ -277,8 +281,13 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
         1 => "first marker selected".to_owned(),
         n => format!("first {n} markers selected, --bench-select"),
     };
+    let marker_graph = if crate::ui::graph::tracks::PROBE.get().is_some() {
+        "docked marker graph for the active view"
+    } else {
+        "floating marker graph in every view"
+    };
     println!(
-        "  playing with floating graphs: marker graph in every view ({selected}), plate graph in {plate_views} of {} view(s) (first force plate chosen)",
+        "  playing: {marker_graph} ({selected}), floating plate graph in {plate_views} of {} view(s) (first force plate chosen)",
         st.views.len()
     );
     if BENCH_HOVER.load(std::sync::atomic::Ordering::Relaxed) {

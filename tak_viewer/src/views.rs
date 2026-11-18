@@ -490,6 +490,7 @@ pub struct View {
     pub filters: crate::device_filter::SharedFilters,
     /// Lanes of the selected marker's graph and of the chosen plate's graph.
     pub lanes: LaneCache,
+    pub(crate) tracks: crate::ui::graph::tracks::State,
     pub plate_lanes: PlateCache,
     /// Red marks of this view's timeline (playback bar).
     pub heat: HeatCache,
@@ -587,6 +588,7 @@ impl Default for View {
             restore_range: None,
             comments_rx: None,
             labels: LabelsState::default(),
+            tracks: Default::default(),
             devices: DevicesState::default(),
             filters: Arc::default(),
             lanes: LaneCache::default(),

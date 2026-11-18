@@ -273,12 +273,23 @@ pub fn sample_tak_with_devices() -> Vec<u8> {
 
 /// The device fixture with the unnamed track sampled in a caller-selected range.
 pub fn sample_tak_with_unlabeled_frames(frames: std::ops::Range<u32>) -> Vec<u8> {
+    sample_with_device_layout(false, frames)
+}
+
+/// Same samples with the counted marker suffix required for creating trajectories.
+#[cfg(test)]
+pub(crate) fn sample_tak_with_verified_marker_suffix() -> Vec<u8> {
+    sample_with_device_layout(true, 50..60)
+}
+
+fn sample_with_device_layout(verified_marker_suffix: bool, frames: std::ops::Range<u32>) -> Vec<u8> {
     let text = |out: &mut Vec<u8>, value: &str| {
         out.extend((value.encode_utf16().count() as u16).to_le_bytes());
         out.extend(utf16(value));
     };
     let asset = [4u8; 16];
-    let mut nodes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let mut nodes = if verified_marker_suffix { vec![2, 5, 0, 0, 0] } else { vec![1, 2, 3, 4, 5, 6, 7, 8] };
+    let mut marker_nodes = Vec::new();
     for (name, uid) in [("LKNE", 1u8), ("RKNE", 2), ("Unl", 3)] {
         let mut marker = marker_node(name, uid);
         if uid < 3 {
@@ -286,8 +297,9 @@ pub fn sample_tak_with_unlabeled_frames(frames: std::ops::Range<u32>) -> Vec<u8>
             marker[n - 20..n - 4].copy_from_slice(&asset);
             marker[n - 4..].copy_from_slice(&(uid as u32).to_le_bytes());
         }
-        nodes.extend(marker);
+        marker_nodes.extend(marker);
     }
+    if !verified_marker_suffix { nodes.append(&mut marker_nodes); }
     nodes.extend(b"\x08\x00Skeleton");
     text(
         &mut nodes,
@@ -357,6 +369,7 @@ pub fn sample_tak_with_unlabeled_frames(frames: std::ops::Range<u32>) -> Vec<u8>
 {"name":"DeviceNode_Corner 2","value":"1,0,3"},
 {"name":"DeviceNode_Corner 3","value":"0,0,3"}]}"#,
     ));
+    nodes.append(&mut marker_nodes);
     let mut recs: Vec<Vec<u8>> = (0..6).map(|n| analog(n, 300)).collect();
     recs.extend([analog(0, 300), analog(1, 300)]);
     recs.extend([

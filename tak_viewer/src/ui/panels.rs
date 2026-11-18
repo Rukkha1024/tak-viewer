@@ -945,7 +945,7 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
 }
 
 /// GRAPH pane button: put the graph back over the 3D views (`graph_float.rs`).
-fn over_3d_button(ui: &mut Ui) -> bool {
+pub(super) fn over_3d_button(ui: &mut Ui) -> bool {
     ui.add(egui::Button::new(RichText::new("3D 위로").small()).small()).on_hover_text("그래프를 3D 화면 위에 띄워요. 이 패널은 닫혀요.").clicked()
 }
 
@@ -973,7 +973,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
     const HINT_H: f32 = 22.0;
     let lane_h = ((ui.available_height() - graph::NAV_H - HINT_H) / lanes.len().max(1) as f32).clamp(34.0, 140.0);
     let look = Look::pane();
-    let goto = graph::show_select(ui, Id::new(("sel_graph", file_id)), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection);
+    let goto = graph::show_select(ui, graph::tracks::graph_id(file_id), lanes, data.start_frame, data.end_frame, frame, gaps, lane_h, &look, Some(drawn), spans, selection);
     let mut over = false;
     let keys = graph_keys(data, markers, frame);
     let footer = ui.horizontal(|ui| {

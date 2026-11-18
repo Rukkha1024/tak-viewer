@@ -224,14 +224,15 @@ fn delete_focus_graph_name_tag_footer_and_overlay_legends_block_marker_delete() 
                 ));
                 app.views[0].shown = [true, true];
             }
-            let mut out = frame_with(&ctx, &mut app, vec![]);
-            for _ in 0..3 { out = frame_with(&ctx, &mut app, vec![]); }
+            wait_marker_graphs(&ctx, &mut app);
+            let out = frame_with(&ctx, &mut app, vec![]);
             let bounds = if floating { app.views[0].graph_rect.unwrap() }
                 else { place_of(&app, Pane::Graph) };
             let at = if overlay_legend {
                 assert!(app.views[0].lanes.drew().legend, "line-style legend must be drawn");
+                let legends = graph_selection_fill_rects(&out, egui::Color32::from_black_alpha(120));
                 text_rects(&out, "1").into_iter().filter(|rect| bounds.contains(rect.center())
-                    && rect.center().y < bounds.top() + 60.0)
+                    && legends.iter().any(|legend| legend.contains(rect.center())))
                     .max_by(|a, b| a.center().x.total_cmp(&b.center().x)).expect("overlay curve legend 1").center()
             } else {
                 text_rects(&out, "M").into_iter().find(|rect| bounds.contains(rect.center()))

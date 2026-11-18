@@ -8,7 +8,7 @@ use crate::edit::{DocumentSnapshot, EditError, Revision};
 use crate::marker_sets;
 use crate::tak::{uid_hex, AnalogChannel, AnalogDevice, DeviceSampling, ForcePlate, MarkerKind, Take, Trajectory, Uid};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Where a marker / group / stick color comes from. The viewer (`ui/theme.rs`) picks the
 /// actual screen color, so the core never depends on the GUI.
@@ -52,7 +52,7 @@ pub struct MarkerView {
     pub gaps: Vec<(i64, i64)>,
     pub max_gap: i64,
     /// Present runs (`src/trajectory.py` `segments`).
-    pub segments: Vec<(i64, i64)>,
+    pub segments: SharedVec<(i64, i64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +236,31 @@ pub struct ViewData {
     analog_generation: u64,
     /// Marker revision used to build this view; None for the initial read-only display.
     pub edit_revision: Option<Revision>,
+    marker_order: Arc<OnceLock<MarkerOrder>>,
+}
+
+/// Marker indices in Labeling order, with constant-time row and UID lookup.
+pub struct MarkerOrder {
+    pub indices: Vec<usize>,
+    pub uids: Vec<Uid>,
+    pub row_by_marker: Vec<usize>,
+    pub marker_by_uid: HashMap<Uid, usize>,
+}
+
+impl MarkerOrder {
+    fn build(data: &ViewData) -> Self {
+        let indices: Vec<_> = data.groups.iter().flat_map(|group| group.members.iter().copied()).collect();
+        let mut row_by_marker = vec![0; data.markers.len()];
+        let mut marker_by_uid = HashMap::with_capacity(indices.len());
+        let mut uids = Vec::with_capacity(indices.len());
+        for (row, &marker) in indices.iter().enumerate() {
+            let uid = data.markers[marker].uid;
+            row_by_marker[marker] = row;
+            marker_by_uid.entry(uid).or_insert(marker);
+            uids.push(uid);
+        }
+        Self { indices, uids, row_by_marker, marker_by_uid }
+    }
 }
 
 /// Frame range and plates of a `ViewData` (`ViewData::analog_target`).
@@ -361,7 +386,7 @@ struct Track {
     in_range: usize,
     gaps: Vec<(i64, i64)>,
     max_gap: i64,
-    segments: Vec<(i64, i64)>,
+    segments: SharedVec<(i64, i64)>,
 }
 
 fn union(a: Option<(Vec3, Vec3)>, b: Option<(Vec3, Vec3)>) -> Option<(Vec3, Vec3)> {
@@ -374,7 +399,7 @@ fn union(a: Option<(Vec3, Vec3)>, b: Option<(Vec3, Vec3)>) -> Option<(Vec3, Vec3
     }
 }
 
-fn track(t: &Trajectory, start: i64, end: i64, scale: f32) -> Track {
+fn track(t: &Trajectory, start: i64, end: i64, scale: f32, runs: Option<&SharedVec<(i64, i64)>>) -> Track {
     let span = match (t.frames.first(), t.frames.last()) {
         (Some(&a), Some(&b)) => Some((a as i64, b as i64)),
         _ => None,
@@ -392,10 +417,17 @@ fn track(t: &Trajectory, start: i64, end: i64, scale: f32) -> Track {
             }
         }
     }
+    let segments = runs.cloned().unwrap_or_else(|| segments(&t.frames).into());
+    let mut cursor = start;
+    let mut gap_list = Vec::new();
+    for &(first, last) in segments.iter().skip_while(|&&(_, last)| last < start).take_while(|&&(first, _)| first <= end) {
+        if cursor < first { gap_list.push((cursor, first - 1)); }
+        cursor = last + 1;
+    }
+    if cursor <= end { gap_list.push((cursor, end)); }
     let in_range = t.frames.iter().filter(|&&f| start <= f as i64 && f as i64 <= end).count();
-    let gap_list = gaps(&t.frames, start, end);
     let max_gap = gap_list.iter().map(|(a, b)| b - a + 1).max().unwrap_or(0);
-    Track { span, dense: dense.into(), bounds, in_range, gaps: gap_list, max_gap, segments: segments(&t.frames) }
+    Track { span, dense: dense.into(), bounds, in_range, gaps: gap_list, max_gap, segments }
 }
 
 /// Preserve the original finite-value summation order without allocating one vector per row.
@@ -492,6 +524,10 @@ impl ViewData {
     }
 
     pub fn build_with_plate_devices(take: Take, plate_devices: Option<Vec<usize>>) -> ViewData {
+        Self::build_with_previous_markers(take, plate_devices, None)
+    }
+
+    fn build_with_previous_markers(take: Take, plate_devices: Option<Vec<usize>>, previous: Option<&Self>) -> ViewData {
         let start = take.start_frame;
         let end = take.end_frame.max(start);
         let frame_count = (end - start + 1) as f32;
@@ -533,7 +569,13 @@ impl ViewData {
         let mut other_parent_groups: HashMap<Uid, usize> = HashMap::new();
 
         // Per-trajectory tables on several threads; groups and colors below in file order.
-        let tracks = crate::par::par_map(&take.trajectories, |t| track(t, start, end, scale));
+        let previous_tracks: HashMap<_, _> = previous.into_iter().flat_map(|data|
+            data.markers.iter().map(|marker| (marker.uid, (&data.take.trajectories[marker.traj].frames, &marker.segments)))
+        ).collect();
+        let tracks = crate::par::par_map(&take.trajectories, |t| {
+            let runs = previous_tracks.get(&t.uid).filter(|(frames, _)| t.frames.shares_storage(frames)).map(|(_, runs)| *runs);
+            track(t, start, end, scale, runs)
+        });
         let mut markers = Vec::with_capacity(take.trajectories.len());
         let mut bounds: Option<(Vec3, Vec3)> = None;
         let mut bounds_all: Option<(Vec3, Vec3)> = None;
@@ -744,26 +786,33 @@ impl ViewData {
             plate_devices,
             analog_generation: 0,
             edit_revision: None,
+            marker_order: Arc::new(OnceLock::new()),
         }
     }
+
+    /// Clones and analog attachment share the lazy index. Marker rebuilds start a new index.
+    pub fn marker_order_handle(&self) -> &Arc<OnceLock<MarkerOrder>> { &self.marker_order }
+
+    /// First initialization scans marker metadata. Call on a worker.
+    pub fn prepare_marker_order(&self) { self.marker_order.get_or_init(|| MarkerOrder::build(self)); }
 
     /// Rebuild marker-derived display data from an immutable document snapshot. Run on a worker
     /// with an owned Take whose analog stage is complete. Publication must check the revision.
     /// The initial fast open does not call this and does not copy an editable document.
     pub fn rebuild_edited(take: Take, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
-        Self::rebuild_edited_with_layout(take, snapshot, None)
+        Self::rebuild_edited_with_layout(take, snapshot, None, None)
     }
 
     /// Run on a worker: retain currently loaded analog stages during marker edit / undo / save.
     pub fn rebuild_markers(&self, snapshot: &DocumentSnapshot) -> Result<ViewData, EditError> {
-        let mut view = Self::rebuild_edited_with_layout(self.take.clone(), snapshot, self.plate_devices.clone())?;
+        let mut view = Self::rebuild_edited_with_layout(self.take.clone(), snapshot, self.plate_devices.clone(), Some(self))?;
         view.analog_pending = self.analog_pending;
         view.emg_pending = self.emg_pending;
         view.analog_generation = self.analog_generation;
         Ok(view)
     }
 
-    fn rebuild_edited_with_layout(mut take: Take, snapshot: &DocumentSnapshot, plate_devices: Option<Vec<usize>>) -> Result<ViewData, EditError> {
+    fn rebuild_edited_with_layout(mut take: Take, snapshot: &DocumentSnapshot, plate_devices: Option<Vec<usize>>, previous: Option<&Self>) -> Result<ViewData, EditError> {
         let input = snapshot.input().ok_or(EditError::NotLoaded)?;
         let mut existing = HashMap::new();
         for track in std::mem::take(&mut take.trajectories) {
@@ -789,13 +838,21 @@ impl ViewData {
                     Trajectory { uid, name: raw.name.clone(), parent_uid, slot_raw: slot.map(|s| s as u32), slot, kind, asset_uid, frames: Vec::new().into(), xyz: Vec::new().into(), raw16_sha256: String::new(), lenient_membership: false }
                 }
             };
-            trajectory.frames = raw.samples.iter().map(|s| s.frame()).collect();
-            trajectory.xyz = raw.samples.iter().map(|s| s.xyz()).collect();
+            // Read XYZ as before and detect presence changes in the same pass. Smoothing and
+            // untouched tracks can keep their frame storage and already built presence runs.
+            let mut same_frames = previous.is_some() && trajectory.frames.len() == raw.samples.len();
+            trajectory.xyz = raw.samples.iter().enumerate().map(|(i, sample)| {
+                same_frames = same_frames && trajectory.frames[i] == sample.frame();
+                sample.xyz()
+            }).collect();
+            if !same_frames {
+                trajectory.frames = raw.samples.iter().map(|s| s.frame()).collect();
+            }
             trajectory.raw16_sha256.clear();
             tracks.push(trajectory);
         }
         take.trajectories = tracks;
-        let mut view = ViewData::build_with_plate_devices(take, plate_devices);
+        let mut view = ViewData::build_with_previous_markers(take, plate_devices, previous);
         view.edit_revision = Some(snapshot.revision());
         Ok(view)
     }
@@ -1149,3 +1206,7 @@ mod tests {
         assert_eq!(segments(&[]), vec![]);
     }
 }
+
+#[cfg(test)]
+#[path = "view_data_tracks_tests.rs"]
+mod tracks_tests;

@@ -2,6 +2,9 @@
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
+#[path = "graph_tracks.rs"]
+pub(crate) mod tracks;
+
 #[derive(Clone)]
 pub struct Lane {
     /// Short label drawn as the faded watermark (e.g. "X").
@@ -55,6 +58,51 @@ pub const FORCED_HOVER_DX: f32 = 12.0;
 struct ViewRange {
     lo: f64,
     hi: f64,
+}
+
+impl ViewRange {
+    fn full(first: i64, last: i64) -> Self {
+        Self { lo: first as f64 - 0.5, hi: last as f64 + 0.5 }
+    }
+
+    fn load(ui: &Ui, id: Id, full: Self) -> Self {
+        ui.data(|d| d.get_temp::<Self>(id))
+            .filter(|vr| vr.hi > vr.lo && vr.lo >= full.lo - 1.0 && vr.hi <= full.hi + 1.0)
+            .unwrap_or(full)
+    }
+
+    fn x(self, plot: Rect, frame: f64) -> f32 {
+        plot.left() + ((frame - self.lo) / (self.hi - self.lo)) as f32 * plot.width()
+    }
+
+    fn at(self, plot: Rect, x: f32) -> f64 {
+        self.lo + ((x - plot.left()) / plot.width()) as f64 * (self.hi - self.lo)
+    }
+
+    fn navigate(&mut self, full: Self, plot: Rect, zoom: Option<(f32, f32)>, pan: f32) {
+        if plot.width() <= 0.0 { return; }
+        if let Some((x, scroll)) = zoom {
+            let center = self.at(plot, x);
+            let k = (-scroll as f64 * 0.002).exp();
+            let max_span = full.hi - full.lo;
+            let span = ((self.hi - self.lo) * k).clamp(10.0_f64.min(max_span), max_span);
+            let t = (center - self.lo) / (self.hi - self.lo);
+            self.lo = center - t * span;
+            self.hi = self.lo + span;
+        }
+        let df = -(pan / plot.width()) as f64 * (self.hi - self.lo);
+        self.lo += df;
+        self.hi += df;
+        let span = self.hi - self.lo;
+        if self.lo < full.lo {
+            self.lo = full.lo;
+            self.hi = self.lo + span;
+        }
+        if self.hi > full.hi {
+            self.hi = full.hi;
+            self.lo = (self.hi - span).max(full.lo);
+        }
+    }
 }
 
 pub const NAV_H: f32 = 18.0;
@@ -319,7 +367,8 @@ impl DecorationGeometry {
         let (lo, hi) = (f64::from_bits(self.frames.0), f64::from_bits(self.frames.1));
         let step = nice_step(hi - lo, (self.plot_x.1 / 80.0) as f64);
         let mut ticks = Vec::new();
-        let mut t = (lo / step).ceil() * step;
+        let first = (lo / step).ceil() * step;
+        let mut t = if first == 0.0 { 0.0 } else { first };
         while t <= hi { ticks.push(t); t += step; }
         ticks
     }
@@ -1313,11 +1362,8 @@ fn show_inner(
     spans: &[Span],
     mut range: Option<&mut Option<(i64, i64)>>,
 ) -> Option<i64> {
-    let full = ViewRange { lo: first as f64 - 0.5, hi: last as f64 + 0.5 };
-    let mut vr: ViewRange = ui.data(|d| d.get_temp(id)).unwrap_or(full);
-    if !(vr.hi > vr.lo) || vr.lo < full.lo - 1.0 || vr.hi > full.hi + 1.0 {
-        vr = full;
-    }
+    let full = ViewRange::full(first, last);
+    let mut vr = ViewRange::load(ui, id, full);
     let height = lanes.len() as f32 * lane_h + NAV_H;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     // The mouse: the whole graph, or around what is drawn over its corner (`Look::keep_out`).
@@ -1327,38 +1373,17 @@ fn show_inner(
         resp = resp.union(ui.interact(below, id.with("plot_below"), Sense::click_and_drag()));
     }
     let plot = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - NAV_H));
-    let x_of = |f: f64, vr: &ViewRange| plot.left() + ((f - vr.lo) / (vr.hi - vr.lo)) as f32 * plot.width();
-    let f_of = |x: f32, vr: &ViewRange| vr.lo + ((x - plot.left()) / plot.width()) as f64 * (vr.hi - vr.lo);
+    let x_of = |f: f64, vr: &ViewRange| vr.x(plot, f);
+    let f_of = |x: f32, vr: &ViewRange| vr.at(plot, x);
 
     // Interaction.
     let mut goto = None;
-    if resp.hovered() {
+    let zoom = resp.hover_pos().and_then(|p| {
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll != 0.0 {
-            if let Some(p) = resp.hover_pos() {
-                let center = f_of(p.x, &vr);
-                let k = (-scroll as f64 * 0.002).exp();
-                let span = ((vr.hi - vr.lo) * k).clamp(10.0, full.hi - full.lo);
-                let t = (center - vr.lo) / (vr.hi - vr.lo);
-                vr.lo = center - t * span;
-                vr.hi = vr.lo + span;
-            }
-        }
-    }
-    if resp.dragged_by(egui::PointerButton::Middle) {
-        let df = -(resp.drag_delta().x / plot.width()) as f64 * (vr.hi - vr.lo);
-        vr.lo += df;
-        vr.hi += df;
-    }
-    let span = vr.hi - vr.lo;
-    if vr.lo < full.lo {
-        vr.lo = full.lo;
-        vr.hi = vr.lo + span;
-    }
-    if vr.hi > full.hi {
-        vr.hi = full.hi;
-        vr.lo = (vr.hi - span).max(full.lo);
-    }
+        (scroll != 0.0).then_some((p.x, scroll))
+    });
+    let pan = if resp.dragged_by(egui::PointerButton::Middle) { resp.drag_delta().x } else { 0.0 };
+    vr.navigate(full, plot, zoom, pan);
     let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
         select_drag(ui, &resp, id, plot, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
     });

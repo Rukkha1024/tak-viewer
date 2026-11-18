@@ -13,7 +13,7 @@ fn graph_selection_setup(ctx: &egui::Context, detached: bool) -> TakViewerApp {
             .set_position(egui::pos2(300.0, 150.0))
             .set_size(egui::vec2(800.0, 400.0));
     }
-    for _ in 0..4 { frame_with(ctx, &mut app, vec![]); }
+    wait_marker_graphs(ctx, &mut app);
     app.quiet();
     app.history.undo.clear();
     app.history.redo.clear();
@@ -122,7 +122,7 @@ fn graph_selection_keeps_3d_overlay_drag_as_frame_scrubbing() {
     let (mut app, _) = one_view_with_graph(&ctx);
     app.views[0].range = Some((1, 3));
     app.views[0].pb.set_frame(5, 0.0);
-    frame_with(&ctx, &mut app, vec![]);
+    wait_marker_graphs(&ctx, &mut app);
     app.quiet();
     app.history.undo.clear();
     app.history.redo.clear();

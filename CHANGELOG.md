@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.56.0 — 2026-11-18
+
+- GRAPH adds saved Channels / Tracks layouts. Tracks shows marker presence and gaps, links row picks to 3D and Labeling, and shares time controls and undo.
+
 ## v0.55.0 — 2026-11-18
 
 - Show saved take progress in local WORKSPACE, OPEN EDITORS and the bottom status. Read visible local rows in the background and give file opening priority.
