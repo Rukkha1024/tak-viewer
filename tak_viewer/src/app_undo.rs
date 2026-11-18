@@ -4,6 +4,7 @@ use crate::views::{Range, Selection};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tak_core::edit::{DocumentId, EditError, EditPatch, EditSelection, LabelKey, Revision};
+use tak_core::playback::PlaybackControls;
 use super::marker_edit::PanelSetting;
 use crate::ui::panels::{fold_indices, fold_keys, FoldKey};
 
@@ -27,6 +28,7 @@ struct FileBase {
     armed_label: Option<LabelKey>,
     linked_pick: panels::LinkedLabelPick,
     range: Range,
+    playback_controls: PlaybackControls,
     plate: Option<usize>,
     speed: f64,
     folds: HashSet<FoldKey>,
@@ -50,6 +52,7 @@ impl FileBase {
             armed_label: v.armed_label,
             linked_pick: v.labels.linked_pick,
             range: v.range,
+            playback_controls: v.pb.controls(),
             plate: v.plate,
             speed: v.pb.speed,
             folds: v.data.as_ref().map(|data| fold_keys(data, &v.labels.collapsed)).unwrap_or_default(),
@@ -85,6 +88,7 @@ pub(super) struct LayoutSnap {
     edit_selections: [Option<EditSelection>; MAX_VIEWS],
     /// The range each of those files had (a file read again gets it back).
     ranges: [Range; MAX_VIEWS],
+    playback_controls: [PlaybackControls; MAX_VIEWS],
     /// The active view then (put back with the layout; choosing a view is no action itself).
     active: usize,
     /// The file laid over each view slot (plan step 7; only once it is on screen) and whose
@@ -168,6 +172,10 @@ fn layout_edit_selection(v: &View) -> Option<EditSelection> {
 
 fn layout_range(v: &View, shown: Range) -> Range {
     if pending_view(v) { v.restore_range.unwrap_or(None) } else { shown }
+}
+
+fn layout_playback_controls(v: &View) -> PlaybackControls {
+    if pending_view(v) { v.restore_playback_controls.unwrap_or_default() } else { v.pb.controls() }
 }
 
 /// Display options and floating graph places (saved in the settings).
@@ -270,6 +278,7 @@ pub(super) enum Part {
     Selection { file: PathBuf, before: Selection, after: Selection },
     PanelSetting { file: PathBuf, before: PanelSetting, after: PanelSetting },
     Range { file: PathBuf, before: Range, after: Range },
+    PlaybackControls { file: PathBuf, before: PlaybackControls, after: PlaybackControls },
     Plate { file: PathBuf, before: Option<usize>, after: Option<usize> },
     Speed { file: PathBuf, before: f64, after: f64 },
     Folds { file: PathBuf, before: HashSet<FoldKey>, after: HashSet<FoldKey> },
@@ -326,6 +335,7 @@ impl Part {
             | Part::Selection { file, .. }
             | Part::PanelSetting { file, .. }
             | Part::Range { file, .. }
+            | Part::PlaybackControls { file, .. }
             | Part::Plate { file, .. }
             | Part::Speed { file, .. }
             | Part::Folds { file, .. }
@@ -521,6 +531,7 @@ impl History {
             Part::Selection { .. } => "Selection",
             Part::PanelSetting { .. } => "PanelSetting",
             Part::Range { .. } => "Range",
+            Part::PlaybackControls { .. } => "PlaybackControls",
             Part::Plate { .. } => "Plate",
             Part::Speed { .. } => "Speed",
             Part::Folds { .. } => "Folds",
@@ -671,6 +682,7 @@ impl TakViewerApp {
             source_stamps: std::array::from_fn(|k| layout_source_stamp(&self.views[k])),
             edit_selections: std::array::from_fn(|k| layout_edit_selection(&self.views[k])),
             ranges: std::array::from_fn(|k| layout_range(&self.views[k], ranges[k])),
+            playback_controls: std::array::from_fn(|k| layout_playback_controls(&self.views[k])),
             active: self.active,
             overlays: std::array::from_fn(|k| layout_overlay(&self.views[k]).map(Path::to_path_buf)),
             shown: std::array::from_fn(|k| self.views[k].shown),
@@ -833,6 +845,7 @@ impl TakViewerApp {
                     wanted.layout.source_stamps[slot] = original.layout.source_stamps[old].clone();
                     wanted.layout.edit_selections[slot] = original.layout.edit_selections[old].clone();
                     wanted.layout.ranges[slot] = original.layout.ranges[old];
+                    wanted.layout.playback_controls[slot] = original.layout.playback_controls[old];
                     wanted.layout.overlays[slot] = original.layout.overlays[old].clone();
                     wanted.layout.shown[slot] = original.layout.shown[old];
                     dock::add_view(&mut wanted.layout.dock, slot as u8, self.dock_area);
@@ -937,6 +950,7 @@ impl TakViewerApp {
             base.layout.source_stamps[slot] = layout_source_stamp(v);
             base.layout.edit_selections[slot] = layout_edit_selection(v);
             base.layout.ranges[slot] = layout_range(v, v.range);
+            base.layout.playback_controls[slot] = layout_playback_controls(v);
             base.layout.overlays[slot] = layout_overlay(v).map(Path::to_path_buf);
             if let Some(file) = base.views[slot].as_mut().filter(|file| Some(file.file.as_path()) == v.target()) {
                 file.range = base.layout.ranges[slot];
@@ -1008,6 +1022,7 @@ impl TakViewerApp {
             for k in 0..MAX_VIEWS {
                 if let Some(b) = base.views[k].as_ref().filter(|b| Some(&b.file) == before.files[k].as_ref()) {
                     before.ranges[k] = b.range;
+                    before.playback_controls[k] = b.playback_controls;
                 }
             }
             if record && !quiet_layout {
@@ -1068,6 +1083,11 @@ impl TakViewerApp {
             if v.range != b.range {
                 parts.push(Part::Range { file: b.file.clone(), before: b.range, after: v.range });
                 b.range = v.range;
+            }
+            if v.pb.controls() != b.playback_controls {
+                let after = v.pb.controls();
+                let before = std::mem::replace(&mut b.playback_controls, after);
+                parts.push(Part::PlaybackControls { file: b.file.clone(), before, after });
             }
             if v.plate != b.plate {
                 parts.push(Part::Plate { file: b.file.clone(), before: b.plate, after: v.plate });
@@ -1702,6 +1722,15 @@ impl TakViewerApp {
                 v.range = pick(redo, *before, *after);
                 views::range_words(v.range)
             }
+            Part::PlaybackControls { before, after, .. } => {
+                let pb = &mut self.views[k].pb;
+                let prior = pb.working_range();
+                pb.restore_controls(pick(redo, *before, *after), now);
+                let (a, b) = pb.working_range();
+                if prior != (a, b) { format!("재생 구간 {a}–{b}") }
+                else if pb.reverse() { "역재생".into() }
+                else { "앞으로 재생".into() }
+            }
             Part::Plate { before, after, .. } => {
                 let v = &mut self.views[k];
                 v.plate = pick(redo, *before, *after);
@@ -1878,6 +1907,7 @@ impl TakViewerApp {
                             view.apply_spot(spot, ctx.input(|i| i.time));
                         }
                         view.range = snap.ranges[k];
+                        view.pb.restore_controls(snap.playback_controls[k], ctx.input(|i| i.time));
                         view.picked = snap.picked[k];
                         view.comment_selection = snap.comments[k].clone();
                         view.labels.list_selection = snap.list_anchors[k].clone();
@@ -1901,6 +1931,7 @@ impl TakViewerApp {
                         view.restore_edit_selection = None;
                         view.restore = None;
                         view.restore_range = None;
+                        view.restore_playback_controls = None;
                         view.restore_picked = None;
                         view.restore_comment_selection = None;
                         view.restore_list_anchors = None;
@@ -1908,6 +1939,7 @@ impl TakViewerApp {
                     } else {
                         self.views[k].restore = snap.spots[k].clone().or_else(|| self.views[k].restore.take());
                         self.views[k].restore_range = Some(snap.ranges[k]);
+                        self.views[k].restore_playback_controls = Some(snap.playback_controls[k]);
                         self.views[k].restore_picked = Some(snap.picked[k]);
                         self.views[k].restore_comment_selection = Some(snap.comments[k].clone());
                         self.views[k].restore_list_anchors = Some(snap.list_anchors[k].clone());

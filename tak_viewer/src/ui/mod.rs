@@ -30,3 +30,4 @@ pub mod scene_measurement;
 pub mod scrub;
 pub mod ssh_explorer;
 pub mod theme;
+pub(crate) mod working_range;

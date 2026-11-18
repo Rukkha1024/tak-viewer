@@ -1,5 +1,12 @@
 //! Frame cursor and real-time playback (FrameRate based). Pure logic, unit-tested.
 
+/// In-memory controls owned by one view. None means the entire take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaybackControls {
+    range: Option<(i64, i64)>,
+    reverse: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Playback {
     pub frame: i64,
@@ -9,9 +16,9 @@ pub struct Playback {
     pub speed: f64,
     pub looping: bool,
     pub playing: bool,
-    /// How many times playback went from the last frame back to the first (a loop in `tick`,
-    /// or `play` at the last frame). The viewer closes a held comment range then.
+    /// How many ticks or play starts wrapped. The viewer closes a held comment range then.
     pub wraps: u64,
+    controls: PlaybackControls,
     anchor_time: f64,
     anchor_frame: i64,
 }
@@ -28,6 +35,7 @@ impl Playback {
             looping: true,
             playing: false,
             wraps: 0,
+            controls: PlaybackControls::default(),
             anchor_time: 0.0,
             anchor_frame: first,
         }
@@ -35,6 +43,44 @@ impl Playback {
 
     pub fn clamp(&self, f: i64) -> i64 {
         f.clamp(self.first, self.last)
+    }
+
+    pub fn controls(&self) -> PlaybackControls {
+        self.controls
+    }
+
+    pub fn restore_controls(&mut self, controls: PlaybackControls, now: f64) {
+        self.set_reverse(controls.reverse, now);
+        let (a, b) = controls.range.unwrap_or((self.first, self.last));
+        self.set_working_range(a, b, now);
+    }
+
+    pub fn working_range(&self) -> (i64, i64) {
+        self.controls.range.unwrap_or((self.first, self.last))
+    }
+
+    pub fn set_working_range(&mut self, a: i64, b: i64, now: f64) {
+        let bounds = (self.clamp(a.min(b)), self.clamp(a.max(b)));
+        if bounds != self.working_range() {
+            self.controls.range = (bounds != (self.first, self.last)).then_some(bounds);
+            self.set_frame(self.frame, now);
+        }
+    }
+
+    pub fn reverse(&self) -> bool {
+        self.controls.reverse
+    }
+
+    pub fn set_reverse(&mut self, reverse: bool, now: f64) {
+        if reverse != self.reverse() {
+            self.controls.reverse = reverse;
+            self.set_frame(self.frame, now);
+        }
+    }
+
+    pub fn outgoing_endpoint(&self) -> i64 {
+        let (start, end) = self.working_range();
+        if self.reverse() { start } else { end }
     }
 
     /// Jump to a frame (clamped). Keeps playing if playing.
@@ -51,8 +97,11 @@ impl Playback {
     }
 
     pub fn play(&mut self, now: f64) {
-        if self.frame >= self.last {
-            self.frame = self.first;
+        let (start, end) = self.working_range();
+        if !(start..=end).contains(&self.frame) {
+            self.frame = start;
+        } else if self.frame == self.outgoing_endpoint() {
+            self.frame = if self.reverse() { end } else { start };
             self.wraps += 1;
         }
         self.playing = true;
@@ -84,20 +133,29 @@ impl Playback {
         if !self.playing {
             return false;
         }
-        let elapsed = (now - self.anchor_time).max(0.0);
-        let mut target = self.anchor_frame + (elapsed * self.rate * self.speed).floor() as i64;
-        if target > self.last {
-            if self.looping {
-                let span = self.last - self.first + 1;
-                target = self.first + (target - self.first).rem_euclid(span);
-                self.anchor_time = now;
-                self.anchor_frame = target;
-                self.wraps += 1;
-            } else {
-                target = self.last;
-                self.playing = false;
-            }
+        let (start, end) = self.working_range();
+        if !(start..=end).contains(&self.anchor_frame) {
+            self.set_frame(start, now);
+            return true;
         }
+        let elapsed = (now - self.anchor_time).max(0.0);
+        let frames = (elapsed * self.rate * self.speed).floor() as i64 as i128;
+        let raw = i128::from(self.anchor_frame) + if self.reverse() { -frames } else { frames };
+        let (lo, hi) = (i128::from(start), i128::from(end));
+        let target = if raw < lo || raw > hi {
+            if self.looping {
+                let wrapped = (lo + (raw - lo).rem_euclid(hi - lo + 1)) as i64;
+                self.anchor_time = now;
+                self.anchor_frame = wrapped;
+                self.wraps += 1;
+                wrapped
+            } else {
+                self.playing = false;
+                self.outgoing_endpoint()
+            }
+        } else {
+            raw as i64
+        };
         let changed = target != self.frame;
         self.frame = target;
         changed
@@ -108,6 +166,10 @@ impl Playback {
         (f - self.first) as f64 / self.rate
     }
 }
+
+#[cfg(test)]
+#[path = "playback_range_tests.rs"]
+mod range_tests;
 
 #[cfg(test)]
 mod tests {

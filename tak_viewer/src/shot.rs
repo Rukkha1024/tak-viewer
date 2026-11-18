@@ -27,6 +27,8 @@ pub struct AutoShot {
     pub plate: Option<String>,
     /// `--range <a>-<b>`: frame range for every view (ordered and clamped when applied).
     pub range: Option<(i64, i64)>,
+    pub working_range: Option<(i64, i64)>,
+    pub reverse_playing: bool,
     pub menu_capture: bool,
     pub edit_tools: bool,
     pub edit_pattern: bool,
@@ -103,6 +105,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
     let mut select = None;
     let mut plate = None;
     let mut range = None;
+    let mut working_range = None;
+    let mut reverse_playing = false;
     let mut menu_capture = false;
     let mut edit_tools = false;
     let mut edit_pattern = false;
@@ -126,6 +130,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                     select: None,
                     plate: None,
                     range: None,
+                    working_range: None,
+                    reverse_playing: false,
                     menu_capture: false,
                     edit_tools: false,
                     edit_pattern: false,
@@ -190,6 +196,17 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
                 }
                 i += 2;
             }
+            "--working-range" if i + 1 < args.len() => {
+                working_range = parse_range(&args[i + 1]);
+                if working_range.is_none() {
+                    eprintln!("--working-range: '{}' is not <a>-<b> (e.g. 300-900)", args[i + 1]);
+                }
+                i += 2;
+            }
+            "--reverse-playing" => {
+                reverse_playing = true;
+                i += 1;
+            }
             "--menu-capture" => {
                 menu_capture = true;
                 i += 1;
@@ -251,6 +268,8 @@ pub fn parse(args: &[String]) -> (Option<AutoShot>, Vec<String>) {
         s.select = select;
         s.plate = plate;
         s.range = range;
+        s.working_range = working_range;
+        s.reverse_playing = reverse_playing;
         s.menu_capture = menu_capture;
         s.edit_tools = edit_tools;
         s.edit_pattern = edit_pattern;

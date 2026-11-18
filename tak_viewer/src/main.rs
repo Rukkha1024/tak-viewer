@@ -256,6 +256,7 @@ fn usage() -> String {
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         "GRAPH screenshot or benchmark: --graph-layout channels|tracks and --graph-zoom A-B",
         "Headless Tracks merge: --merge-keys preview|up|down with --graph-layout tracks and --select A,B",
+        "Headless playback: --working-range A-B and --reverse-playing",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

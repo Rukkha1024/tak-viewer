@@ -604,6 +604,9 @@ pub fn show(
     }
 
     let gesture = ui.input(|i| marker_click(i.modifiers));
+    // A covering graph owns clicks even before egui has registered its latest geometry.
+    let scene_pointer = response.interact_pointer_pos()
+        .filter(|p| !covers.iter().any(|cover| cover.contains(*p)));
     // A plain click may pick a plate when there is no marker underneath.
     let mut click = |at: Pos2| {
         if gesture == MarkerClick::Ignore { return; }
@@ -613,7 +616,7 @@ pub fn show(
         out.plate = if marker.is_none() && gesture == MarkerClick::Plain { pick_plate(&plate_quads, at) } else { None };
     };
     if response.clicked() {
-        if let Some(pointer) = response.interact_pointer_pos() {
+        if let Some(pointer) = scene_pointer {
             click(pointer);
         }
     }
@@ -626,12 +629,12 @@ pub fn show(
         }
     }
     if gesture == MarkerClick::Plain && response.double_clicked() {
-        if let Some(pointer) = response.interact_pointer_pos() {
+        if let Some(pointer) = scene_pointer {
             out.double_clicked = pick(&projected, pointer);
         }
     }
     if response.secondary_clicked() {
-        out.context_clicked = response.interact_pointer_pos().and_then(|p| pick(&projected, p));
+        out.context_clicked = scene_pointer.and_then(|p| pick(&projected, p));
     }
     out.marker_menu = own.then_some(response);
 

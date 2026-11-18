@@ -211,9 +211,11 @@ impl TakViewerApp {
             let selection = (!waiting).then(|| view.edit_selection_state());
             let picked = view.picked;
             let range = if waiting { view.restore_range } else { Some(view.range) };
+            let playback_controls = if waiting { view.restore_playback_controls } else { Some(view.pb.controls()) };
             let restore = if waiting { view.restore.clone() } else { view.spot() };
             view.restore = restore;
             view.restore_range = range;
+            view.restore_playback_controls = playback_controls;
             next += 1;
             drop_later(view.show_shared_file(shared.clone(), next, speed, now));
             view.remote = Some(location.clone());

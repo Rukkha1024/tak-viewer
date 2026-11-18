@@ -1025,8 +1025,21 @@ const BAND_TIP: &str = "끌기 = 구간 잡기 · 그냥 누르기 = 구간 풀�
 pub const BLOCK_MIN_W: f32 = 4.0;
 /// Text on a comment block (dark on orange).
 const BLOCK_FONT: f32 = 9.0;
-/// Height of a view's playback bar: margin, timeline, gap, button row, margin.
-pub const DECK_H: f32 = 4.0 + TIMELINE_H + 3.0 + 24.0 + 4.0;
+pub const TRANSPORT_TOP: f32 = 4.0 + TIMELINE_H + super::working_range::STRIP_H + 3.0;
+/// Height of a view's playback bar, including the working-range strip and controls.
+const INLINE_DECK_H: f32 = TRANSPORT_TOP + 24.0 + 4.0;
+pub const DECK_H: f32 = INLINE_DECK_H + 3.0 + super::working_range::FIELDS_H;
+const INLINE_WORKING_FIELDS_MIN: f32 = 900.0;
+
+fn inline_working_fields(width: f32, pb: &Playback) -> bool {
+    let digits = pb.first.unsigned_abs().max(pb.last.unsigned_abs()).max(1).ilog10()
+        + 1 + u32::from(pb.first < 0);
+    width >= INLINE_WORKING_FIELDS_MIN + 32.0 * digits.saturating_sub(6) as f32
+}
+
+pub fn deck_height(width: f32, pb: &Playback) -> f32 {
+    if inline_working_fields(width, pb) { INLINE_DECK_H } else { DECK_H }
+}
 pub const WIDE_DECK_MIN: f32 = 700.0;
 
 pub fn deck_is_wide(width: f32) -> bool {
@@ -1301,6 +1314,7 @@ pub struct CommentBar<'a> {
 pub struct DeckOut {
     /// Something for the app to do with comments.
     pub action: Option<DeckAction>,
+    pub working_range_error: Option<&'static str>,
 }
 
 /// A 3D view's playback bar, drawn in `rect` under the view: timeline (seek zone + band strip
@@ -1320,37 +1334,61 @@ pub fn deck(
     file_id: usize,
     now: f64,
     mut comments: CommentBar,
+    working_enabled: bool,
 ) -> DeckOut {
     ui.painter().rect_filled(rect, 0.0, theme::PANEL_BG_DARK);
     let inner = rect.shrink2(vec2(6.0, 4.0));
+    let inline_fields = inline_working_fields(rect.width(), pb);
+    let fields_id = super::working_range::fields_id(slot, file_id);
     let mut out = DeckOut::default();
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         match data {
-            Some(d) => out = timeline(ui, slot, d, pb, range, primary, heat, file_id, now, &mut comments),
+            Some(d) => out = timeline(ui, slot, d, pb, range, primary, heat, file_id, now, &mut comments, working_enabled),
             None => {
-                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), TIMELINE_H), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), TIMELINE_H + super::working_range::STRIP_H), Sense::hover());
                 ui.painter().rect_filled(r, 2.0, theme::NAV_BG);
             }
         }
         ui.add_enabled_ui(data.is_some(), |ui| {
             ui.horizontal(|ui| {
+                if inline_fields {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.spacing_mut().button_padding.x = 4.0;
+                }
                 let make = if deck_is_wide(rect.width()) {
-                    transport(ui, pb, slot, now);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| comment_button(ui, &comments.make)).inner
+                    transport(ui, pb, slot, now, working_enabled, inline_fields);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let make = comment_button(ui, &comments.make);
+                        if inline_fields && data.is_some() {
+                            out.working_range_error = ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add_enabled_ui(working_enabled, |ui| {
+                                        super::working_range::fields(ui, fields_id, pb, now)
+                                    }).inner
+                                },
+                            ).inner;
+                        }
+                        make
+                    }).inner
                 } else {
-                    transport_narrow(ui, pb, slot, now, &comments.make)
+                    transport_narrow(ui, pb, slot, now, &comments.make, working_enabled)
                 };
                 if make {
                     out.action = Some(DeckAction::MakeComment);
                 }
             });
         });
+        if !inline_fields && data.is_some() {
+            out.working_range_error = ui.add_enabled_ui(working_enabled, |ui| {
+                super::working_range::fields(ui, fields_id, pb, now)
+            }).inner;
+        }
     });
     out
 }
 
-/// Edit-mode timeline, one row in two zones (v0.13.0). Seek zone on top: green scrubber, red
+/// Edit-mode timeline. Seek zone on top: white scrubber, red
 /// occlusion marks (brighter = more labeled markers missing), selected marker's gaps as a bright
 /// strip; a press or drag moves the frame. Band strip under it: the comment blocks (v0.14.0),
 /// then the frame `range` above them. A drag picks the range (the frame stays; also when it
@@ -1370,8 +1408,11 @@ fn timeline(
     file_id: usize,
     now: f64,
     comments: &mut CommentBar,
+    working_enabled: bool,
 ) -> DeckOut {
-    let (whole, _) = ui.allocate_exact_size(vec2(ui.available_width(), TIMELINE_H), Sense::hover());
+    let (tracks, _) = ui.allocate_exact_size(vec2(ui.available_width(), TIMELINE_H + super::working_range::STRIP_H), Sense::hover());
+    let mut whole = tracks;
+    whole.max.y = whole.min.y + TIMELINE_H;
     let rect = Rect::from_min_size(whole.min, vec2(whole.width(), SEEK_H));
     let band = Rect::from_min_max(pos2(whole.left(), rect.bottom()), whole.max);
     let resp = ui.interact(rect, ui.id().with(("timeline_seek", slot)), Sense::click_and_drag());
@@ -1486,7 +1527,7 @@ fn timeline(
     } else if band_resp.clicked() {
         *range = None;
     }
-    // Seek zone, drawn as before v0.13.0.
+    // Seek zone.
     let p = ui.painter_at(rect);
     // Occlusion heat, one column per pixel.
     let cols = bar.width().max(1.0) as usize;
@@ -1503,8 +1544,6 @@ fn timeline(
             p.rect_filled(r, 0.0, theme::NAV_GAP_BRIGHT);
         }
     }
-    // Played part in green (Motive Edit-mode timeline).
-    p.rect_filled(Rect::from_min_max(pos2(bar.left(), rect.top() + 1.0), pos2(x_of(pb.frame), rect.top() + 4.0)), 0.0, theme::TIMELINE_GREEN);
     // Ticks.
     let total = pb.last - pb.first;
     let target = (bar.width() / 90.0).max(2.0) as i64;
@@ -1520,8 +1559,10 @@ fn timeline(
     }
     // The current-frame line covers the seek zone only.
     let cx = x_of(pb.frame);
-    p.line_segment([pos2(cx, rect.top()), pos2(cx, rect.bottom())], Stroke::new(2.0_f32, theme::TIMELINE_GREEN));
-    DeckOut { action }
+    p.line_segment([pos2(cx, rect.top()), pos2(cx, rect.bottom())], Stroke::new(2.0_f32, theme::TEXT));
+    let strip = Rect::from_min_max(whole.left_bottom(), tracks.max);
+    super::working_range::strip(ui, strip, Id::new(("working_range_strip", slot, file_id)), pb, now, x_of, frame_at, working_enabled);
+    DeckOut { action, ..DeckOut::default() }
 }
 
 /// `Comment` button at the right end of a wide bar. True when pressed.
@@ -1548,13 +1589,17 @@ fn btn(ui: &mut Ui, text: &str, tip: &str) -> bool {
 }
 
 /// −1 · play / pause · +1 (both bar widths).
-fn step_buttons(ui: &mut Ui, pb: &mut Playback, now: f64) {
+fn step_buttons(ui: &mut Ui, pb: &mut Playback, now: f64, working_enabled: bool) {
     if btn(ui, "◀", "−1 프레임 (←)") {
         pb.step(-1, now);
     }
     let play = if pb.playing { "⏸" } else { "▶" };
     if btn(ui, play, "재생/정지 (Space)") {
         pb.toggle(now);
+    }
+    let reverse = egui::Button::new("Reverse").selected(pb.reverse()).min_size(vec2(30.0, 24.0));
+    if ui.add_enabled(working_enabled, reverse).on_hover_text("재생 방향 바꾸기").clicked() {
+        pb.set_reverse(!pb.reverse(), now);
     }
     if btn(ui, "▶|", "+1 프레임 (→)") {
         pb.step(1, now);
@@ -1628,14 +1673,14 @@ fn speed_box(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
     }
 }
 
-fn transport(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
+fn transport(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64, working_enabled: bool, inline_fields: bool) {
     if btn(ui, "⏮", "처음 (Home)") {
         pb.step(i64::MIN / 2, now);
     }
     if btn(ui, "⏪", "−10 프레임 (↓)") {
         pb.step(-10, now);
     }
-    step_buttons(ui, pb, now);
+    step_buttons(ui, pb, now, working_enabled);
     if btn(ui, "⏩", "+10 프레임 (↑)") {
         pb.step(10, now);
     }
@@ -1646,15 +1691,17 @@ fn transport(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
     ui.label(RichText::new("프레임").color(theme::TEXT_DIM));
     frame_field(ui, pb, slot, now);
     ui.separator();
-    ui.label(RichText::new(format!("{:.3} s", pb.time_of(pb.frame))).monospace());
-    ui.separator();
+    if !inline_fields {
+        ui.label(RichText::new(format!("{:.3} s", pb.time_of(pb.frame))).monospace());
+        ui.separator();
+    }
     speed_box(ui, pb, slot, now);
 }
 
 /// Narrow bar: −1 · play · +1 · frame on the left, speed and ⋯ (처음 · −10 · +10 · 끝 · time ·
 /// Comment) on the right. True when `Comment` was chosen in the ⋯ menu.
-fn transport_narrow(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64, make: &Result<String, String>) -> bool {
-    step_buttons(ui, pb, now);
+fn transport_narrow(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64, make: &Result<String, String>, working_enabled: bool) -> bool {
+    step_buttons(ui, pb, now, working_enabled);
     frame_field(ui, pb, slot, now);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let made = more_menu(ui, pb, now, make);
@@ -1829,7 +1876,7 @@ mod deck_tests {
         assert_eq!(ordered_range(20, 30, 0, 10), (10, 10));
         // The bar: 28 pt seek zone + 12 pt band strip in one row.
         assert_eq!((SEEK_H, BAND_H, TIMELINE_H), (28.0, 12.0, 40.0));
-        assert_eq!(DECK_H, 75.0);
+        assert_eq!(DECK_H, 109.0);
     }
 
     #[test]

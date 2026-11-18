@@ -293,8 +293,7 @@ const SAVED_NOTE_S: f64 = 3.0;
 const CHANGE_NOTE_S: f64 = 4.0;
 
 /// A comment being made by holding `M` (v0.15.0): which view and file, the frame and the
-/// selected markers when `M` went down, and the view's `Playback::wraps` then (a wrap past the
-/// last frame closes the range there).
+/// selected markers when `M` went down, and the view's `Playback::wraps` then.
 #[derive(Clone, Debug, PartialEq)]
 struct Hold {
     slot: usize,
@@ -1356,6 +1355,13 @@ impl TakViewerApp {
                     if let Some((a, b)) = auto.range {
                         v.set_range(a, b);
                     }
+                    if let Some((a, b)) = auto.working_range {
+                        v.pb.set_working_range(a, b, now);
+                    }
+                    if auto.reverse_playing {
+                        v.pb.set_reverse(true, now);
+                        v.pb.play(now);
+                    }
                     // `--select A,B,C` (v0.27.0, agent pictures): several markers, the last one
                     // found the primary (as Ctrl+click one after another).
                     if let Some(shot::ShotSelection::Names(names)) = &auto.select {
@@ -2150,6 +2156,7 @@ impl TakViewerApp {
     /// Only actual text editors own typing shortcuts; focused buttons/menus do not.
     fn typing(&self, ctx: &egui::Context) -> bool {
         self.layout_strip.is_renaming() || key_focus::text_input_focused(ctx)
+            || crate::ui::working_range::owns_escape(ctx, self.active, self.view().file_id)
     }
 
     /// Right click on a block: a delete line (with the comment's fields, for people reading the
@@ -2160,7 +2167,7 @@ impl TakViewerApp {
 
     /// `M` held (v0.15.0), run every frame before the other keys. Cancels first (the window lost
     /// focus, so its fake key-up saves nothing; a capture runs; the active view or its file
-    /// changed; Esc, which is then used up), closes at the last frame when playback wrapped,
+    /// changed; Esc, which is then used up), closes at the outgoing frame when playback wrapped,
     /// then takes the `M` key events in order: a real press (not an auto-repeat, no text field
     /// focused, a comment possible) starts, a release ends and saves (`end_hold`).
     fn handle_hold(&mut self, ctx: &egui::Context) {
@@ -2217,7 +2224,7 @@ impl TakViewerApp {
     }
 
     /// The hold ends: `M` went up (`wrapped` false) at the current frame, or playback wrapped
-    /// (`wrapped` true) and the range closes at the last frame. A short press (same frame up as
+    /// (`wrapped` true) and the range closes at the outgoing endpoint. A short press (same frame up as
     /// down) is the v0.14.0 comment: the picked range, else that frame. Otherwise the held range
     /// (in order) with the markers selected at key down, and a picked range is dropped.
     fn end_hold(&mut self, ctx: &egui::Context, wrapped: bool) {
@@ -2226,13 +2233,12 @@ impl TakViewerApp {
         if v.file_id != h.file_id || v.data.is_none() {
             return;
         }
-        let end = if wrapped { v.pb.last } else { v.pb.frame };
+        let end = if wrapped { v.pb.outgoing_endpoint() } else { v.pb.frame };
         let (start, end) = if !wrapped && end == h.start { v.range.unwrap_or((end, end)) } else { panels::ordered_range(h.start, end, v.pb.first, v.pb.last) };
         self.add_comment(ctx, h.slot, h.markers, start, end);
     }
 
-    /// Playback went from the last frame back to the first while `M` is held: save start..last
-    /// now; holding on does nothing more (a new press is needed).
+    /// Playback wrapped while `M` is held: close at the outgoing endpoint once.
     fn close_hold_on_wrap(&mut self, ctx: &egui::Context) {
         if self.hold.as_ref().is_some_and(|h| self.views[h.slot].pb.wraps != h.wraps) {
             self.end_hold(ctx, true);
@@ -2686,6 +2692,13 @@ impl TakViewerApp {
         if pressed(Key::CloseBracket) {
             v.range_end_here();
         }
+        if edit_keys_allowed && !ctx.input(|i| i.key_down(Key::M)) {
+            let reset_start = exact_key(ctx, Key::OpenBracket, false, true, false);
+            let reset_end = exact_key(ctx, Key::CloseBracket, false, true, false);
+            if reset_start || reset_end {
+                v.pb.set_working_range(v.pb.first, v.pb.last, now);
+            }
+        }
         if edit_keys_allowed && pressed(Key::V) { v.range_start_here(); }
         if edit_keys_allowed && pressed(Key::B) { v.range_end_here(); }
         if edit_keys_allowed && exact_key(ctx, Key::B, false, true, false) { v.range = None; }
@@ -3102,7 +3115,7 @@ impl TakViewerApp {
     /// active one has a blue edge around the 3D and its bar.
     fn scene_tab(&mut self, ui: &mut egui::Ui, slot: usize, several: bool, tag: Option<dock::ViewTag>) -> bool {
         let body = ui.available_rect_before_wrap();
-        let deck_top = (body.bottom() - panels::DECK_H).max(body.top());
+        let deck_top = (body.bottom() - panels::deck_height(body.width(), &self.views[slot].pb)).max(body.top());
         let deck_rect = egui::Rect::from_min_max(egui::pos2(body.left(), deck_top), body.max);
         let top = if tag.is_some() { body.top() - dock::TAB_H } else { body.top() };
         // The 3D on screen. It takes the mouse below the tab row (`input`) and in the row right
@@ -3135,6 +3148,8 @@ impl TakViewerApp {
         let can_delete = self.comment_target(slot).is_some();
         let held = self.hold.as_ref().filter(|h| h.slot == slot).map(|h| h.start);
         let editing = self.comment_edit.is_some();
+        let working_enabled = !editing && self.hold.is_none() && !ui.input(|i| i.key_down(Key::M))
+            && !capturing && self.dirty_prompt.is_none();
         let draft = self.frames_draft(slot);
         // The type strip of a comment just made in this view (not in pictures of a capture).
         let file_now = self.views[slot].file_id;
@@ -3252,7 +3267,10 @@ impl TakViewerApp {
         }
         let bar = CommentBar { list: &v.comments.list, blocks: &mut v.comments.blocks, make, can_delete, held, picked: v.picked, draft };
         // (Undo: a band drag, like any drag, is one action when the mouse is let go, `app_undo.rs`.)
-        let deck = panels::deck(ui, deck_rect, slot, v.data.as_deref(), &mut v.pb, &mut v.range, v.primary, &mut v.heat, v.file_id, now, bar);
+        let deck = panels::deck(ui, deck_rect, slot, v.data.as_deref(), &mut v.pb, &mut v.range, v.primary, &mut v.heat, v.file_id, now, bar, working_enabled);
+        if let Some(reason) = deck.working_range_error {
+            self.takm_note = Some((reason.into(), now));
+        }
         match deck.action {
             // During an edit of the COMMENTS pane a block click only moves the frame (the
             // selection is the edit's).
@@ -3675,7 +3693,7 @@ impl TakViewerApp {
             _ => key_focus::Target::Blocked,
         };
         key_focus::begin_frame(ctx, self.capture.is_some() || self.dirty_prompt.is_some()
-            || self.hold.is_some() || self.comment_edit.is_some() || self.layout_strip.is_renaming()
+            || self.hold.is_some() || self.comment_edit.is_some() || self.typing(ctx) || self.layout_strip.is_renaming()
             || self.scene_marker_menu.is_open(), initial_focus);
         let now = ctx.input(|i| i.time);
         self.layout_time = now;
@@ -3784,11 +3802,14 @@ impl TakViewerApp {
         if global_keys && exact_key(ctx, Key::S, true, true, false) {
             self.start_menu_capture();
         }
-        // Every view plays on its own (no frame matching between views).
-        for k in self.open_views() {
-            let pb = &mut self.views[k].pb;
-            if pb.tick(now) || pb.playing {
-                ctx.request_repaint();
+        // A reverse-playback screenshot holds its initial frame for a repeatable picture.
+        if !self.auto.as_ref().is_some_and(|shot| shot.reverse_playing && shot.stage > 0) {
+            // Every view plays on its own (no frame matching between views).
+            for k in self.open_views() {
+                let pb = &mut self.views[k].pb;
+                if pb.tick(now) || pb.playing {
+                    ctx.request_repaint();
+                }
             }
         }
         self.close_hold_on_wrap(ctx);
@@ -4424,6 +4445,7 @@ mod tests {
     include!("app_remote_workspace_tests.rs");
     include!("app_window_launch_tests.rs");
     include!("app_label_assignment_tests.rs");
+    include!("app_working_range_tests.rs");
 
     /// eframe's settings file in memory. Like eframe's `FileStorage`, a value marks the file
     /// changed only when it differs, and `flush` writes (counted here) only then.
@@ -4471,7 +4493,7 @@ mod tests {
 
     #[test]
     fn command_line_runs_leave_the_settings_file_alone() {
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&egui::Context::default(), None, vec![], Some(shot), None);
         let mut st = FileLike::default();
         app.save(&mut st);
@@ -5543,7 +5565,7 @@ mod tests {
     #[test]
     fn screenshot_plate_argument_chooses_that_plate_in_every_view() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: Some("P2".into()), range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         dock::add_view(&mut app.dock, 1, dock::NOMINAL_AREA);
         for (k, name) in [(0, "a.tak"), (1, "b.tak")] {
@@ -5874,7 +5896,7 @@ mod tests {
         // Two views side by side: narrow bars, the rightmost button is ⋯.
         let r = app.views[1].scene_rect;
         assert!(!panels::deck_is_wide(r.width()), "{r:?}");
-        let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + 4.0 + panels::TIMELINE_H + 3.0 + 12.0);
+        let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + panels::TRANSPORT_TOP + 12.0);
         let out = click_at(&ctx, &mut app, dots);
         assert_eq!(app.active, 1, "pressing a view's bar chooses that view");
         let end = text_rects(&out, "⏭  끝");
@@ -6734,7 +6756,7 @@ mod tests {
         frame_with(&ctx, &mut app, vec![]);
         wait_comment_ids(&ctx, &mut app, 1);
         let r = app.views[1].scene_rect;
-        let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + 4.0 + panels::TIMELINE_H + 3.0 + 12.0);
+        let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + panels::TRANSPORT_TOP + 12.0);
         let out = click_at(&ctx, &mut app, dots);
         let item = text_rects(&out, "Comment").into_iter().find(|t| t.top() > 0.0).expect("Comment in the ⋯ menu");
         click_at(&ctx, &mut app, item.center());
@@ -9863,7 +9885,7 @@ mod tests {
         assert!(app.comment_writer.is_none());
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         // A screenshot run is a command run too.
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         assert!(TakViewerApp::build(&ctx, None, vec![], Some(shot), None).no_persist);
     }
 
@@ -10216,7 +10238,7 @@ mod tests {
     #[test]
     fn command_line_runs_do_not_use_or_fill_the_memory() {
         let ctx = egui::Context::default();
-        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: PathBuf::from("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let mut app = TakViewerApp::build(&ctx, None, vec![], Some(shot), None);
         app.settings.file_memory = vec![views::Spot {
             path: "a.tak".into(),
@@ -11293,7 +11315,7 @@ mod tests {
         let _dir_guard = comment_dir("overlay_shot");
         let dir = _dir_guard.to_path_buf();
         let f = take_files(&dir, &["a.tak", "b.tak"]);
-        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
+        let shot = AutoShot { out: dir.join("x.png"), frame: None, select: None, plate: None, range: None, working_range: None, reverse_playing: false, menu_capture: false, edit_tools: false, edit_pattern: false, edit_layout: 0, labeling_link: false, comments: false, pick_comment: None, edit_comment: None, type_strip: None, overlays: vec![f[0].clone()], hide: vec![], hover: None, scene_view: None, scene_follow: false, stage: 0 };
         let app = TakViewerApp::build(&ctx, None, vec![f[0].clone()], Some(shot), None);
         assert!(app.views[0].overlay_target().is_none());
         assert!(app.error.as_deref().is_some_and(|e| e.contains("이 화면에 열린 파일")), "{:?}", app.error);

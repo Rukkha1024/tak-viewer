@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.58.0 — 2026-11-18
+
+- Add per-view green playback bounds. Drag or type endpoints. Reset with `전체 구간` or Shift+either bracket. Keep yellow edit range and plain brackets.
+- Add Reverse beside Play. Both directions loop inside working bounds at selected speed. Ctrl+Z / Ctrl+Y restores bounds and direction.
+
 ## v0.57.0 — 2026-11-18
 
 - GRAPH Tracks adds Merge Keys Up and Down. Move points between two selected rows in the edit range or whole take. Any shared frame blocks the move and shows count plus first frame. One undo restores both rows.

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tak_core::comments::{self, Comments};
 use tak_core::geom::{v3, Vec3};
-use tak_core::playback::Playback;
+use tak_core::playback::{Playback, PlaybackControls};
 use tak_core::tak::MarkerKind;
 use tak_core::view_data::{AnalogPart, ViewData};
 use tak_core::edit::{DocumentId, DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
@@ -483,6 +483,7 @@ pub struct View {
     pub fresh: bool,
     /// The range to put back when the file being read is shown (undo of an open, v0.16.0).
     pub restore_range: Option<Range>,
+    pub restore_playback_controls: Option<PlaybackControls>,
     /// The comment file of the file being opened, still coming (read after the markers).
     pub comments_rx: Option<Receiver<CommentsLoad>>,
     pub labels: LabelsState,
@@ -586,6 +587,7 @@ impl Default for View {
             comments: CommentState::default(),
             fresh: false,
             restore_range: None,
+            restore_playback_controls: None,
             comments_rx: None,
             labels: LabelsState::default(),
             tracks: Default::default(),
@@ -754,9 +756,11 @@ impl View {
         };
         let restore = self.restore.take();
         let restore_range = self.restore_range.take();
+        let restore_playback_controls = self.restore_playback_controls.take();
         self.cancel_load();
         self.restore = restore;
         self.restore_range = restore_range;
+        self.restore_playback_controls = restore_playback_controls;
         self.restore_edit_document = Some(document);
         self.source_stamp = stamp;
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref());
@@ -1040,6 +1044,7 @@ impl View {
         self.pending_identity = None;
         self.restore = None;
         self.restore_range = None;
+        self.restore_playback_controls = None;
         Some(path)
     }
 
@@ -1342,6 +1347,7 @@ impl View {
         self.comments_rx = Some(comments_rx);
         self.restore = restore;
         self.restore_range = None;
+        self.restore_playback_controls = None;
         self.open_started = Some(Instant::now());
         self.markers_ms = None;
         self.analog_ms = None;
@@ -1384,6 +1390,7 @@ impl View {
         self.comments_rx = None;
         self.restore = None;
         self.restore_range = None;
+        self.restore_playback_controls = None;
     }
 
     /// The markers of the file being read, once.
@@ -1438,6 +1445,9 @@ impl View {
         self.emg_failure = None;
         let mut pb = Playback::new(data.start_frame, data.end_frame, data.take.frame_rate);
         pb.speed = speed;
+        if let Some(controls) = self.restore_playback_controls.take() {
+            pb.restore_controls(controls, now);
+        }
         self.pb = pb;
         self.cam.preset = Preset::Perspective;
         self.cam.follow = false;
