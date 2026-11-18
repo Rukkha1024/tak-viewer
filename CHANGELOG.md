@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.70.1 — 2026-11-18
+
+- Release helper: reuse the worker's warm build folder, reserve offline from cached public tags, record and resume a killed check, `prepare --refresh` after review edits keeps the number, versions tagged on main no longer block later ones.
+- Publisher: public filename tests keep matching the renamed sample names.
+
 ## v0.70.0 — 2026-11-18
 
 - Set Comment type names, meanings and order in View → Settings (up to eight). Save works in review (`--only`) windows too; other open windows pick the list up within a second. One undo step per save.
