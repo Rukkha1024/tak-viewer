@@ -154,6 +154,20 @@ pub struct SkeletonAsset {
     pub marker_colors: Vec<(i32, [f32; 3])>,
 }
 
+impl SkeletonModel {
+    fn is_legacy_full_body(&self) -> bool {
+        (self.serialization_version, self.template_code) == skeleton::LEGACY_FULL_BODY_PROFILE
+    }
+}
+
+impl SkeletonAsset {
+    /// SKL models available to existing labeling and slot comparison logic.
+    /// The legacy full-body profile supplies display sticks and reader diagnostics only.
+    pub fn labeling_model(&self) -> Option<&SkeletonModel> {
+        self.model.as_ref().filter(|m| !m.is_legacy_full_body())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LabelGroup {
     pub uid: Uid,
@@ -444,7 +458,7 @@ thread_local! { static LENIENT_PARSE_CALLS: std::cell::Cell<usize> = const { std
 /// Viewer-only: fill the membership of `Unknown` markers from the lenient trailer profile
 /// (`nodes::lenient_memberships`). Runs after the skeleton read, so the Python-compared parts
 /// (assets, sticks) see the strict view. A template candidate is accepted only when its
-/// (asset, slot) is used by no other template marker and, when the SKL model is loaded, the
+/// (asset, slot) is used by no other template marker and, when a labeling model is available, the
 /// slot is one of its constraints; otherwise the marker stays `Unknown`.
 fn apply_lenient_memberships(
     nodes: &[u8],
@@ -485,7 +499,7 @@ fn apply_lenient_memberships(
             let listed = assets
                 .iter()
                 .find(|a| a.uid == parent)
-                .and_then(|a| a.model.as_ref())
+                .and_then(SkeletonAsset::labeling_model)
                 .map_or(true, |m| m.constraints.iter().any(|c| c.slot == slot));
             if !listed || template_use.get(&(parent, slot)) != Some(&1) {
                 continue;

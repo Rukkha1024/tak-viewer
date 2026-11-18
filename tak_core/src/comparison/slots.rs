@@ -95,8 +95,7 @@ impl<'a> Template<'a> {
     fn from_asset(asset: &'a SkeletonAsset) -> Option<Self> {
         let name = asset.markerset_name.as_deref()?.trim();
         let model = asset
-            .model
-            .as_ref()
+            .labeling_model()
             .or(asset.slot_comparison_model.as_ref())?;
         let mut hierarchy: Vec<_> = model.joints.iter().map(|j| (j.id, j.parent)).collect();
         hierarchy.sort_unstable();

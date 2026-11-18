@@ -746,7 +746,7 @@ fn missing_label_donor<'a>(
         return Err(other("지원하는 고유한 라벨 소속을 확인할 수 없어요."));
     }
     if let Some(asset) = matching_assets.first() {
-        let model = asset.model.as_ref().ok_or(EditError::UnsupportedLayout)?;
+        let model = asset.labeling_model().ok_or(EditError::UnsupportedLayout)?;
         if target.slot == 0 {
             return Err(EditError::UnsupportedLayout);
         }

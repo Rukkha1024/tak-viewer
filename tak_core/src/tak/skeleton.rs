@@ -15,8 +15,10 @@ use super::{
 };
 
 pub const SKELETON_SIGNATURE: &[u8] = b"\x08\x00Skeleton";
+pub(super) const LEGACY_FULL_BODY_PROFILE: (u32, u32) = (120, 2039);
+const LEGACY_FULL_BODY_SLOTS: usize = 39;
 /// (SKL serialization version, template code) verified end to end on real TAKs.
-pub const SUPPORTED_PROFILES: [(u32, u32); 2] = [(123, 2039), (123, 2016)];
+pub const SUPPORTED_PROFILES: [(u32, u32); 3] = [(123, 2039), (123, 2016), LEGACY_FULL_BODY_PROFILE];
 /// `STRICT_TEMPLATE_COUNTS`.
 const STRICT_TEMPLATE_COUNTS: [((u32, u32), usize); 1] = [((123, 2016), 16)];
 pub const STICK_TAIL_GAP: usize = 77;
@@ -186,7 +188,7 @@ fn parse_model(raw: &[u8], header: &Header, trajectories: &[Trajectory]) -> Resu
     let template_code = r.u32()?;
     let profile = (version, template_code);
     let strict = STRICT_TEMPLATE_COUNTS.iter().find(|(p, _)| *p == profile).map(|(_, n)| *n);
-    if strict.is_some() {
+    if strict.is_some() || profile == LEGACY_FULL_BODY_PROFILE {
         strict_properties(&header.json).map_err(|e| {
             TakError(format!(
                 "Invalid embedded skeleton properties: SKL version {version}, template code {template_code}: {}",
@@ -302,7 +304,15 @@ fn parse_model(raw: &[u8], header: &Header, trajectories: &[Trajectory]) -> Resu
     if header.props.get("NodeName") != Some(&Value::String(name.clone())) {
         return err("Skeleton names disagree");
     }
-    if expected_templates.is_some_and(|n| n != template_slots.len()) {
+    if profile == LEGACY_FULL_BODY_PROFILE {
+        // The v120 header has no marker-set name. The shared record decoder has
+        // already checked unique signed slots and agreement with the inventory.
+        if template_slots.len() != LEGACY_FULL_BODY_SLOTS
+            || template_slots.iter().any(|&s| s > LEGACY_FULL_BODY_SLOTS as u32)
+        {
+            return err("SKL 120:2039 requires primary template slots 1 through 39");
+        }
+    } else if expected_templates.is_some_and(|n| n != template_slots.len()) {
         return err("SKL primary template count differs from marker-set name");
     }
     Ok(Parsed {
@@ -343,6 +353,13 @@ fn marker_sticks(raw: &[u8], asset: &Uid, parsed: &Parsed) -> Result<Vec<MarkerS
     let (sticks, pos) = stick_records(raw, asset, parsed.parsed_end)?;
     if u32_at(raw, pos)? as usize != parsed.template_slots.len() || raw.get(pos + 4..pos + 20) != Some(&asset[..]) {
         return err("Marker Sticks not followed by the per-marker table");
+    }
+    if parsed.model.is_legacy_full_body() && sticks.iter().any(|s| {
+        let slots = 1..=LEGACY_FULL_BODY_SLOTS as u32;
+        !slots.contains(&s.slot_a) || !slots.contains(&s.slot_b) || s.slot_a == s.slot_b
+            || !s.rgb.iter().all(|c| (0.0..=1.0).contains(c))
+    }) {
+        return err("Invalid SKL 120:2039 Marker Stick slot or color");
     }
     Ok(sticks)
 }
@@ -414,7 +431,8 @@ pub fn read_assets(raw: &[u8], trajectories: &[Trajectory], warnings: &mut Vec<S
                 // Preserve the normal reader result. Compare unaffected slots if the
                 // independent SKL definition still validates without the recorded tracks.
                 if duplicate_track_slot(trajectories, h.uid).is_some() {
-                    asset.slot_comparison_model = parse_model(raw, h, &[]).ok().map(|p| p.model);
+                    asset.slot_comparison_model = parse_model(raw, h, &[]).ok().map(|p| p.model)
+                        .filter(|m| !m.is_legacy_full_body());
                 }
                 warnings.push(format!("{label}: model not loaded: {}", e.0));
             }
@@ -423,9 +441,13 @@ pub fn read_assets(raw: &[u8], trajectories: &[Trajectory], warnings: &mut Vec<S
                     Ok(sticks) => asset.sticks = sticks,
                     Err(e) => warnings.push(format!("{label}: marker sticks not loaded: {}", e.0)),
                 }
-                match marker_colors(raw, &h.uid, &parsed) {
-                    Ok(colors) => asset.marker_colors = colors,
-                    Err(e) => warnings.push(format!("{label}: marker colors not loaded: {}", e.0)),
+                // Preserve marker colors on existing v120 takes. Load only the
+                // model and its stored sticks for this profile.
+                if !parsed.model.is_legacy_full_body() {
+                    match marker_colors(raw, &h.uid, &parsed) {
+                        Ok(colors) => asset.marker_colors = colors,
+                        Err(e) => warnings.push(format!("{label}: marker colors not loaded: {}", e.0)),
+                    }
                 }
                 asset.model = Some(parsed.model);
             }
@@ -441,6 +463,143 @@ pub fn read_assets(raw: &[u8], trajectories: &[Trajectory], warnings: &mut Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view_data::{ColorSource, GroupKind, ViewData};
+
+    const STICK_RGB: [f32; 3] = [0.2, 0.8, 0.4];
+
+    fn full_body_node(profile: (u32, u32), last_slot: u32, endpoint: u32) -> Vec<u8> {
+        fn text(raw: &mut Vec<u8>, value: &str) {
+            raw.extend((value.encode_utf16().count() as u16).to_le_bytes());
+            raw.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
+        }
+
+        let asset = [4; 16];
+        let mut raw = SKELETON_SIGNATURE.to_vec();
+        let metadata = if profile.0 == 123 {
+            r#"{"properties":[{"name":"NodeName","value":"Body"},{"name":"SkeletonMarkersetName","value":"Conventional Full Body (39)"}]}"#
+        } else {
+            r#"{"properties":[{"name":"NodeName","value":"Body"}]}"#
+        };
+        text(&mut raw, metadata);
+        raw.extend([0; 19]);
+        raw.extend(asset);
+        raw.extend(b"SKL");
+        raw.extend(profile.0.to_le_bytes());
+        raw.extend(profile.1.to_le_bytes());
+        text(&mut raw, "Body");
+        raw.extend(0u16.to_le_bytes());
+        raw.extend(1.7f32.to_le_bytes());
+        raw.extend(asset);
+        raw.extend(1u32.to_le_bytes()); // one root joint
+        raw.extend(1u32.to_le_bytes()); // record version
+        raw.extend(1u32.to_le_bytes()); // joint ID
+        raw.extend([0; 28]); // offset, opaque values and root parent
+        raw.extend(39u32.to_le_bytes());
+        raw.extend([0; 8]); // span
+        let slots = (1u32..39).chain([last_slot]);
+        for slot in slots.clone() {
+            raw.extend(asset);
+            raw.extend(slot.to_le_bytes());
+            text(&mut raw, &format!("Constraint {slot}"));
+            raw.extend([0; 28]); // reserved bytes and local position
+            raw.push(1);
+            raw.extend([0; 16]);
+        }
+        raw.extend(0u32.to_le_bytes()); // no secondary constraints
+        raw.extend(39u32.to_le_bytes());
+        for slot in slots.clone() {
+            raw.extend(asset);
+            raw.extend(slot.to_le_bytes());
+        }
+        raw.extend([0; STICK_TAIL_GAP]);
+        raw.extend(STICK_MARKER);
+        raw.extend(1u32.to_le_bytes());
+        for slot in [1u32, endpoint] {
+            raw.extend(asset);
+            raw.extend(slot.to_le_bytes());
+        }
+        raw.extend(STICK_RGB.into_iter().flat_map(f32::to_le_bytes));
+        raw.extend(39u32.to_le_bytes());
+        for slot in slots {
+            raw.extend(asset);
+            raw.extend(slot.to_le_bytes());
+            raw.extend(STICK_RGB.into_iter().flat_map(f32::to_le_bytes));
+        }
+        raw.extend(NODE_END);
+        raw
+    }
+
+    #[test]
+    fn legacy_full_body_uses_stored_sticks_by_slot_and_retains_marker_palette() {
+        let raw = full_body_node(LEGACY_FULL_BODY_PROFILE, 39, 2);
+        let mut warnings = Vec::new();
+        let mut take = crate::tak::decode(
+            std::path::Path::new("fixture.tak"), &crate::sample_tak::sample_tak_with_devices(),
+        ).unwrap();
+        for track in &mut take.trajectories {
+            track.name = "Renamed".into();
+        }
+        let mut extra = take.trajectories[0].clone();
+        extra.uid = [9; 16];
+        extra.slot = Some(-1);
+        extra.slot_raw = Some(u32::MAX);
+        extra.kind = crate::tak::MarkerKind::SkeletonExtra;
+        take.trajectories.push(extra);
+        take.assets = read_assets(&raw, &take.trajectories, &mut warnings);
+        let asset = &take.assets[0];
+        let model = asset.model.as_ref().unwrap();
+        assert_eq!(model.serialization_version, 120);
+        assert_eq!(model.constraints.len(), 39);
+        assert!(asset.labeling_model().is_none());
+        assert!(asset.slot_comparison_model.is_none());
+        assert!(asset.markerset_name.is_none());
+        assert!(asset.marker_colors.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let view = ViewData::build(take);
+        assert_eq!(view.groups[0].kind, GroupKind::AssetTemplate);
+        assert_eq!(view.groups[0].title, "Body");
+        assert_eq!(view.sticks.len(), 1);
+        let stick = &view.sticks[0];
+        assert!(!stick.standard);
+        assert_eq!(stick.color, ColorSource::File(STICK_RGB));
+        assert_eq!((&stick.a[..], &stick.b[..]), (&[0][..], &[1][..]));
+        assert_eq!(view.markers[0].color, ColorSource::Asset(0));
+        assert_eq!(view.markers[2].color, ColorSource::Unlabeled);
+        assert_eq!(view.markers[3].color, ColorSource::AssetExtra(0));
+    }
+
+    #[test]
+    fn legacy_full_body_guards_profile_slots_and_stick_endpoints() {
+        let mut warnings = Vec::new();
+        for (profile, last_slot) in [(LEGACY_FULL_BODY_PROFILE, 40), ((120, 2016), 39)] {
+            let assets = read_assets(&full_body_node(profile, last_slot, 2), &[], &mut warnings);
+            assert!(assets[0].model.is_none());
+            assert!(assets[0].sticks.is_empty());
+        }
+        assert!(warnings[0].contains("primary template slots 1 through 39"));
+        assert!(warnings[1].contains("Unsupported embedded skeleton profile"));
+
+        warnings.clear();
+        let assets = read_assets(&full_body_node(LEGACY_FULL_BODY_PROFILE, 39, 40), &[], &mut warnings);
+        assert!(assets[0].model.is_some());
+        assert!(assets[0].sticks.is_empty());
+        assert!(warnings[0].contains("Invalid SKL 120:2039 Marker Stick slot or color"));
+    }
+
+    #[test]
+    fn modern_full_body_keeps_file_sticks_marker_colors_and_labeling_model() {
+        let mut warnings = Vec::new();
+        let assets = read_assets(&full_body_node((123, 2039), 39, 2), &[], &mut warnings);
+        let asset = &assets[0];
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(asset.labeling_model().unwrap().serialization_version, 123);
+        assert_eq!(asset.markerset_name.as_deref(), Some(crate::marker_sets::FULL_BODY_39));
+        assert_eq!(asset.marker_colors, (1..=39).map(|slot| (slot, STICK_RGB)).collect::<Vec<_>>());
+        assert_eq!(asset.sticks.len(), 1);
+        let stick = &asset.sticks[0];
+        assert_eq!((stick.slot_a, stick.slot_b, stick.rgb), (1, 2, STICK_RGB));
+    }
 
     fn props(name: &str) -> Props {
         let mut p = Props::new();

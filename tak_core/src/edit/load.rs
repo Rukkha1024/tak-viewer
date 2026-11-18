@@ -70,7 +70,7 @@ impl PreparedInput {
         }
         let mut labels = Vec::new();
         for asset in &take.assets {
-            if let Some(model) = &asset.model {
+            if let Some(model) = asset.labeling_model() {
                 labels.extend(model.constraints.iter().filter(|c| c.primary).map(|c| DeclaredLabel { key: LabelKey { parent: asset.uid, slot: c.slot }, name: c.name.clone() }));
             }
         }

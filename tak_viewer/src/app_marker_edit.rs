@@ -1823,7 +1823,7 @@ impl TakViewerApp {
             .assets
             .iter()
             .flat_map(|asset| {
-                asset.model.iter().flat_map(move |model| {
+                asset.labeling_model().into_iter().flat_map(move |model| {
                     model
                         .constraints
                         .iter()

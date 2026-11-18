@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.69.8 — 2026-11-18
+
+- Draw the skeleton lines stored in old takes (Motive build 40156, SKL 120:2039). 3D view, captures and screenshots use the same lines.
+
 ## v0.69.7 — 2026-11-18
 
 - Comment types are now four: `File bad`, `Range OK`, `Range bad`, `File OK`. Older types stay as stored in files and the Comment command still takes them.
