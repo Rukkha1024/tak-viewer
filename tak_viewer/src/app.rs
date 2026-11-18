@@ -92,7 +92,7 @@ const NEW_WINDOW_SHIFT: f32 = 40.0;
 /// Filters of the "파일 열기" dialog: the first (shown at start) holds both kinds the viewer
 /// opens, then each kind alone, then everything.
 const OPEN_FILTERS: [(&str, &[&str]); 4] =
-    [("TAK · TAKM (.tak, .takm)", &["tak", "takm"]), ("TAK (.tak)", &["tak"]), ("TAKM (.takm)", &["takm"]), ("모든 파일", &["*"])];
+    [("TAK · TAKM (.tak, .takm)", &["tak", "takm"]), ("TAK (.tak)", &["tak"]), ("TAKM (.takm)", &["takm"]), ("All Files", &["*"])];
 
 /// The persistent, small part of a layout tab. Remote file paths are never saved.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -333,7 +333,7 @@ struct TypeStrip {
 
 /// The side toggles in screen order, with their menu text.
 const SIDE_TOGGLES: [(Side, &str); 3] =
-    [(Side::Left, "왼쪽 패널 전체  (Ctrl+B)"), (Side::Bottom, "아래 패널 전체  (Ctrl+J)"), (Side::Right, "오른쪽 패널 전체  (Ctrl+Alt+B)")];
+    [(Side::Left, "Left Panels (Ctrl+B)"), (Side::Bottom, "Bottom Panels (Ctrl+J)"), (Side::Right, "Right Panels (Ctrl+Alt+B)")];
 
 /// Toggle button of one side (VS Code layout control): a small window outline whose left /
 /// bottom / right part is filled while panes are docked on that side.
@@ -1564,7 +1564,8 @@ impl TakViewerApp {
         }
         if run.plan.exit_when_done {
             if let Some(e) = self.error.clone() {
-                self.fail_capture(ctx, &run, format!("load failed: {e}"));
+                let reason = if run.plan.exit_when_done { format!("load failed: {e}") } else { format!("파일을 읽지 못했어요. {e}") };
+                self.fail_capture(ctx, &run, reason);
                 return;
             }
         }
@@ -1792,7 +1793,7 @@ impl TakViewerApp {
     fn comment_ready(&self, slot: usize) -> Result<String, String> {
         let path = self.comment_writable(slot)?;
         if self.views[slot].remote.is_none() && self.views[slot].comments.id_pool.as_ref().is_none_or(|ids| ids.is_empty()) {
-            return Err(self.views[slot].comments.id_error.clone().unwrap_or_else(|| "Preparing Comment IDs. Try again shortly.".into()));
+            return Err(self.views[slot].comments.id_error.clone().unwrap_or_else(|| "Comment 번호를 준비 중이에요. 잠시 뒤 다시 눌러 주세요.".into()));
         }
         if let Some(e) = &self.comment_edit {
             if e.field == Field::Type {
@@ -1802,18 +1803,19 @@ impl TakViewerApp {
         }
         let v = &self.views[slot];
         let frames = match v.range {
-            Some((a, b)) if a != b => format!("구간 {a} – {b}"),
-            Some((a, _)) => format!("프레임 {a}"),
-            None => format!("지금 프레임 {}", v.pb.frame),
+            Some((a, b)) if a != b => format!("Frames {a}–{b}"),
+            Some((a, _)) => format!("Frame {a}"),
+            None => format!("Frame {}", v.pb.frame),
         };
         let markers = match v.selected.len() {
-            0 => "마커 없이".to_owned(),
-            n => format!("고른 마커 {n}개"),
+            0 => "no markers".to_owned(),
+            1 => "1 marker".to_owned(),
+            n => format!("{n} markers"),
         };
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let save_note=if v.remote.as_ref().is_some_and(|r|r.path.to_ascii_lowercase().ends_with(".tak")) {"Ctrl+S로 서버의 .takm에 저장해요."} else {"파일 안에 바로 저장해요."};
+        let save_note=if v.remote.as_ref().is_some_and(|r|r.path.to_ascii_lowercase().ends_with(".tak")) {"Ctrl+S saves to the server."} else {"Saves in this file."};
         Ok(format!(
-            "Comment = {frames} + {markers} (M 짧게)\nM을 누른 채 재생하다 떼면 누른 동안의 구간으로 만들어요.\n마커는 골라도 되고 안 골라도 돼요 (3D나 Labeling에서 클릭, Ctrl+클릭 = 여러 개).\n{name} · {save_note} Ctrl+Z = 되돌리기."
+            "Tap M: {frames} + {markers}.\nHold M during play to mark those frames.\nCtrl+click in 3D or Labeling to pick more markers.\n{name} · {save_note} Ctrl+Z to undo."
         ))
     }
 
@@ -1894,7 +1896,7 @@ impl TakViewerApp {
         if self.dirty_prompt.is_some() { return false; }
         self.views[slot].sync_shared();
         if kind != EventKind::Add && self.views[slot].comments.list.id_is_ambiguous(c.id) {
-            self.notice = Some("This older file has duplicate Comment IDs; this comment cannot be edited safely.".into());
+            self.notice = Some("Comment 번호가 겹쳐서 고칠 수 없어요.".into());
             return false;
         }
         let Some((path, file_a)) = self.comment_target(slot) else { return false };
@@ -1939,7 +1941,7 @@ impl TakViewerApp {
         let next = if let Some(location)=&self.views[slot].remote { Some(self.views[slot].comments.list.next_id().max(self.ssh.documents.get(location).map_or(1,|doc|doc.next_comment_id))) }
             else { self.views[slot].comments.id_pool.as_mut().and_then(Iterator::next) };
         let Some(id) = next else {
-            self.notice = Some("Preparing Comment IDs. Try again shortly.".into());
+            self.notice = Some("Comment 번호를 준비 중이에요. 잠시 뒤 다시 눌러 주세요.".into());
             return;
         };
         let c = Comment { id, markers, start, end, comment_type: String::new(), text: String::new() };
@@ -2326,7 +2328,7 @@ impl TakViewerApp {
             self.views[slot].comments.pending += 1;
             self.comment_outstanding += 1;
         } else {
-            self.views[slot].comments.failed = Some("저장하는 스레드가 멈췄어요".into());
+            self.views[slot].comments.failed = Some("저장 작업이 멈췄어요.".into());
             self.comment_failed.push((tag, path, event));
         }
     }
@@ -2463,14 +2465,14 @@ impl TakViewerApp {
         let target = c.target.as_ref()?;
         let mut text = format!("Comments {}", c.list.len());
         let mut tip = match target {
-            Ok(p) => format!("Comment 파일: {}", p.display()),
+            Ok(p) => format!("Comment file: {}", p.display()),
             Err(why) => format!("Comment는 저장하지 않아요: {why}"),
         };
         if self.no_persist {
             tip = "명령 실행은 Comment 파일을 읽기만 해요.".into();
         }
         if c.skipped > 0 {
-            tip += &format!("\n읽지 못한 줄 {}개는 건너뛰었어요 (끝이 잘린 줄 포함).", c.skipped);
+            tip += &format!("\nSkipped {} unreadable lines.", c.skipped);
         }
         let warn = c.failed.is_some();
         if let Some(e) = &c.failed {
@@ -2491,14 +2493,14 @@ impl TakViewerApp {
         let slot = self.comment_edit.as_ref().map_or(self.active, |e| e.slot);
         let write = self.comment_writable(slot).map(|_| ());
         if self.views[slot].remote.as_ref().is_some_and(|r| !r.path.to_ascii_lowercase().ends_with(".takm")) {
-            ui.label(RichText::new("Comment는 화면에 두고 Ctrl+S로 서버의 .takm에 저장해요.").size(11.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new("Ctrl+S saves Comments to the server.").size(11.0).color(theme::TEXT_DIM));
         }
         if self.shows_tak(slot) {
             self.tak_comments_tab(ui, slot);
             return;
         }
         if let Some(reason) = self.views[slot].comments.id_error.clone() {
-            ui.label(RichText::new(format!("Comment ID reservation failed: {reason}")).color(theme::WARN));
+            ui.label(RichText::new(format!("Comment 번호를 준비하지 못했어요. {reason}")).color(theme::WARN));
             if ui.button("Retry Comment IDs").clicked() {
                 let ctx = ui.ctx().clone();
                 self.retry_comment_ids(&ctx, slot);
@@ -2506,8 +2508,8 @@ impl TakViewerApp {
         }
         let v = &self.views[slot];
         let waiting = match (&v.data, &v.comments.target) {
-            (None, _) => Some("파일을 열면 여기에 나와요."),
-            (Some(_), None) => Some("Comment 파일을 읽는 중이에요."),
+            (None, _) => Some("Open a take to start."),
+            (Some(_), None) => Some("Loading Comments…"),
             _ => None,
         };
         if let Some(t) = waiting {
@@ -2554,12 +2556,12 @@ impl TakViewerApp {
         let mut clicked = false;
         ui.horizontal(|ui| {
             ui.add_space(6.0);
-            clicked = ui.add_enabled(allowed.is_ok(), egui::Button::new(".takm으로 저장")).clicked();
+            clicked = ui.add_enabled(allowed.is_ok(), egui::Button::new("Save as .takm")).clicked();
         });
         match (&allowed, self.takm_working()) {
             (_, Some(w)) => line(ui, w, theme::TEXT_DIM),
             (Err(why), None) => line(ui, why.clone(), theme::TEXT_DIM),
-            (Ok(_), None) => line(ui, "TAK 옆에 같은 이름의 .takm을 만들고 이 화면에 열어요. TAK는 그대로예요.".to_owned(), theme::TEXT_DIM),
+            (Ok(_), None) => line(ui, "Save and open a .takm copy.".to_owned(), theme::TEXT_DIM),
         }
         if let (true, Ok(tak)) = (clicked, allowed) {
             let ctx = ui.ctx().clone();
@@ -2838,42 +2840,42 @@ impl TakViewerApp {
         egui::TopBottomPanel::top("menu").frame(frame).show(ctx, |ui| {
             if self.dirty_prompt.is_some() { ui.disable(); }
             egui::menu::bar(ui, |ui| {
-                ui.menu_button("파일", |ui| {
-                    if ui.button("파일 열기…  (Ctrl+O)").clicked() {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open File… (Ctrl+O)").clicked() {
                         ui.close_menu();
                         self.pick_file(ctx, false);
                     }
                     if ui
-                        .button(format!("옆 화면에 파일 열기…  · 3D 화면 최대 {MAX_VIEWS}개"))
-                        .on_hover_text("Explorer에서 Ctrl+클릭해도 옆 화면에 열려요.")
+                        .button(format!("Open Beside… (Max {MAX_VIEWS})"))
+                        .on_hover_text("Ctrl+click in Explorer to open beside.")
                         .clicked()
                     {
                         ui.close_menu();
                         self.pick_file(ctx, true);
                     }
                     if ui
-                        .add_enabled(!self.workspace.is_full(), egui::Button::new(format!("폴더 추가…  (Ctrl+Shift+O)  · 최대 {MAX_ROOTS}개")))
+                        .add_enabled(!self.workspace.is_full(), egui::Button::new(format!("Add Folder… (Ctrl+Shift+O) · Max {MAX_ROOTS}")))
                         .on_disabled_hover_text(format!("저장 폴더 {MAX_ROOTS}개가 다 찼어요. Explorer에서 ✕로 하나 빼세요."))
                         .clicked()
                     {
                         ui.close_menu();
                         self.pick_folder();
                     }
-                    if ui.button("경로로 열기…  (Ctrl+L)  · WSL 경로 가능").clicked() {
+                    if ui.button("Open by Path… (Ctrl+L)").clicked() {
                         ui.close_menu();
                         self.open_path_dialog();
                     }
-                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("저장  (Ctrl+S)")).clicked() {
+                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("Save (Ctrl+S)")).clicked() {
                         ui.close_menu();
                         self.save_markers(ctx, self.active, false, false);
                     }
-                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("다른 이름으로 저장…")).clicked() {
+                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("Save As…")).clicked() {
                         ui.close_menu();
                         self.save_markers(ctx, self.active, true, false);
                     }
                     // `.takm` step ③: the active view's TAK as `.takm` (dim, with the reason).
                     let takm = self.takm_allowed(self.current_path());
-                    if ui.add_enabled(takm.is_ok(), egui::Button::new(".takm으로 저장")).clicked() {
+                    if ui.add_enabled(takm.is_ok(), egui::Button::new("Save as .takm")).clicked() {
                         ui.close_menu();
                         if let Ok(t) = takm.clone() {
                             self.save_takm(ctx, t);
@@ -2883,20 +2885,20 @@ impl TakViewerApp {
                         ui.label(RichText::new(why).size(11.5).color(theme::TEXT_DIM));
                     }
                     ui.separator();
-                    ui.menu_button("최근 폴더", |ui| {
+                    ui.menu_button("Recent Folders", |ui| {
                         if self.settings.recent_workspaces.is_empty() {
-                            ui.label("없음");
+                            ui.label("None");
                         }
                         for r in self.settings.recent_workspaces.clone() {
-                            if ui.button(&r).on_hover_text("저장 폴더에 추가").clicked() {
+                            if ui.button(&r).on_hover_text("Add to Workspace").clicked() {
                                 ui.close_menu();
                                 self.open_workspace(PathBuf::from(r));
                             }
                         }
                     });
-                    ui.menu_button("최근 파일", |ui| {
+                    ui.menu_button("Recent Files", |ui| {
                         if self.settings.recent.is_empty() {
-                            ui.label("없음");
+                            ui.label("None");
                         }
                         for r in self.settings.recent.clone() {
                             if ui.button(&r).clicked() {
@@ -2906,26 +2908,27 @@ impl TakViewerApp {
                         }
                     });
                     if ui
-                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new("화면 캡처 저장 (지금 + 위·옆·앞)  (Ctrl+Shift+S)"))
-                        .on_hover_text("repo 안 experiments/tak_captures/ 에 PNG, sheet.png, captures.json 저장")
+                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new("Save Captures (Ctrl+Shift+S)"))
+                        .on_hover_text("Save images to experiments/tak_captures/.")
                         .clicked()
                     {
                         ui.close_menu();
                         self.start_menu_capture();
                     }
                     if let Some(p) = self.current_path().and_then(workspace::to_wsl_path) {
-                        if ui.button("현재 파일 WSL 경로 복사").on_hover_text(&p).clicked() {
+                        if ui.button("Copy WSL Path").on_hover_text(&p).clicked() {
                             ui.close_menu();
                             ctx.output_mut(|o| o.copied_text = p);
                         }
                     }
                     ui.separator();
-                    if ui.button("끝내기").clicked() {
+                    if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.menu_button("보기", |ui| {
-                    ui.label(RichText::new("패널 한쪽 전체  (오른쪽 위 버튼과 같아요)").color(theme::TEXT_DIM));
+                ui.menu_button("View", |ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(RichText::new("Panel Groups").color(theme::TEXT_DIM));
                     for (side, label) in SIDE_TOGGLES {
                         let mut on = dock::side_open(&self.dock, self.dock_area, side);
                         if ui.checkbox(&mut on, label).changed() {
@@ -2933,14 +2936,14 @@ impl TakViewerApp {
                         }
                     }
                     ui.separator();
-                    ui.label(RichText::new("패널 하나씩  (제목을 마우스로 끌어 옮겨요)").color(theme::TEXT_DIM));
+                    ui.label(RichText::new("Panels · Drag titles to move").color(theme::TEXT_DIM));
                     for (pane, label) in [
-                        (Pane::Explorer, "Explorer (폴더 트리)"),
+                        (Pane::Explorer, "Explorer"),
                         (Pane::Labeling, "Labeling"),
                         (Pane::EditTools, "Edit Tools"),
-                        (Pane::Selected, "선택 마커"),
+                        (Pane::Selected, "Marker Info"),
                         (Pane::Devices, "Devices"),
-                        (Pane::Comments, "Comments 목록"),
+                        (Pane::Comments, "Comments"),
                         (Pane::Graph, "Graph (Below 3D)"),
                     ] {
                         let mut on = dock::has(&self.dock, pane);
@@ -2953,10 +2956,10 @@ impl TakViewerApp {
                         }
                     }
                     let mut float = self.settings.graph_float;
-                    if ui.checkbox(&mut float, "그래프를 3D 화면 위에 띄우기").on_hover_text("끄면 그래프가 3D 아래 Graph 패널로 돌아가요.").changed() {
+                    if ui.checkbox(&mut float, "Float Graph").on_hover_text("Turn off to put Graph below 3D.").changed() {
                         self.set_graph_float(float);
                     }
-                    if ui.button("패널 배치 처음대로").clicked() {
+                    if ui.button("Reset Layout").clicked() {
                         ui.close_menu();
                         let open: Vec<u8> = dock::views(&self.dock);
                         self.dock = dock::default_layout_for(&open);
@@ -2965,46 +2968,46 @@ impl TakViewerApp {
                         self.activate(self.active);
                     }
                     ui.separator();
-                    ui.label(RichText::new("3D 화면").color(theme::TEXT_DIM));
+                    ui.label(RichText::new("3D View").color(theme::TEXT_DIM));
                     self.camera_menu(ui);
                     let s = &mut self.settings.scene;
-                    ui.checkbox(&mut s.grid, "바닥 격자");
-                    ui.checkbox(&mut s.axes, "원점 축");
+                    ui.checkbox(&mut s.grid, "Floor Grid");
+                    ui.checkbox(&mut s.axes, "Origin Axes");
                     ui.checkbox(&mut s.names, "Marker Names (L)");
-                    ui.checkbox(&mut s.unlabeled, "Unlabeled 마커");
-                    ui.checkbox(&mut s.sticks, "Marker Sticks (마커 사이 선)");
-                    ui.add_enabled_ui(s.sticks, |ui| ui.checkbox(&mut s.standard_sticks, "  파일에 선이 없으면 표준 선 표시"));
+                    ui.checkbox(&mut s.unlabeled, "Unlabeled Markers");
+                    ui.checkbox(&mut s.sticks, "Marker Sticks");
+                    ui.add_enabled_ui(s.sticks, |ui| ui.checkbox(&mut s.standard_sticks, "  Use Standard Sticks"));
                     ui.checkbox(&mut s.plates, "Force plate");
-                    ui.checkbox(&mut s.asset_names, "Asset 이름표");
-                    ui.checkbox(&mut s.history, "선택 마커 지나온 길 (250 프레임)");
+                    ui.checkbox(&mut s.asset_names, "Asset Names");
+                    ui.checkbox(&mut s.history, "Marker Trails (250 Frames)");
                     ui.checkbox(&mut s.measurements, "Distance / Angle");
-                    ui.checkbox(&mut s.marker_colors, "마커 색 (끄면 흰색)");
-                    ui.add_enabled(false, egui::Checkbox::new(&mut s.bones, "스켈레톤 뼈 (준비 중)"));
+                    ui.checkbox(&mut s.marker_colors, "Marker Colors");
+                    ui.add_enabled(false, egui::Checkbox::new(&mut s.bones, "Skeleton Bones (Soon)"));
                     ui.separator();
-                    if ui.button("화면 맞춤 (Shift+F)").clicked() {
+                    if ui.button("Fit View (Shift+F)").clicked() {
                         ui.close_menu();
                         self.fit_all();
                     }
                     ui.separator();
-                    if ui.button("설정…").on_hover_text("3D 위에 뜬 그래프의 바탕 진하기").clicked() {
+                    if ui.button("Settings…").on_hover_text("Set the background of floating graphs.").clicked() {
                         ui.close_menu();
                         self.show_settings = true;
                     }
                 });
-                ui.menu_button("도움말", |ui| {
-                    if ui.button("조작키").clicked() {
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Controls").clicked() {
                         ui.close_menu();
                         self.show_help = true;
                     }
                     ui.separator();
-                    ui.label(RichText::new(format!("TAK 뷰어 v{}", crate::version::VERSION)).weak());
+                    ui.label(RichText::new(format!("TAK Viewer v{}", crate::version::VERSION)).weak());
                 });
                 // Side toggles at the right end (VS Code layout controls): left, bottom, right.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(4.0);
                     for (side, label) in SIDE_TOGGLES.into_iter().rev() {
                         let on = dock::side_open(&self.dock, self.dock_area, side);
-                        let tip = format!("{label}\n{}", if on { "누르면 숨겨요. 다시 누르면 그 자리로 돌아와요." } else { "누르면 다시 보여요." });
+                        let tip = format!("{label}\n{}", if on { "Click to hide." } else { "Click to show." });
                         if side_toggle(ui, side, on).on_hover_text(tip).clicked() && self.capture.is_none() {
                             self.toggle_side(side);
                         }
@@ -3036,18 +3039,18 @@ impl TakViewerApp {
                         }
                         ui.label(text(format!("{:.0} Hz", d.take.frame_rate)));
                         if (d.unit_scale - 1.0).abs() > f32::EPSILON {
-                            ui.label(text("좌표를 mm로 보고 m로 환산".to_owned()));
+                            ui.label(text("Scale: mm to m".to_owned()));
                         }
                         if !d.take.warnings.is_empty() {
-                            let warn = egui::Label::new(text(format!("⚠ 경고 {}", d.take.warnings.len())).strong()).sense(egui::Sense::click());
-                            if ui.add(warn).on_hover_text("읽기 경고 보기").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            let warn = egui::Label::new(text(format!("⚠ Warnings {}", d.take.warnings.len())).strong()).sense(egui::Sense::click());
+                            if ui.add(warn).on_hover_text("Show read warnings").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                 show_warnings = true;
                             }
                         }
                         // Comments of this file, and how saving them went.
                         if let Some((s, tip, warn)) = self.comment_status(self.active, now) {
                             let label = if warn { text(format!("⚠ {s}")).strong() } else { text(s) };
-                            let item = ui.add(egui::Label::new(label).sense(egui::Sense::click())).on_hover_text(format!("{tip}\n누르기 = Comments 목록 보기")).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let item = ui.add(egui::Label::new(label).sense(egui::Sense::click())).on_hover_text(format!("{tip}\nClick to show Comments.")).on_hover_cursor(egui::CursorIcon::PointingHand);
                             if item.clicked() {
                                 open_comments = true;
                             }
@@ -3066,7 +3069,7 @@ impl TakViewerApp {
                         }
                     }
                     None => {
-                        ui.label(text("파일을 열면 여기에 파일 정보가 나와요.".to_owned()));
+                        ui.label(text("Open a take to see its details.".to_owned()));
                     }
                 }
                 }
@@ -3093,7 +3096,7 @@ impl TakViewerApp {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(text(format!("TAK 뷰어 v{}", crate::version::VERSION)));
+                    ui.label(text(format!("TAK Viewer v{}", crate::version::VERSION)));
                 });
             });
         });
@@ -3354,7 +3357,7 @@ impl TakViewerApp {
             ui.painter().with_clip_rect(box_rect).text(
                 box_rect.left_center() + egui::vec2(34.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                format!("불러오는 중: {name}"),
+                format!("Loading {name}…"),
                 egui::FontId::proportional(14.0),
                 theme::TEXT,
             );
@@ -3555,7 +3558,11 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 regions.record(name, ui.available_rect_before_wrap().intersect(ui.clip_rect()));
             }
         }
-        let _span=crate::bench_timing::span_view(tab.title(),Some(if let Pane::View(k)=*tab{usize::from(k)}else{app.active}));
+        let _span=crate::bench_timing::span_view(match *tab {
+            Pane::View(_) => "3D 화면",
+            Pane::Selected => "선택 마커",
+            _ => tab.title(),
+        },Some(if let Pane::View(k)=*tab{usize::from(k)}else{app.active}));
         if app.dirty_prompt.is_some() { ui.disable(); }
         let key_target = match *tab {
             Pane::View(slot) => key_focus::Target::Markers(usize::from(slot)),
@@ -3657,7 +3664,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new("파일을 열면 여기에 나와요.").color(theme::TEXT_DIM));
+                ui.label(RichText::new("Open a take to start.").color(theme::TEXT_DIM));
             });
             return;
         };
@@ -4056,7 +4063,7 @@ impl TakViewerApp {
         }
         if self.show_warnings {
             let mut open = true;
-            egui::Window::new("읽기 경고").open(&mut open).default_width(520.0).show(ctx, |ui| {
+            egui::Window::new("Read Warnings").id(egui::Id::new("읽기 경고")).open(&mut open).default_width(520.0).show(ctx, |ui| {
                 if let Some(d) = &self.views[self.active].data {
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         for w in &d.take.warnings {
@@ -4072,11 +4079,11 @@ impl TakViewerApp {
             let mut submit = false;
             let locked = self.dirty_prompt.is_some();
             let (focus, name) = (&mut self.path_focus, &mut self.path_name);
-            egui::Window::new("경로로 열기").open(&mut open).collapsible(false).default_width(620.0).show(ctx, |ui| {
+            egui::Window::new("Open by Path").id(egui::Id::new("경로로 열기")).open(&mut open).collapsible(false).default_width(620.0).show(ctx, |ui| {
                 if locked { ui.disable(); }
-                ui.label("폴더나 .tak 파일 경로를 붙여 넣으세요. WSL 경로도 됩니다.");
+                ui.label("Paste a file or folder path. WSL paths work too.");
                 ui.label(
-                    RichText::new("예: /home/user/workspace/tak-viewer   ·   /mnt/c/Users/User/…   ·   \\\\wsl.localhost\\Ubuntu\\…   ·   C:\\…")
+                    RichText::new("Example: /home/user/workspace/tak-viewer · /mnt/c/Users/User/… · \\\\wsl.localhost\\Ubuntu\\… · C:\\…")
                         .small()
                         .color(theme::TEXT_DIM),
                 );
@@ -4091,9 +4098,9 @@ impl TakViewerApp {
                 if !text.trim().is_empty() {
                     let p = workspace::resolve_path(&text);
                     let (kind, color) = if p.is_dir() {
-                        ("폴더 → 저장 폴더(Explorer)에 추가해요", theme::LABEL_TRACKED)
+                        ("Folder · Add to Workspace", theme::LABEL_TRACKED)
                     } else if p.is_file() {
-                        ("파일 → 바로 열어요", theme::LABEL_TRACKED)
+                        ("File · Open now", theme::LABEL_TRACKED)
                     } else {
                         ("찾을 수 없어요", theme::WARN)
                     };
@@ -4102,21 +4109,21 @@ impl TakViewerApp {
                         // Optional display name for the saved folder (the folder keeps its name).
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.label("표시 이름 (선택)");
+                            ui.label("Display Name (Optional)");
                             let r = ui.add(egui::TextEdit::singleline(name).hint_text(workspace::folder_name(&p)).desired_width(280.0));
                             if r.lost_focus() && enter(ui) {
                                 submit = true;
                             }
                         });
                         ui.label(
-                            RichText::new("비워 두면 폴더 이름 그대로예요. 여기 보이는 이름만 바뀌고 폴더는 그대로예요. 나중에 Explorer에서 연필 버튼으로 바꿀 수 있어요.")
+                            RichText::new("Leave blank to use the folder name. Use the pencil to rename it later.")
                                 .small()
                                 .color(theme::TEXT_DIM),
                         );
                     }
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("열기").clicked() {
+                    if ui.button("Open").clicked() {
                         submit = true;
                     }
                 });
@@ -4139,17 +4146,17 @@ impl TakViewerApp {
         }
         if let Some((dir, lines)) = self.capture_done.clone() {
             let mut open = true;
-            egui::Window::new("캡처를 저장했어요").open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
+            egui::Window::new("Captures Saved").id(egui::Id::new("캡처를 저장했어요")).open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
                 for l in &lines {
                     ui.label(l);
                 }
                 if let Some(dir) = &dir {
                     ui.horizontal(|ui| {
-                        if ui.button("폴더 열기").clicked() {
+                        if ui.button("Open Folder").clicked() {
                             let _ = std::process::Command::new("explorer").arg(dir).spawn();
                         }
                         if let Some(w) = workspace::to_wsl_path(dir) {
-                            if ui.button("WSL 경로 복사").clicked() {
+                            if ui.button("Copy WSL Path").clicked() {
                                 ctx.output_mut(|o| o.copied_text = w);
                             }
                         }
@@ -4162,7 +4169,7 @@ impl TakViewerApp {
         }
         if let Some(msg) = self.notice.clone() {
             let mut open = true;
-            egui::Window::new("알림").open(&mut open).collapsible(false).default_width(460.0).show(ctx, |ui| {
+            egui::Window::new("Notice").id(egui::Id::new("알림")).open(&mut open).collapsible(false).default_width(460.0).show(ctx, |ui| {
                 ui.label(msg);
             });
             if !open {
@@ -4172,22 +4179,30 @@ impl TakViewerApp {
         if self.show_settings {
             let names_before = self.settings.channel_names.clone();
             let mut open = true;
-            let mut channel_catalog = BTreeMap::<String, usize>::new();
-            for view in self.views.iter().chain(self.layout_tabs.tabs().iter().filter_map(|t| t.layout.as_ref()).flat_map(|r| r.views.iter())) {
-                if let Some(data) = &view.data { for device in &data.devices {
-                    if device.plate.is_none() { let n = channel_catalog.entry(device.title.clone()).or_default(); *n = (*n).max(device.channels.len()); }
-                }}
+            let mut channel_catalog = BTreeMap::<String, (String, usize)>::new();
+            let all_views = self.views.iter().chain(
+                self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).flat_map(|layout| layout.views.iter()),
+            );
+            for data in all_views.filter_map(|view| view.data.as_ref()) {
+                for (index, device) in data.devices.iter().enumerate().filter(|(_, device)| device.plate.is_none()) {
+                    let entry = channel_catalog.entry(device.title.clone()).or_insert_with(|| {
+                        let name = data.take.device_names.get(index).and_then(Option::as_ref);
+                        let caption = name.cloned().unwrap_or_else(|| format!("Analog device {}", index + 1));
+                        (caption, 0)
+                    });
+                    entry.1 = entry.1.max(device.channels.len());
+                }
             }
-            egui::Window::new("설정").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+            egui::Window::new("Settings").id(egui::Id::new("설정")).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
                 if self.dirty_prompt.is_some() { ui.disable(); }
-                ui.label(RichText::new("3D 위에 뜬 그래프 (마커 · forceplate)").color(theme::TEXT_DIM));
+                ui.label(RichText::new("Floating Graphs").color(theme::TEXT_DIM));
                 ui.horizontal(|ui| {
-                    ui.label("바탕 진하기");
+                    ui.label("Graph Background");
                     ui.add(egui::Slider::new(&mut self.settings.graph_opacity, 0..=100).suffix(" %"));
                 });
-                ui.label(RichText::new("0 % = 바탕 없음 (선만 보여요) · 100 % = 뒤가 안 비쳐요 · 숫자 칸에 직접 써도 돼요").small().color(theme::TEXT_DIM));
+                ui.label(RichText::new("0% is clear. 100% hides what is behind. Click the number to type.").small().color(theme::TEXT_DIM));
                 ui.add_space(4.0);
-                if ui.button(format!("처음 값으로 ({} %)", graph_float::DEFAULT_OPACITY)).clicked() {
+                if ui.button(format!("Reset ({}%)", graph_float::DEFAULT_OPACITY)).clicked() {
                     self.settings.graph_opacity = graph_float::DEFAULT_OPACITY;
                 }
                 crate::ui::channel_names::show(ui, channel_catalog, &mut self.settings.channel_names);
@@ -5150,7 +5165,7 @@ mod tests {
     /// Where the open "줄" list painted the lane `name` (None while the list is closed): below
     /// its header "보일 줄" and right of where the graph paints its big lane letters.
     fn list_item(out: &egui::FullOutput, name: &str) -> Option<egui::Rect> {
-        let head = text_rects(out, "보일 줄").into_iter().next()?;
+        let head = text_rects(out, "Graph Lanes").into_iter().next()?;
         text_rects(out, name).into_iter().find(|r| r.left() > head.left() && r.top() > head.bottom())
     }
 
@@ -5210,7 +5225,7 @@ mod tests {
         };
         // "줄" opens the list right under it: six lanes, those shown checked.
         let out = click_at(&ctx, &mut app, points[1]);
-        let head = text_rects(&out, "보일 줄");
+        let head = text_rects(&out, "Graph Lanes");
         assert_eq!(head.len(), 1, "the list is open");
         assert!((head[0].left() - points[1].x).abs() < 30.0 && head[0].top() > points[1].y, "right under the button: {head:?}");
         let items: Vec<egui::Rect> = graph_float::PLATE_LANES.iter().map(|l| list_item(&out, l.0).expect("every lane is in the list")).collect();
@@ -5231,7 +5246,7 @@ mod tests {
         assert_eq!(app.settings.plate_channels[0], LaneSet(0b001_111));
         assert_eq!(lane_letters(&out, g), ["Fx", "Fy", "Fz", "Mx"]);
         assert!(list_item(&out, "Mx").is_some(), "still open");
-        assert!(!text_rects(&out, "줄").is_empty(), "the buttons stay while the list is open, the mouse on the list");
+        assert!(!text_rects(&out, "Lanes").is_empty(), "the buttons stay while the list is open, the mouse on the list");
         unmoved(&app);
         // Fy (over the graph) unchecked: away.
         let out = click_at(&ctx, &mut app, items[1].center());
@@ -5958,7 +5973,7 @@ mod tests {
         let dots = egui::pos2(r.right() - 6.0 - 15.0, r.bottom() + panels::TRANSPORT_TOP + 12.0);
         let out = click_at(&ctx, &mut app, dots);
         assert_eq!(app.active, 1, "pressing a view's bar chooses that view");
-        let end = text_rects(&out, "⏭  끝");
+        let end = text_rects(&out, "⏭  Last Frame");
         assert_eq!(end.len(), 1, "⋯ opens its menu");
         click_at(&ctx, &mut app, end[0].center());
         assert_eq!(app.views[1].pb.frame, 9, "끝 in view 1's menu goes to its last frame");
@@ -6635,8 +6650,8 @@ mod tests {
         }
         frame_with(&ctx, &mut app, vec![]);
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert!(!text_rects(&out, "Saving has waited more than 10 seconds.").is_empty());
-        assert!(!text_rects(&out, "Discard loses unsaved Comments and marker edits. A write already in progress may still finish.").is_empty());
+        assert!(!text_rects(&out, "Still saving after 10 seconds.").is_empty());
+        assert!(!text_rects(&out, "Discard drops edits. Any save in progress may finish.").is_empty());
         let cancel = text_rects(&out, "Cancel")[0].center();
         click_at(&ctx, &mut app, cancel);
         assert!(app.dirty_prompt.is_none());
@@ -6665,7 +6680,7 @@ mod tests {
         assert_eq!(app.views[0].comments.list.len(), 2);
         assert!(!app.set_comment_type(&ctx, 0, 1, "Jitter"));
         assert_eq!(app.views[0].comments.list.len(), 2);
-        assert!(app.notice.as_deref().is_some_and(|text| text.contains("duplicate Comment IDs")));
+        assert!(app.notice.as_deref().is_some_and(|text| text.contains("Comment 번호가 겹쳐서")));
     }
 
     fn file_events(dir: &Path) -> Vec<comments::Event> {
@@ -6727,12 +6742,12 @@ mod tests {
         assert!(button[0].left() > r.right() - 150.0 && button[0].top() > r.bottom(), "at the right end of the button row: {:?}", button[0]);
         // No marker selected: the button works (v0.15.2), the hover text says so.
         let tip = app.comment_ready(0).unwrap();
-        assert!(tip.contains("지금 프레임 0 + 마커 없이"), "{tip}");
+        assert!(tip.contains("Frame 0 + no markers"), "{tip}");
         click_at(&ctx, &mut app, button[0].center());
         app.views[0].select(1, false);
         app.views[0].pb.set_frame(6, 0.0);
         frame_with(&ctx, &mut app, vec![]);
-        assert!(app.comment_ready(0).unwrap().contains("지금 프레임 6 + 고른 마커 1개"));
+        assert!(app.comment_ready(0).unwrap().contains("Frame 6 + 1 marker"));
         click_at(&ctx, &mut app, button[0].center());
         let made: Vec<(Vec<String>, i64)> = app.views[0].comments.list.list().iter().map(|c| (c.markers.clone(), c.start)).collect();
         assert_eq!(made, vec![(vec![], 0), (vec!["N".to_owned()], 6)]);
@@ -8122,7 +8137,7 @@ mod tests {
         undo_key(&ctx, &mut app);
         assert_eq!((app.views[0].target(), note(&app).as_str()), (Some(a.as_path()), "Undo · Open a.takm"));
         undo_key(&ctx, &mut app);
-        assert_eq!((note(&app).as_str(), steps(&app, 0)), ("Wait · loading a.takm", (4, 1)));
+        assert_eq!((note(&app).as_str(), steps(&app, 0)), ("a.takm 파일을 다 읽은 뒤 다시 해 주세요.", (4, 1)));
         arrive(&ctx, &mut app, 0);
         // Back at its remembered spot, its comments read again from the file (same ids).
         assert_eq!((app.views[0].pb.frame, sel(&app), ids(&app)), (3, (vec![0], Some(0)), vec![1, 2, 3]));
@@ -8141,7 +8156,7 @@ mod tests {
         redo_key(&ctx, &mut app);
         assert_eq!(note(&app), "Redo · Open a.takm");
         redo_key(&ctx, &mut app);
-        assert_eq!(note(&app), "Wait · loading a.takm");
+        assert_eq!(note(&app), "a.takm 파일을 다 읽은 뒤 다시 해 주세요.");
         arrive(&ctx, &mut app, 0);
         for _ in 0..3 {
             redo_key(&ctx, &mut app);
@@ -8579,7 +8594,7 @@ mod tests {
         assert_eq!(app.history.kinds().last().map(String::as_str), Some("Frame+Selection"));
         // The line at the top says what `#` does.
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, "Comment 1 선택됨 · # 두 번 = 첫 프레임 · 칸 두 번 = 고치기").len(), 1);
+        assert_eq!(text_rects(&out, "Comment 1 · Double-click # to jump · Double-click to edit").len(), 1);
     }
 
     #[test]
@@ -8602,7 +8617,7 @@ mod tests {
             assert_eq!(marked, vec![id], "only the clicked one is marked, though both hold the current frame");
             // The "current frame is inside" mark is the thin bar only (both rows have it).
             assert_eq!(filled(&out, theme::COMMENT).iter().filter(|r| r.width() == 3.0 && rows.iter().any(|row| row.1.left() == r.left())).count(), 2);
-            let words = text_rects(&out, &format!("Comment {id} 선택됨 · # 두 번 = 첫 프레임 · 칸 두 번 = 고치기"));
+            let words = text_rects(&out, &format!("Comment {id} · Double-click # to jump · Double-click to edit"));
             assert_eq!(words.len(), 1, "the line at the top names it");
         }
         // A click on a band block selects that comment too (the twins share the band since step
@@ -8651,7 +8666,7 @@ mod tests {
         assert_eq!(before_edit, vec!["Selection"], "the first click selected; nothing moved (v0.27.3)");
         assert_eq!(app.views[0].pb.frame, 0, "a double click on a cell does not go to the comment");
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert!(shown(&out, "Comment 1 마커 고치는 중 · Enter = 저장 · Esc = 취소"), "the line at the top");
+        assert!(shown(&out, "Edit Comment 1 Markers · Enter save · Esc cancel"), "the line at the top");
         // Labels path: Ctrl+click N away; the cell follows, nothing is written or recorded.
         label_click(&mut app, 1, true);
         let out = frame_with(&ctx, &mut app, vec![]);
@@ -9197,7 +9212,7 @@ mod tests {
             let mut app = comments_tab_app(&ctx, &folder, command_run);
             let why = app.comment_writable(0).expect_err("cannot be written");
             let out = frame_with(&ctx, &mut app, vec![]);
-            assert_eq!(text_rects(&out, &format!("고칠 수 없어요: {why} · # 두 번 = 첫 프레임")).len(), 1, "the reason, as a line in the tab");
+            assert_eq!(text_rects(&out, &format!("고칠 수 없어요: {why} · Double-click # to jump")).len(), 1, "the reason, as a line in the tab");
             let cells = cells_of(&ctx, &mut app, 1);
             for at in &cells[..3] {
                 double_click(&ctx, &mut app, *at);
@@ -9286,7 +9301,7 @@ mod tests {
         let _dir_guard = comment_dir("tab_long");
         let dir = _dir_guard.to_path_buf();
         let mut app = comments_tab_app(&ctx, &dir, false);
-        assert!(text_rects(&frame_with(&ctx, &mut app, vec![]), "아직 Comment가 없어요. M을 누르면 생겨요.").len() == 1, "empty: one line");
+        assert!(text_rects(&frame_with(&ctx, &mut app, vec![]), "No Comments yet. Press M to add one.").len() == 1, "empty: one line");
         // 2,000 comments in memory (as if read from the file).
         let mut list = comments::Comments::default();
         for id in 1..=2000u64 {
@@ -9728,7 +9743,7 @@ mod tests {
         open_type_list(&ctx, &mut app, 6);
         assert_eq!((list_open(&app), picked(&app), app.views[0].pb.frame), (Some(6), Some(6), f0), "selected, not gone to (v0.27.3)");
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, "Comment 6 유형 · ↑ ↓ Enter · Esc 닫기").len(), 1, "the line at the top");
+        assert_eq!(text_rects(&out, "Comment 6 type · ↑ ↓ Enter · Esc close").len(), 1, "the line at the top");
         let items = app.type_items.clone();
         assert!(items.iter().map(|i| i.0.as_str()).eq(comment_list::type_choices()));
         let bx = comment_list::type_box_of(row_of(&ctx, &mut app, 6));
@@ -9959,7 +9974,7 @@ mod tests {
         let mut app = comments_tab_app(&ctx, &dir, true);
         let why = app.comment_writable(0).expect_err("a command run");
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert_eq!(text_rects(&out, &format!("고칠 수 없어요: {why} · # 두 번 = 첫 프레임")).len(), 1, "the reason at the top");
+        assert_eq!(text_rects(&out, &format!("고칠 수 없어요: {why} · Double-click # to jump")).len(), 1, "the reason at the top");
         for (id, short) in [(1, "Jitter"), (2, "—")] {
             assert!(text_in_box(&out, short, comment_list::type_box_of(row_of(&ctx, &mut app, id))), "{short} still shown");
         }
@@ -10481,7 +10496,7 @@ mod tests {
         let explorer = place_of(app, Pane::Explorer);
         let out = frame_with(ctx, app, vec![]);
         editor_texts(&out, explorer).into_iter().map(|t| t.1)
-            .filter(|text| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두") && text != "·").collect()
+            .filter(|text| !text.contains(" selected · Ctrl/Shift") && !text.starts_with("Ctrl+A all") && text != "·").collect()
     }
 
     /// Where an OPEN EDITORS text is (its middle).
@@ -10552,10 +10567,10 @@ mod tests {
         let y = |s: &str| t.iter().find(|x| x.1 == s).unwrap().0.center().y;
         let mark = |s: &str| circles_at(&out, egui::pos2(explorer.left() + 44.0, y(s)));
         assert_eq!((mark(&row("a.tak")), mark(&row("b.tak")), mark(&row("c.tak"))), ((1, 0), (0, 1), (0, 0)));
-        // Key 2 hides b: dim, with " · 숨김" like its name tag.
+        // Key 2 hides b: dim, with " · Hidden" like its name tag.
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Num2)]);
         let out = frame_with(&ctx, &mut app, vec![]);
-        let hidden = editor_texts(&out, explorer).into_iter().find(|x| x.1 == row("b.tak · 숨김")).expect("b listed as hidden");
+        let hidden = editor_texts(&out, explorer).into_iter().find(|x| x.1 == row("b.tak · Hidden")).expect("b listed as hidden");
         assert_ne!(hidden.2, color(&row("a.tak")), "dim");
     }
 
@@ -10638,7 +10653,7 @@ mod tests {
         assert_eq!((by_row.active, by_row.views[0].shown, steps(&by_row, 0)), (0, [true, false], (n.0 + 1, 0)));
         assert_eq!(by_row.overlay_note, None);
         assert_eq!(hidden(&by_row), vec![vec![false, true], vec![false]]);
-        assert!(editor_lines(&ctx, &mut by_row).contains(&"b.tak · 숨김".to_owned()), "dim with · 숨김 at once");
+        assert!(editor_lines(&ctx, &mut by_row).contains(&"b.tak · Hidden".to_owned()), "dim with · Hidden at once");
         // One Ctrl+Z puts it back, one Ctrl+Y hides it again, with the same notes.
         for (c, app) in [(&ctx, &mut by_row), (&ctx2, &mut by_tag)] {
             undo_key(c, app);
@@ -11029,14 +11044,14 @@ mod tests {
         let t1 = text_rects(&out, "1 a.tak")[0];
         let out = click_at(&ctx, &mut app, t1.center());
         assert_eq!(app.views[0].shown, [false, true]);
-        assert_eq!(text_rects(&out, "1 a.tak · 숨김").len(), 1);
+        assert_eq!(text_rects(&out, "1 a.tak · Hidden").len(), 1);
         let out = frame_with(&ctx, &mut app, vec![]);
         let n_dot = dot_on_screen(&app, 0, 1);
         assert_eq!(circles_at(&out, n_dot), (0, 0), "no dot of the hidden file");
         assert_eq!(circles_at(&out, ring_on_screen(&app, 0, 1)), (0, 1), "the rings stay");
         // Click on it again: back.
         idle(&ctx, &mut app);
-        let t1 = text_rects(&out, "1 a.tak · 숨김")[0];
+        let t1 = text_rects(&out, "1 a.tak · Hidden")[0];
         click_at(&ctx, &mut app, t1.center());
         assert_eq!(app.views[0].shown, [true, true]);
         // Keys: 2 hides the rings, 1 the dots.
@@ -11044,7 +11059,7 @@ mod tests {
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(app.views[0].shown, [true, false]);
         assert_eq!(circles_at(&out, ring_on_screen(&app, 0, 1)), (0, 0));
-        assert_eq!(text_rects(&out, "2 b.tak · 숨김").len(), 1);
+        assert_eq!(text_rects(&out, "2 b.tak · Hidden").len(), 1);
         run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Num1)]);
         assert_eq!(app.views[0].shown, [false, false]);
         assert_eq!(steps(&app, 0).0, n + 4, "each hide / show is one action");
@@ -11086,7 +11101,7 @@ mod tests {
         assert_eq!((app.views[0].overlay_target(), app.views[0].shown), (None, [true, true]));
         assert_eq!(steps(&app, 0).0, n + 1, "one action");
         let out = frame_with(&ctx, &mut app, vec![]);
-        assert!(text_rects(&out, "2 b.tak").is_empty() && text_rects(&out, "1 a.tak · 숨김").is_empty());
+        assert!(text_rects(&out, "2 b.tak").is_empty() && text_rects(&out, "1 a.tak · Hidden").is_empty());
         // Undo: b.tak read again, arriving quietly; a.tak hidden again as it was.
         undo_key(&ctx, &mut app);
         assert_eq!(note(&app), "Undo · Overlay b.tak");
@@ -11773,8 +11788,8 @@ mod tests {
         app.show_pane(Pane::Comments);
         let out = frame_with(&ctx, &mut app, vec![]);
         assert_eq!(text_rects(&out, views::TAK_NO_COMMENTS).len(), 1, "in the pane");
-        assert_eq!(text_rects(&out, ".takm으로 저장").len(), 1);
-        assert!(text_rects(&out, "아직 Comment가 없어요. M을 누르면 생겨요.").is_empty());
+        assert_eq!(text_rects(&out, "Save as .takm").len(), 1);
+        assert!(text_rects(&out, "No Comments yet. Press M to add one.").is_empty());
         // Nothing written anywhere.
         frame_with(&ctx, &mut app, vec![]);
         assert!(app.views[0].comments.list.is_empty() && app.comment_writer.is_none());
@@ -11798,13 +11813,13 @@ mod tests {
         let cam = app.views[0].cam.yaw;
         app.show_pane(Pane::Comments);
         let out = frame_with(&ctx, &mut app, vec![]);
-        let button = text_rects(&out, ".takm으로 저장")[0];
+        let button = text_rects(&out, "Save as .takm")[0];
         // The conversion thread waits until the test lets it go: frames go on meanwhile.
         let (go, gate) = std::sync::mpsc::channel();
         app.takm_gate = Some(gate);
         let out = click_at(&ctx, &mut app, button.center());
         assert!(app.takm_job.is_some() && !dir.join("a.takm").exists());
-        assert_eq!(text_rects(&out, "a.tak → .takm 만드는 중…").len(), 2, "the status bar and the pane say it is working");
+        assert_eq!(text_rects(&out, "Saving a.tak as .takm…").len(), 2, "the status bar and the pane say it is working");
         for _ in 0..5 {
             frame_with(&ctx, &mut app, vec![]);
         }
@@ -11812,7 +11827,7 @@ mod tests {
         go.send(()).unwrap();
         until_converted(&ctx, &mut app);
         let line = takm_note(&app);
-        assert!(line.starts_with("a.takm 만들었어요 · ") && line.contains(" MB → ") && line.contains("Comment 줄 2개를 넣었어요"), "{line}");
+        assert!(line.starts_with("Saved a.takm · ") && line.contains(" MB → ") && line.contains("Added 2 Comments from CSV"), "{line}");
         // The view reads the .takm at the same place, with the CSV's comments.
         assert_eq!(app.views[0].target(), Some(dir.join("a.takm").as_path()));
         arrive(&ctx, &mut app, 0);
@@ -11849,9 +11864,9 @@ mod tests {
         let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
         app.hold_loads = true;
         let out = frame_with(&ctx, &mut app, vec![]);
-        let out = click_at(&ctx, &mut app, text_rects(&out, "파일")[0].center());
+        let out = click_at(&ctx, &mut app, text_rects(&out, "File")[0].center());
         assert_eq!(text_rects(&out, "지금 화면에 TAK를 열면 쓸 수 있어요.").len(), 1, "dim, the reason under it");
-        click_at(&ctx, &mut app, text_rects(&out, ".takm으로 저장")[0].center());
+        click_at(&ctx, &mut app, text_rects(&out, "Save as .takm")[0].center());
         assert!(app.takm_job.is_none());
         let tak = dir.join("a.tak");
         std::fs::write(&tak, tak_core::sample_tak::sample_tak()).unwrap();
@@ -11860,17 +11875,17 @@ mod tests {
         arrive(&ctx, &mut app, 0);
         // (The menu may still be open after the click on the dim item.)
         let mut out = frame_with(&ctx, &mut app, vec![]);
-        if text_rects(&out, ".takm으로 저장").is_empty() {
-            out = click_at(&ctx, &mut app, text_rects(&out, "파일")[0].center());
+        if text_rects(&out, "Save as .takm").is_empty() {
+            out = click_at(&ctx, &mut app, text_rects(&out, "File")[0].center());
         }
         assert!(text_rects(&out, "지금 화면에 TAK를 열면 쓸 수 있어요.").is_empty());
-        click_at(&ctx, &mut app, text_rects(&out, ".takm으로 저장")[0].center());
+        click_at(&ctx, &mut app, text_rects(&out, "Save as .takm")[0].center());
         until_converted(&ctx, &mut app);
         assert_eq!(app.views[0].target(), Some(dir.join("a.takm").as_path()));
         arrive(&ctx, &mut app, 0);
         // On a .takm the item is dim and says why.
         let out = frame_with(&ctx, &mut app, vec![]);
-        let out = click_at(&ctx, &mut app, text_rects(&out, "파일")[0].center());
+        let out = click_at(&ctx, &mut app, text_rects(&out, "File")[0].center());
         assert_eq!(text_rects(&out, "지금 화면의 파일이 TAK가 아니에요(이미 .takm).").len(), 1);
     }
 
@@ -11894,9 +11909,9 @@ mod tests {
             watchdog.pause(|| format!("file row missing for {tak:?}. Listing pending: {}", app.workspace.is_loading()));
         };
         let out = right_click_at(&ctx, &mut app, row.expect("the file row").center());
-        click_at(&ctx, &mut app, text_rects(&out, ".takm으로 저장")[0].center());
+        click_at(&ctx, &mut app, text_rects(&out, "Save as .takm")[0].center());
         until_converted(&ctx, &mut app);
-        assert!(takm_note(&app).starts_with("b.takm 만들었어요"), "{}", takm_note(&app));
+        assert!(takm_note(&app).starts_with("Saved b.takm"), "{}", takm_note(&app));
         assert!(dir.join("b.takm").exists());
         assert_eq!(app.views[0].target(), None, "converted only: no view showed it");
         assert!(app.workspace.listing(&dir).is_some(), "its folder is read again");
@@ -11912,7 +11927,7 @@ mod tests {
         let before = std::fs::read(dir.join("a.takm")).unwrap();
         app.save_takm(&ctx, tak.clone());
         until_converted(&ctx, &mut app);
-        assert_eq!(takm_note(&app), "a.takm이(가) 이미 있어서 덮어쓰지 않고 그 파일을 열었어요.");
+        assert_eq!(takm_note(&app), "Opened existing a.takm.");
         assert_eq!(std::fs::read(dir.join("a.takm")).unwrap(), before);
         assert_eq!(app.views[0].target(), Some(dir.join("a.takm").as_path()));
         arrive(&ctx, &mut app, 0);

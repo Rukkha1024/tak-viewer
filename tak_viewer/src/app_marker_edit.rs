@@ -227,12 +227,65 @@ enum SaveMessage {
     Done(Result<Saved, SaveFailure>),
 }
 
+fn edit_reason(message: &str) -> &str {
+    match message {
+        "non-finite input" => "점 좌표에 쓸 수 없는 값이 있어요.",
+        "non-finite result" => "계산한 좌표를 쓸 수 없어요.",
+        "non-finite filtering result" => "계산한 좌표를 쓸 수 없어요.",
+        "result exceeds float32 range" => "계산한 좌표가 너무 커요.",
+        "gap not wholly inside selection" => "빈 구간 전체가 선택 범위에 들어와야 해요.",
+        "gap exceeds Max. Gap Size" => "빈 구간이 Max. Gap Size보다 길어요.",
+        "cubic gap exceeds 75 frames" => "Cubic은 75프레임까지만 채울 수 있어요.",
+        "boundary gap has no two-sided anchors" => "빈 구간 앞과 뒤에 점이 있어야 해요.",
+        "marker layout is not verified for editing" => "이 마커 기록의 형식은 편집할 수 없어요.",
+        "missing spline anchors" => "빈 구간 앞과 뒤에 점이 있어야 해요.",
+        "reference gap: insufficient common references" => "빈 구간에 쓸 수 있는 기준 마커가 부족해요.",
+        "missing left target anchor" => "빈 구간 앞의 점이 없어요.",
+        "missing right target anchor" => "빈 구간 뒤의 점이 없어요.",
+        "coincident references: two-reference line has no direction" => "기준 마커 두 개가 겹쳐 있어요.",
+        "zero or nonfinite direction" => "기준 마커의 방향을 계산할 수 없어요.",
+        "antiparallel references: shortest arc has no unique axis" => "기준 마커 방향이 반대라 회전을 정할 수 없어요.",
+        "twist angle undefined for on-axis target" => "회전축 위에 점이 있어 돌릴 각도를 정할 수 없어요.",
+        "180 degree endpoint twist has ambiguous branch" => "180도 돌아서 회전 방향을 정할 수 없어요.",
+        "rigid fit needs at least three references" => "기준 마커가 세 개 이상 필요해요.",
+        "rigid reference geometry is collinear or degenerate" => "기준 마커가 한 줄에 있거나 겹쳐 있어요.",
+        "fewer than three contiguous samples" => "이어진 점이 세 개 이상 있어야 해요.",
+        "Selected marker is not in the active document" => "선택한 마커가 이 파일에 없어요.",
+        "Select at least one marker" => "마커를 하나 이상 선택해 주세요.",
+        "Target is not in the active document" => "바꿀 마커가 이 파일에 없어요.",
+        "Fill Selected requires a range" => "채울 프레임 범위를 선택해 주세요.",
+        "Pattern fill requires a last-selected marker" => "채울 마커를 마지막에 골라 주세요.",
+        "Max. Gap Size must be positive" => "Max. Gap Size에 1 이상의 정수를 써 주세요.",
+        "Pattern fill requires one target" => "채울 마커를 하나만 골라 주세요.",
+        "Reference is not in the active document" => "기준 마커가 이 파일에 없어요.",
+        "Pattern Based: select reference markers, then the target last" => "기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.",
+        "No marker tracks selected" => "마커 줄을 선택해 주세요.",
+        "Smoothing this scope requires a range" => "프레임 범위를 선택해 주세요.",
+        "Require finite 0 < cutoff < sampling rate / 2" =>
+            "Max. Freq는 0보다 크고 프레임 속도의 절반보다 작아야 해요.",
+        "Save cancelled" => "저장을 취소했어요.",
+        other => other,
+    }
+}
+
 fn edit_error(error: EditError) -> String {
     match error {
-        EditError::FileChangedOnDisk => "File changed on disk".into(),
+        EditError::FileChangedOnDisk => "파일이 바뀌었어요. 다시 열어 주세요.".into(),
         EditError::UnverifiedMarkers(count) => format!("마커 기록 {count}개를 확인할 수 없어 바꿀 수 없어요."),
-        EditError::Other(message) => message,
-        other => format!("{other:?}"),
+        EditError::Other(message) => edit_reason(&message).to_owned(),
+        EditError::NotLoaded => "파일을 먼저 열어 주세요.".into(),
+        EditError::AlreadyLoaded => "이 파일은 이미 열려 있어요.".into(),
+        EditError::StaleRevision | EditError::BeforeMismatch =>
+            "파일이나 편집 내용이 바뀌었어요. 다시 시도해 주세요.".into(),
+        EditError::WrongDocument => "이 파일에 적용할 수 없어요.".into(),
+        EditError::DuplicateUid => "마커 번호가 겹쳐요.".into(),
+        EditError::DuplicateLabel | EditError::AmbiguousLabel =>
+            "같은 라벨이 여러 개 있어요.".into(),
+        EditError::MissingDeclaration => "붙일 라벨을 찾을 수 없어요.".into(),
+        EditError::InvalidRange | EditError::InvalidFrameOrder =>
+            "선택한 프레임 범위를 확인해 주세요.".into(),
+        EditError::UnsupportedLayout => "이 마커 기록의 형식은 편집할 수 없어요.".into(),
+        EditError::NoChange => "바꿀 내용이 없어요.".into(),
     }
 }
 
@@ -259,10 +312,10 @@ fn run_marker_command(
             let mut outcome = LabelEditor::with_creation_streams(&session.creation)
                 .label_with_outcome(snapshot, &request)
                 .map_err(|error| match error {
-                    EditError::AmbiguousLabel => "Multiple markers match this label".into(),
-                    EditError::MissingDeclaration => "Label missing".into(),
-                    EditError::UnsupportedLayout => "Can't edit this track format".into(),
-                    EditError::InvalidRange => "Invalid frame range".into(),
+                    EditError::AmbiguousLabel => "마커가 여러 개여서 라벨을 붙일 수 없어요.".into(),
+                    EditError::MissingDeclaration => "붙일 라벨을 찾을 수 없어요.".into(),
+                    EditError::UnsupportedLayout => "이 마커 기록의 형식은 편집할 수 없어요.".into(),
+                    EditError::InvalidRange => "선택한 프레임 범위를 확인해 주세요.".into(),
                     other => edit_error(other),
                 })?;
             if let Some(patch) = outcome.patch.as_mut().filter(|_| keep_armed) {
@@ -274,9 +327,9 @@ fn run_marker_command(
                 .map(|p| p.result.message.clone())
                 .unwrap_or_else(|| {
                     if outcome.already_assigned {
-                        "Already this label".into()
+                        "Label already set".into()
                     } else {
-                        "No points to relabel in range".into()
+                        "선택한 범위에 바꿀 점이 없어요.".into()
                     }
                 });
             Ok((outcome.patch, message))
@@ -325,7 +378,7 @@ fn run_marker_command(
                 .map_err(edit_error)?;
             let mut message = if outcome.patch.is_none() {
                 format!(
-                    "Fill · No eligible gaps · {} skipped",
+                    "Fill · 채울 수 있는 빈 구간이 없어요. · {} skipped",
                     outcome.result.skipped
                 )
             } else {
@@ -337,7 +390,7 @@ fn run_marker_command(
                     tak_core::tak::uid_hex(&skip.uid),
                     skip.first,
                     skip.last,
-                    skip.reason
+                    edit_reason(&skip.reason)
                 ));
             }
             if request.method == FillMethod::PatternBased
@@ -367,7 +420,7 @@ fn run_marker_command(
                     tak_core::tak::uid_hex(&skip.uid),
                     skip.first,
                     skip.last,
-                    skip.reason
+                    edit_reason(&skip.reason)
                 ));
             }
             Ok((outcome.patch, message))
@@ -394,13 +447,13 @@ fn increment_order(state: &LabelingState, target: LabelKey, moving_at_frame: Opt
 
 fn label_marker_source(view: &View) -> Result<Uid, &'static str> {
     if view.selected.len() != 1 {
-        return Err("Select one 3D point");
+        return Err("3D에서 점을 하나만 선택해 주세요.");
     }
     view.data.as_ref()
         .and_then(|data| data.markers.get(*view.selected.first()?))
         .filter(|marker| (view.shown[0] || view.overlay.is_none()) && marker.present(view.pb.frame))
         .map(|marker| marker.uid)
-        .ok_or("Pick a 3D point at this frame")
+        .ok_or("현재 프레임의 3D 화면에서 점을 선택해 주세요.")
 }
 
 impl TakViewerApp {
@@ -715,8 +768,8 @@ impl TakViewerApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(format!("Save changes to {name}?"));
-                ui.label("Discard loses unsaved Comments and marker edits. A write already in progress may still finish.");
-                if stalled { ui.label("Saving has waited more than 10 seconds."); }
+                ui.label("Discard drops edits. Any save in progress may finish.");
+                if stalled { ui.label("Still saving after 10 seconds."); }
                 if saving {
                     ui.label("Saving changes…");
                 } else if pending_comments {
@@ -927,7 +980,7 @@ impl TakViewerApp {
             .map(|s| format!("{}.takm", s.to_string_lossy()))
             .unwrap_or_else(|| "edited.takm".into());
         rfd::FileDialog::new()
-            .set_title("다른 이름으로 저장")
+            .set_title("Save As")
             .set_file_name(&name)
             .add_filter("TAKM", &["takm"])
             .save_file()
@@ -1001,7 +1054,7 @@ impl TakViewerApp {
                 prompt.started = Instant::now();
             }
         }
-        self.takm_note = Some(("저장 준비 중이에요.".into(), ctx.input(|i| i.time)));
+        self.takm_note = Some(("Getting ready to save…".into(), ctx.input(|i| i.time)));
         ctx.request_repaint_after(Duration::from_millis(30));
     }
 
@@ -1090,7 +1143,7 @@ impl TakViewerApp {
                                 .map_err(|e| SaveFailure::Other(e.to_string()))?
                                 .map_err(SaveFailure::Other)?;
                             if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                                return Err(SaveFailure::Other("Save cancelled".into()));
+                                return Err(SaveFailure::Other("저장을 취소했어요.".into()));
                             }
                             let new_default =
                                 destination.is_none() && tak_core::tak::is_take_path(&source);
@@ -1125,7 +1178,7 @@ impl TakViewerApp {
                             wake.request_repaint();
                             if !wait.recv_timeout(Duration::from_secs(30)).unwrap_or(false) {
                                 return Err(SaveFailure::Other(
-                                    "The destination is open in another view.".into(),
+                                    "저장할 파일이 다른 화면에 열려 있어요.".into(),
                                 ));
                             }
                             let mut updated = data.rebuild_markers(&snapshot)
@@ -1307,7 +1360,7 @@ impl TakViewerApp {
         }
         let view = &self.views[slot];
         if view.edit_document.is_none() || view.data.is_none() {
-            return Some("Can't edit this file");
+            return Some("이 파일은 편집할 수 없어요.");
         }
         if (self.no_persist && !(self.remote_write_probe && view.remote.is_some()) && !allow_capture)
             || self.dirty_prompt.is_some()
@@ -1323,14 +1376,14 @@ impl TakViewerApp {
             return Some(if legacy_notice {
                 "지금은 마커를 편집할 수 없어요."
             } else {
-                "Can't edit markers now"
+                "지금은 마커를 편집할 수 없어요."
             });
         }
         if view.analog_rx.is_some() || view.data.as_ref().is_some_and(|data| data.analog_pending) {
             return Some(if legacy_notice {
                 "파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요."
             } else {
-                "Wait for the take to load"
+                "파일을 읽는 중이에요. 잠시 뒤 다시 해 주세요."
             });
         }
         None
@@ -1419,7 +1472,7 @@ impl TakViewerApp {
             command,
             rx,
         });
-        self.takm_note = Some(("마커 편집 자료를 준비하는 중이에요.".into(), now));
+        self.takm_note = Some(("Getting markers ready…".into(), now));
     }
 
     fn start_prepared_command(
@@ -1847,7 +1900,7 @@ impl TakViewerApp {
         ui.labeling.label_marker_reason = label_marker_source(view).err().or_else(|| {
             (busy || self.dirty_prompt.is_some() || self.hold.is_some() || self.comment_edit.is_some()
                 || view.edit_refresh.is_some() || view.loading.is_some() || data.analog_pending)
-                .then_some("Can't edit markers now")
+                .then_some("지금은 마커를 편집할 수 없어요.")
         });
         ui.labeling.blocked_reason = if self.dirty_prompt.is_some()
             || busy
@@ -1879,7 +1932,7 @@ impl TakViewerApp {
     pub(super) fn labeling_tab(&mut self, ui: &mut egui::Ui) {
         let slot = self.active;
         if self.views[slot].data.is_none() {
-            ui.label("파일을 열면 여기에 나와요.");
+            ui.label("Open a take to start.");
             return;
         }
         self.refresh_marker_ui(slot);
@@ -1900,7 +1953,7 @@ impl TakViewerApp {
     pub(super) fn edit_tools_tab(&mut self, ui: &mut egui::Ui) {
         let slot = self.active;
         if self.views[slot].data.is_none() {
-            ui.label("파일을 열면 여기에 나와요.");
+            ui.label("Open a take to start.");
             return;
         }
         self.refresh_marker_ui(slot);
@@ -2139,7 +2192,7 @@ impl TakViewerApp {
         let view = &self.views[slot];
         let selection = view.edit_selection_state();
         if selection.selected.is_empty() {
-            self.takm_note = Some(("Delete · Select markers".into(), ctx.input(|i| i.time)));
+            self.takm_note = Some(("Delete · 마커를 선택해 주세요.".into(), ctx.input(|i| i.time)));
             return;
         }
         let Ok(current_frame) = u32::try_from(view.pb.frame) else { return };
@@ -2169,7 +2222,7 @@ impl TakViewerApp {
         })) {
             let now = ctx.input(|i| i.time);
             if keep_armed {
-                self.takm_note = Some(("Already this label".into(), now));
+                self.takm_note = Some(("Label already set".into(), now));
                 return;
             }
             if !ui.backward && !ui.forward {
@@ -2182,7 +2235,7 @@ impl TakViewerApp {
                 if !ui.forward { last = last.min(view.pb.frame); }
                 let index = marker.segments.partition_point(|&(_, end)| end < first);
                 if first > last || marker.segments.get(index).is_none_or(|&(start, _)| start > last) {
-                    self.takm_note = Some(("No points to relabel in range".into(), now));
+                    self.takm_note = Some(("선택한 범위에 바꿀 점이 없어요.".into(), now));
                     return;
                 }
             }

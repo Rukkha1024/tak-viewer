@@ -74,7 +74,7 @@ pub struct ExplorerState {
 }
 
 /// What a saved folder that is gone from disk shows after its name (plain text, no mouse).
-pub const MISSING_NOTE: &str = " · 폴더가 없어요";
+pub const MISSING_NOTE: &str = " · Folder Missing";
 
 /// Folders shown expanded in the tree (what ↻ and the watcher re-read), parents first. A saved
 /// folder that is gone shows nothing below it, so neither it nor anything under it is in here.
@@ -204,7 +204,7 @@ fn push_rows(ws: &Workspace, dir: &Path, depth: usize, st: &ExplorerState, out: 
             }
         }
         Some(Listing::Failed(e)) => out.push(Row::Note { depth, text: format!("읽을 수 없어요: {e}") }),
-        Some(Listing::Loading) | None => out.push(Row::Note { depth, text: "불러오는 중…".to_owned() }),
+        Some(Listing::Loading) | None => out.push(Row::Note { depth, text: "Loading…".to_owned() }),
     }
 }
 
@@ -435,7 +435,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
         st.section_collapsed = !st.section_collapsed;
     }
     let hovered = hresp.hovered();
-    hresp.on_hover_text(format!("저장한 폴더 (최대 {MAX_ROOTS}개)\n폴더는 펼칠 때만 읽어요. 로컬은 0.5초쯤마다, SSH는 ↻를 누를 때 다시 읽어요."));
+    hresp.on_hover_text(format!("Saved folders (max {MAX_ROOTS}).\nOpen a folder to see its files. Use ↻ to refresh SSH."));
     if hovered || ui.rect_contains_pointer(hrect) {
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -443,17 +443,17 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         let full_tip = format!("{MAX_ROOTS}개가 다 찼어요. ✕로 하나 뺀 뒤 추가하세요.");
-        if icon_button(&mut child, Icon::AddFolder, if full_list { &full_tip } else { "폴더 추가 (Ctrl+Shift+O)" }, !full_list) {
+        if icon_button(&mut child, Icon::AddFolder, if full_list { &full_tip } else { "Add Folder (Ctrl+Shift+O)" }, !full_list) {
             action = Some(WsAction::PickFolder);
         }
-        if icon_button(&mut child, Icon::Path, if full_list { &full_tip } else { "경로로 추가 — WSL 경로 가능 (Ctrl+L)" }, !full_list) {
+        if icon_button(&mut child, Icon::Path, if full_list { &full_tip } else { "Add by Path (Ctrl+L)" }, !full_list) {
             action = Some(WsAction::EnterPath);
         }
-        if icon_button(&mut child, Icon::Refresh, "새로고침 (펼친 폴더만 지금 다시 읽어요. 0.5초쯤마다 저절로도 읽어요)", true) {
+        if icon_button(&mut child, Icon::Refresh, "Refresh Open Folders", true) {
             let dirs = open_dirs(&tree_rows(ws, st));
             ws.refresh(&dirs);
         }
-        if icon_button(&mut child, Icon::CollapseAll, "모두 접기", true) {
+        if icon_button(&mut child, Icon::CollapseAll, "Collapse All", true) {
             st.expanded.clear();
             st.folds_rev += 1;
         }
@@ -469,16 +469,16 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
             ui.add_space(20.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 10.0);
-                ui.label(RichText::new("저장한 폴더가 없어요.").color(FG));
-                ui.label(RichText::new(format!("폴더를 {MAX_ROOTS}개까지 저장해 한 트리로 볼 수 있어요.")).color(FG_DIM).small());
+                ui.label(RichText::new("No saved folders").color(FG));
+                ui.label(RichText::new(format!("Add up to {MAX_ROOTS} folders.")).color(FG_DIM).small());
                 let w = (ui.available_width() - 20.0).max(120.0);
                 if ui
-                    .add(egui::Button::new(RichText::new("폴더 추가").color(Color32::WHITE)).fill(BUTTON_BG).min_size(vec2(w, 26.0)))
+                    .add(egui::Button::new(RichText::new("Add Folder").color(Color32::WHITE)).fill(BUTTON_BG).min_size(vec2(w, 26.0)))
                     .clicked()
                 {
                     action = Some(WsAction::PickFolder);
                 }
-                if ui.add(egui::Button::new(RichText::new("경로로 추가 (WSL 가능)").color(Color32::WHITE)).fill(BUTTON_BG).min_size(vec2(w, 26.0))).clicked() {
+                if ui.add(egui::Button::new(RichText::new("Add by Path").color(Color32::WHITE)).fill(BUTTON_BG).min_size(vec2(w, 26.0))).clicked() {
                     action = Some(WsAction::EnterPath);
                 }
             });
@@ -492,7 +492,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
         ui.add_space(8.0);
         let w = ui.available_width() - 8.0;
         egui::Frame::none().fill(INPUT_BG).inner_margin(egui::Margin::symmetric(6.0, 3.0)).show(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("펼친 폴더에서 파일 찾기").frame(false).desired_width(w - 12.0));
+            ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("Find Files").frame(false).desired_width(w - 12.0));
         });
     });
     ui.add_space(4.0);
@@ -503,7 +503,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
     } else {
         let mut rows = search_rows(ws, &needle);
         if rows.is_empty() {
-            rows.push(Row::Note { depth: 0, text: "펼친 폴더 안에는 없어요.".to_owned() });
+            rows.push(Row::Note { depth: 0, text: "No matches in open folders".to_owned() });
         }
         rows
     };
@@ -608,16 +608,16 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                             p.with_clip_rect(rect).text(pos2(rect.right() - buttons - 1.0, rect.center().y), Align2::RIGHT_CENTER, "not connected", FontId::proportional(11.0), FG_DIM);
                         }
                         let x = row_button(ui, rect, 14.0, egui::Id::new(("ws_remove_root", path)), Icon::Remove);
-                        if x.on_hover_text("목록에서 빼기 (폴더와 파일은 그대로예요)").clicked() {
+                        if x.on_hover_text("Remove from Workspace").clicked() {
                             remove = Some(path.clone());
                         }
                         let pen = row_button(ui, rect, 36.0, egui::Id::new(("ws_rename_root", path)), Icon::Rename);
-                        if pen.on_hover_text("이름 바꾸기 (여기 보이는 이름만 바뀌어요. 폴더는 그대로예요)").clicked() {
+                        if pen.on_hover_text("Change the name shown here.").clicked() {
                             rename_start = Some(path.clone());
                         }
                         if remote.is_some() {
                             let refresh = row_button(ui, rect, 58.0, egui::Id::new(("ws_refresh_remote", path)), Icon::Refresh);
-                            if refresh.on_hover_text("서버에 연결해 이 폴더 목록을 다시 읽어요.").clicked() {
+                            if refresh.on_hover_text("Refresh this server folder.").clicked() {
                                 ws.relist(path);
                                 ws.request(path);
                                 refreshed = true;
@@ -627,30 +627,30 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     let wsl = to_wsl_path(path).unwrap_or_default();
                     let display = remote.as_ref().map(|(root, _)| root.label()).unwrap_or_else(|| path.display().to_string());
                     let tip = if *missing {
-                        format!("{display}\n{wsl}\n\n이 폴더가 디스크에 없어요(옮겨졌거나 지워졌어요). 다시 생기면 저절로 보여요.\n오른쪽 클릭: 이름 바꾸기 · 목록에서 빼기")
+                        format!("{display}\n{wsl}\n\nFolder missing from disk.\nRight-click to rename or remove.")
                     } else if *named {
-                        format!("{name}\n원래 폴더 이름: {own}\n{display}\n{wsl}\n\n오른쪽 클릭: 이름 바꾸기 · 원래 이름으로 · 목록에서 빼기")
+                        format!("{name}\nFolder name: {own}\n{display}\n{wsl}\n\nRight-click to rename, reset or remove.")
                     } else {
-                        format!("{display}\n{wsl}\n\n오른쪽 클릭: 이름 바꾸기 · 목록에서 빼기")
+                        format!("{display}\n{wsl}\n\nRight-click to rename or remove.")
                     };
                     let resp = resp.on_hover_text(tip);
                     resp.context_menu(|ui| {
-                        if remote.is_some() && ui.button("새로고침 (서버 목록)").clicked() {
+                        if remote.is_some() && ui.button("Refresh Folder").clicked() {
                             ws.relist(path);
                             ws.request(path);
                             refreshed = true;
                             ui.close_menu();
                         }
-                        if ui.button("이름 바꾸기…").clicked() {
+                        if ui.button("Rename…").clicked() {
                             rename_start = Some(path.clone());
                             ui.close_menu();
                         }
-                        if ui.add_enabled(*named, egui::Button::new(format!("원래 이름으로 ({own})"))).clicked() {
+                        if ui.add_enabled(*named, egui::Button::new(format!("Reset Name ({own})"))).clicked() {
                             reset_name = Some(path.clone());
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("목록에서 빼기 (폴더와 파일은 그대로)").clicked() {
+                        if ui.button("Remove from Workspace").clicked() {
                             remove = Some(path.clone());
                             ui.close_menu();
                         }
@@ -701,9 +701,9 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                         }
                     }
                     let tip = if let Some((_, location)) = crate::workspace::remote_address(&file.path) {
-                        format!("{}:{}\n\n클릭: 지금 화면에 열기 · Ctrl+클릭: 옆 화면에 열기\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
+                        format!("{}:{}\n\nClick to open. Ctrl+click to open beside.\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
                     } else { format!(
-                        "{}\n{}\n{}\n\n클릭: 지금 화면에 열기 · Ctrl+클릭: 옆 화면에 열기 (최대 {MAX_VIEWS}개)\n3D 화면으로 끌어다 놓기: 가운데 = 그 화면에 열기 · 가장자리 = 그쪽에 새 화면",
+                        "{}\n{}\n{}\n\nClick to open. Ctrl+click to open beside (max {MAX_VIEWS}).\nDrop in the middle to replace or at an edge to add a view.",
                         mb(file.size),
                         file.path.display(),
                         to_wsl_path(&file.path).unwrap_or_default()
@@ -711,11 +711,11 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     let resp = resp.on_hover_text(tip);
                     if !remote { resp.dnd_set_drag_payload(FileDrag(file.path.clone())); }
                     resp.context_menu(|ui| {
-                        if ui.button("지금 화면에 열기").clicked() {
+                        if ui.button("Open Here").clicked() {
                             action = Some(WsAction::Open(file.path.clone()));
                             ui.close_menu();
                         }
-                        if ui.button("옆 화면에 열기  (Ctrl+클릭)").clicked() {
+                        if ui.button("Open Beside (Ctrl+click)").clicked() {
                             action = Some(WsAction::OpenSide(file.path.clone()));
                             ui.close_menu();
                         }
@@ -725,18 +725,18 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                         }
                         // Plan step 7: both files in one 3D (acts on the active view).
                         ui.separator();
-                        if !remote && ui.button("이 화면에 얹기").clicked() {
+                        if !remote && ui.button("Add Overlay").clicked() {
                             action = Some(WsAction::Overlay(file.path.clone()));
                             ui.close_menu();
                         }
-                        if overlaid && ui.button("얹은 파일 내리기").clicked() {
+                        if overlaid && ui.button("Remove Overlay").clicked() {
                             action = Some(WsAction::OverlayOff);
                             ui.close_menu();
                         }
                         // `.takm` step ③: a TAK takes Comments once saved as `.takm`.
                         if !remote && tak_core::tak::is_take_path(&file.path) {
                             ui.separator();
-                            if ui.button(".takm으로 저장").clicked() {
+                            if ui.button("Save as .takm").clicked() {
                                 action = Some(WsAction::ToTakm(file.path.clone()));
                                 ui.close_menu();
                             }
@@ -838,7 +838,7 @@ mod tests {
         st.expand(&mut ws, &root);
         st.expand(&mut ws, &root.join("input"));
         st.expand(&mut ws, &root.join("input").join("raw"));
-        assert_eq!(labels(&tree_rows(&ws, &st)), vec!["V R", "  v input", "    v raw", "      (불러오는 중…)", "    in.tak", "  z.tak", "> OTHER"]);
+        assert_eq!(labels(&tree_rows(&ws, &st)), vec!["V R", "  v input", "    v raw", "      (Loading…)", "    in.tak", "  z.tak", "> OTHER"]);
         assert!(ws.listing(Path::new("/other")).is_none());
     }
 

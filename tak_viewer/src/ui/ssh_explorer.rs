@@ -29,7 +29,7 @@ enum Input {
 }
 
 fn path_input(ui: &mut Ui, rect: Rect, path: &mut String, windows: bool) -> (egui::Response, Option<String>) {
-    let hint = if windows { "맨 위 · 드라이브 목록" } else { "/" };
+    let hint = if windows { "Drives" } else { "/" };
     let response = ui.put(rect, egui::TextEdit::singleline(path).id_source("path")
         .hint_text(RichText::new(hint).color(FG_DIM))
         .font(FontId::proportional(11.0)).text_color(FG).frame(false).margin(vec2(4.0, 2.0)));
@@ -168,12 +168,12 @@ pub fn show(
     }
     if manager.hosts.is_empty() {
         let text = if manager.discovery_pending {
-            "SSH 별칭 읽는 중…"
+            "Loading SSH hosts…"
         } else {
             manager
                 .discovery_note
                 .as_deref()
-                .unwrap_or("SSH config에 저장한 Host 별칭이 없어요.")
+                .unwrap_or("No hosts in SSH config")
         };
         ui.add(egui::Label::new(RichText::new(text).size(11.0).color(FG_DIM)).wrap());
         return actions;
@@ -184,7 +184,7 @@ pub fn show(
     ScrollArea::vertical().id_salt("ssh_hosts").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
         for host in &mut manager.hosts {
             let platform = match manager.platform_overrides.get(&host.alias).map(String::as_str) { Some("windows") => "Windows", _ => "Linux" };
-            let status = match host.state { HostState::Connected => format!("{platform} · 연결됨"), HostState::Connecting => "연결 중…".to_owned(), HostState::Lost => format!("{platform} · 끊김"), HostState::Off => platform.to_owned() };
+            let status = match host.state { HostState::Connected => format!("{platform} · Connected"), HostState::Connecting => "Connecting…".to_owned(), HostState::Lost => format!("{platform} · Disconnected"), HostState::Off => platform.to_owned() };
             ui.push_id(host.alias.clone(), |ui| {
                 let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
                 if response.hovered() { ui.painter().rect_filled(rect, 0.0, HOVER_BG); }
@@ -195,8 +195,15 @@ pub fn show(
                     HostState::Connecting => { ui.painter().circle_filled(dot, 3.0, AMBER); }
                     _ => { ui.painter().circle_stroke(dot, 3.0, Stroke::new(1.1_f32, FG_DIM)); }
                 }
-                let (button, fill) = match host.state { HostState::Connected => ("끊기", DISCONNECT_BG), HostState::Connecting => ("취소", DISCONNECT_BG), _ => ("연결", BUTTON_BG) };
-                let chip_rect = Rect::from_min_max(pos2((rect.right() - 40.0).max(rect.left()), rect.top() + 3.0), pos2(rect.right() - 3.0, rect.bottom() - 3.0));
+                let (button, fill) = match host.state { HostState::Connected => ("Disconnect", DISCONNECT_BG), HostState::Connecting => ("Cancel", DISCONNECT_BG), _ => ("Connect", BUTTON_BG) };
+                let button_width = ui.fonts(|fonts| {
+                    fonts.layout_no_wrap(button.into(), FontId::proportional(11.0), Color32::WHITE).size().x
+                }) + 12.0;
+                let button_right = rect.right() - 3.0;
+                let chip_rect = Rect::from_min_max(
+                    pos2((button_right - button_width).max(rect.left()), rect.top() + 3.0),
+                    pos2(button_right, rect.bottom() - 3.0),
+                );
                 let chip_response = chip(ui, chip_rect, "connect", button, fill);
                 let alias_left = rect.left() + 44.0;
                 let right = chip_rect.left() - 7.0;
@@ -208,7 +215,7 @@ pub fn show(
                     inputs.push(if matches!(host.state, HostState::Connected | HostState::Connecting) { Input::Disconnect(host.alias.clone()) } else { Input::Connect(host.alias.clone()) });
                 } else if response.clicked() { host.expanded = !host.expanded; }
                 response.context_menu(|ui| {
-                    ui.label(RichText::new("서버 종류").size(11.0).color(FG_DIM));
+                    ui.label(RichText::new("Server Type").size(11.0).color(FG_DIM));
                     let enabled = matches!(host.state, HostState::Off | HostState::Lost);
                     for (name, value) in [("Linux", "linux"), ("Windows", "windows")] {
                         if ui.add_enabled(enabled, egui::SelectableLabel::new(platform == name, name)).clicked() { inputs.push(Input::Platform(host.alias.clone(), value.into())); ui.close_menu(); }
@@ -216,16 +223,16 @@ pub fn show(
                     ui.separator();
                     let setting = manager.python_settings.get(&host.alias);
                     let remembered = setting.and_then(|s| s.remembered.as_deref());
-                    ui.label(RichText::new(remembered.unwrap_or("자동 탐색")).size(11.0).color(FG_DIM));
+                    ui.label(RichText::new(remembered.unwrap_or("Auto")).size(11.0).color(FG_DIM));
                     ui.add_enabled_ui(enabled, |ui| {
-                        ui.menu_button("Python 명령…", |ui| {
+                        ui.menu_button("Python Command…", |ui| {
                             let id = ui.id().with("python_command");
                             let stored = ui.data_mut(|d| d.get_temp::<String>(id));
                             let fresh = stored.is_none();
                             let mut command = stored.unwrap_or_else(|| setting.and_then(|s| s.explicit.clone()).unwrap_or_default());
                             let edit = ui.add(egui::TextEdit::singleline(&mut command).desired_width(360.0));
                             if fresh { edit.request_focus(); }
-                            ui.label(RichText::new("Enter 저장 · Esc 취소 · 빈칸은 자동 탐색").size(11.0).color(FG_DIM));
+                            ui.label(RichText::new("Enter save · Esc cancel · Blank for auto").size(11.0).color(FG_DIM));
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 ui.data_mut(|d| d.remove::<String>(id));
                                 ui.close_menu();
@@ -305,11 +312,11 @@ pub fn show(
                                 }
                                 if response.drag_started() { actions.push(SshAction::Notice(REMOTE_DRAG_NOTE.into())); }
                                 response.context_menu(|ui| {
-                                    if ui.add_enabled(connected, egui::Button::new("열기")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: false }); ui.close_menu(); }
-                                    if ui.add_enabled(connected, egui::Button::new("옆 화면에 열기")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: true }); ui.close_menu(); }
+                                    if ui.add_enabled(connected, egui::Button::new("Open")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: false }); ui.close_menu(); }
+                                    if ui.add_enabled(connected, egui::Button::new("Open Beside")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: true }); ui.close_menu(); }
                                     ui.separator();
                                     ui.add(egui::Label::new(RichText::new("원격 파일은 얹거나 끌어 놓을 수 없어요.").size(11.0).color(FG_DIM)).wrap());
-                                    if ui.button("이유 보기").clicked() { actions.push(SshAction::Notice(format!("{REMOTE_OVERLAY_NOTE} {REMOTE_DRAG_NOTE}"))); ui.close_menu(); }
+                                    if ui.button("Show Reason").clicked() { actions.push(SshAction::Notice(format!("{REMOTE_OVERLAY_NOTE} {REMOTE_DRAG_NOTE}"))); ui.close_menu(); }
                                 });
                             }
                             TreeRow::Note { text, .. } => label(ui, text, Rect::from_min_max(pos2(x + 4.0, rect.top()), rect.right_bottom()), FontId::proportional(11.0), FG_DIM),

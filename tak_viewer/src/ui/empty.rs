@@ -36,7 +36,7 @@ pub fn editor_at(ui: &Ui, rect: egui::Rect) {
 fn panel_hint(pane: Pane) -> &'static str {
     match pane {
         Pane::Labels | Pane::Labeling | Pane::EditTools | Pane::Devices => "Open a file from the Explorer.",
-        _ => "파일을 열면 여기에 나와요.",
+        _ => "Open a take to start.",
     }
 }
 

@@ -69,7 +69,7 @@ pub enum EditToolsAction {
 impl EditToolsState {
     fn pattern_selection_reason(&self) -> Option<&'static str> {
         match self.selected_tracks.len() {
-            0 | 1 => Some("Pattern Based: select reference markers, then the target last"),
+            0 | 1 => Some("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요."),
             _ => None,
         }
     }
@@ -99,14 +99,14 @@ impl EditToolsState {
             return Some(reason);
         }
         if self.parsed_max_gap().is_none() {
-            return Some("Enter a positive whole number for Max. Gap Size.");
+            return Some("Max. Gap Size에 1 이상의 정수를 써 주세요.");
         }
         if scope == FillScope::Everything {
             if method == FillMethod::PatternBased {
-                return Some("Fill Everything is unavailable for Pattern Based.");
+                return Some("Pattern Based에서는 Fill Everything을 쓸 수 없어요.");
             }
             return (self.editable_track_count == 0)
-                .then_some("There are no editable marker tracks.");
+                .then_some("편집할 수 있는 마커 줄이 없어요.");
         }
         if method == FillMethod::PatternBased {
             if let Some(reason) = self.pattern_selection_reason() {
@@ -114,10 +114,10 @@ impl EditToolsState {
             }
         }
         if self.selected_tracks.is_empty() {
-            return Some("Select marker tracks.");
+            return Some("마커 줄을 선택해 주세요.");
         }
         if scope == FillScope::SelectedRange && self.range.is_none() {
-            return Some("Select a frame range.");
+            return Some("프레임 범위를 선택해 주세요.");
         }
         None
     }
@@ -127,28 +127,28 @@ impl EditToolsState {
             return Some(reason);
         }
         if self.sample_rate_hz.is_none() {
-            return Some("Open a take to read its frame rate.");
+            return Some("프레임 속도를 확인하려면 파일을 먼저 열어 주세요.");
         }
         if self.parsed_ui_cutoff().is_none() {
-            return Some("Enter a finite Max. Freq above 0 and below half the frame rate.");
+            return Some("Max. Freq는 0보다 크고 프레임 속도의 절반보다 작아야 해요.");
         }
         if matches!(
             scope,
             SmoothScope::AllTracksSelectedRange | SmoothScope::AllTracksAllFrames
         ) {
             if self.editable_track_count == 0 {
-                return Some("There are no editable marker tracks.");
+                return Some("편집할 수 있는 마커 줄이 없어요.");
             }
             if scope == SmoothScope::AllTracksSelectedRange && self.range.is_none() {
-                return Some("Select a frame range.");
+                return Some("프레임 범위를 선택해 주세요.");
             }
             return None;
         }
         if self.selected_tracks.is_empty() {
-            return Some("Select marker tracks.");
+            return Some("마커 줄을 선택해 주세요.");
         }
         if scope == SmoothScope::SelectedRange && self.range.is_none() {
-            return Some("Select a frame range.");
+            return Some("프레임 범위를 선택해 주세요.");
         }
         None
     }
@@ -641,12 +641,12 @@ mod tests {
         );
         st.selected_tracks.pop();
         assert_eq!(st.fill_reason_for(FillScope::SelectedTracksAllFrames, st.interpolation),
-            Some("Pattern Based: select reference markers, then the target last"));
+            Some("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요."));
         assert_eq!(target_text(&st), "LASI");
         st.selected_tracks.clear();
         assert_eq!(target_text(&st), "—");
         assert_eq!(st.fill_reason_for(FillScope::SelectedRange, st.interpolation),
-            Some("Pattern Based: select reference markers, then the target last"));
+            Some("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요."));
         st.selected_tracks = vec![
             TrackChoice { uid: [1; 16], name: "Same".into() },
             TrackChoice { uid: [2; 16], name: "Same".into() },
@@ -708,16 +708,16 @@ mod tests {
         let (output, _) = draw(&ctx, &st, 440.0, vec![]);
         let labels = texts(&output);
         assert!(labels.iter().any(|(text, _)| text.contains("Shift+C")));
-        assert!(labels.iter().any(|(text, _)| text.contains("Pattern Based: select reference markers, then the target last")));
+        assert!(labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         assert_eq!(click(&ctx, &st, "Fill Selected"), None);
         assert_eq!(click(&ctx, &st, "Fill All"), None);
         assert!(labels
             .iter()
-            .any(|(text, _)| text.contains("Fill Everything is unavailable for Pattern Based")));
+            .any(|(text, _)| text.contains("Pattern Based에서는 Fill Everything을 쓸 수 없어요")));
         assert_eq!(click(&ctx, &st, "Fill Everything"), None);
         st.max_gap = "0".into();
         let (output, _) = draw(&ctx, &st, 440.0, vec![]);
-        assert!(texts(&output).iter().any(|(text, _)| text.contains("Pattern Based: select reference markers, then the target last")));
+        assert!(texts(&output).iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         assert!(!labels
             .iter()
             .any(|(text, _)| text.contains("Preview") || text.contains("Apply")));
@@ -796,7 +796,7 @@ mod tests {
         st.selected_tracks.pop();
         let (output, _) = draw(&ctx, &st, 1200.0, vec![]);
         let labels = texts(&output);
-        assert!(labels.iter().any(|(text, _)| text.contains("Pattern Based: select reference markers, then the target last")));
+        assert!(labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         let at = labels.iter().find(|(text, _)| text == "LASI").unwrap().1.center();
         let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         draw(&ctx, &st, 1200.0, vec![Event::PointerMoved(at)]);

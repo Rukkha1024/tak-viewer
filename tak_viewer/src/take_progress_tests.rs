@@ -184,5 +184,5 @@ fn fixed_slot_and_menu_use_the_mark_without_stealing_row_space() {
         })
         .count();
     assert_eq!(ticks, 1);
-    assert!(texts.contains(&"TAKM에서만 바꿔요."));
+    assert!(texts.contains(&".takm only"));
 }

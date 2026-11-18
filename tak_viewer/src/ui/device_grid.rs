@@ -896,7 +896,7 @@ pub fn show(
                 }
                 ui.label(
                     RichText::new(if emg_failure.is_some() {
-                        "Analog data unavailable"
+                        "장치 자료를 읽지 못했어요."
                     } else {
                         "Loading EMG…"
                     })

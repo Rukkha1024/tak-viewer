@@ -1,5 +1,14 @@
 # 변경 사항
 
+## v0.69.6 — 2026-11-18
+
+- Fix two file-list tests that failed only in the public check. No change in the viewer window.
+
+## v0.69.5 — 2026-11-18
+
+- Use short English across the viewer window, including File, View, Help, Marker Info and the playback bar.
+- Use easy Korean to explain blocked actions and failed saves.
+
 ## v0.69.4 — 2026-11-18
 
 - Add a WSL release helper (`checks/release.py`): reserve a version, prepare, check, confirm pictures, archive, tag, publish, clean up. Done stages are skipped on rerun. Desktop shortcut update is a separate step.

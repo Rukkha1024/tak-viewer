@@ -27,11 +27,11 @@ pub enum Action {
 
 pub fn kind_label(kind: MarkerKind) -> &'static str {
     match kind {
-        MarkerKind::Template => "marker set 마커",
-        MarkerKind::SkeletonExtra => "추가 마커 (Skeleton)",
-        MarkerKind::OtherParent => "추가 마커 (LabelGroup·RigidBody)",
+        MarkerKind::Template => "Marker Set",
+        MarkerKind::SkeletonExtra => "Extra (Skeleton)",
+        MarkerKind::OtherParent => "Extra (LabelGroup/RigidBody)",
         MarkerKind::Unlabeled => "Unlabeled",
-        MarkerKind::Unknown => "구조 미확인",
+        MarkerKind::Unknown => "Unknown Group",
     }
 }
 
@@ -719,7 +719,7 @@ pub const NAME_SEP: &str = "·";
 
 /// "선택 23개 중 8개": the graph draws `drawn` of `total` selected markers (`GRAPH_MAX`).
 pub fn left_out_text(drawn: usize, total: usize) -> String {
-    format!("선택 {total}개 중 {drawn}개")
+    format!("Showing {drawn} of {total}")
 }
 
 /// The Comment bands of a marker graph (Comment plan step 6, `graph::Span`): the frames of each
@@ -952,12 +952,12 @@ fn marker_lanes(data: &ViewData, mi: usize) -> Vec<Lane> {
 pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeSet<usize>, primary: Option<usize>, measurement: Option<super::scene_measurement::Measurement>) -> Option<Action> {
     let Some(mi) = primary.filter(|m| *m < data.markers.len()) else {
         ui.add_space(4.0);
-        ui.label(RichText::new("3D 화면이나 Labeling에서 마커를 클릭하세요.").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Pick a marker in 3D or Labeling.").color(theme::TEXT_DIM));
         return None;
     };
     let m = &data.markers[mi];
     if selected.len() > 1 {
-        ui.label(RichText::new(format!("선택 {}개 · 아래는 마지막으로 고른 마커(하늘색 테두리)", selected.len())).color(theme::TEXT_DIM));
+        ui.label(RichText::new(format!("{} selected · last picked", selected.len())).color(theme::TEXT_DIM));
     }
     egui::Grid::new("sel_info").num_columns(2).spacing([10.0, 3.0]).striped(true).show(ui, |ui| {
         let row = |ui: &mut Ui, k: &str, v: String| {
@@ -968,7 +968,7 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
         if let Some(value) = measurement {
             row(ui, value.name(), value.text());
         }
-        ui.label(RichText::new("이름").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Name").color(theme::TEXT_DIM));
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 5.0, theme::color(m.color));
@@ -977,19 +977,29 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
         });
         ui.end_row();
         let lenient = data.take.trajectories[m.traj].lenient_membership;
-        row(ui, "종류", format!("{}{}", kind_label(m.kind), if lenient { " (copy 파일 형식에서 읽음)" } else { "" }));
-        row(ui, "소속", data.groups[m.group].title.clone());
+        row(ui, "Kind", format!("{}{}", kind_label(m.kind), if lenient { " (from copy)" } else { "" }));
+        let group = &data.groups[m.group];
+        let group_name = match group.kind {
+            tak_core::view_data::GroupKind::AssetExtra => group.asset
+                .and_then(|index| data.take.assets.get(index))
+                .map_or_else(|| "Extra Markers".to_owned(), |asset| format!("{} · Extra Markers", asset.name)),
+            tak_core::view_data::GroupKind::OtherParent => m.parent
+                .map_or_else(|| "Other Group".to_owned(), |uid| format!("Other Group {}", &uid_hex(&uid)[..8])),
+            tak_core::view_data::GroupKind::Unknown => "Unknown Group".to_owned(),
+            _ => group.title.clone(),
+        };
+        row(ui, "Group", group_name);
         row(ui, "slot", m.slot.map_or("-".into(), |s| s.to_string()));
         row(ui, "UID", uid_hex(&m.uid));
-        row(ui, "부모 UID", m.parent.map_or("-".into(), |p| uid_hex(&p)));
-        row(ui, "점 수 / Gaps", format!("{} / {}", m.n_samples, if m.gaps.is_empty() { "0%".into() } else { gaps_text(m.fill_pct) }));
-        row(ui, "빈 구간 / 최대", format!("{}개 / {} 프레임", m.gaps.len(), m.max_gap));
+        row(ui, "Parent UID", m.parent.map_or("-".into(), |p| uid_hex(&p)));
+        row(ui, "Points / Gaps", format!("{} / {}", m.n_samples, if m.gaps.is_empty() { "0%".into() } else { gaps_text(m.fill_pct) }));
+        row(ui, "Gaps / Longest", format!("{} / {} frames", m.gaps.len(), m.max_gap));
         match m.position(frame) {
             Some(p) => {
                 let scale = super::scene_measurement::DISPLAY_MM_PER_UNIT as f32;
-                row(ui, "현재 X Y Z (mm)", format!("{:.2}  {:.2}  {:.2}", p.x * scale, p.y * scale, p.z * scale));
+                row(ui, "X Y Z (mm)", format!("{:.2}  {:.2}  {:.2}", p.x * scale, p.y * scale, p.z * scale));
             }
-            None => row(ui, "현재 X Y Z", "없음 (빈 구간)".into()),
+            None => row(ui, "X Y Z", "No point at this frame".into()),
         }
     });
     None
@@ -997,7 +1007,7 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
 
 /// GRAPH pane button: put the graph back over the 3D views (`graph_float.rs`).
 pub(super) fn over_3d_button(ui: &mut Ui) -> bool {
-    ui.add(egui::Button::new(RichText::new("3D 위로").small()).small()).on_hover_text("그래프를 3D 화면 위에 띄워요. 이 패널은 닫혀요.").clicked()
+    ui.add(egui::Button::new(RichText::new("Float Graph").small()).small()).on_hover_text("Move Graph over 3D.").clicked()
 }
 
 /// X / Y / Z graph of the selected marker in the GRAPH pane (the graph is here instead of
@@ -1015,7 +1025,7 @@ pub fn graph_pane(ui: &mut Ui, data: &ViewData, frame: i64, markers: &[usize], t
         let mut over = false;
         ui.horizontal(|ui| {
             over = over_3d_button(ui);
-            ui.label(RichText::new("3D 화면이나 Labeling에서 마커를 클릭하면 X·Y·Z 그래프가 나와요.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("Pick a marker in 3D or Labeling to see its graph.").color(theme::TEXT_DIM));
         });
         return over.then_some(Action::GraphOver3d);
     };
@@ -1090,7 +1100,7 @@ pub const TIMELINE_H: f32 = SEEK_H + BAND_H;
 /// right edge (both zones, so a range lines up with the ticks).
 const TIMELINE_PAD: f32 = 6.0;
 /// Hover text of the band strip.
-const BAND_TIP: &str = "끌기 = 구간 잡기 · 그냥 누르기 = 구간 풀기 (프레임은 그대로)\n[ / ] = 지금 프레임을 구간 시작 / 끝으로 · Esc = 구간 풀기\nM을 누른 채 재생하다 떼기 = 그 구간으로 Comment (주황 칸, 고른 마커가 있으면 함께)\nM 짧게 = 잡은 구간 + 고른 마커 · 주황 칸 오른쪽 클릭 = 지우기 · Ctrl+Z / Ctrl+Y = 되돌리기 / 다시 하기";
+const BAND_TIP: &str = "Drag to pick a range. Click or press Esc to clear.\n[ / ] sets the start / end to this frame.\nTap M to add a Comment for the range and picked markers.\nHold M during play to mark those frames.\nRight-click a Comment to delete it. Ctrl+Z / Ctrl+Y undo / redo.";
 /// A comment block is at least this wide (a one-frame comment stays visible and clickable).
 pub const BLOCK_MIN_W: f32 = 4.0;
 /// Text on a comment block (dark on orange).
@@ -1566,29 +1576,29 @@ fn timeline(
         let block_resp = ui.interact(r, ui.id().with(("comment_block", slot, b.id)), Sense::click());
         let block_resp = block_resp.on_hover_ui(|ui| {
             if let Some(c) = comments.list.get(b.id) {
-                let frames = if c.start == c.end { format!("프레임 {}", c.start) } else { format!("프레임 {} – {}", c.start, c.end) };
+                let frames = if c.start == c.end { format!("Frame {}", c.start) } else { format!("Frames {}–{}", c.start, c.end) };
                 ui.label(RichText::new(format!("Comment {} · {}", c.id, frames)).strong());
                 // Its type (step 5); the band label stays the number (user decision).
                 if !c.comment_type.is_empty() {
                     ui.label(format!("Type: {}", c.comment_type));
                 }
                 let press = if c.markers.is_empty() {
-                    ui.label("마커 없는 Comment예요 (프레임 구간만 있어요).");
-                    "누르기 = 첫 프레임으로 (고른 마커는 그대로)"
+                    ui.label("This Comment has no markers.");
+                    "Click to jump to the first frame"
                 } else {
                     ui.label(c.markers.join(", "));
-                    "누르기 = 첫 프레임으로 + 이 마커 선택"
+                    "Click to jump and pick this marker"
                 };
                 // Its note (written in the COMMENTS pane, v0.17.0); the band label stays the number.
                 if !c.text.is_empty() {
                     ui.label(RichText::new(&c.text).italics());
                 }
                 let right = if comments.can_delete {
-                    "오른쪽 클릭 = 지우기 (Ctrl+Z = 되돌리기)"
+                    "Right-click to delete. Ctrl+Z to undo."
                 } else {
                     "이 파일의 Comment는 쓸 수 없어서 지울 수도 없어요 (상태 줄에 마우스를 올려 이유를 보세요)"
                 };
-                ui.label(RichText::new(format!("{press} · 끌기 = 구간 잡기\n{right}")).small().color(theme::TEXT_DIM));
+                ui.label(RichText::new(format!("{press} · Drag to pick a range\n{right}")).small().color(theme::TEXT_DIM));
             }
         });
         if block_resp.clicked() {
@@ -1669,24 +1679,24 @@ fn btn(ui: &mut Ui, text: &str, tip: &str) -> bool {
 
 /// −1 · play / pause · +1 (both bar widths).
 fn step_buttons(ui: &mut Ui, pb: &mut Playback, now: f64, working_enabled: bool) {
-    if btn(ui, "◀", "−1 프레임 (←)") {
+    if btn(ui, "◀", "Back 1 Frame (←)") {
         pb.step(-1, now);
     }
     let play = if pb.playing { "⏸" } else { "▶" };
-    if btn(ui, play, "재생/정지 (Space)") {
+    if btn(ui, play, "Play / Pause (Space)") {
         pb.toggle(now);
     }
     let reverse = egui::Button::new("Reverse").selected(pb.reverse()).min_size(vec2(30.0, 24.0));
     if ui.add_enabled(working_enabled, reverse).on_hover_text("Switch playback direction").clicked() {
         pb.set_reverse(!pb.reverse(), now);
     }
-    if btn(ui, "▶|", "+1 프레임 (→)") {
+    if btn(ui, "▶|", "Next Frame (→)") {
         pb.step(1, now);
     }
 }
 
 /// Hover text of the playback bar's frame box (v0.17.3).
-pub const FRAME_BOX_TIP: &str = "끌기 = 프레임 옮기기: 위 · 오른쪽 = 뒤 프레임, 아래 · 왼쪽 = 앞 프레임\n1 pt = 1프레임, Shift를 누른 채 = 10프레임 · 그냥 누르기 = 숫자 쓰기 (Enter)";
+pub const FRAME_BOX_TIP: &str = "Drag up or right to go forward.\nShift moves 10 frames at a time. Click to type a frame (Enter).";
 
 /// The widget id of view `slot`'s frame box (typing and dragging).
 pub fn frame_box_id(slot: usize) -> Id {
@@ -1753,21 +1763,21 @@ fn speed_box(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64) {
 }
 
 fn transport(ui: &mut Ui, pb: &mut Playback, slot: usize, now: f64, working_enabled: bool, inline_fields: bool) {
-    if btn(ui, "⏮", "처음 (Home)") {
+    if btn(ui, "⏮", "First Frame (Home)") {
         pb.step(i64::MIN / 2, now);
     }
-    if btn(ui, "⏪", "−10 프레임 (↓)") {
+    if btn(ui, "⏪", "Back 10 Frames (↓)") {
         pb.step(-10, now);
     }
     step_buttons(ui, pb, now, working_enabled);
-    if btn(ui, "⏩", "+10 프레임 (↑)") {
+    if btn(ui, "⏩", "Next 10 Frames (↑)") {
         pb.step(10, now);
     }
-    if btn(ui, "⏭", "끝 (End)") {
+    if btn(ui, "⏭", "Last Frame (End)") {
         pb.step(i64::MAX / 2, now);
     }
     ui.separator();
-    ui.label(RichText::new("프레임").color(theme::TEXT_DIM));
+    ui.label(RichText::new("Frame").color(theme::TEXT_DIM));
     frame_field(ui, pb, slot, now);
     ui.separator();
     if !inline_fields {
@@ -1798,20 +1808,20 @@ fn more_menu(ui: &mut Ui, pb: &mut Playback, now: f64, make: &Result<String, Str
     let r = egui::menu::menu_custom_button(ui, button, |ui| {
         let item = |ui: &mut Ui, text: &str, key: &str| ui.add(egui::Button::new(text).shortcut_text(key)).clicked();
         let mut step = None;
-        if item(ui, "⏮  처음", "Home") {
+        if item(ui, "⏮  First Frame", "Home") {
             step = Some(i64::MIN / 2);
         }
-        if item(ui, "⏪  −10 프레임", "↓") {
+        if item(ui, "⏪  Back 10", "↓") {
             step = Some(-10);
         }
-        if item(ui, "⏩  +10 프레임", "↑") {
+        if item(ui, "⏩  Next 10", "↑") {
             step = Some(10);
         }
-        if item(ui, "⏭  끝", "End") {
+        if item(ui, "⏭  Last Frame", "End") {
             step = Some(i64::MAX / 2);
         }
         ui.separator();
-        ui.label(RichText::new(format!("지금 시간  {:.3} s", pb.time_of(pb.frame))).color(theme::TEXT_DIM));
+        ui.label(RichText::new(format!("Time {:.3} s", pb.time_of(pb.frame))).color(theme::TEXT_DIM));
         ui.separator();
         let comment = ui.add_enabled(make.is_ok(), egui::Button::new("Comment").shortcut_text("M"));
         let comment = match make {
@@ -1832,7 +1842,7 @@ fn more_menu(ui: &mut Ui, pb: &mut Playback, now: f64, make: &Result<String, Str
     for dx in [-5.0, 0.0, 5.0] {
         ui.painter().circle_filled(c + vec2(dx, 0.0), 1.6, color);
     }
-    r.response.on_hover_text("처음 · 끝 · ±10 프레임 · 지금 시간 · Comment");
+    r.response.on_hover_text("First / last frame · ±10 frames · Time · Comment");
     made
 }
 
@@ -2198,7 +2208,7 @@ mod deck_tests {
         // All twelve: the first eight in LABELS order, and the count of all.
         let all = sel(&(0..12).collect::<Vec<_>>());
         assert_eq!(graphed(&d, &all, 0), (labels[..GRAPH_MAX].to_vec(), 12));
-        assert_eq!(left_out_text(8, 12), "선택 12개 중 8개");
+        assert_eq!(left_out_text(8, 12), "Showing 8 of 12");
     }
 
     #[test]

@@ -218,7 +218,7 @@
             assert!((at(&painted, value).rect.right() - headers[col].rect.right()).abs() < 0.5, "{value} right-aligned to its header");
         }
         assert!(!painted.iter().any(|t| ["빈구간", "최대", "123", "2", "0%"].contains(&t.text.as_str())), "old header/cell numbers are gone");
-        assert!(painted.iter().any(|t| t.text.contains("Gap count and longest gap in Selected Marker.")), "the legend tells where the other numbers are");
+        assert!(painted.iter().any(|t| t.text.contains("See gaps in Marker Info.")), "the legend tells where the other numbers are");
     }
 
     #[test]
@@ -349,7 +349,7 @@
         let mut p = PaneTest::new(&[&refs]);
         p.height = f32::INFINITY;
         let painted = texts(&p.idle());
-        let legend = painted.iter().find(|t| t.text.contains("Gap count and longest gap")).expect("the legend is painted");
+        let legend = painted.iter().find(|t| t.text.contains("See gaps in Marker Info.")).expect("the legend is painted");
         assert!(legend.clip.contains_rect(legend.rect), "the docked pane must not clip its legend below the scroll area");
         assert!(legend.rect.bottom() <= 692.5, "inside the 700 pt screen's panel margin");
     }

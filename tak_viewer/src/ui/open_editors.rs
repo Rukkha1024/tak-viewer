@@ -20,9 +20,9 @@ pub const CHOSEN: Color32 = Color32::from_rgb(0x37, 0x94, 0xff);
 pub const CLOSE_FG: Color32 = ICON_FG;
 /// Dim text (a full WORKSPACE's `폴더 추가`, a hidden file, the empty line).
 pub const DIM: Color32 = FG_DIM;
-pub const ADD_FOLDER: &str = "폴더 추가";
-pub const EMPTY: &str = "열린 파일이 없어요";
-pub const CHOSEN_VIEW: &str = "고른 화면";
+pub const ADD_FOLDER: &str = "Add Folder";
+pub const EMPTY: &str = "No open files";
+pub const CHOSEN_VIEW: &str = "Active View";
 
 /// One file in the list.
 #[derive(Clone)]
@@ -182,7 +182,7 @@ fn name_of(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
 }
 
-/// A row's text in pieces: (file name, " …" / " · 숨김" suffix, folder name).
+/// A row's text in pieces: (file name, " …" / " · Hidden" suffix, folder name).
 fn row_parts(e: &Entry) -> (String, String, String) {
     let mut suffix = String::new();
     if e.dirty { suffix.push('*'); }
@@ -190,13 +190,13 @@ fn row_parts(e: &Entry) -> (String, String, String) {
         suffix.push_str(" …");
     }
     if e.hidden {
-        suffix.push_str(" · 숨김");
+        suffix.push_str(" · Hidden");
     }
     let folder = e.host.clone().unwrap_or_else(|| e.path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     (name_of(&e.path), suffix, folder)
 }
 
-/// A row's text: (name with " …" / " · 숨김", folder name).
+/// A row's text: (name with " …" / " · Hidden", folder name).
 #[cfg(test)]
 pub fn row_text(e: &Entry) -> (String, String) {
     let (name, suffix, folder) = row_parts(e);
@@ -258,7 +258,7 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool, 
     if hresp.clicked() {
         *collapsed = !*collapsed;
     }
-    for text in [format!("선택 {}개 · Ctrl/Shift로 여러 개", selection.selected.len()), "Ctrl+A 모두 · Delete 닫기 · Esc 해제".to_owned()] {
+    for text in [format!("{} selected · Ctrl/Shift to pick more", selection.selected.len()), "Ctrl+A all · Delete close · Esc clear".to_owned()] {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
         ui.painter().with_clip_rect(r.intersect(ui.clip_rect())).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(11.0), FG_DIM);
     }
@@ -463,8 +463,8 @@ mod tests {
         }
         let mut text = String::new();
         out.shapes.iter().for_each(|shape| all_text(&shape.shape, &mut text));
-        assert!(text.contains("선택 3개"));
-        assert!(text.contains("Delete 닫기 · Esc 해제"));
+        assert!(text.contains("3 selected"));
+        assert!(text.contains("Delete close · Esc clear"));
     }
 
     fn entry(path: &str, mark: Option<usize>, outside: bool) -> Entry {
@@ -514,7 +514,7 @@ mod tests {
         }
         let mut found = vec![];
         out.shapes.iter().for_each(|s| walk(&s.shape, &mut found));
-        found.retain(|(_, text, _)| !text.starts_with("선택 ") && !text.starts_with("Ctrl+A 모두"));
+        found.retain(|(_, text, _)| !text.contains(" selected · Ctrl/Shift") && !text.starts_with("Ctrl+A all"));
         found.sort_by(|a, b| (a.0.center().y.round(), a.0.left()).partial_cmp(&(b.0.center().y.round(), b.0.left())).unwrap());
         found
     }
@@ -636,7 +636,7 @@ mod tests {
         odd[0].entries[0].loading = true;
         run(&ctx, &odd, false, &mut folded, None, false);
         let (o, _) = run(&ctx, &odd, false, &mut folded, None, false);
-        for (text, which) in [("a.takm …copy", 0), ("a.tak · 숨김raw", 1)] {
+        for (text, which) in [("a.takm …copy", 0), ("a.tak · Hiddenraw", 1)] {
             let at = at_text(&o, text).center();
             run(&ctx, &odd, false, &mut folded, Some(at), false);
             assert_eq!(run(&ctx, &odd, false, &mut folded, Some(at), true).1, Some(EditorAction::ToggleShown(17, 0, which)), "{text}");
@@ -665,7 +665,7 @@ mod tests {
     fn hidden_and_loading_files_say_so_and_a_narrow_panel_cuts_the_name_not_the_buttons() {
         let mut e = entry("/w/raw/a.tak", Some(1), true);
         e.hidden = true;
-        assert_eq!(row_text(&e), ("a.tak · 숨김".to_owned(), "raw".to_owned()));
+        assert_eq!(row_text(&e), ("a.tak · Hidden".to_owned(), "raw".to_owned()));
         e.hidden = false;
         e.loading = true;
         assert_eq!(row_text(&e).0, "a.tak …");
@@ -697,7 +697,7 @@ mod tests {
         let w = |s: &str| s.chars().count() as f32;
         assert_eq!(fit(n, "", 7.0, 40.0, w), (n.to_owned(), true));
         assert_eq!(fit(n, "", 7.0, 32.0, w), (n.to_owned(), false), "the folder goes first");
-        assert_eq!(fit(n, " · 숨김", 7.0, 20.0, w), ("000000…001.takm · 숨김".to_owned(), false));
+        assert_eq!(fit(n, " · Hidden", 7.0, 20.0, w), (format!("{}…1.takm · Hidden", &n[..4]), false));
         assert_eq!(fit(n, "", 0.0, 1.0, w), ("….takm".to_owned(), false), "never less than the ending");
     }
 
@@ -751,7 +751,8 @@ mod tests {
         // Narrow: cut in the middle, start and whole ending kept; " · 숨김" too.
         let out = at_width(&ctx, rows(true), 260.0);
         let s = shown(&out);
-        assert!(s[0].starts_with("0000") && s[0].contains('…') && s[0].ends_with(".takm · 숨김"), "{}", s[0]);
+        let name = takm.rsplit('/').next().unwrap();
+        assert!(s[0].starts_with(&name[..2]) && s[0].contains('…') && s[0].ends_with(".takm · Hidden"), "{}", s[0]);
         assert!(s[1].starts_with("0000") && s[1].contains('…') && s[1].ends_with("_001.tak"), "{}", s[1]);
         let mut last = usize::MAX;
         for width in [600.0, 420.0, 320.0, 260.0, 220.0, 200.0, 180.0, 160.0, 150.0, 130.0] {
@@ -767,7 +768,7 @@ mod tests {
                     assert!(r.right() <= b.left() - 6.0 + 0.5, "the name ends before the button at {width}: {s}");
                 }
             }
-            assert!(n[0].1.contains(".takm · 숨김"), "suffix kept at {width}: {}", n[0].1);
+            assert!(n[0].1.contains(".takm · Hidden"), "suffix kept at {width}: {}", n[0].1);
             assert!(!n[1].1.contains(".takm"), "{}", n[1].1);
             let pts = cross_points(&out);
             assert_eq!(pts.len(), 8, "two × at {width}");

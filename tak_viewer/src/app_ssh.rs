@@ -425,7 +425,7 @@ impl TakViewerApp {
         self.ssh_note = Some((match result {
             AddRoot::Full => format!("저장 폴더는 {MAX_ROOTS}개까지예요. 하나 뺀 뒤 추가해 주세요."),
             AddRoot::AlreadyThere => "이미 WORKSPACE에 있는 SSH 폴더예요.".into(),
-            AddRoot::Added => format!("{} WORKSPACE에 넣었어요.", root.label()),
+            AddRoot::Added => format!("Added {} to Workspace.", root.label()),
         }, ctx.input(|i| i.time)));
         if result == AddRoot::Added {
             self.explorer.filter.clear();
@@ -675,11 +675,11 @@ impl TakViewerApp {
                 }
                 SshEvent::Cancelled { request_id } => {
                     if let Some(read) = self.ssh_reads.remove(&request_id) {
-                        self.finish_remote_read(request_id, read, "SSH 읽기를 취소했어요. 받은 마커와 힘판은 그대로 볼 수 있어요.");
+                        self.finish_remote_read(request_id, read, "Stopped SSH loading. Loaded markers and plates stay visible.");
                     }
                     if !self.views.iter().any(|v| v.remote_warning.is_some()) {
                         self.ssh_note =
-                            Some(("SSH 읽기를 취소했어요.".into(), ctx.input(|i| i.time)));
+                            Some(("Stopped SSH loading.".into(), ctx.input(|i| i.time)));
                     }
                 }
                 SshEvent::Error {
@@ -746,21 +746,21 @@ impl TakViewerApp {
         let text = |s: String| RichText::new(s).size(12.0).color(theme::STATUS_TEXT);
         if let Some(note) = self.ssh.progress_note() {
             ui.label(text(note).strong());
-            ui.label(text("Esc = 취소".into()));
+            ui.label(text("Esc to cancel".into()));
             return true;
         }
         let v = self.view();
         if let Some((_, location, _)) = &v.remote_loading {
             ui.label(
                 text(format!(
-                    "{} · {} · 마커 읽는 중… {:.1} MB",
+                    "{} · {} · Loading markers… {:.1} MB",
                     remote_name(location),
                     location.host,
                     self.ssh.received_bytes(&location.host) as f64 / 1e6
                 ))
                 .strong(),
             );
-            ui.label(text("Esc = 취소".into()));
+            ui.label(text("Esc to cancel".into()));
             return true;
         }
         let Some(location) = &v.remote else {
@@ -786,8 +786,8 @@ impl TakViewerApp {
                 .any(|read| read.owner == self.remote_owner(self.active) && &read.location == location);
             let demo_pending = crate::ssh::demo_state().as_deref() == Some("markers_ready");
             if data.analog_pending && pending || demo_pending {
-                ui.label(text(format!("포스플레이트 · EMG 읽는 중… {:.1} MB", self.ssh.received_bytes(&location.host) as f64 / 1e6)).strong());
-                ui.label(text("Esc = 취소".into()));
+                ui.label(text(format!("Loading plates and EMG… {:.1} MB", self.ssh.received_bytes(&location.host) as f64 / 1e6)).strong());
+                ui.label(text("Esc to cancel".into()));
             } else {
                 let r = ui.add(
                     egui::Label::new(text(format!("Comments {}", v.comments.list.list().len())))
@@ -828,8 +828,8 @@ impl TakViewerApp {
             }
             v.comments.target = Some(Ok(location.memory_key()));
             for (id, start, end, text) in [
-                (1, 450, 620, "서버의 기존 Comment"),
-                (2, 900, 930, "읽기 전용 예시"),
+                (1, 450, 620, "Comment from the server"),
+                (2, 900, 930, "Read-only example"),
             ] {
                 let c = Comment {
                     id,
@@ -1442,7 +1442,12 @@ impl TakViewerApp {
         state.queued.extend(events);
         self.views[slot].publish_shared_file();
         if self.views[slot].remote.as_ref().is_some_and(|r| !r.path.to_ascii_lowercase().ends_with(".takm")) {
-            self.takm_note = Some(("Comment를 화면에 두었어요. Ctrl+S로 서버에 저장해 주세요.".into(),ctx.input(|i|i.time)));
+            let note = if self.remote_write_probe {
+                "Comment를 화면에 두었어요. Ctrl+S로 서버에 저장해 주세요."
+            } else {
+                "Comment added. Ctrl+S saves it to the server."
+            };
+            self.takm_note = Some((note.into(),ctx.input(|i|i.time)));
         }
         ctx.request_repaint();
     }
@@ -1487,8 +1492,8 @@ impl TakViewerApp {
                 state.job = Some(RemoteWriteJob {location:location.clone(),rx,snapshot,count,discard:false});
                 self.visit_remote_views(|_,view| {if view.document_id()==Some(id) {view.comments.failed=None;view.publish_shared_file();}});
                 if close_after { if let Some(prompt) = &mut self.dirty_prompt {prompt.saving=true;prompt.started=Instant::now();} }
-                let progress=if location.path.to_ascii_lowercase().ends_with(".tak") {format!("서버에 {}.takm 만드는 중…",remote_name(&location).get(..remote_name(&location).len()-4).unwrap_or("파일"))}
-                    else {format!("서버에 {} 저장하는 중…",remote_name(&location))};
+                let progress=if location.path.to_ascii_lowercase().ends_with(".tak") {format!("Saving {}.takm to server…",remote_name(&location).get(..remote_name(&location).len()-4).unwrap_or("File"))}
+                    else {format!("Saving {} to server…",remote_name(&location))};
                 self.takm_note = Some((progress,ctx.input(|i|i.time)));
             }
             Err(reason) => {
@@ -1526,7 +1531,12 @@ impl TakViewerApp {
                         }
                         Ok(written) if written.outcome.existing => {
                             let next=RemoteLocation{host:job.location.host.clone(),path:written.outcome.path.clone()};
-                            self.takm_note=Some(("서버에 같은 이름의 .takm이 있어 그 파일을 열어요. 원본의 편집은 저장하지 않고 남겨 둬요.".into(),ctx.input(|i|i.time)));
+                            let note = if self.remote_write_probe {
+                                "서버에 같은 이름의 .takm이 있어 그 파일을 열어요. 원본의 편집은 저장하지 않고 남겨 둬요."
+                            } else {
+                                "같은 이름의 .takm이 있어 편집을 저장하지 못했어요. 기존 파일을 열어요."
+                            };
+                            self.takm_note=Some((note.into(),ctx.input(|i|i.time)));
                             let prompt=self.dirty_prompt.take();
                             self.remote_action(ctx,SshAction::Open{location:next,side:true});
                             self.dirty_prompt=prompt;
@@ -1567,7 +1577,17 @@ impl TakViewerApp {
                             });
                             self.install_remote_marker_session(id,written.creation);
                             self.rebind_saved_history(&old,&key,id);
-                            self.takm_note=Some((format!("서버에 {} 저장했어요 · {:.1} MB → {:.1} MB · SHA-256 확인{}",remote_name(&next),written.outcome.source_bytes as f64/1e6,written.outcome.output_bytes as f64/1e6,if written.outcome.verified {" 완료"} else {" 못 함"}),now));
+                            let name = remote_name(&next);
+                            let source_mb = written.outcome.source_bytes as f64 / 1e6;
+                            let output_mb = written.outcome.output_bytes as f64 / 1e6;
+                            let note = if self.remote_write_probe {
+                                let state = if written.outcome.verified { " 완료" } else { " 못 함" };
+                                format!("서버에 {name} 저장했어요 · {source_mb:.1} MB → {output_mb:.1} MB · SHA-256 확인{state}")
+                            } else {
+                                let state = if written.outcome.verified { "SHA-256 checked" } else { "SHA-256을 확인하지 못했어요." };
+                                format!("Saved {name} to server · {source_mb:.1} MB → {output_mb:.1} MB · {state}")
+                            };
+                            self.takm_note=Some((note,now));
                             drop_later(Some(written.loaded));
                             if !job.discard {self.reconcile_remote_write_prompt(ctx,id);}
                         }

@@ -975,7 +975,7 @@ impl<'a> LabelEditor<'a> {
                     .find(|track| track.label.is_none() && strict_track(track).is_ok())
                     .map(Arc::as_ref)
                     .or_else(|| common_marker(&destination).then_some(destination.as_ref()))
-                    .ok_or_else(|| other("Can't create an Unlabeled track"))?;
+                    .ok_or_else(|| other("이름 없는 마커 기록을 만들 수 없어요."))?;
                 let name = next_unlabeled_name(&input.tracks().map(|t| t.name.clone()).collect());
                 let uid = new_uid(&proof, input, &HashSet::new());
                 let created = new_track(donor, uid, name, None, displaced)?;

@@ -488,7 +488,7 @@ pub fn show(
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "파일 → 열기, 또는 .tak 파일을 이 창에 끌어다 놓으세요",
+            "Use File → Open File, or drop a take here.",
             FontId::proportional(18.0),
             theme::TEXT_DIM,
         );
@@ -510,7 +510,7 @@ pub fn show(
             painter.text(
                 rect.left_top() + vec2(10.0, note_y + if show_follow { 16.0 } else { 0.0 }),
                 Align2::LEFT_TOP,
-                "선: 파일에 없어 표준 선(Conventional Full Body 39)으로 표시",
+                "Showing standard sticks (Conventional Full Body 39).",
                 FontId::proportional(12.0),
                 theme::TEXT_DIM,
             );

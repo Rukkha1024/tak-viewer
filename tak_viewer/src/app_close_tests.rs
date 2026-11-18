@@ -32,7 +32,7 @@ fn last_close_all_three_entry_points_restore_the_whole_view_with_one_undo() {
                 click_at(&ctx, &mut app, x);
             }
             _ => {
-                let x = editor_x(&ctx, &mut app, "a.tak · 숨김");
+                let x = editor_x(&ctx, &mut app, "a.tak · Hidden");
                 click_at(&ctx, &mut app, x);
             }
         }
@@ -270,13 +270,13 @@ fn last_close_empty_editor_opens_explorer_click_path_dialog_and_recent_menu() {
                 assert!(app.path_input.is_some());
                 app.path_input = Some(path.to_string_lossy().into_owned());
                 out = frame_with(&ctx, &mut app, vec![]);
-                let button = text_rects(&out, "열기")[0].center();
+                let button = text_rects(&out, "Open")[0].center();
                 click_at(&ctx, &mut app, button);
             }
             _ => {
                 app.settings.recent = vec![path.to_string_lossy().into_owned()];
-                out = click_at(&ctx, &mut app, text_rects(&out, "파일")[0].center());
-                out = click_at(&ctx, &mut app, text_rects(&out, "최근 파일")[0].center());
+                out = click_at(&ctx, &mut app, text_rects(&out, "File")[0].center());
+                out = click_at(&ctx, &mut app, text_rects(&out, "Recent Files")[0].center());
                 let file = text_rects(&out, &path.to_string_lossy())[0].center();
                 click_at(&ctx, &mut app, file);
             }

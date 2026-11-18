@@ -168,10 +168,10 @@ impl Field {
     /// Its name in the line at the top.
     fn words(self) -> &'static str {
         match self {
-            Field::Markers => "마커",
-            Field::Frames => "프레임",
-            Field::Text => "메모",
-            Field::Type => "유형",
+            Field::Markers => "Markers",
+            Field::Frames => "Frames",
+            Field::Text => "Comment",
+            Field::Type => "Type",
         }
     }
 }
@@ -532,22 +532,22 @@ fn cell_text(ui: &Ui, cell: Rect, text: &str, color: Color32) {
 pub const LINE_FONT: f32 = 12.0;
 
 /// What a double click on `#` does, in the line at the top (v0.27.3).
-pub const GOTO_WORDS: &str = "# 두 번 = 첫 프레임";
+pub const GOTO_WORDS: &str = "Double-click # to jump";
 
 /// The line at the top (always one, so the rows do not jump): the edit going on, or why
 /// nothing can be changed here, or what a click and a double click do.
 pub fn top_line(edit: Option<(u64, Field)>, picked: Option<u64>, write: &Result<(), String>) -> (String, Color32) {
     match (edit, write, picked) {
         // The frame boxes can be dragged (v0.17.3): said here, since the pane has no hover text.
-        (Some((id, Field::Frames)), _, _) => (format!("Comment {id} 프레임 · 끌기 위+1 (Shift 10) · Enter 저장, Esc 취소"), theme::ACCENT),
+        (Some((id, Field::Frames)), _, _) => (format!("Frames #{id} · Drag ↑ +1 (Shift +10) · Enter save · Esc cancel"), theme::ACCENT),
         // The type list is open (type-combo): short, so Comment 2000 fits ~380 pt.
-        (Some((id, Field::Type)), _, _) => (format!("Comment {id} 유형 · ↑ ↓ Enter · Esc 닫기"), theme::ACCENT),
-        (Some((id, field)), _, _) => (format!("Comment {id} {} 고치는 중 · Enter = 저장 · Esc = 취소", field.words()), theme::ACCENT),
+        (Some((id, Field::Type)), _, _) => (format!("Comment {id} type · ↑ ↓ Enter · Esc close"), theme::ACCENT),
+        (Some((id, field)), _, _) => (format!("Edit Comment {id} {} · Enter save · Esc cancel", field.words()), theme::ACCENT),
         // A double click on `#` goes to the comment (v0.27.3): said in every line without an
         // edit, since only `#` does it and there is no hover text.
         (None, Err(why), _) => (format!("고칠 수 없어요: {why} · {GOTO_WORDS}"), theme::WARN),
-        (None, Ok(()), Some(id)) => (format!("Comment {id} 선택됨 · {GOTO_WORDS} · 칸 두 번 = 고치기"), theme::TEXT_DIM),
-        (None, Ok(()), None) => (format!("줄 누르기 = 고르기 · {GOTO_WORDS} · 칸 두 번 = 고치기"), theme::TEXT_DIM),
+        (None, Ok(()), Some(id)) => (format!("Comment {id} · {GOTO_WORDS} · Double-click to edit"), theme::TEXT_DIM),
+        (None, Ok(()), None) => (format!("Pick a row · {GOTO_WORDS} · Double-click to edit"), theme::TEXT_DIM),
     }
 }
 
@@ -572,7 +572,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("아직 Comment가 없어요. M을 누르면 생겨요.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("No Comments yet. Press M to add one.").color(theme::TEXT_DIM));
         });
         return out;
     }
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(clicks(&list, &ok, head).0, Some(ListAction::Sort(SortKey::Frames)));
         // The line at the top says what `#` does (no hover text in the pane).
         for (picked, write) in [(None, &ok), (Some(7), &ok), (None, &off)] {
-            assert!(top_line(None, picked, write).0.contains("# 두 번 = 첫 프레임"), "{picked:?} {write:?}");
+            assert!(top_line(None, picked, write).0.contains("Double-click # to jump"), "{picked:?} {write:?}");
         }
     }
 

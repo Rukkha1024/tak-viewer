@@ -91,11 +91,11 @@ impl Pane {
         match self {
             Pane::Empty => "",
             Pane::LayoutTabs => "",
-            Pane::View(_) => "3D 화면",
+            Pane::View(_) => "3D View",
             Pane::Explorer => "EXPLORER",
             Pane::Labels | Pane::Labeling => "Labeling",
             Pane::EditTools => "Edit Tools",
-            Pane::Selected => "선택 마커",
+            Pane::Selected => "Marker Info",
             Pane::Graph => "GRAPH",
             Pane::Devices => "Devices",
             Pane::Comments => "COMMENTS",
@@ -128,9 +128,9 @@ impl Pane {
 
 fn translations() -> Translations {
     let mut t = Translations::english();
-    t.tab_context_menu.close_button = "닫기".to_owned();
-    t.tab_context_menu.eject_button = "떼어내기 (떠 있는 창)".to_owned();
-    t.window.close_button_tooltip = "창 닫기".to_owned();
+    t.tab_context_menu.close_button = "Close".to_owned();
+    t.tab_context_menu.eject_button = "Float Panel".to_owned();
+    t.window.close_button_tooltip = "Close Window".to_owned();
     t
 }
 

@@ -148,7 +148,7 @@ fn playback_working_range_controls_commit_cancel_and_restore() {
     type_start(&mut app, "8");
     run_frame(&ctx, &mut app, &[(Modifiers::NONE, Key::Enter)]);
     assert_eq!(app.views[0].pb.working_range(), (2, 5));
-    assert!(takm_note(&app).contains("Start must be before or at end"));
+    assert!(takm_note(&app).contains("재생 구간의 시작은 끝보다 뒤에 올 수 없어요."));
     assert!(app.history.kinds().is_empty());
 
     type_start(&mut app, "4");

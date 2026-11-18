@@ -1568,7 +1568,7 @@ impl TakViewerApp {
             let top = if redo { self.history.redo.last() } else { self.history.undo.last() }.expect("guard keeps history");
             match self.ready(top, redo) {
                 Ready::Wait(name) => {
-                    self.history.note = Some((format!("Wait · loading {name}"), now));
+                    self.history.note = Some((format!("{name} 파일을 다 읽은 뒤 다시 해 주세요."), now));
                     return;
                 }
                 Ready::Gone => {
@@ -1701,7 +1701,7 @@ impl TakViewerApp {
             }
             Part::EditorSelection { before, after } => {
                 self.editor_selection = if redo { after.clone() } else { before.clone() };
-                return format!("열린 파일 선택 {}개", self.editor_selection.selected.len());
+                return format!("{} open files selected", self.editor_selection.selected.len());
             }
             Part::Options { before, after, .. } => {
                 let (from, to) = if redo { (before, after) } else { (after, before) };

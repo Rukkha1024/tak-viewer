@@ -86,7 +86,7 @@ fn show_labels(ui: &mut Ui, rows: &[CatalogRow]) -> Option<LabelKey> {
     const WIDTH: f32 = 200.0;
     ui.set_width(WIDTH);
     if rows.is_empty() {
-        ui.label("No labels to assign");
+        ui.label("이 파일에 붙일 라벨이 없어요.");
         return None;
     }
     let row_height = ui.spacing().interact_size.y;

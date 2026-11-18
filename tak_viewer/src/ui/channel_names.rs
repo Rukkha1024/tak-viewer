@@ -9,12 +9,12 @@ struct Editor {
     drafts: BTreeMap<(String, usize), String>,
 }
 
-pub fn show(ui: &mut Ui, mut catalog: BTreeMap<String, usize>, names: &mut ChannelNames) {
+pub fn show(ui: &mut Ui, mut catalog: BTreeMap<String, (String, usize)>, names: &mut ChannelNames) {
     let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("settings.channel_names"));
     for (device, channels) in names.iter() {
         let count = channels.keys().max().map_or(0, |n| n + 1);
-        let entry = catalog.entry(device.clone()).or_default();
-        *entry = (*entry).max(count);
+        let entry = catalog.entry(device.clone()).or_insert_with(|| (device.clone(), 0));
+        entry.1 = entry.1.max(count);
     }
     ui.separator();
     ui.strong("Channel names");
@@ -30,10 +30,10 @@ pub fn show(ui: &mut Ui, mut catalog: BTreeMap<String, usize>, names: &mut Chann
         editor.selected = catalog.keys().next().unwrap().clone();
     }
     egui::ComboBox::from_id_salt("channel_name_device")
-        .selected_text(&editor.selected)
+        .selected_text(&catalog[&editor.selected].0)
         .show_ui(ui, |ui| {
-            for device in catalog.keys() {
-                ui.selectable_value(&mut editor.selected, device.clone(), device);
+            for (device, (caption, _)) in &catalog {
+                ui.selectable_value(&mut editor.selected, device.clone(), caption);
             }
         });
     let device = editor.selected.clone();
@@ -47,7 +47,7 @@ pub fn show(ui: &mut Ui, mut catalog: BTreeMap<String, usize>, names: &mut Chann
                     ui.label("Ch");
                     ui.label("Name");
                     ui.end_row();
-                    for ci in 0..catalog[&device] {
+                    for ci in 0..catalog[&device].1 {
                         ui.label(ci.to_string());
                         let key = (device.clone(), ci);
                         let current = names

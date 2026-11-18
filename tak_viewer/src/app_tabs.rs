@@ -704,7 +704,7 @@ impl TabStrip {
                                         context_rename = Some(tab.id);
                                         ui.close_menu();
                                     }
-                                    if ui.button("탭 닫기").clicked() {
+                                    if ui.button("Close Tab").clicked() {
                                         actions.push(TabAction::Close(tab.id));
                                         ui.close_menu();
                                     }

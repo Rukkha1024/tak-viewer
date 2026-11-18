@@ -7,8 +7,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Window title: program name + version, then the open file if any.
 pub fn window_title(file: Option<&str>) -> String {
     match file {
-        Some(f) => format!("TAK 뷰어 v{VERSION} — {f}"),
-        None => format!("TAK 뷰어 v{VERSION}"),
+        Some(f) => format!("TAK Viewer v{VERSION} — {f}"),
+        None => format!("TAK Viewer v{VERSION}"),
     }
 }
 
@@ -18,8 +18,8 @@ mod tests {
 
     #[test]
     fn title_shows_version_and_file() {
-        assert_eq!(window_title(None), format!("TAK 뷰어 v{VERSION}"));
-        assert_eq!(window_title(Some("a.tak")), format!("TAK 뷰어 v{VERSION} — a.tak"));
+        assert_eq!(window_title(None), format!("TAK Viewer v{VERSION}"));
+        assert_eq!(window_title(Some("a.tak")), format!("TAK Viewer v{VERSION} — a.tak"));
     }
 
     /// Raising the version without writing the change log (or the reverse) fails here.

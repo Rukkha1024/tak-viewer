@@ -132,7 +132,7 @@ impl TakViewerApp {
                 if !sent { self.comment_waiting.push((tag, path, events)); }
                 ctx.request_repaint_after(Duration::from_millis(30));
             } else {
-                self.views[slot].comments.failed = Some("저장하는 스레드가 멈췄어요".into());
+                self.views[slot].comments.failed = Some("저장 작업이 멈췄어요.".into());
                 self.comment_failed.extend(events.into_iter().map(|event| (tag, path.clone(), event)));
             }
         }

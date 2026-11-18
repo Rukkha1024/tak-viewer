@@ -218,7 +218,7 @@ pub fn row_mark(
                 }
             }
             if !takm {
-                ui.label(egui::RichText::new("TAKM에서만 바꿔요.").color(egui::Color32::from_gray(0x8c)));
+                ui.label(egui::RichText::new(".takm only").color(egui::Color32::from_gray(0x8c)));
             }
             chosen
         },

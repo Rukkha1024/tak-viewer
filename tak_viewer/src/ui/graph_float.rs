@@ -17,7 +17,7 @@ const BTN_W: f32 = 18.0;
 const BTN_H: f32 = 14.0;
 const BTN_GAP: f32 = 3.0;
 /// Width of the plate graph's "줄 ▼" button (lanes list).
-const LANES_W: f32 = 30.0;
+const LANES_W: f32 = 42.0;
 /// Half width of the strips along the edges that resize the graph.
 const EDGE: f32 = 4.0;
 const CORNER: f32 = 12.0;
@@ -432,7 +432,7 @@ fn close_icon(p: &egui::Painter, r: Rect, color: Color32) {
 
 /// "줄" and a small ▼ (painted: the font may not have it): opens the list of lanes.
 fn lanes_icon(p: &egui::Painter, r: Rect, color: Color32) {
-    p.text(pos2(r.left() + 4.0, r.center().y), Align2::LEFT_CENTER, "줄", FontId::proportional(11.0), color);
+    p.text(pos2(r.left() + 4.0, r.center().y), Align2::LEFT_CENTER, "Lanes", FontId::proportional(11.0), color);
     let c = pos2(r.right() - 7.0, r.center().y + 0.5);
     p.add(Shape::convex_polygon(vec![c + vec2(-3.0, -1.5), c + vec2(3.0, -1.5), c + vec2(0.0, 2.0)], color, Stroke::NONE));
 }
@@ -442,7 +442,7 @@ fn lanes_icon(p: &egui::Painter, r: Rect, color: Color32) {
 /// one was checked or unchecked; the last one shown cannot be unchecked.
 fn lanes_list(ui: &mut Ui, shown: LaneSet, offer: LaneSet) -> Option<LaneSet> {
     ui.set_min_width(96.0);
-    ui.label(RichText::new("보일 줄").small().color(theme::TEXT_DIM));
+    ui.label(RichText::new("Graph Lanes").small().color(theme::TEXT_DIM));
     let mut out = None;
     for k in offer.iter() {
         if k == 3 && offer.has(0) {
@@ -555,7 +555,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
     } else if tag.double_clicked() {
         b.collapsed = !b.collapsed;
     } else {
-        tag.on_hover_text("끌어서 옮겨요 · 두 번 누르면 접거나 펴요");
+        tag.on_hover_text("Drag to move. Double-click to fold.");
     }
     painter.rect_filled(tag_rect, 3.0, Color32::from_black_alpha(if open { 150 } else { 190 }));
     if !open {
@@ -588,15 +588,15 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
     }
     if hot {
         let rects = button_rects(kind, handle);
-        let fold_tip = if open { "접어요 (이름표만 남아요)" } else { "펴요" };
+        let fold_tip = if open { "Fold Graph" } else { "Show Graph" };
         let fold = |ui: &mut Ui, r: Rect| button(ui, &painter, r, id.with("fold"), fold_tip, |p, r, color| fold_icon(p, r, color, open));
         let folded = match kind {
             Kind::Marker => {
-                out.to_panel = button(ui, &painter, rects[0], id.with("panel"), "아래 GRAPH 패널로 되돌려요", panel_icon);
+                out.to_panel = button(ui, &painter, rects[0], id.with("panel"), "Put Graph Below 3D", panel_icon);
                 fold(ui, rects[1])
             }
             Kind::Plate { shown, offer } => {
-                let resp = ui.interact(rects[0], id.with("lanes_button"), Sense::click()).on_hover_text("보일 줄을 골라요 (Fx · Fy · Fz · Mx · My · Mz)");
+                let resp = ui.interact(rects[0], id.with("lanes_button"), Sense::click()).on_hover_text("Choose graph lanes (Fx · Fy · Fz · Mx · My · Mz).");
                 let lit = resp.hovered() || list_open;
                 painter.rect_filled(rects[0], 3.0, Color32::from_white_alpha(if lit { 70 } else { 36 }));
                 lanes_icon(&painter, rects[0], if lit { theme::TAB_TEXT_ACTIVE } else { theme::TEXT });
@@ -614,7 +614,7 @@ pub fn show(ui: &mut Ui, area: Rect, view_tag: Rect, slot: usize, kind: Kind, b:
                     }
                 }
                 let folded = fold(ui, rects[1]);
-                out.close = button(ui, &painter, rects[2], id.with("close"), "닫아요 (장치 패널에는 그대로 있어요)", close_icon);
+                out.close = button(ui, &painter, rects[2], id.with("close"), "Close this graph. It stays in Devices.", close_icon);
                 folded
             }
         };
@@ -843,15 +843,15 @@ mod tests {
         assert_eq!((names, notes.len()), (vec!["LKNE0".to_string(), "LKNE1".into(), "LKNE2".into()], 0));
         assert!(w < 800.0);
         assert_eq!(tag_read(3, 0, 800.0).3, "LKNE0 · LKNE1 · LKNE2");
-        assert_eq!(tag_read(8, 4, 2000.0).3, "LKNE0 · LKNE1 · LKNE2 · LKNE3 · LKNE4 · LKNE5 · LKNE6 · LKNE7 선택 12개 중 8개");
+        assert_eq!(tag_read(8, 4, 2000.0).3, "LKNE0 · LKNE1 · LKNE2 · LKNE3 · LKNE4 · LKNE5 · LKNE6 · LKNE7 Showing 8 of 12");
         // Eight drawn of twelve selected: all eight names and the note.
         let (names, notes, _) = tag_of(8, 4, 2000.0);
-        assert_eq!((names.len(), notes), (8, vec!["선택 12개 중 8개".to_string()]));
+        assert_eq!((names.len(), notes), (8, vec!["Showing 8 of 12".to_string()]));
         // Narrow: as many names as fit, then "+N" for the others; never wider than the room
         // (so the first lane's max value stays clear), never without a name.
         let (names, notes, w) = tag_of(8, 4, 260.0);
         assert!(names.len() >= 1 && names.len() < 8, "{names:?}");
-        assert_eq!(notes, vec![format!("+{}", 8 - names.len()), "선택 12개 중 8개".to_string()]);
+        assert_eq!(notes, vec![format!("+{}", 8 - names.len()), "Showing 8 of 12".to_string()]);
         assert!(w <= 260.0, "{w}");
         let (names, _, _) = tag_of(3, 0, 10.0);
         assert_eq!(names.len(), 1);

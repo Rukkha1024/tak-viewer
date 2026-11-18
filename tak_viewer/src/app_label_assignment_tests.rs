@@ -189,8 +189,8 @@ mod label_assignment {
     #[test]
     fn same_label_confirms_only_when_a_point_exists_in_scope() {
         for (range, forward, expected, status) in [
-            ((6, 6), true, KEY_A, "No points to relabel in range"),
-            ((7, 7), false, KEY_A, "No points to relabel in range"),
+            ((6, 6), true, KEY_A, "선택한 범위에 바꿀 점이 없어요."),
+            ((7, 7), false, KEY_A, "선택한 범위에 바꿀 점이 없어요."),
             ((7, 7), true, KEY_B, "Label · A · already set"),
         ] {
             let ctx = egui::Context::default();

@@ -106,7 +106,7 @@ impl Default for LabelingState {
             scroll_to: None,
             scroll_to_track: None,
             selected_labeled_count: 0,
-            label_marker_reason: Some("Select one 3D point"),
+            label_marker_reason: Some("3D에서 점을 하나만 선택해 주세요."),
             blocked_reason: None,
         }
     }
@@ -185,9 +185,9 @@ impl LabelingState {
             return Some(reason);
         }
         if !self.backward && !self.forward {
-            return Some("Select at least one labeling direction.");
+            return Some("앞이나 뒤 방향을 하나 이상 선택해 주세요.");
         }
-        (self.selected_labeled_count == 0).then_some("Select labeled marker tracks.")
+        (self.selected_labeled_count == 0).then_some("이름이 붙은 마커를 선택해 주세요.")
     }
 }
 
@@ -461,7 +461,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             }
             if !state.backward || !state.forward {
                 ui.label(
-                    RichText::new("At least one labeling direction must remain on.")
+                    RichText::new("앞과 뒤 중 하나는 켜 두어야 해요.")
                         .size(11.0)
                         .color(theme::TEXT_DIM),
                 );
@@ -529,9 +529,9 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             let font = egui::TextStyle::Small.resolve(ui.style());
             for (text, color) in [
                 ("White", theme::LABEL_TRACKED),
-                (" = present at current frame · ", theme::TEXT_DIM),
+                (" = here · ", theme::TEXT_DIM),
                 ("Red", theme::LABEL_ABSENT),
-                (" = absent · % = share of take frames with a point. Gap count and longest gap in Selected Marker.", theme::TEXT_DIM),
+                (" = missing · % of frames with a point. See gaps in Marker Info.", theme::TEXT_DIM),
             ] {
                 legend.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
             }
@@ -618,7 +618,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                 }
                                 if gesture.is_none() { resp.context_menu(|ui| {
                                     let label_reason = if row.key.is_none() {
-                                        Some("No label for this row")
+                                        Some("이 행에 지정할 수 있는 이름이 없어요.")
                                     } else {
                                         state.label_marker_reason
                                     };
@@ -634,11 +634,11 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                         ui.close_menu();
                                     }
                                     let why = if row.track_uid.is_none() {
-                                        Some("This label has no marker track.")
+                                        Some("이 라벨에 연결된 마커가 없어요.")
                                     } else if row.selected {
                                         state.unlabel_reason()
                                     } else if row.key.is_none() {
-                                        Some("This marker has no known label.")
+                                        Some("이 마커의 라벨을 찾을 수 없어요.")
                                     } else {
                                         state.blocked_reason.as_deref()
                                     };
@@ -1113,7 +1113,7 @@ mod tests {
         let (out, _) = draw(&ctx, &st, 440.0, vec![]);
         assert!(texts(&out)
             .iter()
-            .any(|item| item.text.contains("At least one labeling direction")));
+            .any(|item| item.text.contains("앞과 뒤 중 하나는 켜 두어야 해요.")));
         assert_eq!(
             click(&ctx, &st, "Back", Modifiers::NONE, PointerButton::Primary),
             None

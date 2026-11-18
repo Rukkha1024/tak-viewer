@@ -116,7 +116,7 @@ fn delete_focus_view_tab_ssh_and_labeling_legend_block_marker_delete() {
                 .find(|r| r.center().y < app.views[0].scene_rect.top() + dock::TAB_H).expect("view name tag").center(),
             "ssh" => text_rects(&out, "SSH (0)").first().expect("SSH section").center(),
             _ => {
-                let text = "White = present at current frame · Red = absent · % = share of take frames with a point. Gap count and longest gap in Selected Marker.";
+                let text = "White = here · Red = missing · % of frames with a point. See gaps in Marker Info.";
                 text_rects(&out, text).first().expect("Labeling legend").center()
             }
         };
@@ -130,13 +130,13 @@ fn delete_focus_view_tab_ssh_and_labeling_legend_block_marker_delete() {
 
 #[test]
 fn delete_focus_settings_help_notice_error_and_warning_windows_block_marker_delete() {
-    for title in ["설정", "Controls", "알림", "파일을 열 수 없어요", "읽기 경고"] {
+    for title in ["Settings", "Controls", "Notice", "파일을 열 수 없어요", "Read Warnings"] {
         let ctx = egui::Context::default();
         let mut app = delete_focus_app(&ctx);
         match title {
-            "설정" => app.show_settings = true,
+            "Settings" => app.show_settings = true,
             "Controls" => app.show_help = true,
-            "알림" => app.notice = Some("focus notice".into()),
+            "Notice" => app.notice = Some("focus notice".into()),
             "파일을 열 수 없어요" => app.error = Some("focus error".into()),
             _ => app.show_warnings = true,
         }

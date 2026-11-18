@@ -43,15 +43,15 @@ impl Endpoint {
         let frame = text
             .trim()
             .parse::<i64>()
-            .map_err(|_| "Enter a frame number")?;
+            .map_err(|_| "재생 구간에는 프레임 번호를 써 주세요.")?;
         if !(pb.first..=pb.last).contains(&frame) {
-            return Err("Frame outside take");
+            return Err("파일에 있는 프레임 번호를 써 주세요.");
         }
         let (_, other) = self.split(pb.working_range());
         match self {
             Self::Start if frame <= other => Ok((frame, other)),
             Self::End if frame >= other => Ok((other, frame)),
-            _ => Err("Start must be before or at end"),
+            _ => Err("재생 구간의 시작은 끝보다 뒤에 올 수 없어요."),
         }
     }
 }

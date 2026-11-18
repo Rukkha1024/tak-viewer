@@ -46,7 +46,7 @@ Windows의 EXPLORER에서 SSH 연결을 설정해 서버 파일을 읽을 수 �
 
 ## Controls
 
-`도움말 → 조작키` opens `Controls`, with grouped shortcuts in short English. Move or resize the window. Scroll its body for more.
+`Help → Controls` opens `Controls`, with grouped shortcuts in short English. Move or resize the window. Scroll its body for more.
 
 Exact modifiers required; focused text/popup/edit/held-M/capture priority → input rules.
 
@@ -55,7 +55,7 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | Left click / Ctrl+click / Shift+click | Select / toggle / add marker. Plain blank click clears. |
 | 3D Alt+click | Inspect one marker without QuickLabel or plate picking. |
 | 3D Ctrl+A | Select visible markers in the last-clicked 3D view at its current frame. |
-| `보기 → Distance / Angle` | Toggle the readout for two or three selected markers. Select the angle vertex second. |
+| `View → Distance / Angle` | Toggle the readout for two or three selected markers. Select the angle vertex second. |
 | Left drag / Ctrl+drag | Box-select / add box; nearest release marker primary |
 | Right drag / middle drag / wheel | Orbit / pan / zoom |
 | Ctrl+B / Ctrl+J / Ctrl+Alt+B | Toggle left / bottom / right panels |
@@ -77,9 +77,9 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | Shift+B / Shift+V | Clear edit range / use the whole file |
 | `[` / `]` | Set green working range start / end at this frame |
 | Shift+[ / Shift+] / `Reset` | Reset working range to full file |
-| G / `보기 → Follow Selected (G)` | Toggle tracking in focused scene / active view |
-| `보기 → View Direction` | Perspective / Front / Back / Left / Right / Top / Bottom |
-| L / `보기 → Marker Names (L)` | Toggle 3D marker names. Off keeps pointer-hover name only |
+| G / `View → Follow Selected (G)` | Toggle tracking in focused scene / active view |
+| `View → View Direction` | Perspective / Front / Back / Left / Right / Top / Bottom |
+| L / `View → Marker Names (L)` | Toggle 3D marker names. Off keeps pointer-hover name only |
 | Ctrl+O / Ctrl+Shift+O / Ctrl+L | Open file / add folder / open by path |
 | Ctrl+T / Ctrl+Shift+T / Ctrl+W | New tab / reopen closed view or tab / close focused view |
 | Ctrl+Tab / Ctrl+PageDown | Next tab |
@@ -110,7 +110,7 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | Timeline Comment click / right-click | Jump/select / delete single |
 | 1 / 2 or overlay tags | Toggle primary/overlay visibility |
 
-Follow and projection per view. Right drag leaves orthographic mode. `보기` trail switch draws up to eight selected markers. 3D behavior.
+Follow and projection per view. Right drag leaves orthographic mode. `View` trail switch draws up to eight selected markers. 3D behavior.
 
 Pattern Based: select references first, target last; check Fill Target then Fill Selected/All or Shift+C. Two-reference failure cases → editing contract. Undo coverage/merge/exclusions → undo table.
 
@@ -207,7 +207,7 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --menu-capture | Exercise menu capture and screenshot completion dialog |
 | --drop-preview x,y incoming… | Headless screenshot only. Put last. Preview a drop at egui window points without opening incoming files |
 
-Use one crop selector. Native window pixels follow display scale. Crop points map to full-image pixels. Clip to the image and round minimum edges down and maximum edges up. Names ignore case: EXPLORER, Labeling, Edit Tools, Selected Marker (`선택 마커`), Devices, COMMENTS, GRAPH, Layout Tabs, footer, timeline, timeline N, 3D view N. N is view slot 1–4. Plain timeline uses the active view. `--comments`, `--edit-tools`, `--labeling-link` and `--graph-layout channels` can bring panels forward.
+Use one crop selector. Native window pixels follow display scale. Crop points map to full-image pixels. Clip to the image and round minimum edges down and maximum edges up. Names ignore case: EXPLORER, Labeling, Edit Tools, Selected Marker (`선택 마커` is also accepted, window tab `Marker Info`), Devices, COMMENTS, GRAPH, Layout Tabs, footer, timeline, timeline N, 3D view N. N is view slot 1–4. Plain timeline uses the active view. `--comments`, `--edit-tools`, `--labeling-link` and `--graph-layout channels` can bring panels forward.
 
 If text clips in the panel, increase `--size` to give it more room before scaling.
 

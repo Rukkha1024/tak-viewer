@@ -256,13 +256,13 @@ impl Host {
                     }
                     if list.truncated {
                         rows.push(TreeRow::Note {
-                            text: format!("처음 {}개만 보여요.", list.entries.len()),
+                            text: format!("Showing the first {} items.", list.entries.len()),
                             depth,
                         });
                     }
                     if list.entries.is_empty() {
                         rows.push(TreeRow::Note {
-                            text: "폴더와 TAK · TAKM 파일이 없어요.".into(),
+                            text: "No folders or takes".into(),
                             depth,
                         });
                     }
@@ -272,7 +272,7 @@ impl Host {
                     depth,
                 }),
                 _ => rows.push(TreeRow::Note {
-                    text: "목록 읽는 중…".into(),
+                    text: "Loading list…".into(),
                     depth,
                 }),
             }
@@ -869,14 +869,14 @@ impl SshManager {
     pub fn progress_note(&self) -> Option<String> {
         for host in &self.hosts {
             if host.state == HostState::Connecting {
-                return Some(format!("{} 연결 중…", host.alias));
+                return Some(format!("Connecting to {}…", host.alias));
             }
             if host.worker.as_ref().is_some_and(|w| {
                 w.operations
                     .values()
                     .any(|op| op.kind == OperationKind::List || op.kind == OperationKind::Connect)
             }) {
-                return Some(format!("{} · 목록 읽는 중… {:.1} MB", host.alias, self.received_bytes(&host.alias) as f64 / 1e6));
+                return Some(format!("{} · Loading list… {:.1} MB", host.alias, self.received_bytes(&host.alias) as f64 / 1e6));
             }
         }
         None

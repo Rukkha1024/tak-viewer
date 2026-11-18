@@ -663,7 +663,17 @@ impl CaptureRun {
     }
 
     pub fn hud_label(&self) -> String {
-        self.shots.get(self.index).map_or("Perspective", |s| s.1.label()).to_owned()
+        self.shots.get(self.index).map_or("Perspective", |s| match s.1 {
+            ViewPreset::Current | ViewPreset::Persp => "Perspective",
+            ViewPreset::Top => "Top",
+            ViewPreset::Bottom => "Bottom",
+            ViewPreset::Side => "Side",
+            ViewPreset::Front => "Front",
+            ViewPreset::PlusX => "+X",
+            ViewPreset::MinusX => "-X",
+            ViewPreset::PlusZ => "+Z",
+            ViewPreset::MinusZ => "-Z",
+        }).to_owned()
     }
 
     /// Shots after the take is loaded: frames x views, capped at MAX_SHOTS.

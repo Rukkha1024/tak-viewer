@@ -155,7 +155,7 @@ impl TakViewerApp {
 
     /// Status bar words while a conversion runs.
     pub(super) fn takm_working(&self) -> Option<String> {
-        self.takm_job.as_ref().map(|j| format!("{} → .takm 만드는 중…", name_of(&j.tak)))
+        self.takm_job.as_ref().map(|j| format!("Saving {} as .takm…", name_of(&j.tak)))
     }
 
     /// Complete conversion and the staged marker read before touching any live view.
@@ -200,13 +200,13 @@ impl TakViewerApp {
             };
             let (out, line, exists) = match outcome {
                 Outcome::Made(c) => {
-                    let mut line = format!("{} 만들었어요 · {} → {}", name_of(&c.out), mb(c.tak_size), mb(c.takm_size));
-                    if c.csv_beside.is_some() { line += &format!(" · 옆 CSV의 Comment 줄 {}개를 넣었어요", c.imported); }
+                    let mut line = format!("Saved {} · {} → {}", name_of(&c.out), mb(c.tak_size), mb(c.takm_size));
+                    if c.csv_beside.is_some() { line += &format!(" · Added {} Comments from CSV", c.imported); }
                     if let Some(dir) = c.out.parent() { self.workspace.relist(dir); }
                     (c.out, line, false)
                 }
                 Outcome::Exists(out) => {
-                    let line = format!("{}이(가) 이미 있어서 덮어쓰지 않고 그 파일을 열었어요.", name_of(&out));
+                    let line = format!("Opened existing {}.", name_of(&out));
                     (out, line, true)
                 }
                 Outcome::Failed(reason) => {
@@ -438,7 +438,7 @@ impl TakViewerApp {
             return true;
         }
         if self.takm_job.is_some() || self.save_destination_reserved(out) { return true; }
-        self.takm_job = Some(Job { tak: tak.to_path_buf(), had_source: true, phase: Phase::Read { out: out.to_path_buf(), line: format!("{} 열었어요.", name_of(out)), view: None }, identities, resolving: None, waiting: None });
+        self.takm_job = Some(Job { tak: tak.to_path_buf(), had_source: true, phase: Phase::Read { out: out.to_path_buf(), line: format!("Opened {}.", name_of(out)), view: None }, identities, resolving: None, waiting: None });
         self.poll_takm(ctx);
         true
     }
@@ -544,11 +544,11 @@ impl TakViewerApp {
     }
 
     pub(super) fn takm_batch_words(&self, batch: &SharedBatch) -> String {
-        let Ok(batch) = batch.lock() else { return "TAKM 파일 전환".into() };
-        let Some(first) = batch.occurrences.first() else { return "TAKM 파일 전환".into() };
+        let Ok(batch) = batch.lock() else { return "Switch TAKM File".into() };
+        let Some(first) = batch.occurrences.first() else { return "Switch TAKM File".into() };
         let name = self.takm_view(first.location).and_then(View::path).map(name_of).unwrap_or_default();
         if batch.occurrences.len() == 1 { format!("Open {name}") }
-        else { format!("Open {name} · 화면 {}개", batch.occurrences.len()) }
+        else { format!("Open {name} · {} views", batch.occurrences.len()) }
     }
 
     pub(super) fn swap_takm_batch(&mut self, batch: &SharedBatch, now: f64) -> bool {

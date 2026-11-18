@@ -456,7 +456,7 @@ impl TakViewerApp {
         // tags and the ✕ stay on screen.
         let room = ((rect.right() - GAP - x0) - GAP - 2.0 * (PAD + ICON_W + PAD) - 4.0 - CLOSE_W + PAD) / 2.0;
         let labels: [String; 2] = std::array::from_fn(|i| {
-            let hidden = if v.shown[i] { "" } else { " · 숨김" };
+            let hidden = if v.shown[i] { "" } else { " · Hidden" };
             let dirty = if if i == 0 { v.marker_dirty() } else { o.marker_dirty() } { " *" } else { "" };
             let (base, folder) = match names[i].rsplit_once(" · ") {
                 Some((b, f)) => (b.to_owned(), format!(" · {f}")),

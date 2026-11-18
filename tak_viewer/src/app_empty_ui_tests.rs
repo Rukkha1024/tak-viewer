@@ -62,7 +62,7 @@ fn empty_ui_all_panes_render_as_active_tabs_and_detached_windows() {
             let hint = if matches!(pane, Pane::Labeling | Pane::EditTools | Pane::Devices) {
                 "Open a file from the Explorer."
             } else {
-                "파일을 열면 여기에 나와요."
+                "Open a take to start."
             };
             let (surface, node, _) = app.dock.find_tab(&pane).unwrap();
             let place = app.dock[surface][node]
@@ -200,7 +200,7 @@ fn empty_ui_reopening_a_file_preserves_shared_panels_and_restores_live_content()
     app.show_pane(Pane::Selected);
     let out = empty_ui_output(&ctx, &mut app);
     assert!(
-        text_rects(&out, "이름").len() >= 1,
+        text_rects(&out, "Name").len() >= 1,
         "the selected-marker pane is live again"
     );
 }
@@ -211,9 +211,9 @@ fn empty_ui_layout_reset_menu_keeps_the_editor_empty() {
     let mut app = empty_ui_after_close(&ctx);
     app.show_pane(Pane::Graph);
     let out = empty_ui_output(&ctx, &mut app);
-    let menu = text_rects(&out, "보기")[0].center();
+    let menu = text_rects(&out, "View")[0].center();
     let out = click_at(&ctx, &mut app, menu);
-    let reset = text_rects(&out, "패널 배치 처음대로")[0].center();
+    let reset = text_rects(&out, "Reset Layout")[0].center();
     click_at(&ctx, &mut app, reset);
     let out = empty_ui_output(&ctx, &mut app);
     assert!(app.open_views().is_empty());

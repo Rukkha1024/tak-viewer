@@ -131,7 +131,7 @@ mod scene_marker_menu {
                 app.labeling_action(&ctx, 0, crate::ui::labeling::LabelingAction::LabelMarker(KEY_A));
             }
 
-            assert_eq!(app.takm_note.as_ref().unwrap().0, "Already this label");
+            assert_eq!(app.takm_note.as_ref().unwrap().0, "Label already set");
             assert_eq!(app.views[0].armed_label, Some(KEY_A));
             assert_eq!(steps(&app, 0), history);
             assert_eq!(snapshot(&app).revision(), revision);
