@@ -9,6 +9,9 @@ use eframe::egui::{self, Color32, Key, Modifiers, PointerButton, Rect, Sense, St
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
+#[path = "app_tab_wheel.rs"]
+mod wheel;
+
 pub type TabId = u64;
 pub const MAX_CLOSED: usize = 20;
 pub const TAB_STRIP_HEIGHT: f32 = 32.0;
@@ -452,6 +455,7 @@ pub struct TabStrip {
     rename: Option<RenameState>,
     dragging: Option<TabId>,
     last_active: Option<TabId>,
+    pub(super) wheel: wheel::TabWheel,
 }
 
 fn consume_plain_key(ui: &egui::Ui, key: Key) -> bool {
@@ -549,19 +553,18 @@ impl TabStrip {
         let mut rename = self.rename.take();
         let scroll_to_active = self.last_active != model.active_id();
         self.last_active = model.active_id();
+        // An explicit tab switch or rename start takes priority over a coasting wheel.
+        if scroll_to_active || rename.as_ref().is_some_and(|field| field.select_all) {
+            self.wheel.stop_gesture();
+        }
         let mut bar_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(bar)
                 .id_salt("whole_layout_tabs"),
         );
         {
-            let ui = &mut bar_ui;
-            egui::ScrollArea::horizontal()
-                .id_salt("tab_scroll")
-                .max_height(TAB_STRIP_HEIGHT)
-                .auto_shrink([false, false])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
+            self.wheel
+                .show(&mut bar_ui, bar, |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.horizontal(|ui| {
                         for tab in model.tabs() {

@@ -209,6 +209,8 @@ fn main() -> eframe::Result<()> {
         eprintln!("{error}");
         std::process::exit(2);
     }
+    let tab_shot = app::tab_shot::TabShot::take(&mut args, headless)
+        .unwrap_or_else(|error| cli_exit(2, error));
     let no_desktop = !headless && instances::no_desktop();
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
@@ -230,6 +232,9 @@ fn main() -> eframe::Result<()> {
         eprintln!("--shot-label requires one local take and --screenshot");
         std::process::exit(2);
     }
+    if tab_shot.is_some() && (initial.len() != 1 || auto.is_none()) {
+        cli_exit(2, "--shot-tabs는 --screenshot과 파일 하나를 함께 넣어 주세요.");
+    }
     let size = capture.as_ref().map_or([1600.0, 960.0], |c| c.size);
     let command_run = capture.is_some() || auto.is_some();
     if no_desktop {
@@ -246,7 +251,7 @@ fn main() -> eframe::Result<()> {
 {}", capture::USAGE);
             std::process::exit(2);
         }
-        std::process::exit(headless::run(initial, auto, capture, size));
+        std::process::exit(headless::run(initial, auto, capture, size, tab_shot));
     }
     run_window(initial, auto, capture, size, None)
 }
@@ -258,6 +263,7 @@ fn usage() -> String {
         "Headless label screenshot: tak_viewer --headless --screenshot out.png --range A-B --shot-label SOURCE=TARGET file.takm",
         "Headless 3D marker menu: --shot-marker-menu menu|info|label with --select and --frame",
         help_shot::USAGE,
+        "Headless layout tabs: --shot-tabs N[:POINTS] with --screenshot and one take",
         "Headless Labeling link: --labeling-link with --select NAME",
         "Headless 3D selection: --select-visible or --select A,B[,C]",
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",

@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.61.0 — 2026-11-18
+
+- Scroll the top layout tabs with the mouse wheel, sideways touchpad or Shift+wheel. Wheel down reveals later tabs. Keep the selected tab and active rename draft.
+
 ## v0.60.3 — 2026-11-18
 
 - Keep the `조작키` title and close button visible at small sizes and higher display scales. Wrap both columns and scroll grouped controls.

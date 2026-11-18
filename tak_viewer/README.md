@@ -114,3 +114,4 @@ Follow and projection per view. Right drag leaves orthographic mode. `보기` tr
 Pattern Based: select references first, target last; check Fill Target then Fill Selected/All or Shift+C. Two-reference failure cases → editing contract. Undo coverage/merge/exclusions → undo table.
 
 In Labeling, enable `Link to 3D Selection` to follow the 3D pick's group. Choose `Increment` after assignment. Right-click a named row → `Label Marker` to assign its label to the single selected 3D point. `%` shows the take share with a point.
+

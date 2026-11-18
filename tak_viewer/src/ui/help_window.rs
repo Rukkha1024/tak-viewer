@@ -99,6 +99,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("Ctrl+T / Ctrl+Shift+T", "빈 탭 만들기 / 마지막으로 닫은 화면 또는 탭 다시 열기"),
         ("Ctrl+Tab / Ctrl+PageDown", "다음 탭"),
         ("Ctrl+Shift+Tab / Ctrl+PageUp", "이전 탭"),
+        ("위쪽 탭 줄에서 휠", "아래로 굴리면 뒤쪽 탭, 위로 굴리면 앞쪽 탭이 보여요. Shift와 휠 또는 가로 스크롤도 돼요"),
         ("F2", "현재 탭 이름 바꾸기. Enter로 확정, Esc로 취소"),
         ("Ctrl+W", "선택한 3D 화면 닫기. 마지막 화면이면 탭 닫기"),
         ("PageDown / PageUp", "같은 폴더의 다음 / 이전 파일"),

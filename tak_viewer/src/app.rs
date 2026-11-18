@@ -48,6 +48,11 @@ pub(super) mod label_shot;
 pub(crate) mod scene_marker_menu;
 #[path = "app_tabs.rs"]
 mod layout_tabs;
+#[path = "app_tab_shot.rs"]
+pub(crate) mod tab_shot;
+#[cfg(test)]
+#[path = "app_tab_wheel_tests.rs"]
+mod tab_wheel_tests;
 #[path = "app_layout_tabs.rs"]
 mod layout_controller;
 #[path = "app_hidden_work.rs"]
@@ -3856,6 +3861,8 @@ impl TakViewerApp {
                     ui.add_enabled_ui(self.dirty_prompt.is_none(), |ui| self.layout_strip.show(ui, &self.layout_tabs)).inner
                 }).inner;
             for action in actions { self.layout_strip_action(ctx, action); }
+        } else {
+            self.layout_strip.wheel.clear_region();
         }
         // A click on a view's tab or inside a view makes it the active one.
         let focused = self.dock.find_active_focused().map(|(_, t)| *t);
@@ -4261,6 +4268,7 @@ impl TakViewerApp {
 impl eframe::App for TakViewerApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.desktop_hover.native_input(ctx, raw);
+        self.layout_strip.wheel.route(ctx, raw);
         // egui processes Tab focus traversal before update(), even with Ctrl held.
         // Normalize to our existing PageUp/Down path before that happens. The frame's
         // popup, capture, held-M and dirty-dialog guards still decide whether to switch.
