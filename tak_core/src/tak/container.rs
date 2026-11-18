@@ -199,6 +199,31 @@ fn words(raw: &[u8]) -> Vec<u32> {
     raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
+pub(super) fn directory_entries(raw: &[u8]) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::with_capacity(raw.len() / 128);
+    for entry in raw.chunks(128) {
+        if entry.len() != 128 {
+            return err("Truncated directory entry");
+        }
+        let name_length = u16_at(entry, 64)? as usize;
+        let kind = entry[66];
+        if kind != 0 && !(2..=64).contains(&name_length) {
+            return err("Invalid directory name length");
+        }
+        let name = utf16le_strict(slice_clamped(entry, 0, name_length.saturating_sub(2)))?;
+        entries.push(DirEntry {
+            name,
+            kind,
+            left: u32_at(entry, 68)?,
+            right: u32_at(entry, 72)?,
+            child: u32_at(entry, 76)?,
+            start: u32_at(entry, 116)?,
+            size: u64_at(entry, 120)?,
+        });
+    }
+    Ok(entries)
+}
+
 /// `TakContainer.read_chain`.
 fn read_chain<B: AsRef<[u8]>>(
     start: u32,
@@ -294,27 +319,7 @@ impl<'a> Container<'a> {
             fat.extend(words(&s));
         }
         let raw = read_chain(u32_at(head, 48)?, &fat, sector_size, &mut sector, None)?;
-        let mut entries = Vec::with_capacity(raw.len() / 128);
-        for entry in raw.chunks(128) {
-            if entry.len() != 128 {
-                return err("Truncated directory entry");
-            }
-            let name_length = u16_at(entry, 64)? as usize;
-            let kind = entry[66];
-            if kind != 0 && !(2..=64).contains(&name_length) {
-                return err("Invalid directory name length");
-            }
-            let name = utf16le_strict(slice_clamped(entry, 0, name_length.saturating_sub(2)))?;
-            entries.push(DirEntry {
-                name,
-                kind,
-                left: u32_at(entry, 68)?,
-                right: u32_at(entry, 72)?,
-                child: u32_at(entry, 76)?,
-                start: u32_at(entry, 116)?,
-                size: u64_at(entry, 120)?,
-            });
-        }
+        let entries = directory_entries(&raw)?;
         if entries.is_empty() {
             return err("Missing root directory entry");
         }
@@ -357,15 +362,19 @@ impl<'a> Container<'a> {
     /// `TakContainer.streams()`: (path, entry index) for every stream, in-order walk.
     /// The whole tree is validated, as the Python caller consumes the full generator.
     pub fn streams(&self) -> Result<Vec<(String, usize)>> {
-        let mut visited = vec![false; self.entries.len()];
+        Self::streams_from_entries(&self.entries)
+    }
+
+    pub(super) fn streams_from_entries(entries: &[DirEntry]) -> Result<Vec<(String, usize)>> {
+        let mut visited = vec![false; entries.len()];
         let mut out = Vec::new();
-        let root_child = self.entries[0].child;
-        self.walk(root_child, &[], &mut visited, &mut out, 0)?;
+        let root_child = entries.first().ok_or_else(|| TakError("Missing root directory entry".into()))?.child;
+        Self::walk(entries, root_child, &[], &mut visited, &mut out, 0)?;
         Ok(out)
     }
 
     fn walk(
-        &self,
+        entries: &[DirEntry],
         index: u32,
         parents: &[String],
         visited: &mut [bool],
@@ -376,20 +385,20 @@ impl<'a> Container<'a> {
             return Ok(());
         }
         let i = index as usize;
-        if i >= self.entries.len() || visited[i] || depth > MAX_TREE_DEPTH {
+        if i >= entries.len() || visited[i] || depth > MAX_TREE_DEPTH {
             return err("Invalid directory tree");
         }
         visited[i] = true;
-        let entry = &self.entries[i];
-        self.walk(entry.left, parents, visited, out, depth + 1)?;
+        let entry = &entries[i];
+        Self::walk(entries, entry.left, parents, visited, out, depth + 1)?;
         let mut path = parents.to_vec();
         path.push(entry.name.clone());
         match entry.kind {
             2 => out.push((path.join("/"), i)),
-            1 => self.walk(entry.child, &path, visited, out, depth + 1)?,
+            1 => Self::walk(entries, entry.child, &path, visited, out, depth + 1)?,
             _ => return err("Unexpected entry type"),
         }
-        self.walk(entry.right, parents, visited, out, depth + 1)
+        Self::walk(entries, entry.right, parents, visited, out, depth + 1)
     }
 
     /// `TakContainer.read_stream`.

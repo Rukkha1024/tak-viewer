@@ -9,6 +9,7 @@ pub mod channels;
 pub mod container;
 pub mod fast_read;
 pub mod metadata;
+pub mod progress;
 pub mod nodes;
 pub mod skeleton;
 

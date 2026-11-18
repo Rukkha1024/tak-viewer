@@ -872,7 +872,7 @@ impl TakViewerApp {
 
     /// Add a folder to the saved folders (at most `MAX_ROOTS`) and expand it.
     /// Returns false when the list is full (nothing changed, a notice is shown).
-    fn open_workspace(&mut self, root: PathBuf) -> bool {
+    pub(crate) fn open_workspace(&mut self, root: PathBuf) -> bool {
         if self.dirty_prompt.is_some() { return false; }
         if self.workspace.add_root(root.clone()) == AddRoot::Full {
             self.notice = Some(format!(
@@ -1129,6 +1129,7 @@ impl TakViewerApp {
             self.record_implicit_file_open(creating_tab);
             return;
         }
+        self.explorer.progress.pause();
         self.views[slot].start_load(ctx, path, restore);
         self.views[slot].set_pending_identity(pending_identity);
         self.views[slot].set_fresh_open_candidate(retained);
@@ -1317,7 +1318,7 @@ impl TakViewerApp {
             let v=&self.views[k]; v.analog_work_pending() || (v.emg_requested && v.data.as_ref().is_some_and(|d|d.emg_pending))
                 || v.lanes.preparing() || v.filters.lock().unwrap().devices.values().any(|device|device.pending()) || v.devices.graphs_pending()
         });
-        if waiting || processing_wait || self.workspace.is_loading() {
+        if waiting || processing_wait || self.workspace.is_loading() || self.explorer.progress.has_work() {
             ctx.request_repaint();
             return;
         }
@@ -2927,8 +2928,8 @@ impl TakViewerApp {
                     Some(d) => {
                         let open = self.open_views();
                         ui.label(text(self.view_label(self.active, &open).unwrap_or_else(|| d.file_name())).strong());
-                        if let Some(p) = d.take.meta("Progress") {
-                            ui.label(text(format!("Progress {p}")));
+                        if let Some(number) = crate::take_progress::saved(&d.take) {
+                            ui.label(text(crate::take_progress::label(number).into_owned()));
                         }
                         ui.label(text(format!("{:.0} Hz", d.take.frame_rate)));
                         if (d.unit_scale - 1.0).abs() > f32::EPSILON {
@@ -3751,6 +3752,7 @@ impl TakViewerApp {
         self.apply_ssh_demo(ctx);
         self.drive_auto_shot(ctx, now);
         self.drive_capture(ctx, now);
+        self.explorer.progress.begin_frame();
         // A cell edit of the COMMENTS pane first (its Enter / Esc), then `M` held (comment while
         // watching): its Esc and its key-up come before the rest.
         // The type strip closes on the next action elsewhere (it uses nothing up).
@@ -4126,6 +4128,12 @@ impl TakViewerApp {
         // Last: what a person changed this frame becomes an undo action (`app_undo.rs`).
         self.graph_in_one_place();
         self.observe_frame(ctx);
+        if self.explorer.progress.has_work() {
+            let minimized = ctx.input(|input| input.viewport().minimized).unwrap_or(false);
+            let opening = self.views.iter().any(|v| v.loading.is_some() || v.overlay_load.is_some()
+                || v.waiting_shared_path().is_some()) || self.hidden_file_work_pending();
+            self.explorer.progress.finish_frame(ctx, minimized || opening);
+        }
         self.publish_window(ctx);
     }
 
@@ -4159,6 +4167,14 @@ pub struct BenchView {
 }
 
 impl TakViewerApp {
+    pub fn bench_workspace_count(&self, folder: &Path) -> Option<Result<usize, &str>> {
+        match self.workspace.listing(folder)? {
+            workspace::Listing::Ready { files, .. } => Some(Ok(files.len())),
+            workspace::Listing::Failed(error) => Some(Err(error)),
+            workspace::Listing::Loading => None,
+        }
+    }
+
     pub fn bench_state(&self) -> BenchState {
         let open = self.open_views();
         let views = open
@@ -4385,6 +4401,7 @@ mod tests {
     include!("app_tab_input_tests.rs");
     include!("app_freshness_tests.rs");
     include!("app_hidden_work_tests.rs");
+    include!("app_take_progress_tests.rs");
     include!("app_remote_workspace_tests.rs");
     include!("app_window_launch_tests.rs");
     include!("app_label_assignment_tests.rs");
@@ -9907,7 +9924,7 @@ mod tests {
     fn an_explorer_file_dropped_on_a_view_opens_there_or_beside_it() {
         use crate::workspace::{Listing, WsFile};
         let dir = PathBuf::from("no_such_dir_tak_viewer_test");
-        let file = |name: &str| WsFile { path: dir.join(name), name: name.into(), size: 0 };
+        let file = |name: &str| WsFile { path: dir.join(name), name: name.into(), size: 0, modified: None };
         let with_folder = |ctx: &egui::Context| {
             let mut app = two_views(ctx);
             let listing = Listing::Ready { dirs: vec![], files: vec![file("z.tak"), file("y.tak")] };

@@ -189,17 +189,28 @@ fn decode_table(v: &Value, table_off: u64, fixed_len: u64) -> Result<Index> {
 }
 
 fn read_table(file: &File, table_off: u64, table_len: u64) -> Result<Value> {
+    read_table_at(table_off, table_len, |buf, offset| read_exact_at(file, buf, offset))
+}
+
+fn read_table_at(table_off: u64, table_len: u64, read: impl FnOnce(&mut [u8], u64) -> Result<()>) -> Result<Value> {
     let mut table = vec![0u8; table_len as usize];
-    read_exact_at(file, &mut table, table_off)?;
+    read(&mut table, table_off)?;
     serde_json::from_slice(&table).map_err(|_| TakError(".takm 표가 맞지 않아요(JSON).".into()))
 }
 
 /// Header and stream table of an open `.takm` of `file_len` bytes (two positional reads).
 pub fn read_index(file: &File, file_len: u64) -> Result<Index> {
+    read_index_at(file_len, MAX_TABLE, |buf, offset| read_exact_at(file, buf, offset))
+}
+
+pub(crate) fn read_index_at(file_len: u64, table_limit: u64, mut read: impl FnMut(&mut [u8], u64) -> Result<()>) -> Result<Index> {
     let mut head = vec![0u8; HEADER_LEN.min(file_len) as usize];
-    read_exact_at(file, &mut head, 0)?;
+    read(&mut head, 0)?;
     let (table_off, table_len, fixed_len) = parse_header(&head, file_len)?;
-    decode_table(&read_table(file, table_off, table_len)?, table_off, fixed_len)
+    if table_len > table_limit {
+        return err(".takm stream table exceeds read budget");
+    }
+    decode_table(&read_table_at(table_off, table_len, read)?, table_off, fixed_len)
 }
 
 /// `read_index` of a path.

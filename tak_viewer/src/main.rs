@@ -37,6 +37,7 @@ mod label_increment;
 mod ssh;
 mod ssh_probe;
 mod soft_render;
+mod take_progress;
 mod ui;
 mod version;
 mod views;
@@ -131,11 +132,23 @@ fn main() -> eframe::Result<()> {
         };
         std::process::exit(bench_load::run(files));
     }
+    if args.get(1).is_some_and(|a| a == "--bench-progress") {
+        std::process::exit(take_progress::bench(&args[2..]));
+    }
     if args.iter().any(|a| a == "--bench") {
         // `--bench [frames] <file.tak>…`: open speed and frame time, up to 4 files side by side
         // (`headless::bench`, never a window).
         // `--overlay <b.tak>` (plan step 7, may repeat): the n-th laid over the n-th view.
         let (overlays, mut args) = shot::take_overlays(&args);
+        let mut folder = None;
+        if let Some(i) = args.iter().position(|a| a == "--bench-workspace") {
+            let Some(path) = args.get(i + 1) else {
+                eprintln!("--bench-workspace 뒤에 폴더 경로를 넣으세요.");
+                std::process::exit(2);
+            };
+            folder = Some(workspace::resolve_path(path));
+            args.drain(i..i + 2);
+        }
         // `--bench-select N` (v0.27.0, agent-only): play with the first N markers selected.
         if let Some(i) = args.iter().position(|a| a == "--bench-select") {
             let n = args.get(i + 1).and_then(|a| a.parse::<usize>().ok()).unwrap_or(1);
@@ -169,7 +182,7 @@ fn main() -> eframe::Result<()> {
             eprintln!("{error}");
             std::process::exit(2);
         }
-        std::process::exit(headless::bench(files, overlays, frames.unwrap_or(300), [1600.0, 960.0]));
+        std::process::exit(headless::bench(files, overlays, frames.unwrap_or(300), [1600.0, 960.0], folder));
     }
     if let Err(error) = app::label_shot::take_probe(&mut args, headless) {
         eprintln!("{error}");
@@ -230,6 +243,8 @@ fn usage() -> String {
         "Headless Labeling link: --labeling-link with --select NAME",
         "Headless 3D selection: --select-visible or --select A,B[,C]",
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",
+        "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
+        "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         comment_command::USAGE,
         window_command::USAGE,
         summary_command::USAGE,

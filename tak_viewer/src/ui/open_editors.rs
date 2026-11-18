@@ -36,6 +36,7 @@ pub struct Entry {
     pub hidden: bool,
     /// Still being read.
     pub loading: bool,
+    pub progress: Option<i64>,
     pub dirty: bool,
     /// The file's folder, when it is inside no WORKSPACE folder (`폴더 추가` adds it).
     pub add_folder: Option<PathBuf>,
@@ -343,6 +344,9 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &E
         right = r.left() - 6.0;
     }
 
+    if ui.is_rect_visible(rect) {
+        right = crate::take_progress::paint(ui, rect, rect.left() + NAME_X, right, e.progress, FG_DIM);
+    }
     // Name, then the folder dim. Too narrow: the folder goes, then the name is cut in the middle
     // with its ending kept (`fit`); × and button stay.
     let (name, suffix, folder) = row_parts(e);
@@ -457,7 +461,7 @@ mod tests {
     fn entry(path: &str, mark: Option<usize>, outside: bool) -> Entry {
         let path = PathBuf::from(path);
         let add_folder = outside.then(|| path.parent().unwrap().to_path_buf());
-        Entry { path, host: None, mark, hidden: false, loading: false, dirty: false, add_folder }
+        Entry { path, host: None, mark, hidden: false, loading: false, progress: None, dirty: false, add_folder }
     }
 
     /// Two views: view 0 (active) with b laid over it, view 2 with c from outside WORKSPACE.

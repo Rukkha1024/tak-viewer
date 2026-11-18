@@ -11,6 +11,7 @@ pub struct WsFile {
     pub path: PathBuf,
     pub name: String,
     pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,7 @@ pub struct RawEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// File the viewer opens: `.tak` or `.takm` (any case; `tak_core::takm`).
@@ -44,7 +46,7 @@ pub fn split_entries(dir: &Path, entries: Vec<RawEntry>) -> (Vec<PathBuf>, Vec<W
                 dirs.push((e.name.to_lowercase(), dir.join(&e.name)));
             }
         } else if is_take_file(&e.name) {
-            files.push(WsFile { path: dir.join(&e.name), name: e.name, size: e.size });
+            files.push(WsFile { path: dir.join(&e.name), name: e.name, size: e.size, modified: e.modified });
         }
     }
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -66,8 +68,10 @@ pub(crate) fn list_dir(dir: &Path) -> Listing {
                 if !(ft.is_dir() || is_tak) {
                     continue;
                 }
-                let size = if is_tak { e.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 };
-                entries.push(RawEntry { name, is_dir: ft.is_dir(), size });
+                let metadata = if is_tak { e.metadata().ok() } else { None };
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+                let modified = metadata.and_then(|m| m.modified().ok());
+                entries.push(RawEntry { name, is_dir: ft.is_dir(), size, modified });
             }
             let (dirs, files) = split_entries(dir, entries);
             Listing::Ready { dirs, files }
@@ -829,7 +833,7 @@ mod tests {
     }
 
     fn raw(name: &str, is_dir: bool) -> RawEntry {
-        RawEntry { name: name.into(), is_dir, size: 7 }
+        RawEntry { name: name.into(), is_dir, size: 7, modified: None }
     }
 
     #[test]

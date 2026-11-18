@@ -49,6 +49,7 @@ pub enum WsAction {
 
 #[derive(Default)]
 pub struct ExplorerState {
+    pub progress: crate::take_progress::Cache,
     pub filter: String,
     /// Expanded folders, saved folders included (a saved folder is open when it is in here).
     expanded: HashSet<PathBuf>,
@@ -523,6 +524,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
     let pass_nr = ui.ctx().cumulative_pass_nr();
     // Raw events: Escape counts even if another handler consumed the key.
     let esc = ui.input(|i| i.raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
+    st.progress.show();
     area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
         for row in &rows[range] {
             // File rows can also be dragged onto a 3D view.
@@ -667,15 +669,23 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     let remote = crate::workspace::is_remote_root_key(&file.path);
                     file_icon(p, pos2(label_x + 6.0, rect.center().y), TAK_ICON);
                     let color = if is_current || is_other { Color32::WHITE } else { FG };
-                    let name_rect = p.with_clip_rect(rect).text(
-                        pos2(label_x + 17.0, rect.center().y),
+                    let name_left = label_x + 17.0;
+                    let progress = if !remote && ui.is_rect_visible(rect) {
+                        file.modified.and_then(|modified| {
+                            st.progress.visible_row(&file.path, crate::take_progress::Stamp { size: file.size, modified })
+                        })
+                    } else { None };
+                    let name_right = crate::take_progress::paint(ui, rect, name_left, rect.right() - 8.0, progress, FG_DIM);
+                    let clip = rect.with_max_x(if progress.is_some() { name_right } else { rect.right() });
+                    let name_rect = p.with_clip_rect(clip).text(
+                        pos2(name_left, rect.center().y),
                         Align2::LEFT_CENTER,
                         &file.name,
                         FontId::proportional(13.0),
                         color,
                     );
                     if let Some(f) = folder {
-                        p.with_clip_rect(rect).text(pos2(name_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, f, FontId::proportional(11.5), FG_DIM);
+                        p.with_clip_rect(clip).text(pos2(name_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, f, FontId::proportional(11.5), FG_DIM);
                     }
                     let tip = if let Some((_, location)) = crate::workspace::remote_address(&file.path) {
                         format!("{}:{}\n\n클릭: 지금 화면에 열기 · Ctrl+클릭: 옆 화면에 열기\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
@@ -763,7 +773,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn f(dir: &Path, name: &str) -> WsFile {
-        WsFile { path: dir.join(name), name: name.into(), size: 0 }
+        WsFile { path: dir.join(name), name: name.into(), size: 0, modified: None }
     }
 
     fn labels(rows: &[Row]) -> Vec<String> {
@@ -849,7 +859,7 @@ mod tests {
     fn a_tak_and_its_takm_are_two_rows_with_full_names_in_the_tree_and_in_search() {
         use crate::workspace::{split_entries, RawEntry};
         let root = PathBuf::from("/t");
-        let raw = |name: &str| RawEntry { name: name.into(), is_dir: false, size: 1 };
+        let raw = |name: &str| RawEntry { name: name.into(), is_dir: false, size: 1, modified: None };
         let (dirs, files) = split_entries(&root, vec![raw("b.tak"), raw("a.takm"), raw("a.tak"), raw("a.json"), raw("B.TAKM")]);
         let mut ws = Workspace::from_listings(vec![root.clone()], HashMap::from([(root.clone(), Listing::Ready { dirs, files })]));
         let mut st = ExplorerState::default();

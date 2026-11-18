@@ -216,7 +216,7 @@ fn last_close_empty_editor_opens_explorer_drag_and_os_dropped_files() {
     app.close_view(0);
     let dir = PathBuf::from("no_such_dir_tak_viewer_test");
     let path = dir.join("drop.takm");
-    let listing = Listing::Ready { dirs: vec![], files: vec![WsFile { path: path.clone(), name: "drop.takm".into(), size: 0 }] };
+    let listing = Listing::Ready { dirs: vec![], files: vec![WsFile { path: path.clone(), name: "drop.takm".into(), size: 0, modified: None }] };
     app.workspace = Workspace::from_listings(vec![dir.clone()], std::collections::HashMap::from([(dir.clone(), listing)]));
     app.explorer.expand(&mut app.workspace, &dir);
     frame_with(&ctx, &mut app, vec![]);
@@ -258,7 +258,7 @@ fn last_close_empty_editor_opens_explorer_click_path_dialog_and_recent_menu() {
         let visibility = shared_panes.map(|pane| dock::has(&app.dock, pane));
         match route {
             "explorer" => {
-                let listing = Listing::Ready { dirs: vec![], files: vec![WsFile { path: path.clone(), name: "open.takm".into(), size: 0 }] };
+                let listing = Listing::Ready { dirs: vec![], files: vec![WsFile { path: path.clone(), name: "open.takm".into(), size: 0, modified: None }] };
                 app.workspace = Workspace::from_listings(vec![dir.clone()], std::collections::HashMap::from([(dir.clone(), listing)]));
                 app.explorer.expand(&mut app.workspace, &dir);
                 let place = place_of(&app, Pane::Explorer);

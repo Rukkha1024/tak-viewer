@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.55.0 — 2026-11-18
+
+- Show saved take progress in local WORKSPACE, OPEN EDITORS and the bottom status. Read visible local rows in the background and give file opening priority.
+
 ## v0.54.0 — 2026-11-18
 
 - 3D Follow Selected (G), per view. Seven direction choices in 보기, including six orthographic views.

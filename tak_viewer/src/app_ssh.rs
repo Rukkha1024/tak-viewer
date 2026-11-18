@@ -769,8 +769,8 @@ impl TakViewerApp {
             return true;
         }
         if let Some(data) = &v.data {
-            if let Some(p) = data.take.meta("Progress") {
-                ui.label(text(format!("Progress {p}")));
+            if let Some(number) = crate::take_progress::saved(&data.take) {
+                ui.label(text(crate::take_progress::label(number).into_owned()));
             }
             ui.label(text(format!("{:.0} Hz", data.take.frame_rate)));
             let pending = self

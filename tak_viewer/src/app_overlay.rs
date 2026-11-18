@@ -225,6 +225,7 @@ impl TakViewerApp {
             self.views[slot].set_overlay_fresh_open_candidate(retained);
             return;
         }
+        self.explorer.progress.pause();
         self.views[slot].start_overlay(ctx, path, quiet);
         self.views[slot].set_overlay_pending_identity(identity);
         self.views[slot].set_overlay_fresh_open_candidate(retained);

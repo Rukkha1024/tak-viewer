@@ -333,6 +333,10 @@ impl TakViewerApp {
         self.hidden_work.files.iter().copied().collect()
     }
 
+    pub(super) fn hidden_file_work_pending(&self) -> bool {
+        !self.hidden_work.files.is_empty() || !self.hidden_work.overlays.is_empty()
+    }
+
     pub(super) fn hidden_overlay_locations(&mut self) -> Vec<Location> {
         self.refresh_hidden_work();
         self.hidden_work.overlays.iter().copied().collect()

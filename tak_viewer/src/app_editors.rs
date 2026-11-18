@@ -200,6 +200,12 @@ impl TakViewerApp {
                 } else {
                     view.overlay_load.is_some()
                 },
+                progress: {
+                    let owner = if index == 0 { Some(view) } else { view.overlay_owner() };
+                    owner.filter(|v| v.remote.is_none() && v.path() == Some(path))
+                        .and_then(|v| v.data.as_ref())
+                        .and_then(|data| crate::take_progress::saved(&data.take))
+                },
                 dirty: if index == 0 {
                     view.marker_dirty() || (view.remote.is_some() && (view.comments.pending > 0 || view.comments.failed.is_some()))
                 } else {

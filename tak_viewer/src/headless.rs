@@ -79,7 +79,7 @@ fn emg_frame_ready(state: &crate::app::BenchState, pending: bool) -> Result<bool
     Ok(!pending)
 }
 
-pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [f32; 2]) -> i32 {
+pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [f32; 2], folder: Option<PathBuf>) -> i32 {
     let ctx = egui::Context::default();
     let start = Instant::now();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
@@ -93,6 +93,31 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
     let memory_baseline = ProcessMemory::sample();
     let mut memory_by_file: std::collections::HashMap<String, (Option<ProcessMemory>, Option<ProcessMemory>)> = std::collections::HashMap::new();
     let started = ms(start);
+    if let Some(folder) = folder {
+        if crate::workspace::is_remote_root_key(&folder) || !folder.is_dir() || !app.open_workspace(folder.clone()) {
+            eprintln!("bench: 로컬 폴더 경로를 확인해 주세요.");
+            return 2;
+        }
+        loop {
+            let out = ctx.run(frame_input(screen, start, vec![]), |ctx| app.frame(ctx));
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+            match app.bench_workspace_count(&folder) {
+                Some(Ok(count)) => {
+                    println!("  workspace before open: {count} take rows");
+                    break;
+                }
+                Some(Err(error)) => {
+                    eprintln!("bench: {error}");
+                    return 1;
+                }
+                None if start.elapsed() >= TIMEOUT => {
+                    eprintln!("bench: 폴더 목록 읽기 시간이 너무 오래 걸려요.");
+                    return 1;
+                }
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
     let opened = Instant::now();
     app.bench_open(&ctx, &files);
     if !overlays.is_empty() {
@@ -334,7 +359,7 @@ mod tests {
         let path = dir.join("markers_only.tak");
         std::fs::write(&path, tak_core::sample_tak::sample_tak()).unwrap();
         let previous = BENCH_EMG.swap(true, std::sync::atomic::Ordering::Relaxed);
-        let code = bench(vec![path], vec![], 1, [900.0, 600.0]);
+        let code = bench(vec![path], vec![], 1, [900.0, 600.0], None);
         BENCH_EMG.store(previous, std::sync::atomic::Ordering::Relaxed);
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(code, 2, "an inapplicable EMG measurement must not report success");

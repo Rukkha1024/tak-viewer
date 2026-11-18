@@ -495,7 +495,7 @@ impl SshManager {
                     if entry.name.contains(['/', '\\', '\0']) || matches!(entry.name.as_str(), "." | "..") { continue; }
                     let path = key.join(&entry.name);
                     if entry.directory { dirs.push(path); }
-                    else { files.push(crate::workspace::WsFile { path, name: entry.name.clone(), size: 0 }); }
+                    else { files.push(crate::workspace::WsFile { path, name: entry.name.clone(), size: 0, modified: None }); }
                 }
                 Ok(Some(crate::workspace::Listing::Ready { dirs, files }))
             }
