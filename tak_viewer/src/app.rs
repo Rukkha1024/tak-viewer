@@ -6324,6 +6324,39 @@ mod tests {
     }
 
     #[test]
+    fn command_comment_appears_after_closing_and_opening_the_file_again() {
+        let ctx = egui::Context::default();
+        let dir = comment_dir("command_comment_reopen");
+        let path = dir.join("a.takm");
+        let mut app = comment_app(&ctx, &dir, false);
+        let report = tak_core::comment_command::add(
+            &path,
+            br#"[{"markers":[],"start":3,"end":5,"text":"from command"}]"#,
+            Default::default(),
+            capture::local_iso_time,
+        ).unwrap();
+        let report = serde_json::to_value(report).unwrap();
+        let command_id = report["added"][0]["id"].as_u64().unwrap();
+        assert_eq!(command_id, 1025);
+        frame_with(&ctx, &mut app, vec![]);
+        assert!(ids(&app).is_empty());
+
+        app.add_comment(&ctx, 0, vec![], 7, 7);
+        until_saved(&ctx, &mut app);
+        assert_eq!(ids(&app), [1]);
+        app.close_view(0);
+        app.open(&ctx, path);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while app.views[0].comments.list.get(command_id).is_none() {
+            assert!(Instant::now() < deadline, "reopen did not reload Comments: {:?}", app.error);
+            frame_with(&ctx, &mut app, vec![]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(ids(&app), [1, command_id]);
+        wait_comment_ids(&ctx, &mut app, 0);
+    }
+
+    #[test]
     fn stale_other_window_edit_and_delete_reload_the_latest_comment() {
         let ctx = egui::Context::default();
         let _dir_guard = comment_dir("stale_window_reload");

@@ -709,10 +709,15 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
     let target = canonical_target(path)?;
     if in_input(&target) || !is_takm_path(&target) { return err("안전하지 않은 Comment 대상이에요"); }
     let _lock = lock_path(&target)?;
+    append_events_locked(&target, events, cancelled)
+}
+
+/// Caller checked the canonical target and holds its path lock.
+pub(crate) fn append_events_locked(target: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<(Option<CommentConflict>, Option<CommentWriteStamp>)> {
     if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
-    let mut file = OpenOptions::new().read(true).append(true).open(&target)?;
+    let mut file = OpenOptions::new().read(true).append(true).open(target)?;
     let before = file.metadata()?;
-    let before = (target.clone(), before.len(), before.modified().ok());
+    let before = (target.to_path_buf(), before.len(), before.modified().ok());
     let (_, mut tail) = tail_bytes(&file)?;
     let original = comments::parse(&String::from_utf8_lossy(&tail)).comments();
     let mut pending = Vec::new();
@@ -759,30 +764,42 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
     file.write_all(&pending)?;
     file.flush()?;
     let after = file.metadata()?;
-    let after = (target, after.len(), after.modified().ok());
+    let after = (target.to_path_buf(), after.len(), after.modified().ok());
     Ok((None, Some(CommentWriteStamp { before, after })))
 }
 
 /// Check the fixed part against its SHA-256 (reads the whole fixed part).
 pub fn verify_fixed(path: &Path) -> Result<()> {
+    verify_fixed_seal(path).map(|_| ())
+}
+
+fn read_seal(file: &File) -> Result<(u64, [u8; SEAL_LEN as usize])> {
+    let fixed_len = read_index(file, file.metadata()?.len())?.fixed_len;
+    let mut seal = [0; SEAL_LEN as usize];
+    read_exact_at(file, &mut seal, fixed_len)?;
+    Ok((fixed_len, seal))
+}
+
+pub(crate) fn fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> {
+    read_seal(&File::open(path)?)
+}
+
+pub(crate) fn verify_fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> {
     let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let index = read_index(&file, len)?;
+    let (fixed_len, seal) = read_seal(&file)?;
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 4 << 20];
     let mut pos = 0u64;
-    while pos < index.fixed_len {
-        let n = (index.fixed_len - pos).min(buf.len() as u64) as usize;
+    while pos < fixed_len {
+        let n = (fixed_len - pos).min(buf.len() as u64) as usize;
         read_exact_at(&file, &mut buf[..n], pos)?;
         hash.update(&buf[..n]);
         pos += n as u64;
     }
-    let mut seal = [0u8; SEAL_LEN as usize];
-    read_exact_at(&file, &mut seal, index.fixed_len)?;
     if hash.finalize().as_slice() != seal {
         return err(".takm 고정 부분이 바뀌었어요(SHA-256이 달라요).");
     }
-    Ok(())
+    Ok((fixed_len, seal))
 }
 
 #[cfg(test)]

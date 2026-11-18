@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.38.0 — 2026-11-18
+
+- **Comment commands:** `--add-comments <file.takm> --from rows.json` adds a validated batch to existing TAKM, `--list-comments` prints live Comments as JSON. No window, no settings. Shares window path lock, ID ledger and appender; fixed part SHA-256 checked before/after.
+- **Safe repeat:** Row equal to a live Comment skipped by default (`--allow-duplicates` overrides). `--dry-run` validates and plans, writes nothing. Any bad row → nothing written, every bad row reported.
+- **Writer mark:** Command-written events carry operation ID prefix `agent-`; list shows `by`. Readers can keep agent notes out of person intervals.
+- **Help:** Bare `--help` / `-h` prints usage and exits instead of opening a window.
+- **Limit:** Open window shows command-added Comments only after closing every view of that file and reopening.
+
 ## v0.37.0 — 2026-11-18
 
 - Devices: drag-only placement, pointer ghost/grips, replace preview, chip swap/move, visible clear.

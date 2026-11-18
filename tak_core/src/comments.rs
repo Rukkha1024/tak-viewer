@@ -106,6 +106,18 @@ impl Event {
     }
 }
 
+/// Operation tokens of command-written events (`--add-comments`) start with this, so readers
+/// can tell an agent's Comment from one a person made in a window.
+pub const AGENT_OPERATION_PREFIX: &str = "agent-";
+
+pub fn writer_of(e: &Event) -> &'static str {
+    match &e.operation {
+        Some(token) if token.starts_with(AGENT_OPERATION_PREFIX) => "agent",
+        Some(_) => "viewer",
+        None => "legacy",
+    }
+}
+
 /// Give each new event a stable token, retained when the same event is retried.
 pub fn new_operation_token() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -241,22 +253,31 @@ impl Comments {
     /// smaller id. Legacy events retain their original folding behavior when ids collided.
     /// New events with an operation key affect at most one live entry.
     pub fn apply(&mut self, e: &Event) {
+        self.apply_with_sources(e, None);
+    }
+
+    fn apply_with_sources<'a>(&mut self, e: &'a Event, mut sources: Option<&mut Vec<&'a Event>>) {
         self.max_id = self.max_id.max(e.id);
         self.revision += 1;
         match e.kind {
             Kind::Add => {
                 let at = self.list.iter().rposition(|c| c.id <= e.id).map_or(0, |k| k + 1);
                 self.list.insert(at, Comment::from_event(e));
+                if let Some(sources) = sources { sources.insert(at, e); }
             }
             Kind::Edit => {
-                for c in self.list.iter_mut().filter(|c| c.id == e.id) {
+                for (at, c) in self.list.iter_mut().enumerate().filter(|(_, c)| c.id == e.id) {
                     *c = Comment::from_event(e);
+                    if let Some(sources) = sources.as_mut() { sources[at] = e; }
                     if e.operation.is_some() { break; }
                 }
             }
             Kind::Delete => {
-                if e.operation.is_none() { self.list.retain(|c| c.id != e.id); }
-                else if let Some(index) = self.list.iter().position(|c| c.id == e.id) { self.list.remove(index); }
+                let start = self.list.partition_point(|c| c.id < e.id);
+                let count = self.list[start..].iter().take_while(|c| c.id == e.id)
+                    .take(if e.operation.is_some() { 1 } else { usize::MAX }).count();
+                self.list.drain(start..start + count);
+                if let Some(sources) = sources { sources.drain(start..start + count); }
             }
         }
     }
@@ -271,9 +292,14 @@ pub fn reserve_takm_ids(path: &Path, count: u64) -> io::Result<std::ops::RangeIn
         return Err(io::Error::other("unsafe Comment target"));
     }
     let _lock = crate::takm::lock_path(&target)?;
-    let parsed = crate::takm::read_comments(&target).map_err(io::Error::other)?;
+    reserve_takm_ids_locked(&target, count)
+}
+
+/// Caller checked the canonical target and holds its path lock. Count must be positive.
+pub(crate) fn reserve_takm_ids_locked(target: &Path, count: u64) -> io::Result<std::ops::RangeInclusive<u64>> {
+    let parsed = crate::takm::read_comments(target).map_err(io::Error::other)?;
     let tail_max = parsed.events.iter().map(|event| event.id).max().unwrap_or(0);
-    let key = crate::takm::path_lock_key(&target)?;
+    let key = crate::takm::path_lock_key(target)?;
     let ledger = crate::takm::coordination_root().join(format!(".tak_viewer_comment_ids_{key}"));
     let mut f = OpenOptions::new().read(true).append(true).create(true).open(ledger)?;
     let mut bytes = Vec::new();
@@ -544,6 +570,14 @@ pub struct Parsed {
 impl Parsed {
     pub fn comments(&self) -> Comments {
         Comments::from_events(&self.events)
+    }
+
+    /// Live Comments, each with the event that last set it (its time and writer).
+    pub(crate) fn comments_with_sources(&self) -> (Comments, Vec<&Event>) {
+        let mut live = Comments::default();
+        let mut sources = Vec::new();
+        for event in &self.events { live.apply_with_sources(event, Some(&mut sources)); }
+        (live, sources)
     }
 }
 

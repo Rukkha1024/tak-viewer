@@ -43,9 +43,17 @@ mod work_queue;
 mod workspace;
 
 use std::path::PathBuf;
+use tak_core::comment_command;
 
 fn main() -> eframe::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) {
+        println!("{}\n\n{}", capture::USAGE, comment_command::USAGE);
+        std::process::exit(0);
+    }
+    if matches!(args.get(1).map(String::as_str), Some("--add-comments" | "--list-comments")) {
+        std::process::exit(comment_command::run(&args[1..], workspace::resolve_path, capture::local_iso_time));
+    }
     if let Err(error) = desktop_drop::take_preview(&mut args) { eprintln!("{error}"); std::process::exit(2); }
     if args.get(1).map(String::as_str)==Some("--dump-device-signal") {
         let result=device_filter::dump(&args[2..]);if let Err(error)=&result{eprintln!("{error}");}std::process::exit(if result.is_ok(){0}else{1});
@@ -142,7 +150,7 @@ fn main() -> eframe::Result<()> {
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
-            println!("{}", capture::USAGE);
+            println!("{}\n\n{}", capture::USAGE, comment_command::USAGE);
             std::process::exit(0);
         }
         Err(e) => {

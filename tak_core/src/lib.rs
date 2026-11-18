@@ -13,6 +13,7 @@
 //! - [`takm`]: `.takm` = a TAK without its camera record + a Comment tail (`docs/takm.md`):
 //!   conversion (`--to-takm`), reading (same `Take` as the TAK), tail read / append / verify.
 //! - [`edit`]: revision-checked marker documents and atomic patches, separate from view data.
+pub mod comment_command;
 pub mod comments;
 pub mod dump;
 pub mod edit;
