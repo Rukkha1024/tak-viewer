@@ -230,6 +230,7 @@ enum SaveMessage {
 fn edit_error(error: EditError) -> String {
     match error {
         EditError::FileChangedOnDisk => "File changed on disk".into(),
+        EditError::UnverifiedMarkers(count) => format!("마커 기록 {count}개를 확인할 수 없어 바꿀 수 없어요."),
         EditError::Other(message) => message,
         other => format!("{other:?}"),
     }

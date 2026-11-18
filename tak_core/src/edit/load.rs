@@ -10,8 +10,8 @@ fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string(
 impl PreparedInput {
     /// Read and validate source records on a worker, returning a markers-only Take for rebuilding
     /// the display. The caller retains the live view's analog data and deferred jobs. Full TAKM
-    /// seals are checked during save passthrough. Unsupported or ambiguous data is refused;
-    /// lenient-only node records can be displayed but are marked ineligible for modification.
+    /// seals are checked during save passthrough. Recovered membership is eligible only when
+    /// the raw trailer agrees with the viewer's accepted identity.
     /// Device headers retain original offsets/counts, with unopened sample ranges represented
     /// by placeholders. Save must copy those ranges from the source, never serialize zeros.
     pub fn read_from_path(path: &Path) -> Result<(PreparedInput, Take), EditError> {
@@ -32,17 +32,25 @@ impl PreparedInput {
         let properties = nodes::property_records(&nodes_bytes, &nodes::MARKER_SIGNATURES).map_err(error)?;
         let inventory = channels::iter_channel_inventory(&channel_bytes).map_err(error)?;
         let rows = channels::read_marker_channels(&channel_bytes, &marker_nodes, take.start_frame, take.end_frame, &assets).map_err(error)?;
+        let shown_by_uid: HashMap<_, _> = take.trajectories.iter().map(|t| (t.uid, t)).collect();
         let mut node_by_uid = HashMap::new();
         for (i, (node, rec)) in marker_nodes.iter().zip(&properties).enumerate() {
-            let end = if node.parent.is_some() { rec.end + 68 } else { properties.get(i + 1).map_or(nodes_bytes.len(), |r| r.start) };
-            if end > nodes_bytes.len() || node_by_uid.insert(node.uid, (node, rec.start, end)).is_some() { return Err(EditError::DuplicateUid); }
+            let limit = properties.get(i + 1).map_or(nodes_bytes.len(), |r| r.start);
+            let shown = shown_by_uid.get(&node.uid).ok_or(EditError::UnsupportedLayout)?;
+            let membership = shown.parent_uid.zip(shown.slot_raw);
+            let trailer_end = rec.end + 68;
+            let verified = trailer_end <= limit && membership.is_some()
+                && nodes::marker_trailer_membership(&nodes_bytes[rec.end..trailer_end]) == membership;
+            let end = if verified { trailer_end } else { limit };
+            if node_by_uid.insert(node.uid, (rec.start, end, membership, verified)).is_some() { return Err(EditError::DuplicateUid); }
         }
         let mut used = HashSet::new();
         let mut tracks = Vec::with_capacity(rows.len());
         let mut first_channel = channel_bytes.len();
         for row in rows {
             if !used.insert(row.node.uid) { return Err(EditError::DuplicateUid); }
-            let (node, start, end) = node_by_uid.get(&row.node.uid).copied().ok_or(EditError::UnsupportedLayout)?;
+            let node = row.node;
+            let (start, end, membership, verified) = node_by_uid.get(&node.uid).copied().ok_or(EditError::UnsupportedLayout)?;
             let mut matches = inventory.iter().filter(|c| c.uid == node.uid && c.kind == "Vector3fChannel" && c.name == "Translation");
             let channel = matches.next().ok_or(EditError::UnsupportedLayout)?;
             if matches.next().is_some() || channel.data_start != row.data_start || channel.data_end != row.data_end { return Err(EditError::UnsupportedLayout); }
@@ -50,14 +58,14 @@ impl PreparedInput {
             let samples = channel_bytes[row.data_start..row.data_end].chunks_exact(16).map(|b| {
                 let mut raw = [0; 16]; raw.copy_from_slice(b); RawSample(raw)
             }).collect::<Vec<_>>();
-            let label = match (node.parent, node.slot) {
-                (Some(parent), Some(slot)) if parent != [0; 16] => Some(LabelKey { parent, slot }),
+            let label = match membership {
+                Some((parent, slot)) if parent != [0; 16] => Some(LabelKey { parent, slot: slot as i32 }),
                 _ => None,
             };
             tracks.push(RawTrack { uid: node.uid, name: node.name.clone(), label, records: RecordBytes {
                 node: Arc::from(&nodes_bytes[start..end]),
                 translation_header: Arc::from(&channel_bytes[channel.start..channel.data_start]),
-                serialization_verified: node.parent.is_some(),
+                serialization_verified: verified,
             }, samples: samples.into() });
         }
         let mut labels = Vec::new();

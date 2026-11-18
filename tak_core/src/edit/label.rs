@@ -169,20 +169,11 @@ fn strict_track(track: &RawTrack) -> Result<(), EditError> {
         return Err(EditError::UnsupportedLayout);
     }
     let tail = &raw[end..];
-    if tail[..19] != nodes::MARKER_PREFIX
-        || tail[35..48] != nodes::MARKER_MIDDLE
-        || tail[19..35] != track.uid
-    {
+    if tail[19..35] != track.uid {
         return Err(EditError::UnsupportedLayout);
     }
-    let parent: Uid = tail[48..64]
-        .try_into()
-        .map_err(|_| EditError::UnsupportedLayout)?;
-    let slot = i32::from_le_bytes(
-        tail[64..68]
-            .try_into()
-            .map_err(|_| EditError::UnsupportedLayout)?,
-    );
+    let (parent, slot) = nodes::marker_trailer_membership(tail).ok_or(EditError::UnsupportedLayout)?;
+    let slot = slot as i32;
     if (parent == [0; 16] && (slot != 0 || track.label.is_some()))
         || (parent != [0; 16] && track.label != Some(LabelKey { parent, slot }))
     {
@@ -217,6 +208,12 @@ fn strict_track(track: &RawTrack) -> Result<(), EditError> {
     {
         return Err(EditError::UnsupportedLayout);
     }
+    Ok(())
+}
+
+fn verify_edit_tracks<'a>(tracks: impl IntoIterator<Item = &'a RawTrack>) -> Result<(), EditError> {
+    let unverified = tracks.into_iter().filter(|t| strict_track(t).is_err()).count();
+    if unverified > 0 { return Err(EditError::UnverifiedMarkers(unverified)); }
     Ok(())
 }
 
@@ -255,6 +252,7 @@ impl<'a> VerifiedCreation<'a> {
         if originals.len() != input.tracks.len() {
             return Err(EditError::DuplicateUid);
         }
+        verify_edit_tracks(&input.tracks)?;
         let mut pos = input.nodes_prefix.len();
         let mut seen = HashSet::new();
         while pos < node_bytes.len() {
@@ -273,7 +271,6 @@ impl<'a> VerifiedCreation<'a> {
             if !seen.insert(uid) || &node_bytes[pos..end] != track.records.node.as_ref() {
                 return Err(EditError::UnsupportedLayout);
             }
-            strict_track(track)?;
             pos = end;
         }
         if seen.len() != originals.len() {
@@ -918,7 +915,6 @@ impl<'a> LabelEditor<'a> {
                 already_assigned: true,
             });
         }
-        strict_track(&source)?;
         let destinations = input.track_uids_for_label(&request.target);
         if destinations.len() > 1 {
             return Err(EditError::AmbiguousLabel);
@@ -926,6 +922,8 @@ impl<'a> LabelEditor<'a> {
         if destinations.is_empty() && input.label(&request.target).is_none() {
             return Err(EditError::MissingDeclaration);
         }
+        verify_edit_tracks(std::iter::once(source.as_ref())
+            .chain(destinations.first().and_then(|uid| input.track(uid)).map(Arc::as_ref)))?;
         let (moved, retained) = select_samples(
             &source,
             input,
@@ -967,7 +965,6 @@ impl<'a> LabelEditor<'a> {
                 .track(uid)
                 .ok_or(EditError::UnsupportedLayout)?
                 .clone();
-            strict_track(&destination)?;
             let mut after = (*destination).clone();
             let (samples, displaced) = merge_assignment_samples(&destination.samples, &moved);
             after.samples = samples.into();
@@ -1094,7 +1091,6 @@ impl<'a> LabelEditor<'a> {
                 });
                 continue;
             }
-            strict_track(&track)?;
             work.push((track, moved, retained));
         }
         if work.is_empty() {
@@ -1105,6 +1101,7 @@ impl<'a> LabelEditor<'a> {
                 already_assigned: false,
             });
         }
+        verify_edit_tracks(work.iter().map(|(track, _, _)| track.as_ref()))?;
         let proof = self.proof(input, work.len())?;
         let donor = input
             .track_order()
@@ -1538,10 +1535,7 @@ mod tests {
         );
         let mut r = request();
         r.increment = false;
-        assert!(matches!(
-            LabelEditor::new().label(&d.snapshot(), &r),
-            Err(EditError::UnsupportedLayout)
-        ));
+        assert_eq!(LabelEditor::new().label(&d.snapshot(), &r).unwrap_err(), EditError::UnverifiedMarkers(1));
     }
     #[test]
     fn unlabel_multiple_tracks_one_patch_skips_and_undo_redo() {

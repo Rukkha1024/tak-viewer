@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.66.1 — 2026-11-18
+
+- Fix QuickLabel, Label Marker and Unlabel on verified recovered marker records. Preserve original record bytes and exact undo. Apply the same verified records to Remove Marker, Fill Gaps and Smooth.
+
 ## v0.66.0 — 2026-11-18
 
 - Remove Merge Keys Up and Down from Tracks. Keep row selection, range drag and Zoom Fit.

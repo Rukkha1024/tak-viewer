@@ -135,6 +135,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("List Ctrl+click / Shift+click / Ctrl+A", "Add or drop a row / pick rows in between / pick all."),
         ("Ctrl+Shift+click in Tracks", "Add the rows in between to your picks."),
         ("D / Q", "Switch between QuickLabel Mode and Select Mode / go to Select Mode."),
+        ("QuickLabel Mode / Label Marker", "Pick a label and apply it to a point in 3D. If the label already has a point on that frame, the old point moves to Unlabeled."),
         ("S / A", "Go to the next / previous label."),
         ("Shift+D", "Remove labels from the markers you picked."),
         ("Delete", "Delete points or Comments, or close files. It depends on where you last clicked."),

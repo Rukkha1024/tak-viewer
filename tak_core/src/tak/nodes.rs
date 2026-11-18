@@ -188,13 +188,24 @@ pub fn classify(parent: Uid, signed_slot: i32, assets: &HashSet<Uid>) -> MarkerK
     }
 }
 
-/// Read-only viewer extension, NOT in the Python reader (so the `--dump` output keeps the
-/// strict view). Marker trailers whose middle differs from `MARKER_MIDDLE` only in
+/// Viewer extension. The parity dump retains the strict Python interpretation.
+/// Marker trailers whose middle differs from `MARKER_MIDDLE` only in
 /// - the float32 at +36 (observed 0.012 = 12 mm, also 0.018; marker size candidate) and
 /// - the uint32 at +40 (strict value 1; observed 0..1284 in Motive-edited copy files),
 /// with the prefix, the `06` byte at +35 and the zero bytes +44..+48 unchanged.
-/// Parent UID / slot are read at the strict offsets. Returns UID -> (parent, slot_raw) for
-/// these records only; a UID seen twice with different values is dropped.
+/// Parent UID / slot are read at the strict offsets, including on the canonical trailer.
+pub(crate) fn marker_trailer_membership(tail: &[u8]) -> Option<(Uid, u32)> {
+    if tail.len() != 68 || tail[..19] != MARKER_PREFIX
+        || tail[35] != MARKER_MIDDLE[0] || tail[44..48] != [0; 4] {
+        return None;
+    }
+    let size = f32::from_le_bytes(tail[36..40].try_into().unwrap());
+    if !(size > 0.0 && size < 0.1) { return None; }
+    Some((uid_from(&tail[48..64]), u32::from_le_bytes(tail[64..68].try_into().unwrap())))
+}
+
+/// Returns UID -> (parent, slot_raw) for the recovered profile only.
+/// A UID seen twice with different values is dropped.
 /// Observed 2026-11-10 in `2_gait_10개/copy` (10 files): every such file then has exactly
 /// one marker per template slot, all slots in the SKL constraint list.
 pub fn lenient_memberships(nodes: &[u8]) -> Result<HashMap<Uid, (Uid, u32)>> {
@@ -204,14 +215,8 @@ pub fn lenient_memberships(nodes: &[u8]) -> Result<HashMap<Uid, (Uid, u32)>> {
     for (i, rec) in records.iter().enumerate() {
         let limit = records.get(i + 1).map_or(nodes.len(), |next| next.start);
         let tail = &nodes[rec.end..(rec.end + 68).min(limit)];
-        if tail.len() != 68 || tail[..19] != MARKER_PREFIX || tail[35..48] == MARKER_MIDDLE {
-            continue;
-        }
-        let size = f32::from_le_bytes([tail[36], tail[37], tail[38], tail[39]]);
-        if tail[35] != MARKER_MIDDLE[0] || tail[44..48] != [0u8; 4] || !(size.is_finite() && size > 0.0 && size < 0.1) {
-            continue;
-        }
-        let value = (uid_from(&tail[48..64]), u32_at(tail, 64)?);
+        let Some(value) = marker_trailer_membership(tail) else { continue };
+        if tail[35..48] == MARKER_MIDDLE { continue; }
         match out.get(&rec.uid) {
             Some(prev) if *prev != value => {
                 conflicted.insert(rec.uid);

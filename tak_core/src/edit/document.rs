@@ -43,7 +43,7 @@ impl RawSample {
 pub struct RecordBytes {
     pub node: Arc<[u8]>,
     pub translation_header: Arc<[u8]>,
-    /// Set only by a strict layout verifier. Lenient-only and ambiguous records stay false.
+    /// Set when record boundaries and marker membership are verified.
     pub serialization_verified: bool,
 }
 /// One trajectory in original stream order. Changes replace only touched tracks.
@@ -152,6 +152,7 @@ pub enum EditError {
     InvalidRange,
     BeforeMismatch,
     UnsupportedLayout,
+    UnverifiedMarkers(usize),
     NoChange,
     FileChangedOnDisk,
     Other(String),
@@ -303,6 +304,10 @@ impl EditPatch {
         for name in ["Nodes.dat", "Channels.dat"] {
             if input.streams.iter().filter(|s| s.name == name).count() > 1 { return Err(EditError::UnsupportedLayout); }
         }
+        let unverified = changes.iter().filter(|change| {
+            [&change.before, &change.after].into_iter().flatten().any(|t| !t.records.serialization_verified)
+        }).count();
+        if unverified > 0 { return Err(EditError::UnverifiedMarkers(unverified)); }
         let mut tracks = snapshot.state.tracks.clone();
         let mut order = snapshot.state.order.to_vec();
         let mut touched = HashSet::new();
@@ -312,7 +317,6 @@ impl EditPatch {
             if tracks.get(&change.uid) != change.before.as_ref() { return Err(EditError::BeforeMismatch); }
             for track in [&change.before, &change.after].into_iter().flatten() {
                 if track.uid != change.uid { return Err(EditError::BeforeMismatch); }
-                if !track.records.serialization_verified { return Err(EditError::UnsupportedLayout); }
                 validate_track(track, input.first_frame, input.last_frame)?;
             }
             if let (Some(before), Some(after)) = (&change.before, &change.after) {
@@ -443,7 +447,7 @@ mod tests {
         unsupported.records.serialization_verified = false;
         let change = TrackChange { uid: uid(1), before: Some(old.clone()), after: Some(Arc::new(unsupported)) };
         let prepare = |c| EditPatch::prepare(&s, c, EditSelection::default(), EditSelection::default(), AffectedFrames { first: 0, last: 10 }, EditResult::default());
-        assert!(matches!(prepare(vec![change]), Err(EditError::UnsupportedLayout)));
+        assert_eq!(prepare(vec![change]).unwrap_err(), EditError::UnverifiedMarkers(1));
         assert!(matches!(prepare(vec![TrackChange { uid: uid(1), before: Some(old.clone()), after: Some(old) }]), Err(EditError::NoChange)));
         let before = s.track(&uid(1)).unwrap().clone();
         let mut outside = (*before).clone();

@@ -24,16 +24,14 @@ fn load(path: &Path) -> EditDocument {
 }
 
 fn fixture() -> (TempDir, EditDocument, CreationStreams) {
+    fixture_from(&crate::sample_tak::sample_tak_for_label_assignments())
+}
+
+fn fixture_from(tak: &[u8]) -> (TempDir, EditDocument, CreationStreams) {
     let dir = TempDir::new("tak_label_assignment");
     let source = dir.join("source.takm");
     let mut file = std::fs::File::create(&source).unwrap();
-    crate::takm::write(
-        &mut file,
-        &crate::sample_tak::sample_tak_for_label_assignments(),
-        "synthetic.tak",
-        "",
-    )
-    .unwrap();
+    crate::takm::write(&mut file, tak, "synthetic.tak", "").unwrap();
     drop(file);
     (
         dir,
@@ -41,6 +39,42 @@ fn fixture() -> (TempDir, EditDocument, CreationStreams) {
         CreationStreams::read_from_path(&source).unwrap(),
     )
 }
+
+fn with_trailers(fields: [[u8; 8]; 2], invalid: [bool; 2]) -> Vec<u8> {
+    let tak = crate::sample_tak::sample_tak_for_label_assignments();
+    let mut streams = crate::tak::container::Container::parse(&tak)
+        .unwrap()
+        .read_named(&["Nodes.dat", "Channels.dat", "MetaData.dat"])
+        .unwrap();
+    let raw = &mut streams
+        .iter_mut()
+        .find(|(name, _)| name == "Nodes.dat")
+        .unwrap()
+        .1;
+    let records = nodes::property_records(raw, &nodes::MARKER_SIGNATURES).unwrap();
+    for ((record, field), invalid) in records.iter().zip(fields).zip(invalid) {
+        raw[record.end + 36..record.end + 44].copy_from_slice(&field);
+        if invalid {
+            raw[record.end + 44] = 1;
+        }
+    }
+    let streams: Vec<_> = streams
+        .into_iter()
+        .map(|(name, raw)| {
+            let name = match name.as_str() {
+                "Nodes.dat" => "Nodes.dat",
+                "Channels.dat" => "Channels.dat",
+                "MetaData.dat" => "MetaData.dat",
+                _ => unreachable!(),
+            };
+            (name, raw)
+        })
+        .collect();
+    crate::sample_tak::cfb(&streams)
+}
+
+const SIZE_TRAILER: [u8; 8] = [0xbc, 0x74, 0x93, 0x3c, 1, 0, 0, 0];
+const COUNTER_TRAILER: [u8; 8] = [0xe2, 0x9b, 0x44, 0x3c, 4, 5, 0, 0];
 
 fn assignment(source: Uid, target: LabelKey) -> LabelRequest {
     LabelRequest {
@@ -120,7 +154,63 @@ fn save_and_reopen(dir: &Path, document: &EditDocument, name: &str) {
 
 #[test]
 fn two_click_swap_preserves_raw_bytes_and_round_trips_each_state() {
-    let (dir, mut document, streams) = fixture();
+    check_two_click_swap(fixture());
+}
+
+#[test]
+fn recovered_trailers_survive_collision_quicklabel_and_round_trip() {
+    let fixture = fixture_from(&with_trailers([SIZE_TRAILER, COUNTER_TRAILER], [false; 2]));
+    let before = fixture.1.snapshot();
+    assert_eq!(before.track(&A).unwrap().label, Some(KEY_A));
+    assert_eq!(before.track(&B).unwrap().label, Some(KEY_B));
+    check_two_click_swap(fixture);
+}
+
+#[test]
+fn recovered_noncolliding_relabel_keeps_nodes_and_restores_samples() {
+    let (dir, mut document, _) =
+        fixture_from(&with_trailers([SIZE_TRAILER, COUNTER_TRAILER], [false; 2]));
+    let before = document.snapshot();
+    let mut request = assignment(B, KEY_A);
+    request.current_frame = 6;
+    request.scope = LabelScope::SelectedOrAll {
+        range: Some((6, 6)),
+    };
+    let patch = LabelEditor::new().label(&before, &request).unwrap().unwrap();
+    document.apply(&patch, true).unwrap();
+    let after = document.snapshot();
+    assert_eq!(after.track_order(), before.track_order());
+    assert_eq!(sample(&after, A, 6), sample(&before, B, 6));
+    assert_eq!(sample(&after, B, 6), None);
+    for uid in [A, B] {
+        assert_eq!(
+            after.track(&uid).unwrap().records,
+            before.track(&uid).unwrap().records
+        );
+    }
+    save_and_reopen(&dir, &document, "label.takm");
+    document.apply(&patch, false).unwrap();
+    assert_state(&document.snapshot(), &before);
+    document.apply(&patch, true).unwrap();
+    assert_state(&document.snapshot(), &after);
+}
+
+#[test]
+fn unknown_trailer_remains_uneditable_and_reports_number_of_records() {
+    let (_, document, creation) =
+        fixture_from(&with_trailers([SIZE_TRAILER, COUNTER_TRAILER], [true; 2]));
+    let before = document.snapshot();
+    assert!(before.tracks().all(|t| !t.records.serialization_verified));
+    assert_eq!(creation.verify(&before).err(), Some(EditError::UnverifiedMarkers(2)));
+    let (_, mixed, _) =
+        fixture_from(&with_trailers([SIZE_TRAILER, COUNTER_TRAILER], [false, true]));
+    let error = LabelEditor::new().label(&mixed.snapshot(), &assignment(B, KEY_A)).unwrap_err();
+    assert_eq!(error, EditError::UnverifiedMarkers(1));
+    assert!(!document.is_dirty());
+    assert!(!mixed.is_dirty());
+}
+
+fn check_two_click_swap((dir, mut document, streams): (TempDir, EditDocument, CreationStreams)) {
     let original = document.snapshot();
     let editor = LabelEditor::with_creation_streams(&streams);
     let request = assignment(B, KEY_A);
@@ -128,6 +218,12 @@ fn two_click_swap_preserves_raw_bytes_and_round_trips_each_state() {
     let displaced = displacements(&first);
     assert_eq!(displaced.label, None);
     assert_eq!(displaced.name, "Unlabeled 1");
+    let middle = |track: &RawTrack| track.records.node.len() - 33;
+    let donor = original.track(&A).unwrap();
+    assert_eq!(
+        displaced.records.node[middle(displaced)..middle(displaced) + 13],
+        donor.records.node[middle(donor)..middle(donor) + 13]
+    );
     assert_eq!(
         displaced.samples.as_ref(),
         &[3, 5, 7].map(|f| sample(&original, A, f).unwrap())
