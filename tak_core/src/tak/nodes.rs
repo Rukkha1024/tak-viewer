@@ -363,11 +363,13 @@ pub fn label_groups(raw: &[u8]) -> Result<Vec<LabelGroup>> {
 // ---------------------------------------------------------------------------------------------
 // Force plates (`scripts/analyze_gait_forceplate.py` `extract_plates`).
 
-/// Structural device identity used by the selective analog reader. Human-facing names are
-/// deliberately excluded: the channel UID must join to exactly one typed device node.
+/// Structural identity for selective analog reading; channel UID joins exactly one typed
+/// device node. Human-facing name is display metadata only, never a decoding/type decision.
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceNode {
     pub uid: Uid,
+    /// Display identity only; never determines device kind.
+    pub name: Option<String>,
     pub forceplate: bool,
     /// Declared channel count; absent/invalid metadata disables the bulk marker suffix path.
     pub channel_count: Option<usize>,
@@ -457,7 +459,7 @@ pub(crate) fn analog_device_nodes(nodes: &[u8]) -> Result<Vec<DeviceNode>> {
                 || multiple < 1.0 || multiple.fract() != 0.0 || multiple > 16.0 { return None; }
             Some(super::DeviceSampling { rate_hz: rate, samples_per_frame: multiple as usize })
         })();
-        out.push(DeviceNode { uid: record.uid, forceplate, channel_count, plate: geometry, sampling });
+        out.push(DeviceNode { uid: record.uid, name: record.props.get("NodeName").map(py_str).filter(|s| !s.trim().is_empty()), forceplate, channel_count, plate: geometry, sampling });
     }
     Ok(out)
 }

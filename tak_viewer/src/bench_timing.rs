@@ -25,6 +25,10 @@ struct DetailFrame {
 }
 thread_local! { static DETAIL: RefCell<DetailFrame> = RefCell::new(DetailFrame::default()); }
 
+pub fn enabled() -> bool {
+    DETAIL.with(|s| s.borrow().enabled)
+}
+
 pub fn begin_details(enabled: bool) {
     DETAIL.with(|s| {
         let mut s = s.borrow_mut();

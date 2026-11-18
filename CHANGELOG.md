@@ -1,5 +1,16 @@
 # 변경 사항
 
+## v0.37.0 — 2026-11-18
+
+- Devices: drag-only placement, pointer ghost/grips, replace preview, chip swap/move, visible clear.
+- Analog Fill grid: first 16 channels, smallest square through4×4. Per-view grid undo/redo; App preset save/delete undo.
+- Settings Channel names: recorded device NodeName + channel index, all matching files; Enter/blur commit, Reset, undo. Legacy saved layouts still load.
+- Steady typed filter fields/status slots; one-line toolbar, overflow, floating Save/Cancel popover.
+- Keep unchanged cell graph state; auto fold at620 px until manual toggle; plate hover current/max-|Fz|.
+- Limit graph mesh publication per frame; avoid redundant mesh culling and idle grid allocations. Screenshot waits for pending meshes.
+- Windows core237/viewer738 tests pass;2 existing ignored. Release build pass. Worker 3D and renamed-grid comparison pixels equal main; release integration differs only by version footer58 pixels. Finite33/122 MB signal f32 bits and null positions equal main. Original input status clean.
+- User approved release with recorded quiet Filter-OFF frame16.426 ms (122 MB m8, outside Devices); main same gate max19.843 ms. Official quiet Filter ON ≤20 ms everywhere; branch ON max15.337 ms. Strict16 ms target still missed: branch1/48 runs, main2/48. All loaded and earlier failures retained; no unconditional16 ms claim.
+
 ## v0.36.0 — 2026-11-17
 
 - Devices에 최대 4×4 그래프 칸과 접을 수 있는 장치·채널 목록을 넣었어요. 항목을 끌거나 고른 뒤 칸을 눌러 배치해요.

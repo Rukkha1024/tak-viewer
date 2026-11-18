@@ -309,6 +309,8 @@ pub fn new_step(kind: usize, fs: Option<f64>) -> Step {
 }
 /// Each step remains one readable sentence. Horizontal scrolling preserves it on narrow panes.
 pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
+    let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_filter.controls"));
+    let computing = device.pending();
     ui.horizontal(|ui| {
         ui.checkbox(&mut device.settings.enabled, "Filter");
         ui.label(
@@ -317,6 +319,17 @@ pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
                 .color(crate::ui::theme::TEXT_DIM),
         );
         ui.checkbox(&mut device.settings.show_raw, "Show raw");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_sized(
+                [96.0, 18.0],
+                egui::Label::new(
+                    RichText::new(if computing { "◌ Computing" } else { "" })
+                        .small()
+                        .weak(),
+                )
+                .selectable(false),
+            );
+        });
     });
     let mut remove = None;
     let mut swap = None;
@@ -407,7 +420,7 @@ pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
                                             ui.visuals_mut().override_text_color =
                                                 Some(Color32::LIGHT_RED);
                                         }
-                                        ui.add(egui::DragValue::new(order).range(1..=8));
+                                        typed(ui, order, !(1..=8).contains(order), 28.0);
                                     });
                                     ui.checkbox(zero_phase, "Zero-lag");
                                 }
@@ -435,15 +448,26 @@ pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
                                 }
                             });
                             ui.end_row();
-                            if let Err(error) =
-                                signal::validate(std::slice::from_ref(step), fs.unwrap_or(f64::NAN))
-                            {
-                                ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
-                                for _ in 0..4 {
-                                    ui.label("");
-                                }
-                                ui.end_row();
+                            let error = signal::validate(
+                                std::slice::from_ref(step),
+                                fs.unwrap_or(f64::NAN),
+                            )
+                            .err()
+                            .unwrap_or_default();
+                            // Paint across the reserved row without widening the stage-name column.
+                            let (slot, _) =
+                                ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
+                            ui.painter().text(
+                                slot.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                error,
+                                egui::FontId::proportional(9.0),
+                                Color32::LIGHT_RED,
+                            );
+                            for _ in 0..4 {
+                                ui.label("");
                             }
+                            ui.end_row();
                         }
                     });
             });
@@ -467,44 +491,83 @@ pub fn controls(ui: &mut Ui, device: &mut Device, fs: Option<f64>) {
             .small()
             .color(crate::ui::theme::TEXT_DIM),
     );
-    if device.pending() {
-        ui.label(
-            RichText::new("Computing…")
-                .small()
-                .color(crate::ui::theme::TEXT_DIM),
-        );
+    if computing {
         ui.ctx().request_repaint();
     }
-    if let Some(error) = &device.error {
-        if signal::validate(&device.settings.steps, fs.unwrap_or(f64::NAN)).is_ok() {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
-    }
-    if let Some(output) = &device.ready {
-        if output.skipped_runs > 0 {
-            ui.label(
-                RichText::new(format!("{} short runs unchanged", output.skipped_runs))
-                    .small()
-                    .color(crate::ui::theme::TEXT_DIM),
-            );
-        }
-    }
+    let error = device
+        .error
+        .as_deref()
+        .filter(|_| signal::validate(&device.settings.steps, fs.unwrap_or(f64::NAN)).is_ok())
+        .unwrap_or("");
+    ui.add_sized(
+        [ui.available_width(), 14.0],
+        egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED)).truncate(),
+    );
+    let short = device
+        .ready
+        .as_ref()
+        .filter(|o| o.skipped_runs > 0)
+        .map_or(String::new(), |o| {
+            format!("{} short runs unchanged", o.skipped_runs)
+        });
+    ui.add_sized(
+        [ui.available_width(), 14.0],
+        egui::Label::new(RichText::new(short).small().weak()).truncate(),
+    );
 }
 fn cutoff_invalid(value: f64, fs: Option<f64>) -> bool {
     !value.is_finite() || value <= 0.0 || fs.is_none_or(|fs| value >= fs / 2.0)
 }
-fn number(ui: &mut Ui, value: &mut f64, suffix: &str, invalid: bool) {
-    ui.scope(|ui| {
-        if invalid {
-            ui.visuals_mut().override_text_color = Some(Color32::LIGHT_RED);
+#[derive(Clone)]
+struct NumericDraft {
+    text: String,
+    source: String,
+}
+fn typed<T: Copy + ToString + std::str::FromStr>(
+    ui: &mut Ui,
+    value: &mut T,
+    invalid: bool,
+    width: f32,
+) {
+    let id = ui.next_auto_id();
+    let source = value.to_string();
+    let mut draft = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<NumericDraft>(id))
+        .filter(|d| d.source == source)
+        .unwrap_or_else(|| NumericDraft {
+            text: source.clone(),
+            source,
+        });
+    let bad_text = draft.text.parse::<T>().is_err();
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut draft.text)
+            .desired_width(width)
+            .text_color(if invalid || bad_text {
+                Color32::LIGHT_RED
+            } else {
+                crate::ui::theme::TEXT
+            }),
+    );
+    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        draft.text = draft.source.clone();
+        response.surrender_focus();
+    } else if response.lost_focus()
+        || response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+    {
+        if let Ok(parsed) = draft.text.parse::<T>() {
+            *value = parsed;
+            draft.source = value.to_string();
         }
-        ui.add(
-            egui::DragValue::new(value)
-                .speed(0.1)
-                .suffix(suffix)
-                .max_decimals(3),
-        );
-    });
+        response.surrender_focus();
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(id, draft));
+}
+fn number(ui: &mut Ui, value: &mut f64, suffix: &str, invalid: bool) {
+    typed(ui, value, invalid, 48.0);
+    if !suffix.is_empty() {
+        ui.label(suffix.trim());
+    }
 }
 pub fn badge(ui: &mut Ui, text: &str) {
     egui::Frame::none()
@@ -839,5 +902,82 @@ mod tests {
             .settings
             .steps
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    fn render(
+        ctx: &egui::Context,
+        device: &mut Device,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    controls(ui, device, Some(1000.0));
+                    ui.label("after_controls");
+                });
+            },
+        )
+    }
+    fn text(out: &egui::FullOutput, want: &str) -> egui::Rect {
+        out.shapes
+            .iter()
+            .find_map(|s| {
+                if let egui::Shape::Text(t) = &s.shape {
+                    (t.galley.text() == want)
+                        .then(|| egui::Rect::from_min_size(t.pos, t.galley.size()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing {want}"))
+    }
+    #[test]
+    fn pending_errors_and_short_runs_keep_existing_rows_stationary() {
+        let ctx = egui::Context::default();
+        let mut device = Device::default();
+        device.settings.steps = vec![
+            Step::BandPass {
+                low_hz: 20.0,
+                high_hz: 450.0,
+                order: 4,
+                zero_phase: true,
+            },
+            Step::Rectify,
+        ];
+        render(&ctx, &mut device, vec![]);
+        let out = render(&ctx, &mut device, vec![]);
+        let row = text(&out, "Rectify");
+        let end = text(&out, "after_controls");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        device.running = Some(rx);
+        device.error = Some("worker failure".into());
+        device.ready = Some(Arc::new(Output {
+            channels: vec![],
+            bands: vec![],
+            badge: String::new(),
+            skipped_runs: 3,
+        }));
+        if let Step::BandPass { high_hz, .. } = &mut device.settings.steps[0] {
+            *high_hz = 600.0;
+        }
+        let out = render(&ctx, &mut device, vec![]);
+        assert_eq!(text(&out, "Rectify"), row);
+        assert_eq!(text(&out, "after_controls"), end);
+        assert!(out
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="◌ Computing")));
     }
 }

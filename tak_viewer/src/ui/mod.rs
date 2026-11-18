@@ -13,6 +13,7 @@
 //! - `dock`: pane layout (VS Code arrangement, side toggles, drag titles to move panes; saved
 //!   with the settings) and the tab look.
 //! - `theme`: all colors and fonts (VS Code frame, Motive inside; `apps/docs/design.md`).
+pub mod channel_names;
 pub mod comment_list;
 pub mod dock;
 pub mod device_grid;

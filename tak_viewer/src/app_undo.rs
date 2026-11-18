@@ -30,6 +30,7 @@ struct FileBase {
     speed: f64,
     folds: HashSet<FoldKey>,
     channels: HashMap<usize, usize>,
+    grid: crate::ui::device_grid::Arrangement,
 }
 
 impl FileBase {
@@ -51,6 +52,7 @@ impl FileBase {
             speed: v.pb.speed,
             folds: v.data.as_ref().map(|data| fold_keys(data, &v.labels.collapsed)).unwrap_or_default(),
             channels: v.devices.channel.clone(),
+            grid: v.devices.arrangement(),
         })
     }
 }
@@ -174,6 +176,8 @@ pub(super) struct Options {
     graph_boxes: Vec<GraphBox>,
     plate_boxes: Vec<GraphBox>,
     plate_channels: Vec<LaneSet>,
+    device_layouts: Vec<crate::device_grid::Layout>,
+    channel_names: crate::device_grid::ChannelNames,
 }
 
 impl Options {
@@ -185,6 +189,8 @@ impl Options {
             graph_boxes: s.graph_boxes.clone(),
             plate_boxes: s.plate_boxes.clone(),
             plate_channels: s.plate_channels.clone(),
+            device_layouts: s.device_layouts.clone(),
+            channel_names: s.channel_names.clone(),
         }
     }
 
@@ -195,11 +201,17 @@ impl Options {
             && self.graph_boxes == s.graph_boxes
             && self.plate_boxes == s.plate_boxes
             && self.plate_channels == s.plate_channels
+            && self.device_layouts == s.device_layouts
+            && self.channel_names == s.channel_names
     }
 
     /// Status bar word for going from `self` to `to`.
     fn words(&self, to: &Options) -> String {
-        if self.scene != to.scene {
+        if self.channel_names != to.channel_names {
+            "Channel names".into()
+        } else if self.device_layouts != to.device_layouts {
+            "Saved layouts".into()
+        } else if self.scene != to.scene {
             "Display".into()
         } else if self.opacity != to.opacity {
             format!("Opacity {}%", to.opacity)
@@ -248,6 +260,7 @@ pub(super) enum Part {
     Speed { file: PathBuf, before: f64, after: f64 },
     Folds { file: PathBuf, before: HashSet<FoldKey>, after: HashSet<FoldKey> },
     Channels { file: PathBuf, before: HashMap<usize, usize>, after: HashMap<usize, usize> },
+    DeviceGrid { file: PathBuf, before: crate::ui::device_grid::Arrangement, after: crate::ui::device_grid::Arrangement },
     /// A comment added or deleted; `cleared` = the picked range adding it cleared.
     Comment { file: PathBuf, change: Change, cleared: Range },
     /// One entire marker command, including selection / armed label, in global order.
@@ -302,7 +315,7 @@ impl Part {
             | Part::Plate { file, .. }
             | Part::Speed { file, .. }
             | Part::Folds { file, .. }
-            | Part::Channels { file, .. }
+            | Part::DeviceGrid { file, .. } | Part::Channels { file, .. }
             | Part::Comment { file, .. }
             | Part::MarkerEdit { file, .. } => Some(file),
             _ => None,
@@ -498,6 +511,7 @@ impl History {
             Part::Speed { .. } => "Speed",
             Part::Folds { .. } => "Folds",
             Part::Channels { .. } => "Channels",
+            Part::DeviceGrid { .. } => "DeviceGrid",
             Part::Comment { .. } => "Comment",
             Part::MarkerEdit { .. } => "MarkerEdit",
             Part::Layout { .. } => "Layout",
@@ -599,7 +613,7 @@ impl TakViewerApp {
                 match part.inner_mut() {
                     Part::Frame { file, .. } | Part::Camera { file, .. } | Part::Selection { file, .. } | Part::PanelSetting { file, .. }
                     | Part::Range { file, .. } | Part::Plate { file, .. } | Part::Speed { file, .. }
-                    | Part::Folds { file, .. } | Part::Channels { file, .. } | Part::Comment { file, .. } => {
+                    | Part::Folds { file, .. } | Part::DeviceGrid { file, .. } | Part::Channels { file, .. } | Part::Comment { file, .. } => {
                         if file == old { *file = new.to_path_buf(); }
                     }
                     Part::MarkerEdit { file, patch } => {
@@ -1049,6 +1063,12 @@ impl TakViewerApp {
             if folds != b.folds {
                 let before = std::mem::replace(&mut b.folds, folds.clone());
                 parts.push(Part::Folds { file: b.file.clone(), before, after: folds });
+            }
+            if v.devices.layout != b.grid.layout || v.devices.folded != b.grid.folded {
+                let grid = v.devices.arrangement();
+                let initialized = b.grid.layout.is_some();
+                let before = std::mem::replace(&mut b.grid, grid.clone());
+                if initialized { parts.push(Part::DeviceGrid { file: b.file.clone(), before, after: grid }); }
             }
             if v.devices.channel != b.channels {
                 let before = std::mem::replace(&mut b.channels, v.devices.channel.clone());
@@ -1599,6 +1619,8 @@ impl TakViewerApp {
             Part::Options { before, after, .. } => {
                 let (from, to) = if redo { (before, after) } else { (after, before) };
                 let s = &mut self.settings;
+                if from.channel_names != to.channel_names { s.channel_names = to.channel_names.clone(); }
+                if from.device_layouts != to.device_layouts { s.device_layouts = to.device_layouts.clone(); }
                 if from.scene != to.scene { s.scene = to.scene.clone(); }
                 if from.graph_float != to.graph_float { s.graph_float = to.graph_float; }
                 if from.opacity != to.opacity { s.graph_opacity = to.opacity; }
@@ -1669,6 +1691,10 @@ impl TakViewerApp {
                 let view = &mut self.views[k];
                 view.labels.collapsed = view.data.as_ref().map(|data| fold_indices(data, folds)).unwrap_or_default();
                 "Labeling".into()
+            }
+            Part::DeviceGrid { before, after, .. } => {
+                self.views[k].devices.restore(if redo { after } else { before });
+                "Device grid".into()
             }
             Part::Channels { before, after, .. } => {
                 self.views[k].devices.channel = if redo { after } else { before }.clone();

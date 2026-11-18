@@ -273,6 +273,7 @@ impl LaneShapes {
             }
         }
         // Complete identical geometry remains visible if a background copy is late.
+        let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("graph.stream_fallback_copy"));
         painter.extend(self.shapes.iter().cloned());
     }
 }
@@ -577,12 +578,13 @@ struct Work {
     put_off: bool,
     put_off_before: bool,
     mesh_promoted: bool,
+    active: bool,
     started: Option<std::time::Instant>,
 }
 
 thread_local! {
     static WORK: std::cell::Cell<Work> =
-        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false, mesh_promoted: false, started: None }) };
+        const { std::cell::Cell::new(Work { frame: u64::MAX, left: None, kept: None, some_done: false, put_off: false, put_off_before: false, mesh_promoted: false, active: false, started: None }) };
 }
 
 /// Start of a pass of the app's frame `frame` (the input time's bits: the same for the passes of
@@ -595,8 +597,9 @@ pub fn start_frame(frame: u64, budget: Option<usize>) -> bool {
         if work.frame == frame {
             work.left = work.kept;
         } else {
-            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off, mesh_promoted: false, started: Some(std::time::Instant::now()) };
+            work = Work { frame, left: budget, kept: budget, some_done: false, put_off: false, put_off_before: work.put_off, mesh_promoted: false, active: true, started: Some(std::time::Instant::now()) };
         }
+        work.active = true;
         w.set(work);
         work.put_off_before
     })
@@ -607,7 +610,7 @@ pub fn start_frame(frame: u64, budget: Option<usize>) -> bool {
 pub fn end_frame() {
     WORK.with(|w| {
         let work = w.get();
-        w.set(Work { kept: work.left, left: None, ..work });
+        w.set(Work { kept: work.left, left: None, active: false, ..work });
     });
 }
 
@@ -615,7 +618,24 @@ pub fn end_frame() {
 /// The complete compact curve is already visible while its promotion waits.
 /// Real wall-time budget shared by all views and sizing passes. Work itself is on workers.
 fn claim_geometry_publication() -> bool {
-    WORK.with(|cell| cell.get().started.is_none_or(|start| start.elapsed().as_secs_f64() < 0.004))
+    WORK.with(|cell| {
+        let work = cell.get();
+        !work.active || (!work.mesh_promoted && work.started.is_none_or(|start| start.elapsed().as_secs_f64() < 0.004))
+    })
+}
+
+fn mark_geometry_published() {
+    WORK.with(|cell| {
+        let mut work = cell.get();
+        if work.active { work.mesh_promoted = true; cell.set(work); }
+    });
+}
+
+fn mark_geometry_pending() {
+    WORK.with(|cell| {
+        let mut work = cell.get();
+        if work.active { work.put_off = true; cell.set(work); }
+    });
 }
 
 fn claim_mesh_promotion(created: u64) -> bool {
@@ -1512,6 +1532,8 @@ fn show_inner(
             if claim_geometry_publication() {
                 if let Some((_, rx)) = &drawn.mesh_rx[li] {
                     if let Ok(ready) = rx.try_recv() {
+                        mark_geometry_published();
+                        let _timing = crate::bench_timing::span("graph.install_worker_mesh");
                         crate::views::drop_later(drawn.shapes[li].replace(ready));
                         drawn.mesh_rx[li] = None;
                     }
@@ -1538,7 +1560,10 @@ fn show_inner(
                     let _ = tx.send(ready); wake.request_repaint();
                 });
             }
-            if drawn.mesh_rx[li].is_some() { ui.ctx().request_repaint(); }
+            if drawn.mesh_rx[li].is_some() {
+                mark_geometry_pending();
+                ui.ctx().request_repaint();
+            }
         }
         if !worker_mesh && drawn.shapes[li].as_ref().map(|m| &m.key) != Some(&shapes_key) {
             // The second file's curves first, dashed, so the first file's solid lines are on
@@ -1864,6 +1889,21 @@ mod tests {
     }
 
     #[test]
+    fn painter_clipping_matches_coarse_culling_for_graph_pixels() {
+        let mut culled = promotion_graph(true);
+        let mut clipped = promotion_graph(true);
+        clipped.ctx.tessellation_options_mut(|o| o.coarse_tessellation_culling = false);
+        let clip = eframe::egui::Rect::from_min_max(eframe::egui::pos2(30.0, 20.0), eframe::egui::pos2(250.0, 140.0));
+        culled.clip = Some(clip);
+        clipped.clip = Some(clip);
+        for _ in 0..3 {
+            let (_, a) = culled.render(vec![]);
+            let (_, b) = clipped.render(vec![]);
+            assert_eq!(a.pixels, b.pixels, "painter clip preserves graph pixels");
+        }
+    }
+
+    #[test]
     fn geometry_publication_obeys_wall_clock_budget_across_views() {
         let frame=0x123456;
         super::start_frame(frame,Some(100));
@@ -1873,6 +1913,36 @@ mod tests {
         assert!(!super::claim_geometry_publication(),"a second layout pass cannot reset the wall budget");
         super::start_frame(frame+1,Some(100));
         assert!(super::claim_geometry_publication());super::end_frame();
+    }
+
+    #[test]
+    fn worker_publication_is_shared_across_views_and_layout_passes() {
+        let frame = 0x654321;
+        super::start_frame(frame, Some(100));
+        assert!(super::claim_geometry_publication());
+        // A pending receiver does not consume the slot until a mesh actually arrives.
+        assert!(super::claim_geometry_publication());
+        super::mark_geometry_published();
+        assert!(!super::claim_geometry_publication());
+        super::end_frame();
+        assert!(super::claim_geometry_publication(), "standalone graph render is unlimited");
+        super::start_frame(frame, Some(100));
+        assert!(!super::claim_geometry_publication(), "another sizing pass shares the slot");
+        super::start_frame(frame + 1, Some(100));
+        assert!(super::claim_geometry_publication(), "next frame gets a new slot");
+        super::end_frame();
+    }
+
+    #[test]
+    fn pending_mesh_keeps_screenshot_waiting_until_a_later_frame() {
+        let frame = 0x765432;
+        super::start_frame(frame, None);
+        super::mark_geometry_pending();
+        super::end_frame();
+        assert!(super::start_frame(frame + 1, None));
+        super::end_frame();
+        assert!(!super::start_frame(frame + 2, None));
+        super::end_frame();
     }
 
     fn pending_promotions(graph: &DecorationGraph) -> usize {

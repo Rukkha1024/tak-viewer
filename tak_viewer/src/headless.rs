@@ -137,7 +137,10 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             }
         }
         let counts = if trace.enabled() {out.shapes.iter().map(|s|geometry_counts(&s.shape)).fold((0,0),|a,b|(a.0+b.0,a.1+b.1))} else {(0,0)};
+        let mut tessellation = trace.enabled().then(|| crate::bench_timing::span("epaint.tessellate"));
         let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+        if let Some(span) = &mut tessellation { span.counts(|| (counts.0, counts.1)); }
+        drop(tessellation);
         let primitive_count = primitives.len();
         let output_vertices = if trace.enabled() {primitives.iter().map(|p|match &p.primitive {egui::epaint::Primitive::Mesh(m)=>m.vertices.len(),_=>0}).sum()} else {0};
         drop(primitives);

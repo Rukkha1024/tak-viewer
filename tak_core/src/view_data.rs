@@ -248,6 +248,7 @@ pub struct AnalogTarget {
     plate_devices: Option<Vec<usize>>,
     frame_rate: f64,
     device_sampling: Vec<Option<DeviceSampling>>,
+    device_names: Vec<Option<String>>,
 }
 
 /// Force plates / EMG of stage 2, prepared off the drawing thread (`ViewData::attach_prepared`).
@@ -263,7 +264,7 @@ pub struct AnalogPart {
 
 impl AnalogPart {
     pub fn prepare(analog: Vec<AnalogDevice>, warning: Option<String>, target: &AnalogTarget) -> AnalogPart {
-        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref(), target.frame_rate, &target.device_sampling);
+        let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref(), target.frame_rate, &target.device_sampling, &target.device_names);
         AnalogPart { analog, warning, devices, plates, selected: None, initial: true }
     }
 
@@ -406,7 +407,7 @@ fn finite_mean(row: &[f32]) -> Option<f32> {
 
 /// Analog devices -> per-frame means, and force plates (corners in display units, Fz per frame
 /// from the device of the same index). Shared by `build` and `AnalogPart::prepare`.
-fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32, plate_devices: Option<&[usize]>, frame_rate: f64, device_sampling: &[Option<DeviceSampling>]) -> (Vec<DeviceView>, Vec<PlateView>) {
+fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end: i64, scale: f32, plate_devices: Option<&[usize]>, frame_rate: f64, device_sampling: &[Option<DeviceSampling>], device_names: &[Option<String>]) -> (Vec<DeviceView>, Vec<PlateView>) {
     let n = (end - start + 1) as usize;
     let mut devices = Vec::new();
     for (di, d) in analog.iter().enumerate() {
@@ -461,7 +462,7 @@ fn analog_views(analog: &[AnalogDevice], plates: &[ForcePlate], start: i64, end:
             .collect();
         let title = match plate {
             Some(p) => format!("Force plate: {}", plates[p].name),
-            None => format!("아날로그 장치 {}", di + 1),
+            None => device_names.get(di).and_then(Option::as_ref).cloned().unwrap_or_else(|| format!("아날로그 장치 {}", di + 1)),
         };
         devices.push(DeviceView { title, plate, channels });
     }
@@ -675,7 +676,7 @@ impl ViewData {
         }
 
         let n = (end - start + 1) as usize;
-        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale, plate_devices.as_deref(), take.frame_rate, &take.device_sampling);
+        let (devices, plates) = analog_views(&take.analog, &take.plates, start, end, scale, plate_devices.as_deref(), take.frame_rate, &take.device_sampling, &take.device_names);
 
         // Robust bounds (2–98 percentile per axis) of labeled markers, so stray points do not
         // shrink the initial view.
@@ -804,7 +805,7 @@ impl ViewData {
     pub fn analog_generation(&self) -> u64 { self.analog_generation }
 
     pub fn analog_target(&self) -> AnalogTarget {
-        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale, plate_devices: self.plate_devices.clone(), frame_rate: self.take.frame_rate, device_sampling: self.take.device_sampling.clone() }
+        AnalogTarget { plates: self.take.plates.clone(), start: self.start_frame, end: self.end_frame, scale: self.unit_scale, plate_devices: self.plate_devices.clone(), frame_rate: self.take.frame_rate, device_sampling: self.take.device_sampling.clone(), device_names: self.take.device_names.clone() }
     }
 
     /// Stage 2 of the markers-first open: the analog devices arrive. Gives the same devices and
@@ -922,7 +923,7 @@ mod tests {
             label_groups: vec![],
             plates: vec![ForcePlate { name: "P1".into(), corners: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]] }],
             analog: vec![device.clone(), device],
-            device_sampling: vec![],
+            device_sampling: vec![], device_names: vec![],
             warnings: vec![],
         };
         let full = ViewData::build(take.clone());
@@ -967,7 +968,7 @@ mod tests {
             path: "x.tak".into(), file_size: 0, metadata: vec![], frame_rate: 100.0,
             start_frame: 0, end_frame: 2, trajectories: vec![], assets: vec![], label_groups: vec![],
             plates: vec![ForcePlate { name: "P1".into(), corners: [[0.0; 3]; 4] }],
-            analog: manifest.clone(), device_sampling: vec![], warnings: vec![],
+            analog: manifest.clone(), device_sampling: vec![], device_names: vec![], warnings: vec![],
         };
         let mut view = ViewData::build_with_plate_devices(take, Some(vec![1]));
         view.analog_pending = true;
@@ -1000,7 +1001,7 @@ mod tests {
             path: "fullrate.tak".into(), file_size: 0, metadata: vec![], frame_rate: 100.0,
             start_frame: 100, end_frame: 103, trajectories: vec![], assets: vec![], label_groups: vec![],
             plates: vec![], analog: vec![AnalogDevice { channels: vec![channel] }],
-            device_sampling: vec![sampling], warnings: vec![],
+            device_sampling: vec![sampling], device_names: vec![], warnings: vec![],
         }
     }
 
@@ -1099,7 +1100,7 @@ mod tests {
         let mut take = analog_test_take(channel, Some(DeviceSampling { rate_hz: 1000.0, samples_per_frame: 10 }));
         take.end_frame = 100_000_000;
         // Avoid the marker occlusion allocation in build: directly exercise analog preparation.
-        let (devices, _) = analog_views(&take.analog, &[], 100, take.end_frame, 1.0, None, 100.0, &take.device_sampling);
+        let (devices, _) = analog_views(&take.analog, &[], 100, take.end_frame, 1.0, None, 100.0, &take.device_sampling, &take.device_names);
         let c = &devices[0].channels[0];
         assert_eq!(c.sample_rate_hz, Some(1000.0));
         assert!(c.per_frame.is_empty() && c.signal.runs.is_empty() && c.raw_min.runs.is_empty() && c.raw_max.runs.is_empty());

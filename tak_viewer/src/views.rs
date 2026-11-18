@@ -2141,6 +2141,7 @@ pub(crate) fn sample_take(path: &str, names: &[&str]) -> tak_core::tak::Take {
         .collect();
     Take {
         device_sampling: Vec::new(),
+        device_names: Vec::new(),
         path: path.into(),
         file_size: 0,
         metadata: vec![],

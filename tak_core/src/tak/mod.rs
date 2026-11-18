@@ -213,6 +213,8 @@ pub struct Take {
     pub analog: Vec<AnalogDevice>,
     /// Same device order as `analog`; None when the stored sampling cannot be proven.
     pub device_sampling: Vec<Option<DeviceSampling>>,
+    /// Recorded NodeName joined by structural UID; no serial exposed by this reader.
+    pub device_names: Vec<Option<String>>,
     /// Non-fatal problems (unsupported SKL, unreadable sticks, analog parse issue...).
     pub warnings: Vec<String>,
 }
@@ -285,8 +287,26 @@ pub(crate) fn decode_streams(path: &Path, file_size: usize, nodes: &[u8], channe
     let (analog, warning) = decode_analog(channels);
     take.analog = analog;
     take.device_sampling = sampling_from_streams(nodes, channels).unwrap_or_default();
+    take.device_names = names_from_streams(nodes, channels).unwrap_or_default();
     take.warnings.extend(warning);
     Ok(take)
+}
+
+/// Header-only display identity; values and marker/device classification unchanged.
+pub(crate) fn names_from_streams(nodes: &[u8], channels: &[u8]) -> Result<Vec<Option<String>>> {
+    let typed = nodes::analog_device_nodes(nodes)?;
+    let inventory = channels::iter_channel_inventory(channels)?;
+    let mut groups: Vec<Vec<&channels::ChannelRecord>> = Vec::new();
+    for record in inventory.iter().filter(|r| r.name.starts_with("AnalogChannel")) {
+        if record.name == "AnalogChannel0" { groups.push(Vec::new()); }
+        let Some(group) = groups.last_mut() else { return err("analog channel before AnalogChannel0") };
+        group.push(record);
+    }
+    Ok(groups.into_iter().map(|group| {
+        let uid = group[0].uid;
+        if group.iter().any(|r| r.uid != uid) { return None; }
+        typed.iter().find(|n| n.uid == uid).and_then(|n| n.name.clone())
+    }).collect())
 }
 
 /// Header-only sampling lookup shared by full and SSH reads. Unknown, duplicated or
@@ -401,6 +421,7 @@ pub(crate) fn decode_markers(
         plates,
         analog: Vec::new(),
         device_sampling: Vec::new(),
+        device_names: Vec::new(),
         warnings,
     })
 }

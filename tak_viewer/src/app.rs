@@ -187,6 +187,7 @@ pub struct Settings {
     /// in settings saved before v0.12.0 (then Fx · Fy · Fz).
     pub plate_channels: Vec<LaneSet>,
     pub device_layouts: Vec<crate::device_grid::Layout>,
+    pub channel_names: crate::device_grid::ChannelNames,
 }
 
 impl Default for Settings {
@@ -216,6 +217,7 @@ impl Default for Settings {
             plate_boxes: vec![GraphBox::default(); MAX_VIEWS],
             plate_channels: vec![LaneSet::default(); MAX_VIEWS],
             device_layouts: Vec::new(),
+            channel_names: Default::default(),
         }
     }
 }
@@ -1271,7 +1273,7 @@ impl TakViewerApp {
         match auto.stage {
             0 => {
                 let mut show_devices=false;
-                for &k in &open {show_devices |= crate::device_filter::apply_probe(&mut self.views[k],ctx,true);show_devices |= crate::device_grid::apply_probe(&mut self.views[k]);}
+                for &k in &open { if let Some(data) = &self.views[k].data { crate::device_grid::apply_names(data,&mut self.settings.channel_names); } show_devices |= crate::device_filter::apply_probe(&mut self.views[k],ctx,true);show_devices |= crate::device_grid::apply_probe(&mut self.views[k]);}
                 if show_devices{
                     // Agent picture: expand the existing draggable Devices pane so each
                     // complete filter sentence and graph can be inspected in one image.
@@ -3462,14 +3464,17 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 if let Some(size) = crate::device_grid::PROBE.get().and_then(|p|p.pane) {
                     let rect=egui::Rect::from_min_size(ui.cursor().min,egui::vec2(size[0],size[1]));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect),|ui| {
-                        panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts)
+                        panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts,&app.settings.channel_names)
                     }).inner
                 } else {
-                    panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts)
+                    panels::devices_pane(ui,d,frame,&mut v.devices,v.file_id,v.plate,v.emg_failure.as_deref(),&v.filters,&mut app.settings.device_layouts,&app.settings.channel_names)
                 }
             }
             Pane::Empty | Pane::LayoutTabs | Pane::View(_) | Pane::Explorer | Pane::Comments | Pane::Labels | Pane::Labeling | Pane::EditTools => None,
         };
+        if let Some(note) = v.devices.note.take() {
+            app.history.note = Some((format!("{note} · Ctrl+Z to undo"), ui.input(|i| i.time)));
+        }
         if action.is_some() {
             self.action = action;
         }
@@ -3548,6 +3553,9 @@ impl Drop for GraphFrame {
 impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // Clip rectangles still constrain every painter. Avoid rescanning all vertices of
+        // already-built graph meshes in egui's additional coarse tessellation culling.
+        ctx.tessellation_options_mut(|options| options.coarse_tessellation_culling = false);
         for (slot, view) in self.views.iter_mut().enumerate() {
             view.comment_marker_draft = self.comment_edit.as_ref().is_some_and(|edit|
                 edit.field == Field::Markers && edit.slot == slot && edit.file_id == view.file_id);
@@ -3930,7 +3938,14 @@ impl TakViewerApp {
             }
         }
         if self.show_settings {
+            let names_before = self.settings.channel_names.clone();
             let mut open = true;
+            let mut channel_catalog = BTreeMap::<String, usize>::new();
+            for view in self.views.iter().chain(self.layout_tabs.tabs().iter().filter_map(|t| t.layout.as_ref()).flat_map(|r| r.views.iter())) {
+                if let Some(data) = &view.data { for device in &data.devices {
+                    if device.plate.is_none() { let n = channel_catalog.entry(device.title.clone()).or_default(); *n = (*n).max(device.channels.len()); }
+                }}
+            }
             egui::Window::new("설정").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
                 if self.dirty_prompt.is_some() { ui.disable(); }
                 ui.label(RichText::new("3D 위에 뜬 그래프 (마커 · forceplate)").color(theme::TEXT_DIM));
@@ -3943,7 +3958,9 @@ impl TakViewerApp {
                 if ui.button(format!("처음 값으로 ({} %)", graph_float::DEFAULT_OPACITY)).clicked() {
                     self.settings.graph_opacity = graph_float::DEFAULT_OPACITY;
                 }
+                crate::ui::channel_names::show(ui, channel_catalog, &mut self.settings.channel_names);
             });
+            if names_before != self.settings.channel_names { self.observe(true); }
             self.show_settings = open;
         }
         if self.show_help {
@@ -4094,6 +4111,7 @@ impl TakViewerApp {
             let v = &mut self.views[k];
             crate::device_filter::apply_probe(v,&egui::Context::default(),false);
             crate::device_grid::apply_probe(v);
+            if let Some(data) = &v.data { crate::device_grid::apply_names(data,&mut self.settings.channel_names); }
             if v.data.as_ref().is_some_and(|d| !d.markers.is_empty()) {
                 v.select(0, false);
             }
@@ -5148,7 +5166,78 @@ mod tests {
     }
 
     #[test]
-    fn device_metadata_expansion_is_lazy_and_click_placement_demands_visible_samples() {
+    fn channel_name_enter_and_blur_each_record_one_committed_app_action() {
+        let ctx=egui::Context::default(); let mut app=views_with_plates(&ctx,1);
+        let mut take=views::sample_data("names.tak", &["M"]).take;
+        take.analog.push(tak_core::tak::AnalogDevice {channels:(0..2).map(|i|tak_core::tak::AnalogChannel {
+            name:format!("AnalogChannel{i}"),kind:"Analog".into(),dim:1,frames:vec![].into(),values:vec![].into(),
+        }).collect()});
+        let data=tak_core::view_data::ViewData::build(take); let device=data.devices[0].title.clone();
+        app.views[0].data=Some(std::sync::Arc::new(data)); app.views[0].devices.layout=Some(crate::device_grid::Layout::default());
+        app.settings.channel_names.insert(device.clone(),[(0,"Before0".into()),(1,"Before1".into())].into());
+        app.show_settings=true;
+        for _ in 0..3 {frame_with(&ctx,&mut app,vec![]);} app.observe(false);
+        let n=app.history.undo.len();
+        let replace=|app:&mut TakViewerApp,old:&str,new:&str| {
+            let out=frame_with(&ctx,app,vec![]); let p=text_rects(&out,old)[0].center(); click_at(&ctx,app,p);
+            frame_with(&ctx,app,vec![egui::Event::Key{key:Key::A,physical_key:None,pressed:true,repeat:false,modifiers:ctrl()},egui::Event::Text(new.into())]);
+        };
+        replace(&mut app,"Before0","L TA");
+        assert_eq!(app.settings.channel_names[&device][&0],"Before0","typing is draft only");
+        run_frame(&ctx,&mut app,&[(Modifiers::NONE,Key::Enter)]);
+        assert_eq!(app.settings.channel_names[&device][&0],"L TA"); assert_eq!(app.history.undo.len(),n+1);
+        replace(&mut app,"Before1","R TA");
+        let out=frame_with(&ctx,&mut app,vec![]);let p=text_rects(&out,"L TA")[0].center();click_at(&ctx,&mut app,p);
+        assert_eq!(app.settings.channel_names[&device][&1],"R TA"); assert_eq!(app.history.undo.len(),n+2,"blur into another text field commits separately");
+        app.undo_redo(&ctx,false); assert_eq!(app.settings.channel_names[&device][&1],"Before1");
+        app.undo_redo(&ctx,false); assert_eq!(app.settings.channel_names[&device][&0],"Before0");
+        app.undo_redo(&ctx,true); assert_eq!(app.settings.channel_names[&device][&0],"L TA");
+    }
+    #[test]
+    fn v036_settings_text_with_legacy_named_layout_loads_without_preference_loss() {
+        let text=r#"(graph_opacity:37,workspace_roots:["C:\\Lab"],device_layouts:[(name:"EMG",rows:2,cols:2,cells:[Some(Channel(device:"아날로그 장치 1",channel:"AnalogChannel0")),None,None,None])])"#;
+        let settings:Settings=ron::from_str(text).unwrap();
+        assert_eq!(settings.graph_opacity,37); assert_eq!(settings.workspace_roots,vec!["C:\\Lab"]);
+        assert!(settings.channel_names.is_empty());
+        let mut data=views::sample_data("a", &["M"]);
+        data.take.analog.push(tak_core::tak::AnalogDevice { channels:vec![tak_core::tak::AnalogChannel {
+            name:"AnalogChannel0".into(),kind:"Analog".into(),dim:1,frames:vec![].into(),values:vec![].into(),
+        }] });
+        data=tak_core::view_data::ViewData::build(data.take);
+        assert_eq!(settings.device_layouts[0].cells[0].as_ref().unwrap().resolve(&data),Some((0,vec![0])));
+        let mut changed=settings.clone(); changed.channel_names.entry("아날로그 장치 1".into()).or_default().insert(0,"L TA".into());
+        let copy:Settings=ron::from_str(&ron::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(copy.channel_names,changed.channel_names);
+        assert_eq!(copy.device_layouts[0].cells[0].as_ref().unwrap().resolve(&data),Some((0,vec![0])));
+    }
+    #[test]
+    fn device_grid_and_app_names_presets_roundtrip_in_global_history_per_view() {
+        let ctx=egui::Context::default(); let mut app=views_with_plates(&ctx,2);
+        dock::show(&mut app.dock,Pane::Devices);
+        for _ in 0..3 { frame_with(&ctx,&mut app,vec![]); }
+        app.views[0].devices.layout=Some(crate::device_grid::Layout::default());
+        app.observe(false);
+        let unchanged=app.views[1].devices.arrangement();
+        let cell=crate::device_grid::items(app.views[0].data.as_ref().unwrap(),0)[0].clone();
+        let grid=|a:&TakViewerApp| a.views[0].devices.layout.clone();
+        round_trip(&ctx,&mut app,"size",|_,a|a.views[0].devices.layout.as_mut().unwrap().resize(3),grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"place",|_,a|a.views[0].devices.layout.as_mut().unwrap().place(0,&[cell.clone()]),grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"move",|_,a|a.views[0].devices.layout.as_mut().unwrap().move_or_swap(0,1),grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"replace",|_,a|{let cell=crate::device_grid::channel(a.views[0].data.as_ref().unwrap(),1,2).unwrap();a.views[0].devices.layout.as_mut().unwrap().place(1,&[cell]);},grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"second placement",|_,a|a.views[0].devices.layout.as_mut().unwrap().place(0,&[cell.clone()]),grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"swap",|_,a|a.views[0].devices.layout.as_mut().unwrap().move_or_swap(0,1),grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"manual fold",|_,a|a.views[0].devices.folded=Some(true),|a|a.views[0].devices.folded,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"clear",|_,a|a.views[0].devices.layout.as_mut().unwrap().cells[1]=None,grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"Fill",|_,a|{ let data=a.views[0].data.clone().unwrap(); a.views[0].devices.layout.as_mut().unwrap().fill_device(&data,0); },grid,"Undo · Device grid");
+        assert_eq!(app.views[1].devices.arrangement().layout,unchanged.layout);
+        round_trip(&ctx,&mut app,"save preset",|_,a|a.settings.device_layouts.push(a.views[0].devices.layout.clone().unwrap()),|a|a.settings.device_layouts.clone(),"Undo · Saved layouts");
+        round_trip(&ctx,&mut app,"load preset",|_,a|{let mut next=a.settings.device_layouts[0].clone();next.resize(4);a.views[0].devices.layout=Some(next);},grid,"Undo · Device grid");
+        round_trip(&ctx,&mut app,"delete preset",|_,a|a.settings.device_layouts.clear(),|a|a.settings.device_layouts.clone(),"Undo · Saved layouts");
+        round_trip(&ctx,&mut app,"rename",|_,a|{a.settings.channel_names.entry("D".into()).or_default().insert(0,"L TA".into());},|a|a.settings.channel_names.clone(),"Undo · Channel names");
+        round_trip(&ctx,&mut app,"reset names",|_,a|a.settings.channel_names.clear(),|a|a.settings.channel_names.clone(),"Undo · Channel names");
+    }
+    #[test]
+    fn device_metadata_click_never_arms_placement_and_drag_demands_samples() {
         use tak_core::tak::{AnalogDevice, AnalogChannel};
         let ctx = egui::Context::default();
         let mut app = views_with_plates(&ctx, 1);
@@ -5169,12 +5258,17 @@ mod tests {
         assert!(!app.views[0].devices.request_emg,"metadata/filter controls do not read samples");
         let source=text_rects(&out,"●  AnalogChannel1");assert_eq!(source.len(),1);
         let out=click_at(&ctx,&mut app,source[0].center());
-        assert!(!app.views[0].devices.request_emg,"arming a source does not read samples");
+        assert!(!app.views[0].devices.request_emg,"source click does not read samples");
         let target=text_rects(&out,"Drop here");assert_eq!(target.len(),4);
         click_at(&ctx,&mut app,target[0].center());
+        assert!(app.views[0].devices.layout.as_ref().unwrap().cells.iter().all(Option::is_none),"click never arms placement");
+        let out=frame_with(&ctx,&mut app,vec![]);
+        let source=text_rects(&out,"●  AnalogChannel1")[0].center();
+        let target=text_rects(&out,"Drop here")[0].center();
+        drag(&ctx,&mut app,source,target);
         frame_with(&ctx,&mut app,vec![]);
         assert!(app.views[0].devices.request_emg,"a visible placed channel requests shared lazy samples");
-        assert!(matches!(&app.views[0].devices.layout.as_ref().unwrap().cells[0],Some(crate::device_grid::Cell::Channel{channel,..}) if channel=="AnalogChannel1"));
+        assert!(matches!(&app.views[0].devices.layout.as_ref().unwrap().cells[0],Some(crate::device_grid::Cell::ChannelIndex{index:1,..})));
         let settings=ron::to_string(&app.settings).unwrap();
         let restored:Settings=ron::from_str(&settings).unwrap();assert!(restored.device_layouts.is_empty());
     }

@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     device_filter::{self, Display, SharedFilters},
-    device_grid::{self as model, Cell, Layout},
+    device_grid::{self as model, Cell, ChannelNames, Layout},
 };
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Id, Rect, RichText, Sense, Stroke, Ui,
@@ -28,12 +28,52 @@ pub struct State {
     pub layout: Option<Layout>,
     pub folded: Option<bool>,
     expanded: HashSet<usize>,
-    picked: Option<Vec<Cell>>,
+    pub note: Option<&'static str>,
     save_name: Option<String>,
     focus_name: bool,
     graphs: HashMap<usize, CellGraph>,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Arrangement {
+    pub layout: Option<Layout>,
+    pub folded: Option<bool>,
+}
+#[derive(Clone)]
+struct Payload {
+    label: String,
+    items: Vec<Cell>,
+    from: Option<usize>,
+}
 impl State {
+    pub fn arrangement(&self) -> Arrangement {
+        Arrangement {
+            layout: self.layout.clone(),
+            folded: self.folded,
+        }
+    }
+    pub fn restore(&mut self, next: &Arrangement) {
+        self.layout = next.layout.clone();
+        self.folded = next.folded;
+        self.reconcile();
+    }
+    pub fn reconcile(&mut self) {
+        let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.reconcile"));
+        let Some(layout) = &self.layout else {
+            return;
+        };
+        let stale: Vec<_> = self
+            .graphs
+            .iter()
+            .filter(|(at, graph)| {
+                layout.cells.get(**at).and_then(Option::as_ref) != Some(&graph.key.1)
+            })
+            .map(|(&at, _)| at)
+            .collect();
+        for at in stale {
+            crate::views::drop_later(self.graphs.remove(&at));
+        }
+    }
+
     pub fn reset_graphs(&mut self) {
         crate::views::drop_later(Some(std::mem::take(self)));
     }
@@ -184,29 +224,32 @@ fn device_title(data: &ViewData, di: usize) -> String {
     d.plate
         .and_then(|pi| data.plates.get(pi))
         .map(|p| p.name.clone())
-        .unwrap_or_else(|| format!("Analog device {} ({} ch)", di + 1, d.channels.len()))
-}
-fn cell_title(data: &ViewData, cell: &Cell, di: usize, channels: &[usize]) -> String {
-    let d = &data.devices[di];
-    match cell {
-        Cell::Plate { .. } => {
-            if channels.len() == 1 {
-                format!(
-                    "{} · {}",
-                    device_title(data, di),
-                    PLATE_LANES[channels[0]].0
+        .unwrap_or_else(|| {
+            data.take
+                .device_names
+                .get(di)
+                .and_then(Option::as_ref)
+                .map_or_else(
+                    || format!("Analog device {} ({} ch)", di + 1, d.channels.len()),
+                    |name| format!("{name} ({} ch)", d.channels.len()),
                 )
-            } else {
-                device_title(data, di)
-            }
-        }
-        Cell::Channel { channel, .. } => {
-            if d.plate.is_some() {
-                format!("{} · {channel}", device_title(data, di))
-            } else {
-                channel.clone()
-            }
-        }
+        })
+}
+fn cell_title(
+    data: &ViewData,
+    cell: &Cell,
+    di: usize,
+    channels: &[usize],
+    names: &ChannelNames,
+) -> String {
+    match cell {
+        Cell::Plate { .. } if channels.len() == 1 => format!(
+            "{} · {}",
+            device_title(data, di),
+            PLATE_LANES[channels[0]].0
+        ),
+        Cell::Plate { .. } => device_title(data, di),
+        _ => model::display_name(names, data, di, channels[0]).to_owned(),
     }
 }
 pub fn display_badge(display: &Display) -> Option<&str> {
@@ -217,102 +260,166 @@ pub fn display_badge(display: &Display) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-fn source(ui: &mut Ui, text: String, items: Vec<Cell>, picked: &mut Option<Vec<Cell>>) {
-    let response = ui.add(
-        egui::Label::new(RichText::new(text).size(11.0))
-            .truncate()
-            .sense(Sense::click_and_drag()),
-    );
-    response.dnd_set_drag_payload(items.clone());
-    if response.clicked() {
-        *picked = Some(items);
+fn source(ui: &mut Ui, text: String, items: impl FnOnce() -> Vec<Cell>, suffix: Option<String>) {
+    let (grip, _) = ui.allocate_exact_size(vec2(9.0, 16.0), Sense::hover());
+    for x in [2.0, 6.0] {
+        for y in [4.0, 8.0, 12.0] {
+            ui.painter()
+                .circle_filled(grip.min + vec2(x, y), 0.8, theme::TEXT_DIM);
+        }
+    }
+    let response = ui
+        .add(
+            egui::Label::new(RichText::new(text.as_str()).size(11.0))
+                .selectable(false)
+                .truncate()
+                .sense(Sense::drag()),
+        )
+        .on_hover_cursor(egui::CursorIcon::Grab);
+    let grip_id = response.id.with("grip");
+    let response = response.union(ui.interact(grip, grip_id, Sense::drag()).on_hover_cursor(egui::CursorIcon::Grab));
+    if response.drag_started() {
+        response.dnd_set_drag_payload(Payload {
+            label: text.trim_start_matches('●').trim().to_owned(),
+            items: items(),
+            from: None,
+        });
+    }
+    if let Some(suffix) = suffix {
+        ui.label(RichText::new(suffix).size(9.0).color(theme::TEXT_DIM));
     }
 }
-fn toolbar(ui: &mut Ui, st: &mut State, saved: &mut Vec<Layout>) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        ui.label(RichText::new("Grid").small().color(theme::TEXT_DIM));
-        for n in 1..=4 {
-            let on = st
-                .layout
-                .as_ref()
-                .is_some_and(|l| l.rows == n && l.cols == n);
-            let button = egui::Button::new(RichText::new(format!("{n}×{n}")).size(11.0))
-                .small()
-                .fill(if on {
-                    theme::ACTIVE_VIEW
-                } else {
-                    Color32::from_gray(54)
-                });
-            if ui.add(button).clicked() {
-                st.layout.as_mut().unwrap().resize(n);
-                st.picked = None;
-                crate::views::drop_later(Some(std::mem::take(&mut st.graphs)));
-            }
+fn presets(ui: &mut Ui, st: &mut State, saved: &mut Vec<Layout>, data: &ViewData) {
+    ui.menu_button(RichText::new("Saved layouts").size(11.0), |ui| {
+        if saved.is_empty() {
+            ui.label(RichText::new("No saved layouts").weak());
         }
-        ui.menu_button(RichText::new("Saved layouts").size(11.0), |ui| {
-            if saved.is_empty() {
-                ui.label(RichText::new("No saved layouts").weak());
-            }
-            let mut remove = None;
-            for (i, l) in saved.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.button(&l.name).clicked() {
-                        let mut next = l.clone();
-                        next.normalize();
+        let mut remove = None;
+        for (i, layout) in saved.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button(&layout.name).clicked() {
+                    let mut next = layout.clone();
+                    next.normalize();
+                    next.canonicalize(data);
+                    if st.layout.as_ref() != Some(&next) {
                         st.layout = Some(next);
-                        st.picked = None;
-                        crate::views::drop_later(Some(std::mem::take(&mut st.graphs)));
-                        ui.close_menu();
+                        st.note = Some("Layout loaded");
+                        st.reconcile();
                     }
-                    if ui.small_button("×").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                saved.remove(i);
-            }
-        });
-        if ui
-            .small_button(RichText::new("+ Save layout").size(11.0))
-            .clicked()
-        {
-            st.save_name = Some(String::new());
-            st.focus_name = true;
+                    ui.close_menu();
+                }
+                if ui.small_button("×").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            saved.remove(i);
         }
     });
+}
+fn save_button(ui: &mut Ui, st: &mut State) {
+    if ui
+        .small_button(RichText::new("+ Save layout").size(11.0))
+        .clicked()
+    {
+        st.save_name = Some(String::new());
+        st.focus_name = true;
+        ui.close_menu();
+    }
+}
+fn sizes(ui: &mut Ui, st: &mut State) {
+    ui.label(RichText::new("Grid").small().color(theme::TEXT_DIM));
+    for n in 1..=4 {
+        let on = st
+            .layout
+            .as_ref()
+            .is_some_and(|l| l.rows == n && l.cols == n);
+        let button = egui::Button::new(RichText::new(format!("{n}×{n}")).size(11.0))
+            .small()
+            .fill(if on {
+                theme::ACTIVE_VIEW
+            } else {
+                Color32::from_gray(54)
+            });
+        if ui.add(button).clicked() && !on {
+            st.layout.as_mut().unwrap().resize(n);
+            st.note = Some("Grid resized");
+            st.reconcile();
+        }
+    }
+}
+fn toolbar(ui: &mut Ui, st: &mut State, saved: &mut Vec<Layout>, data: &ViewData) {
+    let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.toolbar"));
+    let width = ui.available_width();
+    let row = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            if width >= 235.0 {
+                sizes(ui, st);
+            }
+            if width >= 450.0 {
+                presets(ui, st, saved, data);
+                save_button(ui, st);
+            } else {
+                ui.menu_button("···", |ui| {
+                    if width < 235.0 {
+                        sizes(ui, st);
+                    }
+                    presets(ui, st, saved, data);
+                    save_button(ui, st);
+                });
+            }
+        })
+        .response
+        .rect;
     if let Some(name) = &mut st.save_name {
         let mut commit = false;
         let mut cancel = false;
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(name)
-                    .hint_text("Layout name")
-                    .desired_width(150.0)
-                    .char_limit(64),
-            );
-            if st.focus_name {
-                response.request_focus();
-                st.focus_name = false;
-            }
-            commit = ui.input(|i| i.key_pressed(egui::Key::Enter)) && !name.trim().is_empty();
-            cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            ui.label(
-                RichText::new("Enter to save · Esc to cancel")
-                    .small()
-                    .weak(),
-            );
-        });
-        if commit {
+        egui::Area::new(ui.id().with("save_layout_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(
+                (row.right() - 230.0).max(row.left()),
+                row.bottom() + 3.0,
+            ))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(210.0);
+                    ui.label("Layout name");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .desired_width(200.0)
+                            .char_limit(64),
+                    );
+                    if st.focus_name {
+                        response.request_focus();
+                        st.focus_name = false;
+                    }
+                    ui.horizontal(|ui| {
+                        commit = ui
+                            .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        commit = !name.trim().is_empty();
+                    }
+                    cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if commit || cancel {
+                        response.surrender_focus();
+                    }
+                });
+            });
+        if cancel {
+            st.save_name = None;
+        } else if commit {
             let mut layout = st.layout.as_ref().unwrap().clone();
             layout.name = name.trim().to_owned();
+            layout.canonicalize(data);
             if let Some(i) = saved.iter().position(|l| l.name == layout.name) {
                 saved.remove(i);
             }
             saved.push(layout);
-            st.save_name = None;
-        } else if cancel {
             st.save_name = None;
         }
     }
@@ -325,7 +432,9 @@ fn list(
     file_id: usize,
     chosen: Option<usize>,
     filters: &SharedFilters,
+    names: &ChannelNames,
 ) -> Option<Action> {
+    let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.list"));
     let mut action = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Devices").small().color(theme::TEXT_DIM));
@@ -355,12 +464,6 @@ fn list(
                                 st.expanded.insert(di);
                             }
                         }
-                        source(
-                            ui,
-                            device_title(data, di),
-                            model::items(data, di),
-                            &mut st.picked,
-                        );
                         let display = filters
                             .lock()
                             .unwrap()
@@ -368,8 +471,51 @@ fn list(
                             .get(&di)
                             .map(|f| f.display())
                             .unwrap_or_default();
-                        if let Some(badge) = display_badge(&display) {
-                            device_filter::badge(ui, badge);
+                        // Reserve actions before truncating the draggable title/badge.
+                        let badge = display_badge(&display);
+                        let badge_w = badge.map_or(0.0, |text| {
+                            (text.chars().count() as f32 * 5.0 + 8.0).min(80.0)
+                        });
+                        let action_w = if d.plate.is_none() { 52.0 } else { 28.0 };
+                        let gaps =
+                            ui.spacing().item_spacing.x * if badge.is_some() { 2.0 } else { 1.0 };
+                        let name_w = (ui.available_width() - badge_w - action_w - gaps).max(28.0);
+                        ui.allocate_ui_with_layout(
+                            vec2(name_w, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                source(ui, device_title(data, di), || model::items(data, di), None);
+                            },
+                        );
+                        if let Some(badge) = badge {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(badge_w, 17.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, 2.0, Color32::from_rgb(9, 71, 113));
+                            ui.put(
+                                rect,
+                                egui::Label::new(
+                                    RichText::new(badge).size(9.5).color(Color32::WHITE),
+                                )
+                                .selectable(false)
+                                .truncate(),
+                            );
+                        }
+                        if d.plate.is_none()
+                            && ui
+                                .add_sized(
+                                    [action_w, 18.0],
+                                    egui::Button::new(RichText::new("Fill grid").size(10.5))
+                                        .small(),
+                                )
+                                .clicked()
+                        {
+                            let before = st.layout.clone();
+                            st.layout.as_mut().unwrap().fill_device(data, di);
+                            if st.layout != before {
+                                st.note = Some("Grid filled");
+                                st.reconcile();
+                            }
                         }
                         if let Some(pi) = d.plate {
                             ui.with_layout(
@@ -405,14 +551,21 @@ fn list(
                             );
                             // Expanding a list uses metadata only; a visible cell demands samples.
                             drop(guard);
-                            for (ci, c) in d.channels.iter().enumerate() {
+                            for (ci, _) in d.channels.iter().enumerate() {
                                 let name = if d.plate.is_some() && ci < 6 {
                                     PLATE_LANES[ci].0
                                 } else {
-                                    c.name.as_str()
+                                    model::display_name(names, data, di, ci)
                                 };
                                 if let Some(cell) = model::channel(data, di, ci) {
-                                    source(ui, format!("●  {name}"), vec![cell], &mut st.picked);
+                                    ui.horizontal(|ui| {
+                                        source(
+                                            ui,
+                                            format!("●  {name}"),
+                                            || vec![cell],
+                                            d.plate.is_none().then(|| format!("ch {ci}")),
+                                        )
+                                    });
                                 }
                             }
                         });
@@ -423,7 +576,17 @@ fn list(
     action
 }
 fn empty(ui: &mut Ui, rect: Rect, text: &str) {
-    let stroke = Stroke::new(1.0_f32, Color32::from_gray(65));
+    dashed(ui, rect, Color32::from_gray(65));
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(11.0),
+        theme::TEXT_DIM,
+    );
+}
+fn dashed(ui: &mut Ui, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(1.0_f32, color);
     for [a, b] in [
         [rect.left_top(), rect.right_top()],
         [rect.right_top(), rect.right_bottom()],
@@ -443,29 +606,33 @@ fn empty(ui: &mut Ui, rect: Rect, text: &str) {
             );
         }
     }
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        text,
-        FontId::proportional(11.0),
-        theme::TEXT_DIM,
-    );
 }
-fn header(ui: &mut Ui, title: &str, badge: Option<&str>, plate: bool) {
+fn header(
+    ui: &mut Ui,
+    title: &str,
+    suffix: Option<String>,
+    badge: Option<&str>,
+    plate: bool,
+    at: usize,
+    cell: &Cell,
+) -> bool {
+    let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.chip"));
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-    let painter = ui.painter().with_clip_rect(r.shrink2(vec2(0.0, 1.0)));
-    let badge_w = badge.map_or(0.0, |s| {
-        (s.chars().count() as f32 * 5.0 + 8.0).min(r.width() * 0.68)
-    });
-    let title_width = painter
-        .layout_no_wrap(title.to_owned(), FontId::proportional(10.5), theme::TEXT)
+    let painter = ui.painter().with_clip_rect(r);
+    let font = FontId::proportional(10.5);
+    let title_w = painter
+        .layout_no_wrap(title.to_owned(), font.clone(), theme::TEXT)
         .size()
-        .x
-        + 18.0;
-    let name_w = (r.width() - badge_w - 5.0)
-        .max(24.0)
-        .min(title_width.max(24.0));
-    let name = Rect::from_min_size(r.min + vec2(2.0, 1.0), vec2(name_w, 17.0));
+        .x;
+    let suffix_w = suffix.as_ref().map_or(0.0, |s| {
+        painter
+            .layout_no_wrap(s.clone(), FontId::proportional(9.0), theme::TEXT_DIM)
+            .size()
+            .x
+            + 5.0
+    });
+    let name_w = (title_w + suffix_w + 33.0).min(r.width()).max(24.0);
+    let name = Rect::from_min_size(r.min + vec2(2.0, 1.0), vec2(name_w - 2.0, 17.0));
     painter.rect_filled(name, 2.0, Color32::from_gray(18));
     painter.circle_filled(
         name.left_center() + vec2(6.0, 0.0),
@@ -476,24 +643,73 @@ fn header(ui: &mut Ui, title: &str, badge: Option<&str>, plate: bool) {
             Color32::from_rgb(192, 128, 192)
         },
     );
-    painter.with_clip_rect(name.shrink2(vec2(1.0, 0.0))).text(
-        name.left_center() + vec2(13.0, 0.0),
-        Align2::LEFT_CENTER,
-        title,
-        FontId::proportional(10.5),
-        theme::TEXT,
-    );
-    if let Some(text) = badge {
-        let rect = Rect::from_min_size(pos2(name.right() + 4.0, name.top()), vec2(badge_w, 17.0));
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(9, 71, 113));
-        painter.with_clip_rect(rect).text(
-            rect.left_center() + vec2(3.0, 0.0),
+    let close = Rect::from_min_size(name.right_top() - vec2(18.0, 0.0), vec2(18.0, 17.0));
+    let drag_rect = Rect::from_min_max(name.min, close.left_bottom());
+    let drag = ui
+        .interact(drag_rect, ui.id().with(("cell_chip", at)), Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::Grab);
+    if drag.drag_started() {
+        drag.dnd_set_drag_payload(Payload {
+            label: title.to_owned(),
+            items: vec![cell.clone()],
+            from: Some(at),
+        });
+    }
+    let clip = painter.with_clip_rect(name);
+    let title_room = (drag_rect.width() - suffix_w - 13.0).max(0.0);
+    let text_rect = Rect::from_min_size(name.min + vec2(13.0, 0.0), vec2(title_room, 17.0));
+    if title_room > 0.0 {
+        let mut job =
+            egui::text::LayoutJob::simple(title.to_owned(), font, theme::TEXT, f32::INFINITY);
+        job.wrap.max_width = title_room;
+        job.wrap.max_rows = 1;
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+        let pos = text_rect.left_center() - vec2(0.0, galley.size().y / 2.0);
+        clip.galley(pos, galley, theme::TEXT);
+    }
+    if let Some(suffix) = suffix {
+        clip.text(
+            pos2(text_rect.right() + 3.0, name.center().y),
             Align2::LEFT_CENTER,
-            text,
-            FontId::proportional(9.5),
-            Color32::WHITE,
+            suffix,
+            FontId::proportional(9.0),
+            theme::TEXT_DIM,
         );
     }
+    let clear = ui
+        .interact(close, ui.id().with(("clear", at)), Sense::click())
+        .on_hover_text("Clear cell");
+    clip.text(
+        close.center(),
+        Align2::CENTER_CENTER,
+        "×",
+        FontId::proportional(13.0),
+        if clear.hovered() {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        },
+    );
+    if let Some(text) = badge {
+        let badge_rect = Rect::from_min_max(pos2(name.right() + 4.0, name.top()), r.right_bottom());
+        if badge_rect.width() > 25.0 {
+            let p = painter.with_clip_rect(badge_rect);
+            let w = (text.chars().count() as f32 * 5.0 + 7.0).min(badge_rect.width());
+            p.rect_filled(
+                Rect::from_min_size(badge_rect.min, vec2(w, 17.0)),
+                2.0,
+                Color32::from_rgb(9, 71, 113),
+            );
+            p.text(
+                badge_rect.left_top() + vec2(3.0, 8.5),
+                Align2::LEFT_CENTER,
+                text,
+                FontId::proportional(9.5),
+                Color32::WHITE,
+            );
+        }
+    }
+    clear.clicked()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -507,7 +723,9 @@ pub fn show(
     emg_failure: Option<&str>,
     filters: &SharedFilters,
     saved: &mut Vec<Layout>,
+    names: &ChannelNames,
 ) -> Option<Action> {
+    let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.show"));
     if !ui.is_visible() {
         return None;
     }
@@ -517,10 +735,10 @@ pub fn show(
     }
     st.layout
         .get_or_insert_with(|| Layout::initial(data, saved));
-    toolbar(ui, st, saved);
+    toolbar(ui, st, saved, data);
     ui.add_space(3.0);
     let area = ui.available_rect_before_wrap();
-    let folded = *st.folded.get_or_insert(area.width() < 620.0);
+    let folded = st.folded.unwrap_or(area.width() < 620.0);
     let list_w = if folded {
         22.0
     } else {
@@ -535,7 +753,7 @@ pub fn show(
                 st.folded = Some(false);
             }
         } else {
-            action = list(ui, data, st, file_id, chosen, filters);
+            action = list(ui, data, st, file_id, chosen, filters, names);
         }
     });
     let grid = Rect::from_min_max(pos2(left.right() + 5.0, area.top()), area.max);
@@ -554,38 +772,53 @@ pub fn show(
     let mut displays: HashMap<usize, Display> = HashMap::new();
     let mut placement = None;
     let mut clear = None;
-    for (at, cell) in cells.iter().enumerate() {
-        let rect = Rect::from_min_size(
+    let cell_rect = |at: usize| {
+        Rect::from_min_size(
             grid.min
                 + vec2(
                     (at % cols) as f32 * (size.x + 4.0),
                     (at / cols) as f32 * (size.y + 4.0),
                 ),
             size,
-        );
+        )
+    };
+    let probe = model::PROBE.get().and_then(|p| p.drag);
+    let payload = egui::DragAndDrop::payload::<Payload>(ui.ctx()).or_else(|| {
+        probe.map(|(di, _)| {
+            Arc::new(Payload {
+                label: data
+                    .devices
+                    .get(di)
+                    .map_or(String::new(), |_| device_title(data, di)),
+                items: model::items(data, di),
+                from: None,
+            })
+        })
+    });
+    let target = probe.map(|(_, at)| at).or_else(|| {
+        ui.input(|i| i.pointer.hover_pos())
+            .and_then(|p| (0..cells.len()).find(|&at| cell_rect(at).contains(p)))
+    });
+    let placing = payload.is_some();
+    let destinations = payload
+        .as_ref()
+        .zip(target)
+        .map_or_else(Vec::new, |(p, at)| {
+            if p.from.is_some() {
+                vec![at]
+            } else {
+                layout.destinations(at, p.items.len())
+            }
+        });
+    for (at, cell) in cells.iter().enumerate() {
+        let rect = cell_rect(at);
         if !ui.is_rect_visible(rect) {
             continue;
         }
-        let payload = egui::DragAndDrop::payload::<Vec<Cell>>(ui.ctx());
-        let placing = payload.is_some() || st.picked.is_some();
-        let response = ui.interact(
-            rect,
-            ui.id().with(("grid_cell", at)),
-            if placing {
-                Sense::click()
-            } else {
-                Sense::hover()
-            },
-        );
-        if response.contains_pointer() && placing {
-            ui.painter()
-                .rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::ACCENT));
-            if let Some(items) = response.dnd_release_payload::<Vec<Cell>>() {
+        let response = ui.interact(rect, ui.id().with(("grid_cell", at)), Sense::hover());
+        if placing && target == Some(at) {
+            if let Some(items) = response.dnd_release_payload::<Payload>() {
                 placement = Some((at, items.as_ref().clone()));
-            } else if response.clicked() {
-                if let Some(items) = st.picked.take() {
-                    placement = Some((at, items));
-                }
             }
         }
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
@@ -594,8 +827,28 @@ pub fn show(
                 empty(ui, rect.shrink(1.0), "Drop here");
                 return;
             };
-            let Some((di, channels)) = cell.resolve(data) else {
-                empty(ui, rect.shrink(1.0), "Not in this file");
+            let resolved = {
+                let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.resolve"));
+                cell.resolve(data)
+            };
+            let Some((di, channels)) = resolved else {
+                let title = match cell {
+                    Cell::Channel { channel, .. } => channel.as_str(),
+                    _ => cell.device(),
+                };
+                if header(
+                    ui,
+                    title,
+                    None,
+                    None,
+                    matches!(cell, Cell::Plate { .. }),
+                    at,
+                    cell,
+                ) {
+                    clear = Some(at);
+                }
+                let body = Rect::from_min_max(rect.min + vec2(0.0, 20.0), rect.max);
+                empty(ui, body.shrink(1.0), "Not in this file");
                 return;
             };
             let d = &data.devices[di];
@@ -610,12 +863,33 @@ pub fn show(
                 }
                 f.display()
             });
-            header(
+            let title = {
+                let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.channel_name"));
+                cell_title(data, cell, di, &channels, names)
+            };
+            if header(
                 ui,
-                &cell_title(data, cell, di, &channels),
+                &title,
+                d.plate.is_none().then(|| format!("ch {}", channels[0])),
                 display_badge(display),
                 d.plate.is_some(),
-            );
+                at,
+                cell,
+            ) {
+                clear = Some(at);
+            }
+            if let Some(plate) = d.plate.and_then(|pi| data.plates.get(pi)) {
+                let current = frame
+                    .checked_sub(data.start_frame)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| plate.fz.get(i))
+                    .filter(|v| v.is_finite());
+                response.clone().on_hover_text(format!(
+                    "Fz: {} · max |Fz|: {:.1}",
+                    current.map_or("—".into(), |v| format!("{v:.1}")),
+                    plate.fz_abs_max
+                ));
+            }
             if d.plate.is_none() && data.emg_pending {
                 if emg_failure.is_none() && !ui.is_sizing_pass() && !ui.ctx().will_discard() {
                     st.request_emg = true;
@@ -645,6 +919,12 @@ pub fn show(
                 crate::views::drop_later(st.graphs.insert(at, replacement));
             }
             let graph = st.graphs.get_mut(&at).unwrap();
+            if d.plate.is_none() {
+                let name = model::display_name(names, data, di, channels[0]);
+                if graph.lanes[0].letter != name {
+                    graph.lanes[0].letter = name.to_owned();
+                }
+            }
             let lane_h =
                 ((rect.height() - 24.0 - graph::NAV_H) / graph.lanes.len().max(1) as f32).max(1.0);
             let mut look = Look::pane();
@@ -668,24 +948,93 @@ pub fn show(
                 action = Some(Action::GotoFrame(f));
             }
         });
-        if cell.is_some() && response.contains_pointer() && !placing {
-            let x = Rect::from_min_size(rect.right_top() - vec2(18.0, 0.0), vec2(18.0, 18.0));
-            if ui.put(x, egui::Button::new("×").small()).clicked() {
-                clear = Some(at);
+        if placing {
+            let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.drop_overlay"));
+            if cell.is_none() {
+                dashed(ui, rect.shrink(1.0), theme::ACCENT);
+            }
+            if destinations.contains(&at) {
+                ui.painter()
+                    .rect_filled(rect, 0.0, theme::ACCENT.gamma_multiply(0.15));
+                ui.painter()
+                    .rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(1.5, theme::ACCENT));
+            }
+            if target == Some(at) {
+                let payload = payload.as_ref().unwrap();
+                let title = cell.as_ref().map(|cell| {
+                    cell.resolve(data).map_or_else(
+                        || cell.device().to_owned(),
+                        |(di, ch)| cell_title(data, cell, di, &ch, names),
+                    )
+                });
+                let label = if payload.from == Some(at) {
+                    "".into()
+                } else if payload.from.is_some() && cell.is_some() {
+                    "Swap".into()
+                } else if let Some(title) = title {
+                    format!("Replace: {title}")
+                } else {
+                    "Drop to place".into()
+                };
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
+                let chip = Rect::from_center_size(rect.center(), galley.size() + vec2(12.0, 8.0));
+                ui.painter()
+                    .rect_filled(chip, 2.0, Color32::from_rgb(9, 71, 113));
+                ui.painter()
+                    .galley(chip.min + vec2(6.0, 4.0), galley, Color32::WHITE);
             }
         }
     }
-    if let Some((at, items)) = placement {
-        st.layout.as_mut().unwrap().place(at, &items);
-        st.picked = None;
-        crate::views::drop_later(Some(std::mem::take(&mut st.graphs)));
+    if let Some(payload) = &payload {
+        let _timing = crate::bench_timing::enabled().then(|| crate::bench_timing::span("device_grid.ghost"));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(pointer) = probe
+            .map(|(_, at)| cell_rect(at.min(cells.len() - 1)).center())
+            .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+        {
+            let text = format!("● {}", payload.label);
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                ui.id().with("drag_ghost"),
+            ));
+            let galley = painter.layout_no_wrap(text, FontId::proportional(11.0), theme::TEXT);
+            let rect =
+                Rect::from_min_size(pointer + vec2(14.0, 16.0), galley.size() + vec2(10.0, 6.0));
+            painter.rect_filled(rect, 2.0, Color32::from_gray(18));
+            painter.galley(rect.min + vec2(5.0, 3.0), galley, theme::TEXT);
+        }
+    }
+    if let Some((at, payload)) = placement {
+        let layout = st.layout.as_mut().unwrap();
+        let before = layout.clone();
+        let message = if let Some(from) = payload.from {
+            let swap = layout.cells[at].is_some();
+            layout.move_or_swap(from, at);
+            if swap {
+                "Cells swapped"
+            } else {
+                "Cell moved"
+            }
+        } else {
+            let replace = layout.cells[at].is_some();
+            layout.place(at, &payload.items);
+            if replace {
+                "Cell replaced"
+            } else {
+                "Cell placed"
+            }
+        };
+        if *layout != before {
+            st.note = Some(message);
+            st.reconcile();
+        }
     }
     if let Some(at) = clear {
         st.layout.as_mut().unwrap().cells[at] = None;
-        crate::views::drop_later(st.graphs.remove(&at));
-    }
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        st.picked = None;
+        st.note = Some("Cell cleared");
+        st.reconcile();
     }
     ui.advance_cursor_after_rect(area);
     action
@@ -702,6 +1051,7 @@ mod tests {
         saved: Vec<Layout>,
         filters: SharedFilters,
         frame: usize,
+        width: f32,
     }
     impl Harness {
         fn new() -> Self {
@@ -715,13 +1065,17 @@ mod tests {
                 saved: vec![],
                 filters: Default::default(),
                 frame: 0,
+                width: 960.0,
             }
         }
         fn render(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
             self.frame += 1;
             self.ctx.run(
                 egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(960.0, 640.0))),
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(self.width, 640.0),
+                    )),
                     time: Some(self.frame as f64 / 60.0),
                     events,
                     ..Default::default()
@@ -738,6 +1092,7 @@ mod tests {
                             None,
                             &self.filters,
                             &mut self.saved,
+                            &ChannelNames::default(),
                         );
                     });
                 },
@@ -775,6 +1130,141 @@ mod tests {
         }
     }
 
+    #[test]
+    fn automatic_fold_tracks_width_manual_override_and_save_keeps_grid_geometry() {
+        let mut h = Harness::new();
+        h.state.folded = None;
+        h.width = 600.0;
+        h.render(vec![]);
+        let out = h.render(vec![]);
+        assert!(Harness::text(&out, "Devices").is_empty());
+        assert_eq!(h.state.folded, None);
+        h.width = 960.0;
+        let out = h.render(vec![]);
+        assert_eq!(Harness::text(&out, "Devices").len(), 1);
+        h.click(Harness::text(&out, "◀")[0].center());
+        h.width = 800.0;
+        let out = h.render(vec![]);
+        assert!(Harness::text(&out, "Devices").is_empty());
+        assert_eq!(h.state.folded, Some(true));
+        let before = Harness::text(&out, "Drop here");
+        h.state.save_name = Some(String::new());
+        h.state.focus_name = true;
+        h.render(vec![]);
+        let out = h.render(vec![]);
+        assert_eq!(
+            Harness::text(&out, "Drop here"),
+            before,
+            "popover never moves grid"
+        );
+        h.state.save_name = None;
+        h.width = 389.0;
+        h.render(vec![]);
+        let out = h.render(vec![]);
+        assert_eq!(Harness::text(&out, "···").len(), 1);
+        assert!(Harness::text(&out, "+ Save layout").is_empty());
+        assert!(
+            Harness::text(&out, "1×1")[0].center().y - Harness::text(&out, "4×4")[0].center().y
+                < 1.0
+        );
+    }
+    #[test]
+    fn unchanged_cell_keeps_prepared_graph_across_resize_place_and_preset_load() {
+        let mut h = Harness::new();
+        h.state
+            .layout
+            .as_mut()
+            .unwrap()
+            .place(0, &model::items(&h.data, 0));
+        h.render(vec![]);
+        h.render(vec![]);
+        h.state.graphs.get_mut(&0).unwrap().drawn.push_more(vec![]);
+        let sentinel = h.state.graphs[&0].drawn.more_len();
+        let key = h.state.graphs[&0].key.clone();
+        h.state.layout.as_mut().unwrap().resize(3);
+        h.state.reconcile();
+        assert_eq!(h.state.graphs[&0].key, key);
+        assert_eq!(h.state.graphs[&0].drawn.more_len(), sentinel);
+        h.state
+            .layout
+            .as_mut()
+            .unwrap()
+            .place(1, &model::items(&h.data, 1));
+        h.state.reconcile();
+        assert_eq!(h.state.graphs[&0].drawn.more_len(), sentinel);
+        let next = h.state.arrangement();
+        h.state.restore(&next);
+        assert_eq!(h.state.graphs[&0].drawn.more_len(), sentinel);
+        h.state
+            .layout
+            .as_mut()
+            .unwrap()
+            .place(0, &model::items(&h.data, 1));
+        h.state.reconcile();
+        assert!(!h.state.graphs.contains_key(&0));
+    }
+    #[test]
+    fn real_chip_drag_swaps_then_moves_and_click_never_places() {
+        let mut h = Harness::new();
+        h.state
+            .layout
+            .as_mut()
+            .unwrap()
+            .place(0, &model::items(&h.data, 0));
+        h.state
+            .layout
+            .as_mut()
+            .unwrap()
+            .place(1, &model::items(&h.data, 1));
+        h.render(vec![]);
+        let out = h.render(vec![]);
+        let from = Harness::text(&out, "P1")
+            .into_iter()
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap()
+            .center();
+        let to = Harness::text(&out, "P2")
+            .into_iter()
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap()
+            .center()
+            + vec2(0.0, 50.0);
+        let drag = |h: &mut Harness, from: egui::Pos2, to: egui::Pos2| {
+            h.render(vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ]);
+            h.render(vec![egui::Event::PointerMoved(from + vec2(15.0, 0.0))]);
+            let preview = h.render(vec![egui::Event::PointerMoved(to)]);
+            h.render(vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }]);
+            preview
+        };
+        let before = h.state.layout.clone().unwrap();
+        let preview = drag(&mut h, from, to);
+        assert!(!Harness::text(&preview, "Swap").is_empty());
+        assert_eq!(h.state.layout.as_ref().unwrap().cells[0], before.cells[1]);
+        assert_eq!(h.state.layout.as_ref().unwrap().cells[1], before.cells[0]);
+        let out = h.render(vec![]);
+        let from = Harness::text(&out, "P1")
+            .into_iter()
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap()
+            .center();
+        let to = Harness::text(&out, "Drop here")[0].center();
+        drag(&mut h, from, to);
+        assert!(h.state.layout.as_ref().unwrap().cells[1].is_none());
+        assert_eq!(h.state.layout.as_ref().unwrap().cells[2], before.cells[0]);
+    }
     #[test]
     fn actual_device_drag_replaces_a_grid_cell_and_hover_close_clears_it() {
         let mut h = Harness::new();
