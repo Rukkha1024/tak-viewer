@@ -89,6 +89,7 @@ mod scene_marker_menu {
             frame_with(&ctx, &mut app, vec![]);
             app.quiet();
             let count = steps(&app, 0).0;
+            let before = snapshot(&app).revision();
             let original = read_saved(dir.join("labels.takm"));
 
             if scene {
@@ -100,7 +101,7 @@ mod scene_marker_menu {
                 app.labeling_action(&ctx, 0, crate::ui::labeling::LabelingAction::LabelMarker(KEY_A));
             }
 
-            wait(&ctx, &mut app, |app| !app.marker_job_running(0));
+            wait_for_close_edit(&ctx, &mut app, before);
             assert_eq!(steps(&app, 0).0, count + 1, "{:?}", app.takm_note);
             assert_eq!(app.views[0].armed_label, None);
             let edited = snapshot(&app);

@@ -51,43 +51,43 @@ fn picked_progress_writes_unopened_and_clean_open_takm_with_undo_redo() {
     let pick = |before, after| Pick { target: Target::Local(path.clone()), before: State(before), after: State(after), stamp: Some(stamp()) };
 
     app.pick_progress(&ctx, pick(None, Some(2)));
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &path);
     assert_eq!(saved().as_deref(), Some("2"));
     assert_eq!(app.history.kinds().last().map(String::as_str), Some("Progress"));
     app.undo_redo(&ctx, false);
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &path);
     assert_eq!(saved(), None);
     app.undo_redo(&ctx, true);
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &path);
     assert_eq!(saved().as_deref(), Some("2"));
 
     app.open_in(&ctx, 0, path.clone());
-    wait_for_progress_view(&ctx, &mut app);
+    wait_for_progress_view(&ctx, &mut app, &path);
     assert_eq!(app.views[0].take_progress(), Some(State(Some(2))));
     let old = stamp();
     app.pick_progress(&ctx, pick(Some(2), Some(5)));
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &path);
     assert_eq!(saved().as_deref(), Some("5"));
     assert_eq!(app.views[0].take_progress(), Some(State(Some(5))));
     assert!(!app.views[0].marker_dirty());
     assert_eq!(app.explorer.progress.visible_row(&path, old), Some((stamp(), State(Some(5)))));
 }
 
-fn wait_for_progress(ctx: &egui::Context, app: &mut TakViewerApp) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.progress_job.is_some() {
+fn wait_for_progress(ctx: &egui::Context, app: &mut TakViewerApp, path: &Path) {
+    assert!(app.progress_writing(path), "no write started for {path:?}: {:?}", app.takm_note);
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    while app.progress_writing(path) {
+        watchdog.pause(|| format!("progress write for {path:?}: {:?}", app.takm_note));
         frame_with(ctx, app, vec![]);
-        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
-        std::thread::sleep(Duration::from_millis(4));
     }
 }
 
-fn wait_for_progress_view(ctx: &egui::Context, app: &mut TakViewerApp) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.views[0].data.is_none() || app.views[0].analog_work_pending() {
+fn wait_for_progress_view(ctx: &egui::Context, app: &mut TakViewerApp, path: &Path) {
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    while app.views[0].path() != Some(path) || app.views[0].analog_work_pending() {
+        watchdog.pause(|| format!("loading {path:?}: shown={:?}, target={:?}, analog={}, error={:?}",
+            app.views[0].path(), app.views[0].target(), app.views[0].analog_work_pending(), app.error));
         frame_with(ctx, app, vec![]);
-        assert!(Instant::now() < deadline, "{:?}", app.error);
-        std::thread::sleep(Duration::from_millis(4));
     }
 }
 
@@ -101,23 +101,19 @@ fn progress_updates_save_baseline_and_leaves_unsaved_marker_edit_pending() {
     let disk_before = tak_core::tak::read_take(&path).unwrap();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.open_in(&ctx, 0, path.clone());
-    wait_for_progress_view(&ctx, &mut app);
+    wait_for_progress_view(&ctx, &mut app, &path);
     let marker = app.views[0].data.as_ref().unwrap().markers.iter()
         .position(|marker| marker.name == "LKNE").unwrap();
     let uid = app.views[0].data.as_ref().unwrap().markers[marker].uid;
     app.views[0].select(marker, false);
     app.views[0].range = Some((5, 10));
+    let before = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().revision();
     app.delete_selected(&ctx, 0);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.marker_job_running(0) || app.views[0].edit_refresh.is_some() {
-        frame_with(&ctx, &mut app, vec![]);
-        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
-        std::thread::sleep(Duration::from_millis(4));
-    }
+    wait_for_close_edit(&ctx, &mut app, before);
     assert!(app.views[0].marker_dirty(), "{:?}", app.takm_note);
     let expected = app.views[0].edit_document.as_ref().unwrap().lock().unwrap().snapshot();
     app.pick_progress(&ctx, Pick { target: Target::Local(path.clone()), before: State(None), after: State(Some(3)), stamp: None });
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &path);
     let progress_only = tak_core::tak::read_take(&path).unwrap();
     assert_eq!(progress_only.meta("Progress"), Some("3"), "{:?}", app.takm_note);
     assert_eq!(progress_only.trajectories.iter().find(|row| row.uid == uid).unwrap().frames,
@@ -125,12 +121,8 @@ fn progress_updates_save_baseline_and_leaves_unsaved_marker_edit_pending() {
     assert!(app.views[0].marker_dirty());
 
     app.save_markers(&ctx, 0, false, false);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.marker_saving(0) {
-        frame_with(&ctx, &mut app, vec![]);
-        assert!(Instant::now() < deadline, "{:?}", app.takm_note);
-        std::thread::sleep(Duration::from_millis(4));
-    }
+    assert!(app.marker_saving(0), "no marker save started for {path:?}: {:?}", app.takm_note);
+    close_wait_until(&ctx, &mut app, |app| !app.marker_saving(0));
     assert!(!app.views[0].marker_dirty(), "{:?}", app.takm_note);
     assert_eq!(tak_core::tak::read_take(&path).unwrap().meta("Progress"), Some("3"));
     let (input, _) = tak_core::edit::PreparedInput::read_from_path(&path).unwrap();
@@ -159,7 +151,7 @@ fn busy_or_failed_progress_write_keeps_state_and_history() {
     assert_eq!(std::fs::read(&path).unwrap(), original);
     let gone = temp.join("missing.takm");
     app.pick_progress(&ctx, pick(gone.clone()));
-    wait_for_progress(&ctx, &mut app);
+    wait_for_progress(&ctx, &mut app, &gone);
     assert!(!gone.exists());
     assert!(app.takm_note.as_ref().unwrap().0.contains("저장할 수 없어요"));
     assert!(!app.history.kinds().iter().any(|k| k == "Progress"));

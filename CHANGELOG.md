@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.69.3 — 2026-11-18
+
+- Tests for the Tracks wheel, Progress writes and QuickLabel edits wait for the real result. The Tracks wheel test failed about one run in seven under load.
+
 ## v0.69.2 — 2026-11-18
 
 - The SSH Progress test takes a server alias, platform and Python command. It checks the test folder before it connects.

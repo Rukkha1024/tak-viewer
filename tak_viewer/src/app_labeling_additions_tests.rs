@@ -1,5 +1,6 @@
-use super::integration_tests::{settled, step, wait_for};
+use super::integration_tests::{settled, step};
 use super::*;
+use crate::app::tests::{close_wait_until, wait_for_close_edit};
 use tak_core::tak;
 use tak_core::test_support::TempDir;
 use tak_core::view_data::ViewData;
@@ -184,7 +185,10 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     let ctx = egui::Context::default();
     let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
     app.open_in(&ctx, 0, path.clone());
-    wait_for(&ctx, &mut app, |app| app.views[0].data.is_some() && !app.views[0].analog_work_pending());
+    close_wait_until(&ctx, &mut app, |app| {
+        let view = &app.views[0];
+        view.path() == Some(path.as_path()) && !view.analog_work_pending()
+    });
     let index = app.views[0].data.as_ref().unwrap().markers.iter().position(|marker| marker.uid == source).unwrap();
     app.views[0].select(index, false);
     app.views[0].pb.set_frame(i64::from(moved_frame), 0.0);
@@ -196,8 +200,9 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     app.observe(false);
     let count = app.history.undo.len();
 
+    let before = session.lock().unwrap().revision();
     app.labeling_action(&ctx, 0, LabelingAction::LabelMarker(target));
-    wait_for(&ctx, &mut app, settled);
+    wait_for_close_edit(&ctx, &mut app, before);
     let assigned = session.lock().unwrap().snapshot();
     let check_assigned = |snapshot: &DocumentSnapshot| {
         let actual = snapshot.track(&destination).unwrap_or_else(|| panic!("assignment has no destination"));
@@ -211,19 +216,20 @@ fn labeling_context_assigns_exact_samples_in_one_undo_and_saves_takm() {
     assert_eq!(app.history.undo.len(), count + 1);
 
     app.undo_redo(&ctx, false);
-    wait_for(&ctx, &mut app, settled);
+    wait_for_close_edit(&ctx, &mut app, assigned.revision());
     let undone = session.lock().unwrap().snapshot();
     for track in [destination, source] {
         assert_eq!(undone.track(&track).unwrap().samples, original.track(&track).unwrap().samples);
     }
     assert_eq!(app.views[0].edit_selection_state(), expected_before_selection);
     app.undo_redo(&ctx, true);
-    wait_for(&ctx, &mut app, settled);
+    wait_for_close_edit(&ctx, &mut app, undone.revision());
     check_assigned(&session.lock().unwrap().snapshot());
     assert_eq!(app.views[0].armed_label, expected_before_selection.armed_label);
 
     app.save_markers(&ctx, 0, false, false);
-    wait_for(&ctx, &mut app, |app| !app.marker_saving(0));
+    assert!(app.marker_saving(0), "no marker save started for {path:?}: {:?}", app.takm_note);
+    close_wait_until(&ctx, &mut app, |app| !app.marker_saving(0));
     assert!(!app.views[0].marker_dirty(), "{:?}", app.takm_note);
     let reopened = snapshot_from_disk(&path);
     check_assigned(&reopened);

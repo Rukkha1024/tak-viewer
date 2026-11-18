@@ -1,5 +1,6 @@
 mod label_assignment {
     use super::*;
+    use super::close_wait_until as wait;
     use crate::label_increment::IncrementMode;
     use crate::ui::labeling::LabelingMode;
     use tak_core::edit::{DocumentSnapshot, LabelKey};
@@ -17,19 +18,6 @@ mod label_assignment {
 
     include!("app_scene_marker_menu_tests.rs");
 
-    fn wait(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
-        let start = Instant::now();
-        while !ready(app) {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "{:?}",
-                app.takm_note
-            );
-            frame_with(ctx, app, vec![]);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
     fn fixture(ctx: &egui::Context) -> (TempDir, TakViewerApp) {
         fixture_from(ctx, tak_core::sample_tak::sample_tak_for_label_assignments())
     }
@@ -44,9 +32,9 @@ mod label_assignment {
             "",
         )
         .unwrap();
-        let mut app = TakViewerApp::build(ctx, None, vec![path], None, None);
+        let mut app = TakViewerApp::build(ctx, None, vec![path.clone()], None, None);
         wait(ctx, &mut app, |app| {
-            app.views[0].data.is_some() && !app.views[0].busy()
+            app.views[0].path() == Some(path.as_path()) && !app.views[0].busy()
         });
         let view = &mut app.views[0];
         view.pb.set_frame(5, 0.0);
@@ -237,6 +225,7 @@ mod label_assignment {
         frame_with(&ctx, &mut app, vec![]);
         app.quiet();
         let undo_count = steps(&app, 0).0;
+        let edits = [false, true, true, false, true];
         let mut revisions = vec![snapshot(&app).revision()];
         for (index, position) in positions.into_iter().enumerate() {
             idle(&ctx, &mut app);
@@ -246,19 +235,26 @@ mod label_assignment {
             let point = marker_on_screen(&app, marker);
             assert!(app.views[0].scene_rect.contains(point), "click {} is outside 3D", index + 1);
             click_at(&ctx, &mut app, point);
-            wait(&ctx, &mut app, |app| !app.marker_job_running(0));
+            if edits[index] {
+                wait_for_close_edit(&ctx, &mut app, revisions[index]);
+            }
             assert_eq!(app.views[0].armed_label, Some(key(index as i32 + 2)), "{:?}", app.takm_note);
             assert_eq!(steps(&app, 0).0, undo_count + index + 1);
             revisions.push(snapshot(&app).revision());
         }
-        let edits = [false, true, true, false, true];
         for (pair, edited) in revisions.windows(2).zip(edits) {
             assert_eq!(pair[0] != pair[1], edited);
         }
         // Undo all five steps. Each edit must be one history entry, with its armed row.
         for index in (0..5).rev() {
             undo_key(&ctx, &mut app);
-            wait(&ctx, &mut app, |app| app.views[0].edit_refresh.is_none());
+            if edits[index] {
+                close_wait_until(&ctx, &mut app, |app| {
+                    let view = &app.views[0];
+                    view.data.as_ref().unwrap().edit_revision == Some(revisions[index])
+                        && view.edit_refresh.is_none()
+                });
+            }
             assert_eq!(app.views[0].armed_label, Some(key(index as i32 + 1)));
             assert_eq!(snapshot(&app).revision(), revisions[index]);
         }

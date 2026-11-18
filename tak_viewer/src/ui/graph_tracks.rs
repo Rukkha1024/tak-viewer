@@ -61,6 +61,14 @@ pub(crate) fn graph_id(file_id: usize) -> Id {
     Id::new(("sel_graph", file_id))
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollPass {
+    pub(crate) rows: usize,
+    pub(crate) painted_offset: f32,
+    pub(crate) committed_offset: f32,
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     file_id: Option<usize>,
@@ -70,9 +78,20 @@ pub(crate) struct State {
     offset: f32,
     spans: SpanCache,
     decorations: Decorations,
+    #[cfg(test)]
+    order_gate: Option<std::sync::mpsc::Receiver<()>>,
+    #[cfg(test)]
+    pub(crate) scroll_pass: Option<ScrollPass>,
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn hold_marker_order(&mut self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        self.order_gate = Some(gate);
+        release
+    }
+
     pub(super) fn prepare(&mut self, data: &Arc<ViewData>, file_id: usize, ui: &Ui) {
         if self.file_id != Some(file_id) {
             self.file_id = Some(file_id);
@@ -90,7 +109,15 @@ impl State {
             if handle.get().is_none() {
                 let data = data.clone();
                 let ctx = ui.ctx().clone();
+                #[cfg(test)]
+                let gate = self.order_gate.take();
                 crate::work_queue::geometry(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        if gate.recv().is_err() {
+                            return;
+                        }
+                    }
                     data.prepare_marker_order();
                     crate::work_queue::retire(data);
                     ctx.request_repaint();
@@ -293,6 +320,14 @@ pub(crate) fn show(
     state.offset = out.state.offset.y;
     let body = out.inner_rect;
     let (rows, top, offset) = out.inner;
+    #[cfg(test)]
+    {
+        state.scroll_pass = Some(ScrollPass {
+            rows: count,
+            painted_offset: offset,
+            committed_offset: state.offset,
+        });
+    }
     let name_width = (body.width() * 0.25)
         .clamp(84.0, 148.0)
         .min(body.width() * 0.52);

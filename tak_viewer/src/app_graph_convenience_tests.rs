@@ -164,27 +164,64 @@ fn graph_tracks_wheel_scrolls_rows_without_changing_time_extent() {
     app.set_graph_float(false);
     let file_id = app.views[0].file_id;
     let plot = graph::tracks::graph_id(file_id).with("tracks_body");
-    let wait = std::time::Instant::now();
+    let release = app.views[0].tracks.hold_marker_order();
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    // Labeling can paint the same name before Tracks receives its order.
+    loop {
+        let out = frame_with(&ctx, &mut app, vec![]);
+        if let Some(response) = ctx.read_response(plot) {
+            let names_in_window = text_rects(&out, &names[0]);
+            if !names_in_window.is_empty() {
+                assert!(names_in_window.iter().all(|rect| !response.interact_rect.contains(rect.center())));
+                assert_eq!(app.views[0].tracks.scroll_pass.unwrap().rows, 0);
+                assert!(!text_rects(&out, "Loading tracks…").is_empty());
+                break;
+            }
+        }
+        watchdog.pause(|| format!("Tracks order held: {:?}", app.views[0].tracks.scroll_pass));
+    }
+    release.send(()).unwrap();
+
+    let watchdog = crate::work_queue::TestWatchdog::new();
     let body = loop {
         let out = frame_with(&ctx, &mut app, vec![]);
-        if !text_rects(&out, &names[0]).is_empty() {
-            break ctx.read_response(plot).unwrap().interact_rect;
+        if let Some(response) = ctx.read_response(plot) {
+            let body = response.interact_rect;
+            if app.views[0].tracks.scroll_pass.is_some_and(|pass| pass.rows == names.len())
+                && text_rects(&out, &names[0]).iter().any(|rect| body.contains(rect.center()))
+            {
+                break body;
+            }
         }
-        assert!(wait.elapsed() < std::time::Duration::from_secs(3));
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        watchdog.pause(|| format!("Tracks order for file {file_id}: {:?}", app.views[0].tracks.scroll_pass));
     };
     let extent = graph::tracks::zoom_extent(&ctx, file_id);
-    frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(body.center())]);
-    frame_with(&ctx, &mut app, vec![egui::Event::MouseWheel {
-        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -620.0), modifiers: Modifiers::NONE,
-    }]);
-    let mut out = frame_with(&ctx, &mut app, vec![]);
+    let wheel_points = 620.0;
+    frame_with(&ctx, &mut app, vec![
+        egui::Event::PointerMoved(body.center()),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -wheel_points),
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let first_scroll = app.views[0].tracks.scroll_pass.unwrap();
+    assert!(first_scroll.committed_offset > 0.0,
+        "the first wheel over painted Tracks rows must move them: {first_scroll:?}");
+    let watchdog = crate::work_queue::TestWatchdog::new();
+    let out = loop {
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let pass = app.views[0].tracks.scroll_pass.unwrap();
+        // egui applies smoothed wheel input after laying out this pass's viewport.
+        if (pass.committed_offset - wheel_points).abs() < 0.01
+            && pass.painted_offset == pass.committed_offset
+        {
+            break out;
+        }
+        watchdog.pause(|| format!("Tracks wheel {wheel_points} pt for file {file_id}: {pass:?}"));
+    };
     let later_row_visible = |out: &egui::FullOutput| names[20..].iter().any(|name|
         text_rects(out, name).iter().any(|rect| body.contains(rect.center())));
-    for _ in 0..12 {
-        if later_row_visible(&out) { break; }
-        out = frame_with(&ctx, &mut app, vec![]);
-    }
     assert!(text_rects(&out, &names[0]).iter().all(|rect| !body.contains(rect.center())));
     assert!(later_row_visible(&out));
     assert_eq!(graph::tracks::zoom_extent(&ctx, file_id), extent);

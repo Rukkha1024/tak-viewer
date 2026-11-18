@@ -380,7 +380,7 @@ fn last_close_dirty_dialog_cancel_and_discard_work_for_all_three_entry_points() 
     }
 }
 
-fn close_wait_until(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
+pub(super) fn close_wait_until(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
     let watchdog = crate::work_queue::TestWatchdog::new();
     while !ready(app) {
         frame_with(ctx, app, vec![]);
@@ -391,7 +391,7 @@ fn close_wait_until(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(
     }
 }
 
-fn wait_for_close_edit(ctx: &egui::Context, app: &mut TakViewerApp, before: tak_core::edit::Revision) {
+pub(super) fn wait_for_close_edit(ctx: &egui::Context, app: &mut TakViewerApp, before: tak_core::edit::Revision) {
     close_wait_until(ctx, app, |app| {
         let view = &app.views[0];
         let revision = view.edit_document.as_ref().unwrap().lock().unwrap().revision();
