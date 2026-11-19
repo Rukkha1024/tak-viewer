@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.71.0 — 2026-11-19
+
+- Add WSL commands to check Windows and viewer options, test and build an isolated worker, and verify demo startup with a screenshot.
+
 ## v0.70.2 — 2026-11-18
 
 - `--summary` and `--check` print results, help and capture captions in simple English. Refusal and save failure reasons stay in easy Korean. JSON keys and codes unchanged.
