@@ -40,6 +40,7 @@ mod instances;
 mod shot;
 mod shot_output;
 mod label_increment;
+mod marker_order;
 mod ssh;
 mod ssh_probe;
 mod ssh_progress_probe;

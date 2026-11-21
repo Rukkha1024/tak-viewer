@@ -24,6 +24,7 @@ pub mod graph;
 pub mod graph_float;
 pub(crate) mod help_window;
 pub mod labeling;
+pub mod marker_order;
 pub mod open_editors;
 pub mod panels;
 pub mod scene;

@@ -181,6 +181,13 @@ pub(crate) fn declared_group_id(parent: &tak_core::tak::Uid) -> usize {
     hash.finish() as usize | (1usize << (usize::BITS - 1))
 }
 
+/// Like `declared_group_id`, for an asset's "Extra Markers" group made only from declarations.
+pub(crate) fn declared_extra_group_id(parent: &tak_core::tak::Uid) -> usize {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (parent, "extra").hash(&mut hash);
+    hash.finish() as usize | (1usize << (usize::BITS - 1))
+}
+
 /// Primary groups retain identity while their first trajectory appears or disappears.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FoldKey {

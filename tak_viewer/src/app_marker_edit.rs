@@ -1854,17 +1854,21 @@ impl TakViewerApp {
             if !seen.insert(key) {
                 continue;
             }
+            // Skeleton slot <= 0 is an extra marker: it belongs under "Extra Markers", not the set.
+            let extra = key.slot <= 0 && data.take.assets.iter().any(|a| a.uid == key.parent);
+            let wanted = |kind: GroupKind| if extra { kind == GroupKind::AssetExtra } else { matches!(kind, GroupKind::AssetTemplate | GroupKind::LabelGroup) };
+            let declared_id = if extra { panels::declared_extra_group_id(&key.parent) } else { panels::declared_group_id(&key.parent) } as u64;
             let index = groups
                 .iter()
                 .position(|group| group.asset_uid == Some(key.parent)
-                    && (data.groups.get(group.id as usize).is_some_and(|g| matches!(g.kind, GroupKind::AssetTemplate | GroupKind::LabelGroup))
-                        || group.id == panels::declared_group_id(&key.parent) as u64))
+                    && (data.groups.get(group.id as usize).is_some_and(|g| wanted(g.kind))
+                        || group.id == declared_id))
                 .unwrap_or_else(|| {
-                    let id = panels::declared_group_id(&key.parent) as u64;
+                    let id = declared_id;
                     let title = assets
                         .iter()
                         .find(|a| a.uid == key.parent)
-                        .map(|a| a.name.clone())
+                        .map(|a| if extra { format!("{} · Extra Markers", a.name) } else { a.name.clone() })
                         .unwrap_or_else(|| "Labels".to_owned());
                     groups.push(LabelGroup {
                         id,
@@ -1887,6 +1891,7 @@ impl TakViewerApp {
                 primary: false,
             });
         }
+        crate::marker_order::order_label_rows(&mut groups, &data.take, &self.settings.marker_order);
         ui.labeling.view_slot = slot;
         ui.labeling.increment = self.settings.labeling_increment;
         ui.labeling.link_to_3d = self.settings.labeling_link;
@@ -3347,6 +3352,68 @@ mod integration_tests {
         assert_eq!(groups[0].labels.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), ["Primary"]);
         assert_eq!(groups[1].labels.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), ["Extra"]);
         assert!(groups[1].title.ends_with("Extra Markers"));
+    }
+
+    /// v0.72.0: Labeled rows follow the file's declared order (Motive's order), a missing
+    /// extra declaration sits under Extra Markers, and the Settings order comes first.
+    #[test]
+    fn labeled_rows_follow_declared_then_settings_order_with_undo() {
+        let ctx = egui::Context::default();
+        let mut take = views::sample_take("order.tak", &["A", "B", "C", "XB"]);
+        let constraint = |name: &str, slot: i32| tak_core::tak::Constraint {
+            joint_id: 0, slot_raw: slot as u32, slot, name: name.into(), local: [0.0; 3], enabled: true, primary: true,
+        };
+        take.assets.push(tak_core::tak::SkeletonAsset {
+            uid: [7; 16], name: "Asset".into(), markerset_name: None,
+            model: Some(tak_core::tak::SkeletonModel { serialization_version: 1, template_code: 1, joints: vec![],
+                constraints: vec![constraint("B", 2), constraint("A", 1), constraint("XA", -1), constraint("C", 3)] }),
+            slot_comparison_model: None,
+            sticks: vec![], marker_colors: vec![],
+        });
+        for (track, slot) in take.trajectories.iter_mut().zip([1, 2, 3, -2]) {
+            track.kind = if slot > 0 { MarkerKind::Template } else { MarkerKind::SkeletonExtra };
+            track.asset_uid = Some([7; 16]);
+            track.parent_uid = Some([7; 16]);
+            track.slot = Some(slot);
+        }
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = mpsc::channel();
+        app.views[0].show(tak_core::view_data::ViewData::build(take), rx, 10, 1.0, 0.0);
+        let names = |app: &mut TakViewerApp| {
+            app.refresh_marker_ui(0);
+            app.marker_ui[0].labeling.groups.iter()
+                .map(|group| group.labels.iter().map(|row| row.name.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&mut app), [vec!["B", "A", "C"], vec!["XA", "XB"]], "file order; missing XA under Extra Markers");
+        assert!(app.marker_ui[0].labeling.groups[1].title.ends_with("Extra Markers"));
+        let data = app.views[0].data.clone().unwrap();
+        assert_eq!(crate::marker_order::declared_names(&data.take), ["B", "A", "C", "XA"]);
+
+        app.observe(false);
+        app.settings.marker_order = vec!["c".into(), "XB".into()];
+        app.observe(true);
+        assert_eq!(names(&mut app), [vec!["C", "B", "A"], vec!["XB", "XA"]], "Settings names first, ignoring case");
+        app.undo_redo(&ctx, false);
+        assert!(app.settings.marker_order.is_empty());
+        assert_eq!(names(&mut app), [vec!["B", "A", "C"], vec!["XA", "XB"]]);
+        app.undo_redo(&ctx, true);
+        assert_eq!(app.settings.marker_order, ["c", "XB"]);
+    }
+
+    #[test]
+    fn settings_saved_before_marker_order_still_load() {
+        let old: Settings = ron::from_str(r#"(workspace_roots: ["C:/takes"], graph_opacity: 40, labeling_link: true)"#).unwrap();
+        assert_eq!(old.workspace_roots, ["C:/takes"]);
+        assert_eq!(old.graph_opacity, 40);
+        assert!(old.labeling_link);
+        assert!(old.marker_order.is_empty());
+        let mut saved = Settings { marker_order: vec![" LASI ".into(), "".into(), "lasi".into(), "C7".into()], ..old };
+        saved.migrate();
+        assert_eq!(saved.marker_order, ["LASI", "C7"]);
+        let loaded: Settings = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(loaded.marker_order, ["LASI", "C7"]);
+        assert_eq!(loaded.workspace_roots, ["C:/takes"]);
     }
 
     #[test]

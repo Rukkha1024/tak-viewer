@@ -1,5 +1,11 @@
 # 변경 사항
 
+## v0.72.0 — 2026-11-21
+
+- Labeling `Labeled` list follows the file's declared label order (Motive list order), not slot order.
+- Missing extra-marker declaration (Skeleton slot ≤ 0, e.g. `RUArm_3`) shows under `Extra Markers`, not the marker set.
+- `View → Settings… → Labeled marker order`: one name list for all files. Listed names come first in each group; others keep file order. ↑/↓/Top/✕, Add, `Add names from open files`, `Use file order`. Each click undoable.
+
 ## v0.71.0 — 2026-11-19
 
 - Add WSL commands to check Windows and viewer options, test and build an isolated worker, and verify demo startup with a screenshot.

@@ -214,6 +214,9 @@ pub struct Settings {
     pub(crate) labeling_increment: crate::label_increment::IncrementMode,
     pub(crate) labeling_link: bool,
     pub graph_layout: graph::tracks::Layout,
+    /// Names put first in the Labeling "Labeled" list (`View → Settings…`), in this order.
+    /// Empty = the file's own order. Not in settings saved before v0.72.0.
+    pub marker_order: Vec<String>,
 }
 
 impl Default for Settings {
@@ -247,6 +250,7 @@ impl Default for Settings {
             labeling_increment: Default::default(),
             labeling_link: false,
             graph_layout: graph::tracks::Layout::default(),
+            marker_order: Vec::new(),
         }
     }
 }
@@ -294,6 +298,7 @@ impl Settings {
         self.plate_boxes.resize(MAX_VIEWS, GraphBox::default());
         self.plate_channels.resize(MAX_VIEWS, LaneSet::default());
         self.graph_opacity = self.graph_opacity.min(100);
+        crate::marker_order::clean(&mut self.marker_order);
     }
 }
 
@@ -4187,12 +4192,15 @@ impl TakViewerApp {
         }
         if self.show_settings {
             let names_before = self.settings.channel_names.clone();
+            let order_before = self.settings.marker_order.clone();
+            let mut marker_names = Vec::new();
             let mut open = true;
             let mut channel_catalog = BTreeMap::<String, (String, usize)>::new();
             let all_views = self.views.iter().chain(
                 self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).flat_map(|layout| layout.views.iter()),
             );
             for data in all_views.filter_map(|view| view.data.as_ref()) {
+                marker_names.extend(crate::marker_order::declared_names(&data.take));
                 for (index, device) in data.devices.iter().enumerate().filter(|(_, device)| device.plate.is_none()) {
                     let entry = channel_catalog.entry(device.title.clone()).or_insert_with(|| {
                         let name = data.take.device_names.get(index).and_then(Option::as_ref);
@@ -4219,12 +4227,14 @@ impl TakViewerApp {
                 }
                 self.show_comment_type_settings(ui);
                 crate::ui::channel_names::show(ui, channel_catalog, &mut self.settings.channel_names);
+                crate::marker_order::clean(&mut marker_names);
+                crate::ui::marker_order::show(ui, &marker_names, &mut self.settings.marker_order);
             });
             if let (Some(window), Some(regions)) = (window, &mut self.shot_regions) {
                 regions.record("Settings", window.response.rect);
             }
             if !open { self.close_comment_type_settings(); }
-            if names_before != self.settings.channel_names { self.observe(true); }
+            if names_before != self.settings.channel_names || order_before != self.settings.marker_order { self.observe(true); }
             self.show_settings = open;
         }
         if self.show_help {
