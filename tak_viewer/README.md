@@ -114,7 +114,7 @@ Follow and projection per view. Right drag leaves orthographic mode. `View` trai
 
 Pattern Based: select references first, target last; check Fill Target then Fill Selected/All or Shift+C. Two-reference failure cases → editing contract. Undo coverage/merge/exclusions → undo table.
 
-In Labeling, enable `Link to 3D Selection` to follow the 3D pick's group. Choose `Increment` after assignment. Right-click a named row → `Label Marker` to assign its label to the single selected 3D point. `%` shows the take share with a point.
+Labeling honors saved 3D-selection link and increment settings. A/S steps through visible labels. Right-click a named row → `Label Marker` to assign its label to the single selected 3D point. `%` shows the take share with a point.
 
 ## Agent commands
 
@@ -189,6 +189,7 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --shot-label SOURCE=TARGET | Headless screenshot only. Repeat in order, one local file. Exact unique names. Apply QuickLabel in memory at --frame/--range. NAME=NAME confirms and advances. =TARGET arms the row for a before shot |
 | --shot-marker-menu menu\|info\|label | Headless screenshot only. Use --select and --frame to pick visible points in the active view. Open the 3D marker menu alone or with Marker Info / Label Marker expanded. Label submenu needs one selected point. Read/write no settings or take data |
 | --shot-comment-types | With `--headless --screenshot out.png`, open Settings at Comment types. Crop with `--crop-panel Settings`. A take is optional |
+| --shot-marker-order [PREFIX:]NAME[,NAME…] | Headless screenshot with a temporary name order. Default opens Reorder on. Prefix names with menu: for its open menu, off: for Reorder off, or settings: for Settings. Supply a take. |
 | --shot-help | Use with `--headless --screenshot out.png`, without a take. Open `Controls`. Default 1600×960 px at 100%. Optional `--shot-help-size 1920x1080@1.5` sets pixel size and scale. Add `--shot-help-bottom` to capture the last rows |
 | --comments | Bring COMMENTS forward |
 | --pick-comment ID | Jump/select; explicit --frame wins |

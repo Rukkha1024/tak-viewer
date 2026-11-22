@@ -262,6 +262,11 @@ fn main() -> eframe::Result<()> {
     {
         cli_exit(2, "--shot-comment-types는 --headless --screenshot과 함께 써 주세요.");
     }
+    if args.iter().any(|a| a == "--shot-marker-order")
+        && (!headless || !args.iter().any(|a| a == "--screenshot"))
+    {
+        cli_exit(2, "--shot-marker-order는 --headless --screenshot과 함께 써 주세요.");
+    }
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,
         Err(e) if e.is_empty() => {
@@ -346,6 +351,7 @@ fn usage() -> String {
         &bench_load_usage,
         "tak_viewer --dump-device-signal FILE DEVICE CHANNEL CHAIN OUT.json\nDevice screenshot or benchmark: --device-chain DEVICE=CHAIN (repeat) --device-open DEVICE --device-bypass\nDevice grid: --device-grid CxR --device-cells CELLS --device-list folded --device-fill DEVICE --channel-names NAMES --device-drag DEVICE:CELL --device-pane-size WxH",
         comment_types::LIST_USAGE,
+        "Headless marker order screenshot: --shot-marker-order [PREFIX:]NAME[,NAME…] with --headless --screenshot and a take (prefix: menu, off or settings)",
         "Headless Settings screenshot: --shot-comment-types with --headless --screenshot",
         comment_command::USAGE,
         window_command::USAGE,

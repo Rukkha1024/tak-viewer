@@ -1,6 +1,6 @@
 //! Independent Labeling pane. Rows carry stable identities, not just display names.
 
-use super::panels::{label_cell, label_columns, label_row_pairs, LinkedLabelPick};
+use super::panels::{label_cell, label_columns, label_row_pairs, LinkedLabelPick, LABELS_TWO_COL_MIN};
 use super::theme;
 use crate::label_increment::IncrementMode;
 pub use super::panels::{MarkerList, SelectionGesture};
@@ -9,6 +9,8 @@ use tak_core::edit::LabelKey;
 use tak_core::tak::{uid_hex, Uid};
 
 const ROW_H: f32 = 20.0;
+pub(crate) const LEGEND: &str = "Red = missing at this frame. % = share of take frames with a point.";
+const REORDER_TWO_COL_MIN: f32 = 360.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelingMode {
@@ -31,6 +33,8 @@ pub struct LabelRow {
     /// Eligibility for multiselect: at least one sample anywhere in this take.
     pub has_samples: bool,
     pub name: String,
+    pub file_index: usize,
+    pub moved: bool,
     pub color: Color32,
     pub fill_pct: f32,
     pub present: bool,
@@ -44,6 +48,7 @@ pub struct LabelGroup {
     pub id: u64,
     /// Unknown memberships have no established asset; they appear under All only.
     pub asset_uid: Option<Uid>,
+    pub order_scope: Option<String>,
     pub title: String,
     pub collapsed: bool,
     /// Ordered declared labels and existing labeled trajectories, including missing declarations.
@@ -112,13 +117,38 @@ impl Default for LabelingState {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Reorder {
+    pub enabled: bool,
+    pub file_id: usize,
+    pub frame: i64,
+    pub preview_menu: bool,
+    pub can_reset: bool,
+    pub can_add: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RowDrag {
+    file_id: usize,
+    group: u64,
+    file_index: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum LabelingAction {
+    SetReorder(bool),
+    MoveLabel { group: u64, source: usize, boundary: usize },
+    UseFileOrder,
+    AddOpenNames,
     SetFilter(String),
     SetMode(LabelingMode),
+    #[allow(dead_code, reason = "Keep the existing setting action when its control is hidden")]
     SetIncrement(IncrementMode),
+    #[allow(dead_code, reason = "Keep the existing setting action when its control is hidden")]
     SetLinkTo3d(bool),
+    #[allow(dead_code, reason = "Keep the existing setting action when its control is hidden")]
     SetBackward(bool),
+    #[allow(dead_code, reason = "Keep the existing setting action when its control is hidden")]
     SetForward(bool),
     SetAssetFilter(Option<Uid>),
     ToggleGroup(u64),
@@ -143,7 +173,7 @@ pub enum LabelingAction {
 }
 
 impl LabelingState {
-    fn shown_asset(&self) -> Option<Uid> {
+    pub(crate) fn shown_asset(&self) -> Option<Uid> {
         if self.link_to_3d { self.linked_pick.asset } else { self.asset_filter }
     }
 
@@ -160,7 +190,8 @@ impl LabelingState {
         }
     }
 
-    fn selection_summary(&self) -> (String, String) {
+    #[cfg(test)]
+    fn selection_summary(&self, reorder: bool) -> (String, String) {
         let selected: std::collections::HashSet<_> = self.groups.iter().flat_map(|g| &g.labels)
             .filter(|row| row.selected).filter_map(|row| row.track_uid)
             .chain(self.unlabeled.iter().filter(|row| row.selected).map(|row| row.uid)).collect();
@@ -170,8 +201,10 @@ impl LabelingState {
                 if let Some(uid) = self.groups[group].labels[index].track_uid { visible.insert(uid); }
             }
         }
-        let needle = self.filter.trim().to_lowercase();
-        visible.extend(self.unlabeled.iter().filter(|row| self.matches_row(Some(row.uid), &row.name, &needle)).map(|row| row.uid));
+        if !reorder {
+            let needle = self.filter.trim().to_lowercase();
+            visible.extend(self.unlabeled.iter().filter(|row| self.matches_row(Some(row.uid), &row.name, &needle)).map(|row| row.uid));
+        }
         let hidden = selected.difference(&visible).count();
         let target = self.groups.iter().flat_map(|g| &g.labels).find(|row| row.primary && row.selected)
             .map(|row| row.name.as_str())
@@ -288,6 +321,7 @@ fn paint_row(
     armed: bool,
     hover: bool,
     alternate: bool,
+    moved: Option<bool>,
 ) {
     let p = ui.painter();
     let bg = if primary {
@@ -305,16 +339,31 @@ fn paint_row(
     if armed {
         p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, theme::ACCENT));
     }
-    p.circle_filled(pos2(rect.left() + 13.0, rect.center().y), 4.0, dot);
+    let grip_width = if moved.is_some() { 16.0 } else { 0.0 };
+    if moved.is_some() {
+        for x in [8.0, 11.0] {
+            for y in [-4.0, 0.0, 4.0] {
+                p.circle_filled(pos2(rect.left() + x, rect.center().y + y), 0.85, theme::TEXT_DIM);
+            }
+        }
+    }
+    p.circle_filled(pos2(rect.left() + 12.0 + grip_width, rect.center().y), 4.0, dot);
     let color = if present {
         theme::LABEL_TRACKED
     } else {
         theme::LABEL_ABSENT
     };
     let percent = p.layout_no_wrap(coverage_text(fill_pct), FontId::proportional(12.5), theme::TEXT);
-    let left = rect.left() + 24.0;
+    let left = rect.left() + 24.0 + grip_width;
     let percent_r = rect.right() - 8.0;
-    let name_width = (percent_r - 44.0_f32.max(percent.size().x + 6.0) - left).max(0.0);
+    let percent_left = percent_r - 44.0_f32.max(percent.size().x + 6.0);
+    let mut name_right = percent_left;
+    if moved == Some(true) {
+        let badge = p.layout_no_wrap("Moved".into(), FontId::proportional(10.0), theme::ACCENT);
+        name_right -= badge.size().x + 5.0;
+        p.galley(pos2(percent_left - badge.size().x, rect.center().y - badge.size().y * 0.5), badge, theme::ACCENT);
+    }
+    let name_width = (name_right - left).max(0.0);
     let mut job = egui::text::LayoutJob::simple_singleline(
         name.to_owned(),
         FontId::proportional(13.0),
@@ -341,12 +390,12 @@ fn paint_row(
     );
 }
 
-fn draw_headers(ui: &Ui, rect: Rect, count: usize) {
+fn draw_headers(ui: &Ui, rect: Rect, count: usize, reorder: bool) {
     let p = ui.painter();
     for col in 0..count {
         let r = label_cell(rect, col, count);
         p.text(
-            pos2(r.left() + 24.0, r.center().y),
+            pos2(r.left() + if reorder { 40.0 } else { 24.0 }, r.center().y),
             Align2::LEFT_CENTER,
             "Labels",
             FontId::proportional(12.5),
@@ -379,171 +428,277 @@ fn modifier_gesture(modifiers: egui::Modifiers) -> Option<SelectionGesture> {
     else { None }
 }
 
+fn reorder_target(ui: &Ui, resp: &egui::Response, row: RowDrag, index: usize) -> Option<LabelingAction> {
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        egui::DragAndDrop::set_payload(ui.ctx(), row);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    let source = resp.dnd_hover_payload::<RowDrag>()?;
+    if source.file_id != row.file_id || source.group != row.group || source.file_index == row.file_index {
+        return None;
+    }
+    let pointer = ui.input(|i| i.pointer.interact_pos())?;
+    let after = pointer.y >= resp.rect.center().y;
+    let y = if after { resp.rect.bottom() } else { resp.rect.top() };
+    ui.painter().line_segment(
+        [pos2(resp.rect.left(), y), pos2(resp.rect.right(), y)],
+        Stroke::new(2.0, theme::ACCENT),
+    );
+    if !ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+        return None;
+    }
+    let source = resp.dnd_release_payload::<RowDrag>()?;
+    Some(LabelingAction::MoveLabel {
+        group: row.group,
+        source: source.file_index,
+        boundary: index + usize::from(after),
+    })
+}
+
+fn order_menu(ui: &mut Ui, rect: Rect, reorder: Reorder, action: &mut Option<LabelingAction>) {
+    let popup_id = ui.make_persistent_id("labeling_order_options");
+    let response = ui.interact(rect, ui.make_persistent_id("order_options_button"), Sense::click());
+    if reorder.preview_menu {
+        ui.memory_mut(|memory| memory.open_popup(popup_id));
+    } else if response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    let open = ui.memory(|memory| memory.is_popup_open(popup_id));
+    let fill = if open { theme::PICKED_ROW } else { ui.style().interact(&response).weak_bg_fill };
+    ui.painter().rect_filled(response.rect, 2.0, fill);
+    let mut anchor = response.clone();
+    anchor.rect = Rect::from_min_max(
+        pos2(response.rect.right() - 200.0, response.rect.bottom() + 12.0),
+        pos2(response.rect.right(), response.rect.bottom() + 12.0),
+    );
+    egui::popup::popup_below_widget(
+        ui, popup_id, &anchor, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            for (enabled, label, reason, next) in [
+                (reorder.can_reset, "Use file order", "이미 파일 순서예요.", LabelingAction::UseFileOrder),
+                (reorder.can_add, "Add names from open files", "열린 파일에 추가할 마커 이름이 없어요.", LabelingAction::AddOpenNames),
+            ] {
+                let item = ui.add_enabled(enabled, egui::Button::new(RichText::new(label).size(12.0))
+                    .frame(false).min_size(vec2(0.0, 20.0)));
+                if item.clicked() {
+                    *action = Some(next);
+                    ui.memory_mut(|memory| memory.close_popup());
+                }
+                item.on_disabled_hover_text(reason);
+            }
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Order options"));
+    let center = response.rect.center();
+    let at = |x, y| center + vec2(x, y);
+    let stroke = Stroke::new(1.3_f32, theme::TEXT);
+    let painter = ui.painter();
+    for y in [-4.0, 0.0, 4.0] {
+        painter.line_segment([at(-7.0, y), at(0.0, y)], stroke);
+    }
+    painter.line_segment([at(4.0, -5.0), at(4.0, 5.0)], stroke);
+    painter.add(egui::Shape::line(vec![at(1.0, 2.0), at(4.0, 5.0), at(7.0, 2.0)], stroke));
+    if !open { response.on_hover_text("Order options"); }
+}
+
+fn asset_picker(ui: &mut Ui, state: &LabelingState, width: f32, action: &mut Option<LabelingAction>) {
+    let selected = state.shown_asset()
+        .and_then(|id| state.assets.iter().find(|asset| asset.uid == id))
+        .map(|asset| asset_name(asset, &state.assets))
+        .unwrap_or_else(|| "All".to_owned());
+    let response = ui.add_enabled_ui(!state.link_to_3d, |ui| {
+        egui::ComboBox::from_id_salt("labeling_asset")
+            .selected_text(RichText::new(&selected).size(12.0))
+            .width(width)
+            .truncate()
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(state.asset_filter.is_none(), "All").clicked() {
+                    *action = Some(LabelingAction::SetAssetFilter(None));
+                }
+                for asset in &state.assets {
+                    if ui.selectable_label(state.asset_filter == Some(asset.uid), asset_name(asset, &state.assets)).clicked() {
+                        *action = Some(LabelingAction::SetAssetFilter(Some(asset.uid)));
+                    }
+                }
+            })
+    }).inner.response;
+    response.on_hover_text(selected).on_disabled_hover_text("3D 선택에 맞춰 표시하고 있어요.");
+}
+
+fn search(ui: &mut Ui, state: &LabelingState, width: f32, action: &mut Option<LabelingAction>) {
+    let mut filter = state.filter.clone();
+    let response = ui.add_sized([width, 24.0], egui::TextEdit::singleline(&mut filter)
+        .id(ui.make_persistent_id("labeling_search"))
+        .font(FontId::proportional(12.0))
+        .hint_text("Search")
+        .min_size(vec2(0.0, 24.0))
+        .margin(egui::Margin { left: 26.0, right: 6.0, top: 4.0, bottom: 4.0 }));
+    // egui 0.29 returns the text rect, inside the field's 26 pt leading margin.
+    let center = pos2(response.rect.left() - 13.0, response.rect.center().y - 1.0);
+    let stroke = Stroke::new(1.0_f32, theme::TEXT_DIM);
+    ui.painter().circle_stroke(center, 2.5, stroke);
+    ui.painter().line_segment([center + vec2(2.0, 2.0), center + vec2(4.0, 4.0)], stroke);
+    if response.changed() {
+        *action = Some(LabelingAction::SetFilter(filter));
+    }
+}
+
+fn labeling_header(ui: &mut Ui, state: &LabelingState, reorder: Reorder, action: &mut Option<LabelingAction>) {
+    let narrow = ui.available_width() < 400.0;
+    let mode_size = if narrow { 10.0 } else { 11.0 };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().interact_size.y = 24.0;
+        if narrow {
+            ui.spacing_mut().button_padding.x = 2.0;
+        }
+        let wide = ui.available_width() >= 464.0;
+        let min_size = |width| vec2(if wide { width } else { 0.0 }, 24.0);
+        for (mode, caption, width) in [
+            (LabelingMode::QuickLabel, "QuickLabel Mode  D", 128.0),
+            (LabelingMode::Select, "Select Mode  Q", 104.0),
+        ] {
+            let button = egui::Button::new(RichText::new(caption).size(mode_size))
+                .frame(!reorder.enabled && state.mode == mode)
+                .selected(!reorder.enabled && state.mode == mode)
+                .min_size(min_size(width));
+            let response = ui.add_enabled(!reorder.enabled, button);
+            if response.clicked() {
+                *action = Some(LabelingAction::SetMode(mode));
+            }
+            response.on_disabled_hover_text("순서 변경을 끝낸 뒤 모드를 바꿀 수 있어요.");
+        }
+        let why = if reorder.enabled {
+            Some("순서 변경을 끝낸 뒤 라벨을 지울 수 있어요.")
+        } else {
+            state.unlabel_reason()
+        };
+        let unlabel = ui.add_enabled(why.is_none(), egui::Button::new(RichText::new("Unlabel  Shift+D").size(mode_size)).min_size(min_size(112.0)));
+        if let Some(why) = why {
+            unlabel.on_disabled_hover_text(why);
+        } else if unlabel.clicked() {
+            *action = Some(LabelingAction::Unlabel);
+        }
+        let toggle = if reorder.enabled {
+            egui::Button::new(RichText::new("Reorder: On").size(mode_size)).fill(theme::PICKED_ROW)
+        } else {
+            egui::Button::new(RichText::new("Reorder: Off").size(mode_size))
+        };
+        if ui.add(toggle.min_size(min_size(96.0))).clicked() {
+            *action = Some(LabelingAction::SetReorder(!reorder.enabled));
+        }
+    });
+    ui.horizontal(|ui| {
+        let total: usize = state.groups.iter().map(|group| group.labels.len()).sum();
+        let present = state.groups.iter().flat_map(|group| &group.labels)
+            .filter(|row| row.track_uid.is_some() && row.present).count();
+        ui.label(RichText::new("Labeled").size(14.0));
+        let coverage = format!("{present} / {total} at frame {}", reorder.frame);
+        ui.label(RichText::new(coverage).color(theme::TEXT_DIM).size(11.0));
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = 24.0;
+        let width = ui.available_width();
+        let gap = (width * (17.0 / 479.0)).clamp(8.0, 17.0);
+        let search_width = (width * (182.0 / 479.0)).clamp(60.0, 182.0);
+        ui.label(RichText::new("Selected").size(12.0).color(theme::TEXT_DIM));
+        let left = ui.available_width() - search_width - 24.0 - gap - 8.0;
+        asset_picker(ui, state, left.clamp(28.0, 96.0), action);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (slot, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            if reorder.enabled {
+                order_menu(ui, slot, reorder, action);
+            }
+            ui.add_space(gap);
+            search(ui, state, search_width.min(ui.available_width()), action);
+        });
+    });
+}
+
+fn group_title<'a>(state: &LabelingState, group: &'a LabelGroup) -> &'a str {
+    let scope = group.order_scope.as_deref().unwrap_or_default();
+    let mut title = group.title.as_str();
+    if state.assets.len() == 1 && (scope == "extra" || scope.starts_with("set:")) {
+        let asset = &state.assets[0];
+        if group.asset_uid == Some(asset.uid) {
+            title = title.strip_prefix(&asset.name)
+                .and_then(|rest| rest.strip_prefix(" · "))
+                .unwrap_or(title);
+        }
+    }
+    if scope.starts_with("set:") {
+        if let Some((name, count)) = title.rsplit_once(" (") {
+            if let Some(count) = count.strip_suffix(')') {
+                if !count.is_empty() && count.bytes().all(|c| c.is_ascii_digit()) {
+                    return name;
+                }
+            }
+        }
+    }
+    title
+}
+
+fn group_header(ui: &Ui, rect: Rect, title: &str, total: usize, collapsed: bool) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, theme::HEADER_BG);
+    let center = pos2(rect.left() + 10.0, rect.center().y);
+    let chevron = if collapsed {
+        [vec2(-1.0, -2.5), vec2(1.5, 0.0), vec2(-1.0, 2.5)]
+    } else {
+        [vec2(-2.5, -1.0), vec2(0.0, 1.5), vec2(2.5, -1.0)]
+    };
+    painter.add(egui::Shape::line(chevron.map(|p| center + p).to_vec(), Stroke::new(1.0_f32, theme::TEXT_DIM)));
+    let total = painter.text(
+        pos2(rect.right() - 8.0, center.y), Align2::RIGHT_CENTER,
+        total, FontId::proportional(11.0), theme::TEXT_DIM,
+    );
+    painter.with_clip_rect(Rect::from_min_max(rect.min, pos2(total.left() - 6.0, rect.bottom())))
+        .text(pos2(rect.left() + 24.0, center.y), Align2::LEFT_CENTER,
+            title, FontId::proportional(12.0), theme::TEXT);
+}
+
 /// Draw the pane and return at most one user action. The caller applies selection and edits.
-pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
+pub(crate) fn show(ui: &mut Ui, state: &LabelingState, reorder: Reorder) -> Option<LabelingAction> {
+    let pane_width = ui.available_width();
+    // Use the same inset in both modes so the Search field keeps its position.
+    let inset = ((pane_width - LABELS_TWO_COL_MIN) * 0.5).clamp(0.0, 16.0);
+    egui::Frame::none().inner_margin(egui::Margin::symmetric(inset, 16.0))
+        .show(ui, |ui| show_content(ui, state, reorder, pane_width)).inner
+}
+
+fn show_content(ui: &mut Ui, state: &LabelingState, reorder: Reorder, pane_width: f32) -> Option<LabelingAction> {
     let mut action = None;
-    let (count, target) = state.selection_summary();
-    ui.label(RichText::new(count).size(11.0).color(theme::TEXT_DIM));
-    ui.label(RichText::new(target).size(11.0).color(theme::TEXT_DIM));
     let panel_height = ui.available_height();
     egui::ScrollArea::vertical()
         .id_salt("labeling_pane")
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
             let panel_top = ui.cursor().min.y;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                if ui
-                    .selectable_label(
-                        state.mode == LabelingMode::QuickLabel,
-                        RichText::new("QuickLabel Mode  D").size(11.0),
-                    )
-                    .clicked()
-                {
-                    action = Some(LabelingAction::SetMode(LabelingMode::QuickLabel));
-                }
-                if ui
-                    .selectable_label(
-                        state.mode == LabelingMode::Select,
-                        RichText::new("Select Mode  Q").size(11.0),
-                    )
-                    .clicked()
-                {
-                    action = Some(LabelingAction::SetMode(LabelingMode::Select));
-                }
-                if ui
-                    .add_enabled(
-                        state.unlabel_reason().is_none(),
-                        egui::Button::new(RichText::new("Unlabel  Shift+D").size(11.0)),
-                    )
-                    .clicked()
-                {
-                    action = Some(LabelingAction::Unlabel);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Increment");
-                egui::ComboBox::from_id_salt("labeling_increment")
-                    .width(188.0)
-                    .selected_text(state.increment.caption())
-                    .show_ui(ui, |ui| {
-                        for mode in IncrementMode::ALL {
-                            if ui.selectable_label(state.increment == mode, mode.caption()).clicked() {
-                                action = Some(LabelingAction::SetIncrement(mode));
-                            }
-                        }
-                    });
-                if ui
-                    .add_enabled(
-                        !state.backward || state.forward,
-                        egui::Button::new(RichText::new("Back").size(11.0))
-                            .selected(state.backward),
-                    )
-                    .clicked()
-                {
-                    action = Some(LabelingAction::SetBackward(!state.backward));
-                }
-                if ui
-                    .add_enabled(
-                        !state.forward || state.backward,
-                        egui::Button::new(RichText::new("Fwd").size(11.0)).selected(state.forward),
-                    )
-                    .clicked()
-                {
-                    action = Some(LabelingAction::SetForward(!state.forward));
-                }
-            });
-            if let Some(reason) = state.unlabel_reason() {
-                ui.label(
-                    RichText::new(format!("Unlabel: {reason}"))
-                        .size(11.0)
-                        .color(theme::TEXT_DIM),
-                );
-            }
-            if !state.backward || !state.forward {
-                ui.label(
-                    RichText::new("앞과 뒤 중 하나는 켜 두어야 해요.")
-                        .size(11.0)
-                        .color(theme::TEXT_DIM),
-                );
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Selected");
-                let selected = state
-                    .shown_asset()
-                    .and_then(|id| state.assets.iter().find(|a| a.uid == id))
-                    .map(|asset| asset_name(asset, &state.assets))
-                    .unwrap_or_else(|| "All".to_owned());
-                ui.add_enabled_ui(!state.link_to_3d, |ui| egui::ComboBox::from_id_salt("labeling_asset")
-                    .selected_text(selected)
-                    .width(160.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(state.asset_filter.is_none(), "All")
-                            .clicked()
-                        {
-                            action = Some(LabelingAction::SetAssetFilter(None));
-                        }
-                        for asset in &state.assets {
-                            if ui
-                                .selectable_label(
-                                    state.asset_filter == Some(asset.uid),
-                                    asset_name(asset, &state.assets),
-                                )
-                                .clicked()
-                            {
-                                action = Some(LabelingAction::SetAssetFilter(Some(asset.uid)));
-                            }
-                        }
-                    }));
-                if ui.small_button("A Prev").clicked() {
-                    action = Some(LabelingAction::StepLabel { forward: false });
-                }
-                if ui.small_button("S Next").clicked() {
-                    action = Some(LabelingAction::StepLabel { forward: true });
-                }
-            });
-            let mut link_to_3d = state.link_to_3d;
-            if ui.checkbox(&mut link_to_3d, "Link to 3D Selection").changed() {
-                action = Some(LabelingAction::SetLinkTo3d(link_to_3d));
-            }
-
-            ui.horizontal(|ui| {
-                let total = state.groups.iter().flat_map(|g| &g.labels).filter(|row| row.track_uid.is_some()).count();
-                let present = state.groups.iter().flat_map(|g| &g.labels).filter(|row| row.track_uid.is_some() && row.present).count();
-                ui.label(RichText::new("Labeled").strong().size(14.0));
-                ui.label(RichText::new(format!("{present} / {total}")).color(theme::TEXT_DIM).size(14.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut filter = state.filter.clone();
-                    let width = 130.0_f32.min(ui.available_width()).max(0.0);
-                    if ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search").desired_width(width)).changed() {
-                        action = Some(LabelingAction::SetFilter(filter));
-                    }
-                });
-            });
-            let count = label_columns(ui.available_width());
+            labeling_header(ui, state, reorder, &mut action);
+            let width = ui.available_width();
+            let count = if reorder.enabled && pane_width < REORDER_TWO_COL_MIN { 1 } else { label_columns(width) };
             let (header, _) =
                 ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
             let rows = list_rows(state, count);
             // Reserve the measured legend and the unlabeled section before filling the list.
-            let mut legend = egui::text::LayoutJob::default();
-            let font = egui::TextStyle::Small.resolve(ui.style());
-            for (text, color) in [
-                ("White", theme::LABEL_TRACKED),
-                (" = here · ", theme::TEXT_DIM),
-                ("Red", theme::LABEL_ABSENT),
-                (" = missing · % of frames with a point. See gaps in Marker Info.", theme::TEXT_DIM),
-            ] {
-                legend.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
-            }
-            legend.wrap.max_width = ui.available_width();
-            let legend = ui.painter().layout_job(legend);
+            let legend = ui.painter().layout(
+                LEGEND.to_owned(),
+                FontId::proportional(10.0), theme::TEXT_DIM, ui.available_width(),
+            );
             let needle = state.filter.trim().to_lowercase();
-            let unlabeled: Vec<_> = state.unlabeled.iter().enumerate()
-                .filter(|(_, row)| state.matches_row(Some(row.uid), &row.name, &needle))
-                .map(|(index, _)| index).collect();
-            let pitch = ROW_H + ui.spacing().item_spacing.y;
+            let unlabeled: Vec<_> = if reorder.enabled {
+                Vec::new()
+            } else {
+                state.unlabeled.iter().enumerate()
+                    .filter(|(_, row)| state.matches_row(Some(row.uid), &row.name, &needle))
+                    .map(|(index, _)| index).collect()
+            };
+            let pitch = ROW_H;
             let unlabeled_height = (unlabeled.len() as f32 * pitch).min(120.0);
-            let reserve = legend.size().y + ROW_H + unlabeled_height + 4.0 * ui.spacing().item_spacing.y;
+            let footer = if reorder.enabled { 24.0 + ui.spacing().item_spacing.y } else { 0.0 };
+            let reserve = legend.size().y + ROW_H + unlabeled_height + footer + 6.0 * ui.spacing().item_spacing.y;
             let height = (panel_height - (ui.cursor().min.y - panel_top) - reserve).max(40.0);
             let mut label_scroll = egui::ScrollArea::vertical()
                 .id_salt("labeling_labels")
@@ -552,6 +707,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             if let Some(offset) = label_scroll_offset(&rows, state, pitch) {
                 label_scroll = label_scroll.vertical_scroll_offset(offset);
             }
+            ui.spacing_mut().item_spacing.y = 0.0;
             let list = label_scroll.show_rows(ui, ROW_H, rows.len(), |ui, visible| {
                 let first = visible.start;
                 for (offset, row) in rows[visible].iter().enumerate() {
@@ -565,22 +721,8 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                 ui.make_persistent_id(("group", group.id)),
                                 Sense::click(),
                             );
-                            ui.painter().rect_filled(rect, 0.0, theme::HEADER_BG);
-                            let present = group.labels.iter().filter(|row| row.track_uid.is_some() && row.present).count();
-                            let total = group.labels.iter().filter(|row| row.track_uid.is_some()).count();
-                            ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER,
-                                if group.collapsed && needle.is_empty() { "+" } else { "-" },
-                                FontId::proportional(12.0), theme::TEXT_DIM);
-                            let title = ui.painter().with_clip_rect(rect).text(
-                                pos2(rect.left() + 24.0, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                &group.title,
-                                FontId::proportional(12.0),
-                                theme::TEXT,
-                            );
-                            ui.painter().with_clip_rect(rect).text(pos2(title.right() + 8.0, rect.center().y),
-                                Align2::LEFT_CENTER, format!("{present} / {total}"),
-                                FontId::proportional(12.0), theme::TEXT_DIM);
+                            group_header(ui, rect, group_title(state, group), group.labels.len(),
+                                group.collapsed && needle.is_empty());
                             if resp.clicked() {
                                 action = Some(LabelingAction::ToggleGroup(group.id));
                             }
@@ -589,11 +731,12 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                             for (col, index) in [Some(left), right].into_iter().enumerate() {
                                 let Some(index) = index else { continue };
                                 let row = &state.groups[gi].labels[index];
+                                let draggable = reorder.enabled && state.groups[gi].order_scope.is_some();
                                 let rect = label_cell(rect, col, count);
                                 let resp = ui.interact(
                                     rect,
                                     ui.make_persistent_id(("label", row.key, row.track_uid)),
-                                    Sense::click(),
+                                    if draggable { Sense::click_and_drag() } else if reorder.enabled { Sense::hover() } else { Sense::click() },
                                 );
                                 paint_row(
                                     ui,
@@ -604,10 +747,22 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                     row.color,
                                     row.selected,
                                     row.primary,
-                                    row.key.is_some() && state.armed == row.key,
+                                    !reorder.enabled && row.key.is_some() && state.armed == row.key,
                                     resp.hovered(),
                                     (first + offset) % 2 == 1,
+                                    draggable.then_some(row.moved),
                                 );
+                                if draggable {
+                                    let drag = RowDrag {
+                                        file_id: reorder.file_id,
+                                        group: state.groups[gi].id,
+                                        file_index: row.file_index,
+                                    };
+                                    if let Some(next) = reorder_target(ui, &resp, drag, index) {
+                                        action = Some(next);
+                                    }
+                                }
+                                if reorder.enabled { continue; }
                                 let gesture = ui.input(|i| modifier_gesture(i.modifiers));
                                 if resp.clicked() {
                                     action = Some(if let Some(gesture) = gesture {
@@ -629,7 +784,15 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                         action = row.key.map(LabelingAction::LabelMarker);
                                         ui.close_menu();
                                     }
-                                    if ui.add_enabled(row.track_uid.is_some() && state.blocked_reason.is_none(), egui::Button::new("Remove Marker")).clicked() {
+                                    let remove_reason = if row.track_uid.is_none() {
+                                        Some("이 라벨에 연결된 마커가 없어요.")
+                                    } else {
+                                        state.blocked_reason.as_deref()
+                                    };
+                                    let remove = ui.add_enabled(remove_reason.is_none(), egui::Button::new("Remove Marker"));
+                                    if let Some(reason) = remove_reason {
+                                        remove.on_disabled_hover_text(reason);
+                                    } else if remove.clicked() {
                                         action = Some(context_track_action(row, false));
                                         ui.close_menu();
                                     }
@@ -642,20 +805,12 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                                     } else {
                                         state.blocked_reason.as_deref()
                                     };
-                                    if ui
-                                        .add_enabled(
-                                            why.is_none(),
-                                            egui::Button::new("Unlabel  Shift+D"),
-                                        )
-                                        .clicked()
-                                    {
+                                    let unlabel = ui.add_enabled(why.is_none(), egui::Button::new("Unlabel  Shift+D"));
+                                    if let Some(why) = why {
+                                        unlabel.on_disabled_hover_text(why);
+                                    } else if unlabel.clicked() {
                                         action = Some(context_track_action(row, true));
                                         ui.close_menu();
-                                    }
-                                    if let Some(why) = why {
-                                        ui.label(
-                                            RichText::new(why).size(11.0).color(theme::TEXT_DIM),
-                                        );
                                     }
                                 }); }
                             }
@@ -672,21 +827,37 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                     }
                 }
             });
-            crate::app::key_focus::region(ui, list.inner_rect, crate::app::key_focus::Target::NamedMarkers(state.view_slot));
+            ui.spacing_mut().item_spacing.y = 8.0;
+            use crate::app::key_focus::{region, Target};
+            region(ui, list.inner_rect, if reorder.enabled { Target::Blocked } else { Target::NamedMarkers(state.view_slot) });
             draw_headers(
                 ui,
                 Rect::from_min_max(header.min, pos2(list.inner_rect.right(), header.bottom())),
                 count,
+                reorder.enabled,
             );
+            ui.add_space(16.0);
             let (rect, _) = ui.allocate_exact_size(legend.size(), Sense::hover());
             crate::app::key_focus::region(ui, rect, crate::app::key_focus::Target::Blocked);
             ui.painter().galley(rect.min, legend, theme::TEXT_DIM);
+            if reorder.enabled {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Changes apply to all files.").size(11.0).color(theme::TEXT_DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_sized([64.0, 24.0], egui::Button::new(RichText::new("Done").size(11.0))).clicked() {
+                            action = Some(LabelingAction::SetReorder(false));
+                        }
+                    });
+                });
+            }
+            ui.separator();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Unlabeled Markers").strong());
+                ui.label(RichText::new("Unlabeled Markers").size(12.0).color(theme::TEXT_DIM));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new("%").color(theme::TEXT_DIM));
                 });
             });
+            if reorder.enabled { return; }
             let mut unlabeled_scroll = egui::ScrollArea::vertical()
                 .id_salt("labeling_unlabeled")
                 .max_height(120.0)
@@ -694,6 +865,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
             if let Some(index) = state.scroll_to_track.and_then(|uid| unlabeled.iter().position(|&i| state.unlabeled[i].uid == uid)) {
                 unlabeled_scroll = unlabeled_scroll.vertical_scroll_offset(((index as f32 - 3.0) * pitch).max(0.0));
             }
+            ui.spacing_mut().item_spacing.y = 0.0;
             let unlabeled_list = unlabeled_scroll.show_rows(ui, ROW_H, unlabeled.len(), |ui, visible| {
                     let first = visible.start;
                     for (offset, &index) in unlabeled[visible].iter().enumerate() {
@@ -717,6 +889,7 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                             false,
                             resp.hovered(),
                             (first + offset) % 2 == 1,
+                            None,
                         );
                         let gesture = ui.input(|i| modifier_gesture(i.modifiers));
                         if resp.clicked() || (resp.secondary_clicked() && !row.selected) {
@@ -727,14 +900,17 @@ pub fn show(ui: &mut Ui, state: &LabelingState) -> Option<LabelingAction> {
                             });
                         }
                         if gesture.is_none() { resp.context_menu(|ui| {
-                            if ui.add_enabled(state.blocked_reason.is_none(), egui::Button::new("Remove Marker")).clicked() {
+                            let remove = ui.add_enabled(state.blocked_reason.is_none(), egui::Button::new("Remove Marker"));
+                            if let Some(reason) = state.blocked_reason.as_deref() {
+                                remove.on_disabled_hover_text(reason);
+                            } else if remove.clicked() {
                                 action = Some(LabelingAction::RemoveMarker);
                                 ui.close_menu();
                             }
                         }); }
                     }
                 });
-            crate::app::key_focus::region(ui, unlabeled_list.inner_rect, crate::app::key_focus::Target::UnlabeledMarkers(state.view_slot));
+            region(ui, unlabeled_list.inner_rect, Target::UnlabeledMarkers(state.view_slot));
         });
     action
 }
@@ -753,6 +929,8 @@ mod tests {
             track_uid: Some([index; 16]),
             has_samples: true,
             name: format!("L{index:02}"),
+            file_index: usize::from(index),
+            moved: false,
             color: theme::ACCENT,
             fill_pct: 90.0,
             present,
@@ -775,6 +953,7 @@ mod tests {
             groups: vec![LabelGroup {
                 id: 1,
                 asset_uid: Some([7; 16]),
+                order_scope: Some("set:Asset".into()),
                 title: "Asset · Markers".into(),
                 collapsed: false,
                 labels,
@@ -802,6 +981,16 @@ mod tests {
         width: f32,
         events: Vec<Event>,
     ) -> (egui::FullOutput, Option<LabelingAction>) {
+        draw_with_reorder(ctx, state, width, events, Reorder::default())
+    }
+
+    fn draw_with_reorder(
+        ctx: &egui::Context,
+        state: &LabelingState,
+        width: f32,
+        events: Vec<Event>,
+        reorder: Reorder,
+    ) -> (egui::FullOutput, Option<LabelingAction>) {
         let modifiers = events
             .iter()
             .filter_map(|event| match event {
@@ -820,7 +1009,7 @@ mod tests {
         let mut action = None;
         let output = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                action = show(ui, state);
+                action = show(ui, state, reorder);
             });
         });
         (output, action)
@@ -915,6 +1104,110 @@ mod tests {
     }
 
     #[test]
+    fn reorder_drags_between_columns_and_ignores_row_clicks_and_other_groups() {
+        let ctx = egui::Context::default();
+        let mut st = state(5);
+        st.groups[0].labels.swap(0, 1);
+        crate::marker_order::mark_moved(&mut st.groups[0].labels);
+        st.groups.push(LabelGroup {
+            id: 2,
+            asset_uid: None,
+            order_scope: Some("extra".into()),
+            title: "Extra Markers".into(),
+            collapsed: false,
+            labels: vec![LabelRow { file_index: 0, ..label(9, true) }],
+        });
+        let reorder = Reorder { enabled: true, file_id: 3, ..Default::default() };
+        let draw = |events| draw_with_reorder(&ctx, &st, 440.0, events, reorder);
+        let (output, _) = draw(vec![]);
+        let painted = texts(&output);
+        assert_eq!(painted.iter().filter(|item| item.text == "Moved").count(), 1);
+        assert!(painted.iter().all(|item| item.text != "Unlabeled 99"));
+        let point = |name| painted.iter().find(|item| item.text == name).unwrap().rect.center();
+        let source = point("L03");
+        let first = point("L01") - vec2(0.0, 4.0);
+        assert!(source.x > first.x, "drag starts in the right column");
+        let button = |pos, pressed| Event::PointerButton {
+            pos, pressed, button: PointerButton::Primary, modifiers: Modifiers::NONE,
+        };
+        draw(vec![Event::PointerMoved(source)]);
+        assert_eq!(draw(vec![button(source, true)]).1, None);
+        assert_eq!(draw(vec![button(source, false)]).1, None);
+        for (target, expected) in [
+            (point("L09"), None),
+            (first, Some(LabelingAction::MoveLabel { group: 1, source: 3, boundary: 0 })),
+        ] {
+            draw(vec![Event::PointerMoved(source)]);
+            assert_eq!(draw(vec![button(source, true)]).1, None);
+            draw(vec![Event::PointerMoved(target)]);
+            assert_eq!(draw(vec![button(target, false)]).1, expected);
+        }
+        let done = point("Done");
+        draw(vec![Event::PointerMoved(done)]);
+        draw(vec![button(done, true)]);
+        assert_eq!(draw(vec![button(done, false)]).1, Some(LabelingAction::SetReorder(false)));
+    }
+
+    #[test]
+    fn order_menu_aligns_to_icon_and_dispatches_both_actions() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let st = state(5);
+        let reorder = Reorder {
+            enabled: true,
+            can_reset: true,
+            can_add: true,
+            ..Default::default()
+        };
+        let draw = |reorder, events| draw_with_reorder(&ctx, &st, 515.0, events, reorder);
+        let click_at = |reorder, pos| {
+            let button = |pressed| Event::PointerButton {
+                pos, pressed, button: PointerButton::Primary, modifiers: Modifiers::NONE,
+            };
+            draw(reorder, vec![Event::PointerMoved(pos)]);
+            draw(reorder, vec![button(true)]);
+            draw(reorder, vec![button(false)]).1
+        };
+
+        let (out, _) = draw(reorder, vec![]);
+        let options = out.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Path(path) if path.points.len() == 3 && path.stroke.width == 1.3
+                && path.points[0].x < path.points[1].x && path.points[1].x < path.points[2].x =>
+            {
+                Some(path.points[1] - vec2(4.0, 5.0))
+            }
+            _ => None,
+        }).expect("painted down arrow");
+        let search = texts(&out).into_iter().find(|t| t.text == "Search").unwrap();
+        assert!(options.x > 470.0 && options.x > search.rect.right());
+        assert!((options.y - search.rect.center().y).abs() < 2.0);
+        for (item, expected) in [
+            ("Use file order", LabelingAction::UseFileOrder),
+            ("Add names from open files", LabelingAction::AddOpenNames),
+        ] {
+            assert!(!texts(&draw(reorder, vec![]).0).iter().any(|t| t.text == item));
+            assert_eq!(click_at(reorder, options), None);
+            let (out, _) = draw(reorder, vec![]);
+            let picked = out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                if r.fill == theme::PICKED_ROW && r.rect.center().distance(options) < 1.0));
+            assert!(picked, "open Order options icon is highlighted");
+            let popup = out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Vec(shapes) => Some(shapes),
+                _ => None,
+            }).find_map(|shapes| match shapes.as_slice() {
+                [_, egui::Shape::Rect(frame)] if frame.rect.top() > options.y
+                    && (frame.rect.width() - 200.0).abs() < 3.0 => Some(frame.rect),
+                _ => None,
+            }).expect("floating menu frame with shadow");
+            assert!((popup.right() - (options.x + 12.0)).abs() < 2.0, "{popup:?} vs {options:?}");
+            let pos = texts(&out).iter().find(|t| t.text == item)
+                .unwrap_or_else(|| panic!("missing {item} in Order options")).rect.center();
+            assert_eq!(click_at(reorder, pos), Some(expected));
+        }
+    }
+
+    #[test]
     fn column_major_order_filter_and_fold_use_existing_layout_rules() {
         let mut st = state(5);
         assert_eq!((label_columns(259.9), label_columns(260.0)), (1, 2));
@@ -952,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn search_filters_both_lists_but_count_excludes_declarations_and_ignores_filters() {
+    fn search_filters_both_lists_but_totals_include_declarations_and_ignore_filters() {
         let ctx = egui::Context::default();
         let mut st = state(5);
         st.groups[0].labels[4].track_uid = None;
@@ -960,13 +1253,13 @@ mod tests {
         st.filter = "unlabeled".into();
         let out = draw(&ctx, &st, 440.0, vec![]).0;
         let painted = texts(&out);
-        assert!(painted.iter().any(|t| t.text == "3 / 4"));
+        assert!(painted.iter().any(|t| t.text == "3 / 5 at frame 0"));
         assert!(painted.iter().any(|t| t.text == "Unlabeled 99"));
         assert!(!painted.iter().any(|t| t.text == "L00"));
         st.filter = "L00".into();
         let out = draw(&ctx, &st, 440.0, vec![]).0;
         let painted = texts(&out);
-        assert!(painted.iter().any(|t| t.text == "3 / 4"));
+        assert!(painted.iter().any(|t| t.text == "3 / 5 at frame 0"));
         assert!(!painted.iter().any(|t| t.text == "Unlabeled 99"));
     }
 
@@ -1065,22 +1358,24 @@ mod tests {
     }
 
     #[test]
-    fn group_and_global_presence_counts_use_actual_tracks_including_extras() {
+    fn group_totals_include_declarations_and_global_presence_counts_actual_tracks() {
         let ctx = egui::Context::default();
         let mut st = state(5);
         st.groups[0].labels[4].track_uid = None;
         st.groups[0].labels[4].present = false;
         let out = draw(&ctx, &st, 440.0, vec![]).0;
         let painted = texts(&out);
-        assert_eq!(painted.iter().filter(|t| t.text == "3 / 4").count(), 2, "global and group totals exclude the declaration");
-        assert!(!painted.iter().any(|t| t.text == "3 / 5"));
+        for coverage in ["5", "3 / 5 at frame 0"] {
+            assert!(painted.iter().any(|t| t.text == coverage), "missing {coverage}");
+        }
+        assert!(!painted.iter().any(|t| t.text == "3 / 4"));
     }
 
     #[test]
-    fn headless_clicks_return_stable_ids_and_do_not_disable_the_last_direction() {
+    fn headless_clicks_return_stable_ids() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
-        let mut st = state(5);
+        let st = state(5);
         let ctrl = Modifiers {
             ctrl: true,
             ..Default::default()
@@ -1109,15 +1404,7 @@ mod tests {
             None,
             "opening the menu keeps the 3D source selected"
         );
-        st.forward = false;
-        let (out, _) = draw(&ctx, &st, 440.0, vec![]);
-        assert!(texts(&out)
-            .iter()
-            .any(|item| item.text.contains("앞과 뒤 중 하나는 켜 두어야 해요.")));
-        assert_eq!(
-            click(&ctx, &st, "Back", Modifiers::NONE, PointerButton::Primary),
-            None
-        );
+
     }
 
     #[test]
@@ -1181,6 +1468,7 @@ mod tests {
         st.groups = vec![LabelGroup {
             id: 2,
             asset_uid: None,
+            order_scope: None,
             title: "Unknown".into(),
             collapsed: false,
             labels: vec![unknown],
@@ -1249,27 +1537,13 @@ mod tests {
     }
 
     #[test]
-    fn mode_and_step_controls_return_actions_without_using_keyboard_events() {
+    fn mode_button_still_dispatches_selection_mode() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let st = state(5);
         assert_eq!(
-            click(
-                &ctx,
-                &st,
-                "Select Mode  Q",
-                Modifiers::NONE,
-                PointerButton::Primary
-            ),
+            click(&ctx, &st, "Select Mode  Q", Modifiers::NONE, PointerButton::Primary),
             Some(LabelingAction::SetMode(LabelingMode::Select))
-        );
-        assert_eq!(
-            click(&ctx, &st, "A Prev", Modifiers::NONE, PointerButton::Primary),
-            Some(LabelingAction::StepLabel { forward: false })
-        );
-        assert_eq!(
-            click(&ctx, &st, "S Next", Modifiers::NONE, PointerButton::Primary),
-            Some(LabelingAction::StepLabel { forward: true })
         );
     }
 
@@ -1335,8 +1609,7 @@ mod tests {
             "QuickLabel Mode  D",
             "Select Mode  Q",
             "Unlabel  Shift+D",
-            "A Prev",
-            "S Next",
+            "Search",
             "Unlabeled Markers",
         ] {
             assert!(
@@ -1346,6 +1619,89 @@ mod tests {
         }
         save_snapshot(&ctx, output);
     }
+
+    #[test]
+    fn mode_buttons_and_search_fit_the_default_dock_width() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let st = state(5);
+        // The central panel's padding is 8 pt on each side.
+        let geometry = |enabled| {
+            let (out, _) = draw_with_reorder(&ctx, &st, 376.0 + 16.0, vec![],
+                Reorder { enabled, ..Default::default() });
+            let painted = texts(&out);
+            let at = |text| painted.iter().find(|item| item.text == text)
+                .unwrap_or_else(|| panic!("missing {text}")).rect;
+            let mode = if enabled { "Reorder: On" } else { "Reorder: Off" };
+            assert!((at("QuickLabel Mode  D").center().y - at(mode).center().y).abs() < 1.0);
+            assert!((at("Selected").center().y - at("Search").center().y).abs() < 2.0);
+            assert!(at("Search").left() > at("All").right() + 20.0);
+            assert!(at("Search").top() > at("4 / 5 at frame 0").bottom());
+            assert!(at(mode).right() <= 376.0);
+            for hidden in ["A Prev", "S Next", "Increment", "Back", "Fwd", "Link to 3D Selection",
+                "Pattern target", "selected (", "Undo", "Redo"] {
+                assert!(!painted.iter().any(|item| item.text.contains(hidden)), "unexpected {hidden}");
+            }
+            assert_eq!(painted.iter().any(|item| item.text == "Done"), enabled);
+            let grip_dots = out.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Circle(c)
+                if c.radius == 0.85 && c.center.y >= at("L00").top() - 4.0)).count();
+            assert_eq!(grip_dots, if enabled { 30 } else { 0 });
+            (at("Search"), at("L00").left())
+        };
+        let (off_search, off_name) = geometry(false);
+        let (on_search, on_name) = geometry(true);
+        assert_eq!(off_search, on_search);
+        assert!((on_name - off_name - 16.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn group_header_separates_the_total_from_the_title_even_with_search() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut st = state(39);
+        st.groups[0].title = "Asset · Conventional Full Body (39)".into();
+        st.groups[0].labels[2].track_uid = None;
+        st.filter = "L01".into();
+        for (title, second_asset) in [
+            ("Conventional Full Body", false),
+            ("Asset · Conventional Full Body", true),
+        ] {
+            if second_asset {
+                st.assets.push(AssetChoice { uid: [8; 16], name: "Second".into() });
+                st.asset_filter = Some([7; 16]);
+            }
+            let (out, _) = draw(&ctx, &st, 511.0 + 16.0, vec![]);
+            let painted = texts(&out);
+            let at = |text| painted.iter().find(|item| item.text == text)
+                .unwrap_or_else(|| panic!("missing {text}")).rect;
+            assert!((at(title).center().y - at("39").center().y).abs() < 2.0);
+            let header_right = painted.iter().filter(|item| item.text == "%"
+                && (item.rect.center().y - at("Labels").center().y).abs() < 1.0)
+                .map(|item| item.rect.right()).fold(0.0, f32::max);
+            assert!((at("39").right() - header_right).abs() < 1.0, "{:?} vs {header_right}", at("39"));
+            assert!(at("39").left() > at(title).right());
+            assert!(!painted.iter().any(|item| item.text.contains("(39)")));
+            assert!(painted.iter().any(|item| item.text == "38 / 39 at frame 0"));
+        }
+    }
+
+    #[test]
+    fn disabled_unlabel_reason_is_visible_only_on_hover() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let mut st = state(5);
+        st.blocked_reason = Some("편집 작업이 끝날 때까지 기다려 주세요.".into());
+        let why = st.unlabel_reason().unwrap();
+        let (out, _) = draw(&ctx, &st, 440.0, vec![]);
+        let painted = texts(&out);
+        assert!(!painted.iter().any(|item| item.text == why));
+        let pos = painted.iter().find(|item| item.text == "Unlabel  Shift+D").unwrap().rect.center();
+        draw(&ctx, &st, 440.0, vec![Event::PointerMoved(pos)]);
+        let (out, _) = draw(&ctx, &st, 440.0, vec![]);
+        assert!(texts(&out).iter().any(|item| item.text == why));
+    }
+
 }
 
 #[cfg(test)]

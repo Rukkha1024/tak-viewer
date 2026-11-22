@@ -193,6 +193,7 @@ pub(super) struct Options {
     labeling_increment: crate::label_increment::IncrementMode,
     labeling_link: bool,
     marker_order: Vec<String>,
+    marker_orders: BTreeMap<String, Vec<String>>,
 }
 
 impl Options {
@@ -210,6 +211,7 @@ impl Options {
             labeling_increment: s.labeling_increment,
             labeling_link: s.labeling_link,
             marker_order: s.marker_order.clone(),
+            marker_orders: s.marker_orders.clone(),
         }
     }
 
@@ -226,11 +228,12 @@ impl Options {
             && self.labeling_increment == s.labeling_increment
             && self.labeling_link == s.labeling_link
             && self.marker_order == s.marker_order
+            && self.marker_orders == s.marker_orders
     }
 
     /// Status bar word for going from `self` to `to`.
     fn words(&self, to: &Options) -> String {
-        if self.marker_order != to.marker_order {
+        if self.marker_order != to.marker_order || self.marker_orders != to.marker_orders {
             "Marker order".into()
         } else if self.channel_names != to.channel_names {
             "Channel names".into()
@@ -1743,6 +1746,7 @@ impl TakViewerApp {
                 let s = &mut self.settings;
                 if from.channel_names != to.channel_names { s.channel_names = to.channel_names.clone(); }
                 if from.marker_order != to.marker_order { s.marker_order = to.marker_order.clone(); }
+                if from.marker_orders != to.marker_orders { s.marker_orders = to.marker_orders.clone(); }
                 if from.labeling_increment != to.labeling_increment { s.labeling_increment = to.labeling_increment; }
                 if from.labeling_link != to.labeling_link { s.labeling_link = to.labeling_link; }
                 if from.device_layouts != to.device_layouts { s.device_layouts = to.device_layouts.clone(); }

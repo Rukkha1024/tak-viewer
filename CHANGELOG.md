@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.74.0 — 2026-11-22
+
+- Labeling `Reorder: On/Off`: drag labeled rows inside a group. `Moved` tags only rows actually moved. Order icon menu: `Use file order`, `Add names from open files`; `Done` or Esc ends.
+- Order shared by scope: same marker set name → all files; Extra Markers → by name in any file; LabelGroup → by group name. v0.72.0 list kept as fallback.
+- Labeling layout from user-confirmed Figma: Search in Selected row; group title + dim count; no grip column when Reorder Off. Removed from UI (functions kept): selection/Pattern target line, A Prev/S Next (A/S keys), Increment, Back/Fwd, Link to 3D Selection (saved values apply); disabled reasons → tooltips. No undo/redo icon (Ctrl+Z/Ctrl+Y).
+- Edit Tools: three equal buttons per row, shortcuts and reasons in tooltips, label/value settings boxes.
+- Settings `Labeled marker order` = per-scope summary + `Go to Labeling` + `Use file order`.
+
 ## v0.72.0 — 2026-11-21
 
 - Labeling `Labeled` list follows the file's declared label order (Motive list order), not slot order.

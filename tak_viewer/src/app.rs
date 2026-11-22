@@ -214,9 +214,11 @@ pub struct Settings {
     pub(crate) labeling_increment: crate::label_increment::IncrementMode,
     pub(crate) labeling_link: bool,
     pub graph_layout: graph::tracks::Layout,
-    /// Names put first in the Labeling "Labeled" list (`View → Settings…`), in this order.
-    /// Empty = the file's own order. Not in settings saved before v0.72.0.
+    /// Legacy app-wide fallback. New edits go into marker_orders.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub marker_order: Vec<String>,
+    /// Names put first in each Labeling scope. An empty list overrides the legacy fallback.
+    pub marker_orders: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -251,6 +253,7 @@ impl Default for Settings {
             labeling_link: false,
             graph_layout: graph::tracks::Layout::default(),
             marker_order: Vec::new(),
+            marker_orders: BTreeMap::new(),
         }
     }
 }
@@ -299,6 +302,13 @@ impl Settings {
         self.plate_channels.resize(MAX_VIEWS, LaneSet::default());
         self.graph_opacity = self.graph_opacity.min(100);
         crate::marker_order::clean(&mut self.marker_order);
+        for names in self.marker_orders.values_mut() {
+            crate::marker_order::clean(names);
+        }
+    }
+
+    pub(crate) fn marker_order_for(&self, scope: &str) -> &[String] {
+        crate::marker_order::effective_order(&self.marker_orders, &self.marker_order, scope)
     }
 }
 
@@ -475,6 +485,7 @@ pub struct TakViewerApp {
     show_warnings: bool,
     /// "설정" window (menu "보기 → 설정…").
     show_settings: bool,
+    labeling_reorder: bool,
     comment_types: comment_types_ui::State,
     /// A view's floating graph asked for the GRAPH pane this frame (applied after drawing).
     graph_to_panel: bool,
@@ -716,6 +727,7 @@ impl TakViewerApp {
             show_help: false,
             show_warnings: false,
             show_settings: auto.as_ref().is_some_and(|shot| shot.comment_types),
+            labeling_reorder: false,
             comment_types: Default::default(),
             graph_to_panel: false,
             auto,
@@ -924,6 +936,14 @@ impl TakViewerApp {
         self.hidden.forget(pane);
         dock::show(&mut self.dock, pane);
         self.activate(self.active);
+    }
+
+    fn start_labeling_reorder(&mut self) {
+        self.show_pane(Pane::Labeling);
+        if let Some((surface, node, _)) = self.dock.find_tab(&Pane::Labeling) {
+            self.dock.set_focused_node_and_surface((surface, node));
+        }
+        self.labeling_reorder = true;
     }
 
     /// Close a pane (menu "보기").
@@ -1420,6 +1440,29 @@ impl TakViewerApp {
                 if auto.labeling_link {
                     self.settings.labeling_link = true;
                     self.show_pane(Pane::Labeling);
+                }
+                if let Some(order) = &auto.output.marker_order {
+                    let names = order.names.clone();
+                    use crate::shot_output::MarkerOrderPane;
+                    let pane = order.pane;
+                    self.refresh_marker_ui(self.active);
+                    self.settings.marker_order.clear();
+                    self.settings.marker_orders = crate::marker_order::preview(
+                        &self.marker_ui[self.active].labeling.groups, &names,
+                    );
+                    if pane == MarkerOrderPane::Settings {
+                        self.show_settings = true;
+                    } else {
+                        for pane in [Pane::Labeling, Pane::EditTools, Pane::Selected, Pane::Devices, Pane::Graph, Pane::Comments] {
+                            dock::hide(&mut self.dock, pane);
+                        }
+                        self.dock.main_surface_mut().split_right(egui_dock::NodeIndex::root(), 0.67, vec![Pane::Labeling, Pane::EditTools]);
+                        if pane == MarkerOrderPane::Off {
+                            self.show_pane(Pane::Labeling);
+                        } else {
+                            self.start_labeling_reorder();
+                        }
+                    }
                 }
                 if auto.edit_pattern { self.select_pattern_for_capture(self.active); }
                 if auto.edit_layout != 0 {
@@ -3881,7 +3924,14 @@ impl TakViewerApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        if self.ssh.is_busy() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        if self.labeling_reorder && self.dirty_prompt.is_none() && self.hold.is_none()
+            && self.comment_edit.is_none() && !self.scene_marker_menu.is_open()
+            && exact_key(ctx, Key::Escape, false, false, false)
+        {
+            self.labeling_reorder = false;
+            ctx.memory_mut(|memory| memory.close_popup());
+            egui::DragAndDrop::clear_payload(ctx);
+        } else if self.ssh.is_busy() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.ssh.cancel_all();
         }
         // Background loads: markers ready? Then force plates / EMG.
@@ -4192,15 +4242,20 @@ impl TakViewerApp {
         }
         if self.show_settings {
             let names_before = self.settings.channel_names.clone();
-            let order_before = self.settings.marker_order.clone();
-            let mut marker_names = Vec::new();
+            let can_reset_order = !self.settings.marker_orders.is_empty() || !self.settings.marker_order.is_empty();
+            let order_summary = if self.view().data.is_some() {
+                self.refresh_marker_ui(self.active);
+                crate::marker_order::summary(&self.marker_ui[self.active].labeling.groups, &self.settings)
+            } else {
+                Vec::new()
+            };
+            let mut marker_order_action = None;
             let mut open = true;
             let mut channel_catalog = BTreeMap::<String, (String, usize)>::new();
             let all_views = self.views.iter().chain(
                 self.layout_tabs.tabs().iter().filter_map(|tab| tab.layout.as_ref()).flat_map(|layout| layout.views.iter()),
             );
             for data in all_views.filter_map(|view| view.data.as_ref()) {
-                marker_names.extend(crate::marker_order::declared_names(&data.take));
                 for (index, device) in data.devices.iter().enumerate().filter(|(_, device)| device.plate.is_none()) {
                     let entry = channel_catalog.entry(device.title.clone()).or_insert_with(|| {
                         let name = data.take.device_names.get(index).and_then(Option::as_ref);
@@ -4210,7 +4265,11 @@ impl TakViewerApp {
                     entry.1 = entry.1.max(device.channels.len());
                 }
             }
+            let order_preview = self.auto.as_ref()
+                .and_then(|shot| shot.output.marker_order.as_ref())
+                .is_some_and(|order| order.pane == crate::shot_output::MarkerOrderPane::Settings);
             let window = egui::Window::new("Settings").id(egui::Id::new("설정")).open(&mut open)
+                .fade_in(!order_preview)
                 .collapsible(false).resizable(false).default_width(500.0)
                 .default_pos(egui::pos2((area.center().x - 250.0).max(area.left()), area.top() + 42.0))
                 .vscroll(true).show(ctx, |ui| {
@@ -4227,14 +4286,24 @@ impl TakViewerApp {
                 }
                 self.show_comment_type_settings(ui);
                 crate::ui::channel_names::show(ui, channel_catalog, &mut self.settings.channel_names);
-                crate::marker_order::clean(&mut marker_names);
-                crate::ui::marker_order::show(ui, &marker_names, &mut self.settings.marker_order);
+                marker_order_action = crate::ui::marker_order::show(ui, &order_summary, can_reset_order);
+                if order_preview {
+                    ui.scroll_to_cursor_animation(Some(egui::Align::BOTTOM), egui::style::ScrollAnimation::none());
+                }
             });
             if let (Some(window), Some(regions)) = (window, &mut self.shot_regions) {
                 regions.record("Settings", window.response.rect);
             }
+            if names_before != self.settings.channel_names { self.observe(true); }
+            match marker_order_action {
+                Some(crate::ui::marker_order::Action::GoToLabeling) => {
+                    self.start_labeling_reorder();
+                    open = false;
+                }
+                Some(crate::ui::marker_order::Action::UseFileOrder) => self.clear_marker_orders(),
+                None => {}
+            }
             if !open { self.close_comment_type_settings(); }
-            if names_before != self.settings.channel_names || order_before != self.settings.marker_order { self.observe(true); }
             self.show_settings = open;
         }
         if self.show_help {

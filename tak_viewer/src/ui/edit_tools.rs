@@ -173,132 +173,188 @@ fn target_text(state: &EditToolsState) -> String {
         .unwrap_or_else(|| "—".to_owned())
 }
 
-fn reason(ui: &mut Ui, label: &str, text: Option<&str>) {
-    if let Some(text) = text {
-        ui.label(
-            RichText::new(format!("{label}: {text}"))
-                .size(11.0)
-                .color(theme::TEXT_DIM),
+struct ToolButton<'a> {
+    name: &'static str,
+    shortcut: Option<&'static str>,
+    reason: Option<&'a str>,
+    action: EditToolsAction,
+}
+
+fn fill_buttons(state: &EditToolsState) -> [ToolButton<'_>; 3] {
+    let key = match state.interpolation {
+        FillMethod::Cubic => "C",
+        FillMethod::PatternBased => "Shift+C",
+    };
+    [
+        ("Fill Selected", Some(key), FillScope::SelectedRange),
+        ("Fill All", None, FillScope::SelectedTracksAllFrames),
+        ("Fill Everything", None, FillScope::Everything),
+    ].map(|(name, shortcut, scope)| ToolButton {
+        name, shortcut, reason: state.fill_reason_for(scope, state.interpolation),
+        action: EditToolsAction::Fill(scope),
+    })
+}
+
+fn smooth_buttons(state: &EditToolsState) -> [ToolButton<'_>; 3] {
+    [
+        ("Smooth Selection", Some("X"), SmoothScope::SelectedRange),
+        ("Smooth Track", None, SmoothScope::SelectedTracksAllFrames),
+        ("Smooth All Tracks", Some("Ctrl+Alt+X"), SmoothScope::AllTracksAllFrames),
+    ].map(|(name, shortcut, scope)| ToolButton {
+        name, shortcut, reason: state.smooth_reason(scope),
+        action: EditToolsAction::Smooth(scope),
+    })
+}
+
+fn tool_buttons(
+    ui: &mut Ui,
+    buttons: [ToolButton<'_>; 3],
+    size: egui::Vec2,
+    action: &mut Option<EditToolsAction>,
+) {
+    for button in buttons {
+        let response = ui.add_enabled(
+            button.reason.is_none(),
+            egui::Button::new(RichText::new(button.name).size(11.0)).min_size(size),
         );
+        if response.clicked() {
+            *action = Some(button.action);
+        }
+        if let Some(why) = button.reason {
+            response.on_disabled_hover_ui(|ui| {
+                if let Some(key) = button.shortcut {
+                    ui.label(format!("{} ({key})", button.name));
+                }
+                ui.label(why);
+            });
+        } else if let Some(key) = button.shortcut {
+            response.on_hover_ui(|ui| { ui.label(format!("{} ({key})", button.name)); });
+        }
     }
 }
 
-fn button_row(ui: &mut Ui, labels: &[(&str, bool)]) -> Vec<bool> {
-    let mut clicked = Vec::with_capacity(labels.len());
-    let gap = ui.spacing().item_spacing.x;
-    if ui.available_width() < 330.0 {
-        for (label, enabled) in labels {
-            clicked.push(
-                ui.add_enabled(
-                    *enabled,
-                    egui::Button::new(RichText::new(*label).size(11.0))
-                        .min_size(egui::vec2(ui.available_width(), 31.0)),
-                )
-                .clicked(),
-            );
-        }
+fn tool_row(ui: &mut Ui, buttons: [ToolButton<'_>; 3], action: &mut Option<EditToolsAction>) {
+    let width = ui.available_width();
+    if width < 330.0 {
+        tool_buttons(ui, buttons, egui::vec2(width, 32.0), action);
     } else {
-        let width = ((ui.available_width() - gap * (labels.len() - 1) as f32)
-            / labels.len() as f32)
-            .max(0.0);
-        ui.horizontal(|ui| {
-            for (label, enabled) in labels {
-                clicked.push(
-                    ui.add_enabled(
-                        *enabled,
-                        egui::Button::new(RichText::new(*label).size(11.0))
-                            .min_size(egui::vec2(width, 34.0)),
-                    )
-                    .clicked(),
-                );
+        let button_width = (width - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+        ui.horizontal(|ui| tool_buttons(ui, buttons, egui::vec2(button_width, 32.0), action));
+    }
+}
+
+fn interpolation_picker(ui: &mut Ui, state: &EditToolsState, width: f32, action: &mut Option<EditToolsAction>) {
+    egui::ComboBox::from_id_salt("fill_interpolation")
+        .selected_text(match state.interpolation {
+            FillMethod::Cubic => "Cubic",
+            FillMethod::PatternBased => "Pattern Based",
+        })
+        .width(width)
+        .truncate()
+        .show_ui(ui, |ui| {
+            for (method, name) in [
+                (FillMethod::Cubic, "Cubic"),
+                (FillMethod::PatternBased, "Pattern Based"),
+            ] {
+                if ui.selectable_label(state.interpolation == method, name).clicked() {
+                    *action = Some(EditToolsAction::SetInterpolation(method));
+                }
             }
         });
-    }
-    clicked
 }
 
-/// The same controls in two short rows when the pane is dragged above the graph.
+fn value_field(ui: &mut Ui, value: &str, width: f32) -> Option<String> {
+    let mut value = value.to_owned();
+    ui.add(egui::TextEdit::singleline(&mut value)
+        .font(egui::FontId::proportional(12.0))
+        .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
+        .desired_width(width))
+        .changed().then_some(value)
+}
+
+/// Keep a short layout for the wide dock above the graph.
 fn show_compact(ui: &mut Ui, state: &EditToolsState) -> Option<EditToolsAction> {
     let mut action = None;
-    if let Some(reason) = state.blocked_reason.as_deref() {
-        ui.label(RichText::new(reason).size(11.0).color(theme::TEXT_DIM));
-    }
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Fill Gaps").strong());
         ui.label("Interpolation");
-        egui::ComboBox::from_id_salt("fill_interpolation")
-            .selected_text(match state.interpolation {
-                FillMethod::Cubic => "Cubic",
-                FillMethod::PatternBased => "Pattern Based",
-            })
-            .width(112.0)
-            .show_ui(ui, |ui| {
-                for (method, name) in [
-                    (FillMethod::Cubic, "Cubic"),
-                    (FillMethod::PatternBased, "Pattern Based"),
-                ] {
-                    if ui
-                        .selectable_label(state.interpolation == method, name)
-                        .clicked()
-                    {
-                        action = Some(EditToolsAction::SetInterpolation(method));
-                    }
-                }
-            });
+        interpolation_picker(ui, state, 112.0, &mut action);
         ui.label("Max. Gap Size");
-        let mut value = state.max_gap.clone();
-        if ui
-            .add(egui::TextEdit::singleline(&mut value).desired_width(42.0))
-            .changed()
-        {
+        if let Some(value) = value_field(ui, &state.max_gap, 42.0) {
             action = Some(EditToolsAction::SetMaxGap(value));
         }
         ui.label("Fill Target");
         ui.label(target_text(state));
-        for (label, scope) in [
-            ("Fill Selected", FillScope::SelectedRange),
-            ("Fill All", FillScope::SelectedTracksAllFrames),
-            ("Fill Everything", FillScope::Everything),
-        ] {
-            let why = state.fill_reason_for(scope, state.interpolation);
-            let response = ui.add_enabled(why.is_none(), egui::Button::new(label));
-            if response.clicked() {
-                action = Some(EditToolsAction::Fill(scope));
-            }
-            if let Some(why) = why {
-                response.on_hover_text(why);
-            }
-        }
+        tool_buttons(ui, fill_buttons(state), egui::Vec2::ZERO, &mut action);
     });
-    if state.interpolation == FillMethod::PatternBased {
-        if let Some(why) = state.pattern_selection_reason() {
-            ui.label(RichText::new(why).size(11.0).color(theme::TEXT_DIM));
-        }
-    }
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Smooth").strong());
         ui.label("Max. Freq (Hz)");
-        let mut value = state.max_frequency.clone();
-        if ui
-            .add(egui::TextEdit::singleline(&mut value).desired_width(48.0))
-            .changed()
-        {
+        if let Some(value) = value_field(ui, &state.max_frequency, 48.0) {
             action = Some(EditToolsAction::SetMaxFrequency(value));
         }
-        for (label, scope) in [
-            ("Smooth Selection", SmoothScope::SelectedRange),
-            ("Smooth Track", SmoothScope::SelectedTracksAllFrames),
-            ("Smooth All Tracks", SmoothScope::AllTracksAllFrames),
-        ] {
-            let why = state.smooth_reason(scope);
-            let response = ui.add_enabled(why.is_none(), egui::Button::new(label));
-            if response.clicked() {
-                action = Some(EditToolsAction::Smooth(scope));
+        tool_buttons(ui, smooth_buttons(state), egui::Vec2::ZERO, &mut action);
+    });
+    action
+}
+
+fn settings_label(ui: &mut Ui, width: f32, label: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 24.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| ui.label(RichText::new(label).size(11.0)),
+    );
+}
+
+fn group_title(ui: &mut Ui, title: &str) -> f32 {
+    let width = ui.available_width();
+    ui.set_min_width(width);
+    ui.label(RichText::new(title).color(theme::TEXT_DIM).size(11.0));
+    ui.add_space(4.0);
+    (width * 0.43).clamp(70.0, 144.0)
+}
+
+fn show_standard(ui: &mut Ui, state: &EditToolsState) -> Option<EditToolsAction> {
+    let mut action = None;
+    ui.spacing_mut().item_spacing.x = 8.0;
+    ui.spacing_mut().interact_size.y = 24.0;
+    ui.label(RichText::new("Fill Gaps").size(14.0));
+    tool_row(ui, fill_buttons(state), &mut action);
+
+    ui.add_space(12.0);
+    egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+        let label_width = group_title(ui, "Settings");
+        ui.horizontal(|ui| {
+            settings_label(ui, label_width, "Max. Gap Size");
+            if let Some(value) = value_field(ui, &state.max_gap, ui.available_width()) {
+                action = Some(EditToolsAction::SetMaxGap(value));
             }
-            if let Some(why) = why {
-                response.on_hover_text(why);
+        });
+        ui.horizontal(|ui| {
+            settings_label(ui, label_width, "Interpolation");
+            interpolation_picker(ui, state, ui.available_width(), &mut action);
+        });
+        ui.horizontal(|ui| {
+            settings_label(ui, label_width, "Fill Target");
+            let target = target_text(state);
+            ui.add(egui::Label::new(RichText::new(&target).size(12.0)).truncate()).on_hover_text(target);
+        });
+        ui.label(RichText::new("Fill Target is used by Pattern Based.").size(11.0).color(theme::TEXT_DIM));
+    });
+
+    ui.add_space(20.0);
+    ui.label(RichText::new("Smooth").size(14.0));
+    tool_row(ui, smooth_buttons(state), &mut action);
+
+    ui.add_space(12.0);
+    egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+        let label_width = group_title(ui, "Filter Cutoff Frequency");
+        ui.horizontal(|ui| {
+            settings_label(ui, label_width, "Max. Freq (Hz)");
+            if let Some(value) = value_field(ui, &state.max_frequency, ui.available_width()) {
+                action = Some(EditToolsAction::SetMaxFrequency(value));
             }
-        }
+        });
     });
     action
 }
@@ -308,163 +364,11 @@ pub fn show(ui: &mut Ui, state: &EditToolsState) -> Option<EditToolsAction> {
     if ui.available_width() >= 740.0 {
         return show_compact(ui, state);
     }
-    let mut action = None;
     egui::ScrollArea::vertical()
         .id_salt("edit_tools_pane")
-        .show(ui, |ui| {
-            ui.add_space(4.0);
-            if let Some(reason) = state.blocked_reason.as_deref() {
-                ui.label(RichText::new(reason).size(11.0).color(theme::TEXT_DIM));
-            }
-            ui.label(RichText::new("Fill Gaps").strong().size(14.0));
-            let fill_scopes = [
-                FillScope::SelectedRange,
-                FillScope::SelectedTracksAllFrames,
-                FillScope::Everything,
-            ];
-            let fill_reasons = fill_scopes.map(|s| state.fill_reason_for(s, state.interpolation));
-            let fill_key = if state.interpolation == FillMethod::Cubic {
-                "C"
-            } else {
-                "Shift+C"
-            };
-            let fill_selected = format!("Fill Selected\n{fill_key}");
-            let clicked = button_row(
-                ui,
-                &[
-                    (&fill_selected, fill_reasons[0].is_none()),
-                    ("Fill All", fill_reasons[1].is_none()),
-                    ("Fill Everything", fill_reasons[2].is_none()),
-                ],
-            );
-            for (i, did_click) in clicked.into_iter().enumerate() {
-                if did_click {
-                    action = Some(EditToolsAction::Fill(fill_scopes[i]));
-                }
-            }
-            if state.interpolation == FillMethod::PatternBased {
-                if let Some(why) = state.pattern_selection_reason() {
-                    ui.label(RichText::new(why).size(11.0).color(theme::TEXT_DIM));
-                }
-            }
-            if state.blocked_reason.is_none() {
-                for (name, why) in ["Fill Selected", "Fill All", "Fill Everything"]
-                    .into_iter()
-                    .zip(fill_reasons)
-                {
-                    if why != state.pattern_selection_reason() || state.interpolation != FillMethod::PatternBased {
-                        reason(ui, name, why);
-                    }
-                }
-            }
-
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(RichText::new("Settings").color(theme::TEXT_DIM).size(11.0));
-                let label_width = (ui.available_width() * 0.43).clamp(90.0, 130.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized([label_width, 20.0], egui::Label::new("Max. Gap Size"));
-                    let mut value = state.max_gap.clone();
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut value)
-                                .desired_width(ui.available_width()),
-                        )
-                        .changed()
-                    {
-                        action = Some(EditToolsAction::SetMaxGap(value));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([label_width, 20.0], egui::Label::new("Interpolation"));
-                    let width = (ui.available_width() - 24.0).max(1.0);
-                    egui::ComboBox::from_id_salt("fill_interpolation")
-                        .selected_text(match state.interpolation {
-                            FillMethod::Cubic => "Cubic",
-                            FillMethod::PatternBased => "Pattern Based",
-                        })
-                        .width(width)
-                        .show_ui(ui, |ui| {
-                            for (method, name) in [
-                                (FillMethod::Cubic, "Cubic"),
-                                (FillMethod::PatternBased, "Pattern Based"),
-                            ] {
-                                if ui
-                                    .selectable_label(state.interpolation == method, name)
-                                    .clicked()
-                                {
-                                    action = Some(EditToolsAction::SetInterpolation(method));
-                                }
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([label_width, 20.0], egui::Label::new("Fill Target"));
-                    ui.label(target_text(state));
-                });
-                if state.interpolation == FillMethod::Cubic {
-                    ui.label(
-                        RichText::new("Fill Target is used by Pattern Based.")
-                            .size(11.0)
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-            });
-
-            ui.add_space(18.0);
-            ui.label(RichText::new("Smooth").strong().size(14.0));
-            let smooth_scopes = [
-                SmoothScope::SelectedRange,
-                SmoothScope::SelectedTracksAllFrames,
-                SmoothScope::AllTracksAllFrames,
-            ];
-            let smooth_reasons = smooth_scopes.map(|s| state.smooth_reason(s));
-            let clicked = button_row(
-                ui,
-                &[
-                    ("Smooth Selection\nX", smooth_reasons[0].is_none()),
-                    ("Smooth Track", smooth_reasons[1].is_none()),
-                    ("Smooth All Tracks\nCtrl+Alt+X", smooth_reasons[2].is_none()),
-                ],
-            );
-            for (i, did_click) in clicked.into_iter().enumerate() {
-                if did_click {
-                    action = Some(EditToolsAction::Smooth(smooth_scopes[i]));
-                }
-            }
-            if state.blocked_reason.is_none() {
-                for (name, why) in ["Smooth Selection", "Smooth Track", "Smooth All Tracks"]
-                    .into_iter()
-                    .zip(smooth_reasons)
-                {
-                    reason(ui, name, why);
-                }
-            }
-            ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(
-                    RichText::new("Filter Cutoff Frequency")
-                        .color(theme::TEXT_DIM)
-                        .size(11.0),
-                );
-                let label_width = (ui.available_width() * 0.43).clamp(90.0, 130.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized([label_width, 20.0], egui::Label::new("Max. Freq (Hz)"));
-                    let mut value = state.max_frequency.clone();
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut value)
-                                .desired_width(ui.available_width()),
-                        )
-                        .changed()
-                    {
-                        action = Some(EditToolsAction::SetMaxFrequency(value));
-                    }
-                });
-            });
-        });
-    action
+        .show(ui, |ui| egui::Frame::none().inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| show_standard(ui, state)).inner)
+        .inner
 }
 
 #[cfg(test)]
@@ -666,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_controls_emit_immediate_scope_actions_and_show_reasons() {
+    fn headless_controls_emit_immediate_scope_actions() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let mut st = state();
@@ -707,20 +611,66 @@ mod tests {
         st.selected_tracks.pop();
         let (output, _) = draw(&ctx, &st, 440.0, vec![]);
         let labels = texts(&output);
-        assert!(labels.iter().any(|(text, _)| text.contains("Shift+C")));
-        assert!(labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
+        assert!(!labels.iter().any(|(text, _)| text.contains("Shift+C")));
+        assert!(!labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         assert_eq!(click(&ctx, &st, "Fill Selected"), None);
         assert_eq!(click(&ctx, &st, "Fill All"), None);
-        assert!(labels
+        assert!(!labels
             .iter()
             .any(|(text, _)| text.contains("Pattern Based에서는 Fill Everything을 쓸 수 없어요")));
         assert_eq!(click(&ctx, &st, "Fill Everything"), None);
         st.max_gap = "0".into();
         let (output, _) = draw(&ctx, &st, 440.0, vec![]);
-        assert!(texts(&output).iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
+        assert!(!texts(&output).iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         assert!(!labels
             .iter()
             .any(|(text, _)| text.contains("Preview") || text.contains("Apply")));
+    }
+
+    #[test]
+    fn disabled_fill_shows_its_korean_reason_and_shortcut_on_hover() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let mut st = state();
+        st.range = None;
+        let why = st.fill_reason_for(FillScope::SelectedRange, st.interpolation).unwrap();
+        let (out, _) = draw(&ctx, &st, 376.0, vec![]);
+        let labels = texts(&out);
+        assert!(!labels.iter().any(|(text, _)| text == why || text == "Fill Selected (C)"));
+        let pos = labels.iter().find(|(text, _)| text == "Fill Selected").unwrap().1.center();
+        draw(&ctx, &st, 376.0, vec![Event::PointerMoved(pos)]);
+        let (out, _) = draw(&ctx, &st, 376.0, vec![]);
+        let labels = texts(&out);
+        for tip in [why, "Fill Selected (C)"] {
+            assert!(labels.iter().any(|(text, _)| text == tip), "missing tooltip {tip}");
+        }
+    }
+
+    #[test]
+    fn default_width_keeps_equal_buttons_in_each_action_row() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let (out, _) = draw(&ctx, &state(), 376.0 + 16.0, vec![]);
+        let labels = texts(&out);
+        for names in [
+            ["Fill Selected", "Fill All", "Fill Everything"],
+            ["Smooth Selection", "Smooth Track", "Smooth All Tracks"],
+        ] {
+            let buttons = names.map(|name| {
+                let center = labels.iter().find(|(text, _)| text == name).unwrap().1.center();
+                out.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.rect.contains(center)
+                        && (r.rect.height() - 32.0).abs() < 1.0 => Some(r.rect),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("missing button background for {name}"))
+            });
+            for pair in buttons.windows(2) {
+                assert_eq!(pair[0].top(), pair[1].top());
+                assert!((pair[0].width() - pair[1].width()).abs() < 1.0);
+                assert!((pair[1].left() - pair[0].right() - 8.0).abs() < 1.0);
+            }
+        }
     }
 
     #[test]
@@ -788,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_pattern_explains_missing_references_and_target_is_read_only() {
+    fn wide_pattern_target_remains_read_only_without_inline_reason() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let mut st = state();
@@ -796,7 +746,7 @@ mod tests {
         st.selected_tracks.pop();
         let (output, _) = draw(&ctx, &st, 1200.0, vec![]);
         let labels = texts(&output);
-        assert!(labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
+        assert!(!labels.iter().any(|(text, _)| text.contains("기준 마커를 먼저 고르고 채울 마커를 마지막에 골라 주세요.")));
         let at = labels.iter().find(|(text, _)| text == "LASI").unwrap().1.center();
         let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         draw(&ctx, &st, 1200.0, vec![Event::PointerMoved(at)]);

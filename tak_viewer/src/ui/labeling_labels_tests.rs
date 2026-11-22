@@ -13,11 +13,11 @@
         LabelingState {
             filter: st.filter.clone(),
             groups: data.groups.iter().enumerate().map(|(gi, group)| LabelGroup {
-                id: gi as u64, asset_uid: None, title: group.title.clone(),
+                id: gi as u64, asset_uid: None, order_scope: None, title: group.title.clone(),
                 collapsed: st.collapsed.contains(&gi),
                 labels: group.members.iter().map(|&i| {
                     let m = &data.markers[i];
-                    LabelRow { key: None, track_uid: Some(m.uid), has_samples: m.n_samples > 0, name: m.name.clone(), color: theme::color(m.color), fill_pct: m.fill_pct, present: m.present(frame), selected: selected.contains(&i), primary: primary == Some(i) }
+                    LabelRow { key: None, track_uid: Some(m.uid), has_samples: m.n_samples > 0, name: m.name.clone(), file_index: i, moved: false, color: theme::color(m.color), fill_pct: m.fill_pct, present: m.present(frame), selected: selected.contains(&i), primary: primary == Some(i) }
                 }).collect(),
             }).collect(),
             scroll_to_track: st.scroll_to.map(|i| data.markers[i].uid),
@@ -138,7 +138,7 @@
                     ui.set_width(self.width);
                     ui.spacing_mut().item_spacing.y = self.spacing;
                     let state = pane_state(&self.data, &self.state, &self.selected, self.primary, self.frame);
-                    let result = show(ui, &state);
+                    let result = show(ui, &state, Reorder::default());
                     self.state.scroll_to = None;
                     action = match result {
                         Some(LabelingAction::ToggleGroup(id)) => { if !self.state.collapsed.remove(&(id as usize)) { self.state.collapsed.insert(id as usize); } None },
@@ -210,7 +210,7 @@
         assert_eq!(headers.len(), 2);
         for (left, right) in [("M0", "M3"), ("M1", "M4")] {
             assert!((at(&painted, left).rect.center().y - at(&painted, right).rect.center().y).abs() < 0.1);
-            assert!((at(&painted, right).rect.left() - at(&painted, left).rect.left() - 190.0).abs() < 0.5);
+            assert!((at(&painted, right).rect.left() - at(&painted, left).rect.left() - 174.0).abs() < 0.5);
         }
         assert!(at(&painted, "M0").rect.top() < at(&painted, "M1").rect.top());
         assert!(at(&painted, "M1").rect.top() < at(&painted, "M2").rect.top());
@@ -218,7 +218,7 @@
             assert!((at(&painted, value).rect.right() - headers[col].rect.right()).abs() < 0.5, "{value} right-aligned to its header");
         }
         assert!(!painted.iter().any(|t| ["빈구간", "최대", "123", "2", "0%"].contains(&t.text.as_str())), "old header/cell numbers are gone");
-        assert!(painted.iter().any(|t| t.text.contains("See gaps in Marker Info.")), "the legend tells where the other numbers are");
+        assert!(painted.iter().any(|t| t.text.eq(LEGEND)), "the legend explains presence and coverage");
     }
 
     #[test]
@@ -335,10 +335,10 @@
             egui::Shape::Rect(r) if r.rect.contains(target.rect.center()) && (r.rect.height() - ROW_H).abs() < 0.1 => Some((r.rect.top(), s.clip_rect.top())),
             _ => None,
         }).expect("the target's background is painted");
-        assert!((row_top - viewport_top - 3.0 * (ROW_H + p.spacing)).abs() < 6.0, "three actual row pitches below the viewport top");
+        assert!((row_top - viewport_top - 3.0 * ROW_H).abs() < 6.0, "three actual row pitches below the viewport top");
         assert_eq!(p.state.scroll_to, None);
         assert!(!painted.iter().any(|t| t.text == "M000" || t.text == "M199"));
-        assert!(painted.iter().filter(|t| t.text.starts_with('M')).count() < 32, "virtualized instead of painting all 200 markers");
+        assert!(painted.iter().filter(|t| t.text.starts_with('M')).count() < 40, "virtualized instead of painting all 200 markers");
         assert!(texts(&p.idle()).iter().any(|t| t.text == "M180"));
     }
 
@@ -349,7 +349,7 @@
         let mut p = PaneTest::new(&[&refs]);
         p.height = f32::INFINITY;
         let painted = texts(&p.idle());
-        let legend = painted.iter().find(|t| t.text.contains("See gaps in Marker Info.")).expect("the legend is painted");
+        let legend = painted.iter().find(|t| t.text.eq(LEGEND)).expect("the legend is painted");
         assert!(legend.clip.contains_rect(legend.rect), "the docked pane must not clip its legend below the scroll area");
         assert!(legend.rect.bottom() <= 692.5, "inside the 700 pt screen's panel margin");
     }
@@ -364,7 +364,7 @@
         assert_eq!(at(&painted, "M0").color, theme::LABEL_TRACKED);
         assert_eq!(at(&painted, "M2").color, theme::LABEL_TRACKED);
         for (name, fill) in [("M0", theme::SELECT_SECONDARY.gamma_multiply(0.22)), ("M2", theme::SELECT_PRIMARY.gamma_multiply(0.28))] {
-            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == fill && r.rect.contains(at(&painted, name).rect.center()) && (r.rect.width() - 190.0).abs() < 0.5)));
+            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == fill && r.rect.contains(at(&painted, name).rect.center()) && (r.rect.width() - 174.0).abs() < 0.5)));
         }
         for m in &p.data.markers {
             assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Circle(c) if c.fill == theme::color(m.color) && (c.radius - 4.0).abs() < 0.1)));
@@ -450,21 +450,18 @@
     }
 
     #[test]
-    fn pinned_selection_summary_counts_hidden_rows_and_names_the_hidden_target() {
+    fn folded_group_keeps_hidden_selection_and_primary_target() {
         let d = data(&[&["M0", "M1", "M2"], &["M3", "M4", "M5"]]);
         let mut st = LabelsState::default();
         st.collapsed.insert(1);
         let selected = (0..6).collect();
         let pane = pane_state(&d, &st, &selected, Some(4), 0);
-        assert_eq!(pane.selection_summary(), ("6 selected (3 hidden)".into(), "Pattern target: M4".into()));
+        assert_eq!(pane.selection_summary(false), ("6 selected (3 hidden)".into(), "Pattern target: M4".into()));
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(380.0, 280.0))), ..Default::default() }, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| { show(ui, &pane); });
+            egui::CentralPanel::default().show(ctx, |ui| { show(ui, &pane, Reorder::default()); });
         });
         let painted = texts(&output);
-        for name in ["6 selected (3 hidden)", "Pattern target: M4"] {
-            let label = at(&painted, name);
-            assert!(label.clip.contains_rect(label.rect));
-            assert!(label.rect.top() < at(&painted, "QuickLabel Mode  D").rect.top());
-        }
+        assert!(!painted.iter().any(|label| label.text.contains("Pattern target")
+            || label.text.contains("6 selected")));
     }

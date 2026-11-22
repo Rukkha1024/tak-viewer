@@ -53,9 +53,24 @@ enum Crop {
     Panel(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarkerOrderPane {
+    On,
+    Menu,
+    Off,
+    Settings,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MarkerOrderPreview {
+    pub pane: MarkerOrderPane,
+    pub names: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub size: Option<[f32; 2]>,
+    pub(crate) marker_order: Option<MarkerOrderPreview>,
     crop: Option<Crop>,
     scale: usize,
     crop_only: bool,
@@ -66,6 +81,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             size: None,
+            marker_order: None,
             crop: None,
             scale: 1,
             crop_only: false,
@@ -145,6 +161,21 @@ pub fn parse(args: &[String]) -> Result<(Options, Vec<String>), String> {
                     .ok()
                     .filter(|&n| n > 0)
                     .ok_or("--scale에는 1 이상의 정수를 써 주세요.")?;
+            }
+            "--shot-marker-order" => {
+                let v = value(arg, &mut input)?;
+                let (pane, names) = match v.split_once(':') {
+                    Some(("settings", names)) => (MarkerOrderPane::Settings, names),
+                    Some(("menu", names)) => (MarkerOrderPane::Menu, names),
+                    Some(("off", names)) => (MarkerOrderPane::Off, names),
+                    _ => (MarkerOrderPane::On, v.as_str()),
+                };
+                let mut names: Vec<_> = names.split(',').map(str::to_owned).collect();
+                crate::marker_order::clean(&mut names);
+                if names.is_empty() {
+                    return Err("--shot-marker-order 뒤에 마커 이름을 하나 이상 써 주세요.".into());
+                }
+                options.marker_order = Some(MarkerOrderPreview { pane, names });
             }
             "--crop-only" => options.crop_only = true,
             "--regions" => options.regions = true,

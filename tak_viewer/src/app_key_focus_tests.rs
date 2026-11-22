@@ -116,7 +116,7 @@ fn delete_focus_view_tab_ssh_and_labeling_legend_block_marker_delete() {
                 .find(|r| r.center().y < app.views[0].scene_rect.top() + dock::TAB_H).expect("view name tag").center(),
             "ssh" => text_rects(&out, "SSH (0)").first().expect("SSH section").center(),
             _ => {
-                let text = "White = here · Red = missing · % of frames with a point. See gaps in Marker Info.";
+                let text = crate::ui::labeling::LEGEND;
                 text_rects(&out, text).first().expect("Labeling legend").center()
             }
         };

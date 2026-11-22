@@ -10,16 +10,10 @@ pub(crate) enum IncrementMode {
     NextMissing,
 }
 
+#[cfg(test)]
 impl IncrementMode {
     pub(crate) const ALL: [Self; 3] = [Self::Stay, Self::Next, Self::NextMissing];
 
-    pub(crate) fn caption(self) -> &'static str {
-        match self {
-            Self::Stay => "Do Not Increment",
-            Self::Next => "Go To Next Label",
-            Self::NextMissing => "Go To Next Unlabeled Marker",
-        }
-    }
 }
 
 impl Serialize for IncrementMode {
