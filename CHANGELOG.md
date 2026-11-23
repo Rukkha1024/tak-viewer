@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.75.1 — 2026-11-23
+
+- Read SSH host names from the native home folder on Windows and macOS.
+- Prefer the short alias when a matching Tailscale address uses the same direct host, account and port.
+
 ## v0.75.0 — 2026-11-23
 
 - Build, verify and install a native macOS app from the shared source.

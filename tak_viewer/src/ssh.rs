@@ -1670,7 +1670,12 @@ fn host_worker(
 /// Concrete Host aliases only. Parsing never expands substitutions or runs a command.
 fn aliases_from_config(text: &str) -> Vec<String> {
     let mut aliases = Vec::new();
-    let mut seen = HashSet::new();
+    let mut routes = HashMap::<String, SshRoute>::new();
+    let mut dns_aliases = HashSet::new();
+    let mut active = Vec::new();
+    let mut used_fields = HashSet::new();
+    let mut literal_block = false;
+    let mut can_merge = true;
     for line in text.lines() {
         let mut words = Vec::new();
         let (mut word, mut quoted) = (String::new(), None);
@@ -1694,27 +1699,124 @@ fn aliases_from_config(text: &str) -> Vec<String> {
         if !word.is_empty() {
             words.push(word);
         }
-        if words
-            .first()
-            .is_none_or(|s| !s.eq_ignore_ascii_case("host"))
-        {
+        let Some((key, args)) = words.split_first() else {
             continue;
-        }
-        for alias in words.into_iter().skip(1) {
-            if !alias.starts_with('-')
-                && !alias.contains(['*', '?', '!', '[', ']', '\0', '/', '\\', '='])
-                && !alias.chars().any(char::is_whitespace)
-                && seen.insert(alias.clone())
-            {
-                aliases.push(alias);
+        };
+        let args = if args.first().is_some_and(|value| value == "=") {
+            &args[1..]
+        } else {
+            args
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "host" => {
+                active.clear();
+                used_fields.clear();
+                active.extend(
+                    args.iter()
+                        .filter(|alias| {
+                            !alias.starts_with('-')
+                                && !alias.contains(['*', '?', '!', '[', ']', '\0', '/', '\\', '='])
+                                && !alias.chars().any(char::is_whitespace)
+                        })
+                        .cloned(),
+                );
+                literal_block = !active.is_empty() && active.len() == args.len();
+                for alias in &active {
+                    if !routes.contains_key(alias) {
+                        if !dns_aliases.insert(alias.to_ascii_lowercase()) {
+                            can_merge = false;
+                        }
+                        aliases.push(alias.clone());
+                        routes.insert(alias.clone(), SshRoute::default());
+                    }
+                }
             }
+            "include" | "match" | "canonicalizehostname" => can_merge = false,
+            field @ ("hostname" | "user" | "port" | "proxycommand" | "proxyjump") => {
+                if !literal_block {
+                    can_merge = false;
+                    continue;
+                }
+                // First value wins. Visit a Host block's aliases at most once per field.
+                if used_fields.contains(field) {
+                    continue;
+                }
+                used_fields.insert(field.to_owned());
+                let value = args.first().cloned().unwrap_or_default();
+                for alias in &active {
+                    let route = routes.get_mut(alias).expect("listed alias has a route");
+                    match field {
+                        "hostname" => {
+                            route.hostname.get_or_insert_with(|| value.clone());
+                        }
+                        "user" => {
+                            route.user.get_or_insert_with(|| value.clone());
+                        }
+                        "port" => {
+                            route.port.get_or_insert_with(|| value.clone());
+                        }
+                        _ => route.has_proxy = true,
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+    if can_merge {
+        aliases.retain(|alias| !has_matching_short_alias(alias, &routes));
     }
     aliases
 }
 
+#[derive(Default)]
+struct SshRoute {
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<String>,
+    has_proxy: bool,
+}
+
+fn has_matching_short_alias(full: &str, routes: &HashMap<String, SshRoute>) -> bool {
+    let Some((short, network)) = full
+        .strip_suffix(".ts.net")
+        .and_then(|name| name.split_once('.'))
+    else {
+        return false;
+    };
+    if short.is_empty() || network.is_empty() || network.contains('.') {
+        return false;
+    }
+    let Some(short_route) = routes.get(short) else {
+        return false;
+    };
+    let full_route = &routes[full];
+    let port = |route: &SshRoute| {
+        route
+            .port
+            .as_deref()
+            .unwrap_or("22")
+            .parse::<u16>()
+            .ok()
+            .filter(|&number| number != 0)
+    };
+    !short_route.has_proxy
+        && !full_route.has_proxy
+        && short_route
+            .hostname
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(full))
+        && full_route
+            .hostname
+            .as_deref()
+            .unwrap_or(full)
+            .eq_ignore_ascii_case(full)
+        && short_route.user == full_route.user
+        && port(short_route).is_some_and(|number| Some(number) == port(full_route))
+}
+
 fn discover_aliases() -> Result<Vec<String>, String> {
-    let Some(profile) = std::env::var_os("USERPROFILE") else {
+    let profile_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let Some(profile) = std::env::var_os(profile_var).filter(|value| !value.is_empty()) else {
         return Ok(Vec::new());
     };
     let path = PathBuf::from(profile).join(".ssh").join("config");
@@ -1800,6 +1902,60 @@ mod tests {
                 "한글"
             ]
         );
+    }
+
+    #[test]
+    fn config_prefers_short_alias_for_the_same_direct_tailscale_login() {
+        let text = "Host station.tail123.ts.net\n  User operator\n  IdentityFile key-full\n\
+                    Host lab\n  HostName 192.0.2.7\n\
+                    Host station\n  HostName station.tail123.ts.net\n  User operator\n  Port 22\n  IdentityFile key-short\n\
+                    Host helper.tail123.ts.net\n";
+        assert_eq!(aliases_from_config(text), ["lab", "station", "helper.tail123.ts.net"]);
+    }
+
+    #[test]
+    fn config_keeps_aliases_with_different_or_ambiguous_routes() {
+        let pair = "Host station\n  HostName station.tail123.ts.net\n  User operator\n\
+                    Host station.tail123.ts.net\n";
+        for full_host_options in [
+            "  User observer\n",
+            "  User operator\n  Port 2222\n",
+            "  User operator\n  HostName another.tail123.ts.net\n",
+            "  User operator\n  ProxyJump gateway\n",
+            "  User operator\nInclude ~/.ssh/other\n",
+            "  User operator\nHost *.ts.net\n  Port 2222\n",
+        ] {
+            assert_eq!(
+                aliases_from_config(&format!("{pair}{full_host_options}")),
+                ["station", "station.tail123.ts.net"],
+                "{full_host_options}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_reads_the_native_user_folder() {
+        const CHILD: &str = "TAK_TEST_NATIVE_SSH_DISCOVERY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(discover_aliases().unwrap(), ["native-host"]);
+            return;
+        }
+        let temp = tak_core::test_support::TempDir::new("native_ssh_home");
+        let native = temp.join("native");
+        let other = temp.join("other");
+        for (folder, alias) in [(&native, "native-host"), (&other, "other-host")] {
+            std::fs::create_dir_all(folder.join(".ssh")).unwrap();
+            std::fs::write(folder.join(".ssh/config"), format!("Host {alias}\n")).unwrap();
+        }
+        let (home, userprofile) = if cfg!(windows) { (&other, &native) } else { (&native, &other) };
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ssh::tests::discovery_reads_the_native_user_folder"])
+            .env("HOME", home)
+            .env("USERPROFILE", userprofile)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
