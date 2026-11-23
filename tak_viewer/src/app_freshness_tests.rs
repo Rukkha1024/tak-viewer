@@ -9,8 +9,7 @@ mod freshness_tests {
     fn wait(ctx: &egui::Context, app: &mut TakViewerApp, ready: impl Fn(&TakViewerApp) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready(app) {
-            app.poll_loads(ctx);
-            app.poll_hidden_file_work(ctx);
+            frame_with(ctx, app, vec![]);
             assert!(app.error.is_none(), "{:?}", app.error);
             assert!(Instant::now() < deadline, "fresh-open reader did not finish");
             std::thread::sleep(Duration::from_millis(1));

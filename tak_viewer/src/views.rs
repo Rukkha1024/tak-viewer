@@ -50,7 +50,7 @@ impl RetainedDocument {
 /// Live file state shared by repeated views. Cloning the handle never copies marker samples.
 /// A hidden tab consumes its latest generation only when activated or explicitly notified.
 #[derive(Clone)]
-pub struct SharedFile(Arc<Mutex<SharedFileState>>);
+pub struct SharedFile(Arc<Mutex<SharedFileState>>, Option<Arc<FirstPaint>>);
 
 struct SharedFileState {
     progress: Option<crate::take_progress::State>,
@@ -119,8 +119,8 @@ pub const MAX_VIEWS: usize = 4;
 /// Remembered files (`Spot`), most recent first.
 pub const MAX_SPOTS: usize = 50;
 
-/// Messages from a background open. Markers come first (`tak::fast_read`); force plate
-/// forces / EMG follow when no file's markers are still loading.
+/// Messages from a background open. Initial forceplate samples wait for a 3D paint
+/// of the installed markers and for all current local marker reads to finish.
 pub enum LoadMsg {
     /// View data (analog still missing when `analog_pending`) and step times in ms.
     Markers(Result<(ViewData, Vec<(&'static str, f64)>), String>),
@@ -245,6 +245,45 @@ impl CommentState {
 /// Marker loads running now (all views). A file's analog part waits until this is 0, so the
 /// markers of every file being opened come first.
 static MARKER_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// One gate per fresh marker read, shared by all views and overlays of that publication.
+#[derive(Default)]
+pub struct FirstPaint {
+    complete: AtomicBool,
+    remote_request: Option<u64>,
+    local_analog: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl FirstPaint {
+    pub fn pending(&self) -> bool {
+        !self.complete.load(Ordering::Acquire)
+    }
+
+    /// Return the SSH request to wake, once. The local reader observes the same flag.
+    pub fn finish(&self) -> Option<u64> {
+        if self.complete.swap(true, Ordering::AcqRel) { return None; }
+        let start = self.local_analog.lock().unwrap().take();
+        if let Some(start) = start { std::thread::spawn(start); }
+        self.remote_request
+    }
+
+    /// The marker worker can exit while a hidden or closed tab waits for a scene.
+    fn defer_local_analog(&self, start: impl FnOnce() + Send + 'static) {
+        let mut pending = self.local_analog.lock().unwrap();
+        if self.pending() {
+            *pending = Some(Box::new(start));
+        } else {
+            drop(pending);
+            std::thread::spawn(start);
+        }
+    }
+}
+
+impl Drop for FirstPaint {
+    fn drop(&mut self) {
+        drop_later(self.local_analog.get_mut().unwrap().take());
+    }
+}
 
 pub fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
@@ -515,6 +554,8 @@ pub struct View {
     analog_merge: Option<Receiver<(Arc<ViewData>, ViewData, AnalogPart, [f64;2])>>,
     /// Set when the file being read is no longer wanted.
     load_cancel: Arc<AtomicBool>,
+    pending_first_paint: Option<Arc<FirstPaint>>,
+    first_paint: Option<Arc<FirstPaint>>,
     /// Put the file being read here once its markers arrive (remembered `Spot`).
     pub restore: Option<Spot>,
     /// Latest open: start, step times in ms, ms until markers / force plates (`--bench`).
@@ -611,6 +652,8 @@ impl Default for View {
             analog_queue: Vec::new(),
             analog_merge: None,
             load_cancel: Arc::new(AtomicBool::new(false)),
+            pending_first_paint: None,
+            first_paint: None,
             restore: None,
             open_started: None,
             load_steps: Vec::new(),
@@ -723,7 +766,7 @@ impl View {
                 emg_demand: false,
                 emg_wake: None,
                 editor_wake: None,
-            }))));
+            })), self.first_paint.clone()));
             self.shared_generation = 0;
         }
         self.sync_shared();
@@ -801,6 +844,7 @@ impl View {
         self.comments_rx = None;
         comments.install(&mut self.comments);
         if remote.is_some() {self.remote=remote;}
+        self.first_paint = shared.1.clone();
         self.shared_file = Some(shared);
         self.shared_generation = generation;
         // The canonical data already represents this document's current revision.
@@ -873,6 +917,7 @@ impl View {
         if let Some((a, b)) = self.range {
             self.range = Some(panels::ordered_range(a, b, self.pb.first, self.pb.last));
         }
+        self.first_paint = shared.1.clone();
         drop_later(self.shared_file.replace(shared));
         self.shared_generation = generation;
         true
@@ -1274,9 +1319,8 @@ impl View {
         Some(self.pb.frame - d.start_frame + o.data.start_frame)
     }
 
-    /// Read a file on a background thread: markers first, then its comment file (small), then
-    /// force plates / EMG once no file's markers are loading any more. A load this view started
-    /// before is cancelled.
+    /// Read markers and Comments off the UI thread. Initial forceplates wait for the
+    /// marker scene. The other analog job remains deferred until a device requests it.
     pub fn start_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>) {
         if self.data.is_some() && self.loading.is_none() && self.waiting_shared.is_none() {
             self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.shown_identity.take());
@@ -1307,6 +1351,9 @@ impl View {
         self.load_cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
         self.load_cancel = cancel.clone();
+        let paint = Arc::new(FirstPaint::default());
+        self.pending_first_paint = Some(paint.clone());
+        let paint = Arc::downgrade(&paint);
         MARKER_LOADS.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             let panic_msg = || "읽는 중 내부 오류(panic)가 났어요.".to_owned();
@@ -1356,21 +1403,22 @@ impl View {
             let _ = comments_tx.send(load);
             ctx2.request_repaint();
             let Some((job, target)) = job else { return };
-            while MARKER_LOADS.load(Ordering::SeqCst) > 0 && !cancel.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if cancel.load(Ordering::SeqCst) {
-                return;
-            }
-            let t = Instant::now();
-            let analog = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let indices = job.device_indices().to_vec();
-                let selective = job.plate_devices().is_some();
-                job.run().map(|(analog, warning)| if selective { AnalogPart::prepare_selected(analog, warning, &target, indices, true) } else { AnalogPart::prepare(analog, warning, &target) }).map_err(|e| e.to_string())
-            }))
-            .unwrap_or_else(|_| Err(panic_msg()));
-            let _ = tx.send(LoadMsg::Analog(analog, ms_since(t)));
-            ctx2.request_repaint();
+            let Some(paint) = paint.upgrade() else { return; };
+            paint.defer_local_analog(move || {
+                while MARKER_LOADS.load(Ordering::SeqCst) > 0 && !cancel.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if cancel.load(Ordering::SeqCst) { return; }
+                let t = Instant::now();
+                let analog = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let indices = job.device_indices().to_vec();
+                    let selective = job.plate_devices().is_some();
+                    job.run().map(|(analog, warning)| if selective { AnalogPart::prepare_selected(analog, warning, &target, indices, true) } else { AnalogPart::prepare(analog, warning, &target) }).map_err(|e| e.to_string())
+                }))
+                .unwrap_or_else(|_| Err(panic_msg()));
+                let _ = tx.send(LoadMsg::Analog(analog, ms_since(t)));
+                ctx2.request_repaint();
+            });
         });
         self.loading = Some((path, rx));
         self.comments_rx = Some(comments_rx);
@@ -1398,6 +1446,7 @@ impl View {
         self.waiting_shared = None;
         self.pending_identity = None;
         self.set_fresh_open_candidate(None);
+        self.pending_first_paint = None;
         self.load_cancel.store(true, Ordering::SeqCst);
         drop_later(self.restore_edit_document.take());
         self.restore_edit_selection = None;
@@ -1430,7 +1479,10 @@ impl View {
             Err(TryRecvError::Disconnected) => Err("읽기가 중간에 끝났어요".to_owned()),
         };
         let (path, rx) = self.loading.take()?;
-        if msg.is_err() { self.set_fresh_open_candidate(None); }
+        if msg.is_err() {
+            self.pending_first_paint = None;
+            self.set_fresh_open_candidate(None);
+        }
         self.markers_ms = self.open_started.map(ms_since);
         Some(Loaded { path, result: msg, rx })
     }
@@ -1442,6 +1494,7 @@ impl View {
     }
 
     pub fn show_shared(&mut self, data: Arc<ViewData>, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
+        self.first_paint = self.pending_first_paint.take().filter(|_| data.analog_pending);
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.pending_identity.take());
         self.pending_identity = None;
         let mut verified_restore = false;
@@ -1527,6 +1580,18 @@ impl View {
             self.range = range.map(|(a, b)| panels::ordered_range(a, b, self.pb.first, self.pb.last));
         }
         old
+    }
+
+    pub fn wait_for_remote_first_paint(&mut self, request: u64) {
+        self.first_paint = Some(Arc::new(FirstPaint {
+            complete: AtomicBool::new(false),
+            remote_request: Some(request),
+            local_analog: Mutex::new(None),
+        }));
+    }
+
+    pub fn pending_first_paint(&self) -> Option<Arc<FirstPaint>> {
+        self.first_paint.as_ref().filter(|paint| paint.pending()).cloned()
     }
 
     /// The comment file of the shown file arrived (it comes right after the markers).
@@ -2948,6 +3013,40 @@ mod tests {
     }
 
     #[test]
+    fn local_initial_analog_waits_for_its_marker_paint_and_can_be_cancelled() {
+        let dir = tak_core::test_support::TempDir::new("forceplate_first_paint");
+        let path = dir.join("devices.tak");
+        std::fs::write(&path, tak_core::sample_tak::sample_tak()).unwrap();
+        let ctx = egui::Context::default();
+        for close in [false, true] {
+            let mut view = View::default();
+            view.start_load(&ctx, path.clone(), None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let loaded = loop {
+                if let Some(loaded) = view.poll_markers() { break loaded; }
+                assert!(Instant::now() < deadline, "marker reader timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let (data, _) = loaded.result.unwrap();
+            assert!(data.analog_pending, "fixture must use a separate analog stage");
+            drop_later(view.show(data, loaded.rx, 1, 1.0, 0.0));
+            let (_, rx) = view.analog_rx.take().unwrap();
+            assert!(matches!(rx.recv_timeout(Duration::from_millis(20)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+            let paint = view.pending_first_paint().unwrap();
+            if close {
+                view.cancel_load();
+                assert!(paint.pending());
+                drop(paint);
+                drop(view);
+                assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+            } else {
+                paint.finish();
+                assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(LoadMsg::Analog(Ok(_), _))));
+            }
+        }
+    }
+
+    #[test]
     fn actual_local_emg_is_requested_once_and_cancellation_reopen_rebuilds_deferred_job() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
         if !path.exists() { return; }
@@ -2964,6 +3063,7 @@ mod tests {
                 }
                 assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));
             }
+            if let Some(paint) = view.pending_first_paint() { paint.finish(); }
             while view.analog_work_pending() {
                 view.poll_analog();
                 assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));

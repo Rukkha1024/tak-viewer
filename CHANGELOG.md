@@ -1,5 +1,11 @@
 # 변경 사항
 
+## v0.76.1 — 2026-11-23
+
+- Fix EXPLORER → SSH opens from empty tabs. Create the 3D view and draw markers.
+- Wait for the first completed marker frame before reading forceplate samples. Hidden tabs wait until shown. Keep other analog on demand.
+- Check real marker pixels after an SSH list click with a fake server.
+
 ## v0.76.0 — 2026-11-23
 
 - Add Help → Check for Updates… on Windows and macOS. Click checks the source's upstream in the background, asks `Update` / `Not now`, runs the existing build script (Windows `빌드.cmd`, macOS `scripts/01_build_macos.sh`), then asks `Restart` / `Later` after the usual save prompt. Nothing runs at startup. Refusals and failures in easy Korean with the log path.

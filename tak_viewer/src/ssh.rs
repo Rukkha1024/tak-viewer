@@ -293,7 +293,7 @@ enum OperationKind {
     ProgressWrite,
 }
 #[derive(Clone, Copy)]
-enum AnalogStage { Initial, Full, OnAccess }
+enum AnalogStage { WaitingForPaint { full: bool }, Initial, Full, OnAccess }
 struct Operation {
     cancel: CancelToken,
     kind: OperationKind,
@@ -348,6 +348,7 @@ enum Command {
         id: u64, location: RemoteLocation, snapshot: Option<tak_core::edit::DocumentSnapshot>,
         events: Vec<comments::Event>, data: Arc<ViewData>, document:RemoteDocument, reply: Sender<Result<RemoteWritten, String>>, cancel: CancelToken,
     },
+    ReleaseAnalog(u64),
     Stop,
 }
 
@@ -830,11 +831,22 @@ impl SshManager {
         Ok(())
     }
 
+    /// Wake the host worker after the frame containing this open's markers is complete.
+    pub fn markers_painted(&self, id: u64) {
+        for worker in self.hosts.iter().filter_map(|host| host.worker.as_ref()) {
+            if worker.operations.contains_key(&id) {
+                let _ = worker.tx.send(Command::ReleaseAnalog(id));
+                break;
+            }
+        }
+    }
+
     pub fn cancel_request(&mut self, id: u64) {
-        for host in &mut self.hosts {
-            if let Some(op) = host.worker.as_mut().and_then(|w| w.operations.remove(&id)) {
+        for worker in self.hosts.iter_mut().filter_map(|host| host.worker.as_mut()) {
+            if let Some(op) = worker.operations.remove(&id) {
                 op.cancel.cancel();
                 if op.kind == OperationKind::Open {
+                    let _ = worker.tx.send(Command::ReleaseAnalog(id));
                     self.emitted.push(SshEvent::Cancelled { request_id: id });
                 }
             }
@@ -1054,6 +1066,25 @@ impl SshManager {
         std::mem::take(&mut self.emitted)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fake_open_list(&mut self) -> FakeOpenList {
+        self.set_demo("connected");
+        self.demo = false;
+        self.collapsed = false;
+        let (tx, rx) = mpsc::channel();
+        self.hosts[0].worker = Some(WorkerHandle { tx, operations: HashMap::new() });
+        FakeOpenList(rx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_marker_reply(&self, id: u64, location: RemoteLocation, data: ViewData) {
+        self.tx.send(Envelope {
+            host: location.host.clone(),
+            generation: 0,
+            event: WorkerEvent::Markers { id, location, data: Arc::new(data), comments: Comments::default() },
+        }).unwrap();
+    }
+
     /// Screenshot-only fake state; no config, SSH, process or network activity.
     pub fn set_demo(&mut self, state: &str) {
         self.cancel_all();
@@ -1127,6 +1158,27 @@ impl SshManager {
         }
         if state == "lost" {
             h.note = Some(LOST_NOTE.into());
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FakeOpenList(mpsc::Receiver<Command>);
+
+#[cfg(test)]
+impl FakeOpenList {
+    pub(crate) fn opened(&self) -> (u64, RemoteLocation, CancelToken) {
+        match self.0.try_recv().expect("clicked SSH row sends Open") {
+            Command::Open { id, location, cancel, .. } => (id, location, cancel),
+            _ => panic!("expected SSH marker request"),
+        }
+    }
+
+    pub(crate) fn analog_released(&self) -> Option<u64> {
+        match self.0.try_recv() {
+            Ok(Command::ReleaseAnalog(id)) => Some(id),
+            Err(mpsc::TryRecvError::Empty) => None,
+            _ => panic!("unexpected SSH command"),
         }
     }
 }
@@ -1331,6 +1383,7 @@ fn host_worker(
     let mut editable: HashMap<RemoteLocation, RemoteDocument> = HashMap::new();
     let mut pending_access: VecDeque<(u64, RemoteLocation, AnalogTarget, CancelToken)> = VecDeque::new();
     loop {
+        pending_access.retain(|(_, _, _, cancel)| !cancel.is_cancelled());
         if let Some(index) = pending_access.iter().position(|(_, l, _, _)| !analog.iter().any(|(_, active, _, _, _, _)| active == l)) {
             let (id, location, target, cancel) = pending_access.remove(index).unwrap();
             if let Some(loaded) = deferred.remove(&location) {
@@ -1339,11 +1392,15 @@ fn host_worker(
                 emit(WorkerEvent::Error { id:Some(id), message:"EMG를 읽을 준비가 없어요. 파일을 다시 열어 주세요.".into(), kind:SshErrorKind::Failed });
             }
         }
+        // A hidden tab may wait indefinitely. Leave its job queued while servicing this host.
+        let runnable = analog.iter().position(|(_, _, _, _, cancel, stage)| {
+            cancel.is_cancelled() || !matches!(stage, AnalogStage::WaitingForPaint { .. })
+        });
         // Any queued marker/list request goes before analog work from an earlier open.
         let command = match commands.try_recv() {
             Ok(cmd) => Some(cmd),
             Err(mpsc::TryRecvError::Disconnected) => return,
-            Err(mpsc::TryRecvError::Empty) if analog.is_empty() => {
+            Err(mpsc::TryRecvError::Empty) if runnable.is_none() => {
                 match commands.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(cmd) => Some(cmd),
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1515,7 +1572,7 @@ fn host_worker(
                             }
                         }
                         if pending {
-                            analog.push_back((id, location, loaded, target, cancel, if full { AnalogStage::Full } else { AnalogStage::Initial }));
+                            analog.push_back((id, location, loaded, target, cancel, AnalogStage::WaitingForPaint { full }));
                         } else {
                             if lazy { deferred.insert(location, loaded); }
                             emit(WorkerEvent::Done(id));
@@ -1601,10 +1658,16 @@ fn host_worker(
                     emit(WorkerEvent::Error { id:Some(id), message:"EMG를 읽을 준비가 없어요. 파일을 다시 열어 주세요.".into(), kind:SshErrorKind::Failed });
                 }
             }
+            Some(Command::ReleaseAnalog(request)) => {
+                if let Some((_, _, _, _, _, stage)) = analog.iter_mut().find(|job| job.0 == request) {
+                    if let AnalogStage::WaitingForPaint { full } = *stage {
+                        *stage = if full { AnalogStage::Full } else { AnalogStage::Initial };
+                    }
+                }
+            }
             None => {
-                let Some((id, location, mut loaded, target, cancel, stage)) = analog.pop_front() else {
-                    continue;
-                };
+                let (id, location, mut loaded, target, cancel, stage) =
+                    analog.remove(runnable.expect("ready analog work")).expect("queued analog work");
                 if cancel.is_cancelled() {
                     if matches!(stage, AnalogStage::OnAccess) {
                         deferred.insert(location, loaded);
@@ -1615,6 +1678,7 @@ fn host_worker(
                 let indices = if matches!(stage, AnalogStage::OnAccess) { loaded.lazy_device_indices() } else { loaded.initial_device_indices() };
                 let selective = loaded.plate_devices().is_some();
                 let read = match stage {
+                    AnalogStage::WaitingForPaint { .. } => unreachable!("paint is pending"),
                     AnalogStage::Full => session.read_analog(&mut loaded, &cancel),
                     AnalogStage::Initial => session.read_initial_analog(&mut loaded, &cancel),
                     AnalogStage::OnAccess => session.read_lazy_analog(&mut loaded, &cancel),
@@ -2077,6 +2141,7 @@ mod tests {
         let id = manager.request_analog(location.clone(), data.analog_target()).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Command::Analog { id: sent, location: sent_location, .. } if sent == id && sent_location == location));
         manager.cancel_request(id);
+        assert!(matches!(rx.try_recv().unwrap(), Command::ReleaseAnalog(sent) if sent == id));
         assert!(manager.drain_events().iter().any(|event| matches!(event, SshEvent::Cancelled { request_id } if *request_id == id)));
         manager.full_analog_probe = true;
         manager.open(location).unwrap();

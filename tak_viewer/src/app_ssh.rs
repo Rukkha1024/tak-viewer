@@ -383,7 +383,7 @@ impl TakViewerApp {
         true
     }
 
-    fn remote_action(&mut self, ctx: &egui::Context, action: SshAction) {
+    pub(super) fn remote_action(&mut self, ctx: &egui::Context, action: SshAction) {
         match action {
             SshAction::Progress(pick) => self.pick_progress(ctx, pick),
             SshAction::AddWorkspace { location, platform } => {
@@ -642,6 +642,7 @@ impl TakViewerApp {
                     if read.location != location || read.file_id.is_some() || owner.is_none() {
                         drop_later(Some(data));
                         self.ssh_reads.remove(&request_id);
+                        self.ssh.cancel_request(request_id);
                         continue;
                     }
                     let owner = owner.unwrap();
@@ -651,7 +652,10 @@ impl TakViewerApp {
                     read.document = self.remote_view(owner).and_then(View::document_id);
                     if !pending {
                         self.ssh_reads.remove(&request_id);
-                    } else { self.ssh_reads.insert(request_id, read); }
+                    } else {
+                        self.remote_view_mut(owner).unwrap().wait_for_remote_first_paint(request_id);
+                        self.ssh_reads.insert(request_id, read);
+                    }
                     let older: Vec<_> = self.ssh_reads.iter().filter(|(id, read)| **id != request_id && read.location == location)
                         .map(|(&id, _)| id).collect();
                     for id in older { self.ssh_reads.remove(&id); self.ssh.cancel_request(id); }
@@ -733,13 +737,9 @@ impl TakViewerApp {
     }
 
     /// Root lays out WORKSPACE above this section with enough reserved space for SSH.
-    pub(super) fn ssh_section(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn ssh_section(&mut self, ui: &mut egui::Ui) -> Vec<SshAction> {
         let current = self.view().remote.clone();
-        let actions = crate::ui::ssh_explorer::show(ui, &mut self.ssh, current.as_ref());
-        let ctx = ui.ctx().clone();
-        for action in actions {
-            self.remote_action(&ctx, action);
-        }
+        crate::ui::ssh_explorer::show(ui, &mut self.ssh, current.as_ref())
     }
 
     pub(super) fn ssh_status(&self, ui: &mut egui::Ui) -> bool {
@@ -868,6 +868,103 @@ mod tests {
     fn pending(app: &mut TakViewerApp, request: u64, location: &RemoteLocation) {
         app.views[0].remote_loading = Some((request, location.clone(), location.memory_key()));
         app.track_remote_read(request, 0, location.clone());
+    }
+
+    fn painted_frame(ctx: &egui::Context, app: &mut TakViewerApp, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| app.frame(ctx))
+    }
+
+    fn click_fake_ssh_row(ctx: &egui::Context, app: &mut TakViewerApp,
+                         textures: &mut crate::soft_render::Textures) {
+        dock::set_editor_layout(&mut app.dock, &dock::EditorLayout::Empty);
+        assert!(app.open_views().is_empty(), "start from an empty editor");
+        let frame = painted_frame(ctx, app, vec![]);
+        textures.set(&frame.textures_delta);
+        let row = frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "gait_001.tak" => {
+                let pos = text.pos + text.galley.size() * 0.5;
+                shape.clip_rect.contains(pos).then_some(pos)
+            }
+            _ => None,
+        }).expect("SSH file row is visible");
+        for pressed in [true, false] {
+            let out = painted_frame(ctx, app, vec![egui::Event::PointerMoved(row), egui::Event::PointerButton {
+                pos: row, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+            textures.set(&out.textures_delta);
+        }
+        assert_eq!(app.open_views(), vec![0], "list click creates a 3D pane in the real dock");
+    }
+
+    #[test]
+    fn ssh_list_empty_tab_paints_marker_pixels_before_forceplates() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let server = app.ssh.fake_open_list();
+        let mut textures = crate::soft_render::Textures::default();
+        click_fake_ssh_row(&ctx, &mut app, &mut textures);
+        let (id, location, _) = server.opened();
+
+        let marker_color = [237, 11, 193];
+        let mut data = views::sample_data(location.memory_key().to_str().unwrap(), &["M"]);
+        data.markers[0].color = tak_core::view_data::ColorSource::File(marker_color.map(|value| f32::from(value) / 255.0));
+        data.analog_pending = true;
+        app.ssh.fake_marker_reply(id, location, data);
+        app.poll_ssh(&ctx);
+        assert!(app.views[0].data.is_some());
+        assert_eq!(server.analog_released(), None, "install alone cannot start forceplates");
+
+        let out = painted_frame(&ctx, &mut app, vec![]);
+        textures.set(&out.textures_delta);
+        let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let image = crate::soft_render::paint(&primitives, &textures, [1280, 900], out.pixels_per_point, egui::Color32::BLACK);
+        let scene = app.views[0].scene_rect;
+        let target = egui::Color32::from_rgb(marker_color[0], marker_color[1], marker_color[2]);
+        let marker_pixels = image.pixels.iter().enumerate().filter(|&(i, pixel)| {
+            *pixel == target && scene.contains(egui::pos2((i % 1280) as f32, (i / 1280) as f32))
+        }).count();
+        assert!(marker_pixels >= 4, "the first frame must contain the marker: {marker_pixels} pixels");
+        assert_eq!(server.analog_released(), None, "first frame still has no forceplate request");
+        painted_frame(&ctx, &mut app, vec![]);
+        assert_eq!(server.analog_released(), Some(id));
+        assert_eq!(server.analog_released(), None, "one release per open");
+    }
+
+    #[test]
+    fn hidden_ssh_open_waits_for_first_paint_or_close() {
+        for close in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+            let server = app.ssh.fake_open_list();
+            click_fake_ssh_row(&ctx, &mut app, &mut crate::soft_render::Textures::default());
+            let original = app.layout_tabs.active_id().unwrap();
+            let (id, location, cancel) = server.opened();
+            next_tab(&mut app);
+            // No samples at the first frame still counts as a paint once the tab is shown.
+            let mut data = views::sample_data(location.memory_key().to_str().unwrap(), &[]);
+            data.analog_pending = true;
+            app.ssh.fake_marker_reply(id, location, data);
+            painted_frame(&ctx, &mut app, vec![]);
+            painted_frame(&ctx, &mut app, vec![]);
+            assert_eq!(server.analog_released(), None);
+            if close {
+                app.close_layout_tab(original);
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(app.switch_layout_tab_internal(original));
+                painted_frame(&ctx, &mut app, vec![]);
+                assert_eq!(server.analog_released(), None);
+                painted_frame(&ctx, &mut app, vec![]);
+                assert!(!cancel.is_cancelled());
+            }
+            assert_eq!(server.analog_released(), Some(id), "paint releases the job; close wakes the cancelled job");
+        }
     }
 
     #[test]

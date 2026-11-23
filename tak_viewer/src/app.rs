@@ -522,6 +522,8 @@ pub struct TakViewerApp {
     /// Command line runs (`--screenshot`, `--capture`, `--bench`) never save settings and never
     /// write comment files (they still read them).
     no_persist: bool,
+    /// At most two marker publications per visible view. Release after the completed frame.
+    painted_markers: Vec<std::sync::Arc<views::FirstPaint>>,
     /// Appends comment events on its own thread (started with the first comment).
     comment_writer: Option<comments::Writer>,
     comment_registration: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -755,6 +757,7 @@ impl TakViewerApp {
             capture: capture_plan.map(CaptureRun::new),
             capture_done: None,
             no_persist,
+            painted_markers: Vec::new(),
             comment_writer: None,
             comment_registration: None,
             comment_registration_error: None,
@@ -3355,6 +3358,8 @@ impl TakViewerApp {
             own: v.shown[0] || v.overlay.is_none(),
             overlay: v.overlay.as_ref().zip(overlay_frame).filter(|_| v.shown[1]).map(|(o, f)| (o.data.as_ref(), f)),
         };
+        let own_shown = layers.own && v.data.is_some();
+        let overlay_shown = layers.overlay.is_some() && v.data.is_some();
         let measurement = v.measurement(layers.own && scene_opts.measurements);
         for &cover in &covers {
             key_focus::region(ui, cover, key_focus::Target::Markers(slot));
@@ -3365,6 +3370,17 @@ impl TakViewerApp {
                 scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, measurement, v.plate, hud.as_deref(), legacy_capture, follow_target, layers)
             })
             .inner;
+        if (own_shown || overlay_shown) && !ui.is_sizing_pass() && ui.is_visible()
+            && rect.intersect(ui.clip_rect()).is_positive()
+            && !ui.input(|input| input.viewport().minimized.unwrap_or(false))
+        {
+            if let Some(paint) = own_shown.then(|| v.pending_first_paint()).flatten() {
+                self.painted_markers.push(paint);
+            }
+            if let Some(paint) = overlay_shown.then(|| v.overlay_owner().and_then(View::pending_first_paint)).flatten() {
+                self.painted_markers.push(paint);
+            }
+        }
         let quick = quick_available && self.marker_ui[slot].labeling.mode == crate::ui::labeling::LabelingMode::QuickLabel && v.armed_label.is_some();
         if let Some(response) = out.marker_menu {
             self.draw_scene_marker_menu(slot, &response, out.context_clicked);
@@ -3577,6 +3593,7 @@ impl TakViewerApp {
 /// Draws each pane inside its dock tab (the layout itself is in `ui/dock.rs`).
 struct Tabs<'a> {
     app: &'a mut TakViewerApp,
+    ssh_actions: Vec<crate::ssh::SshAction>,
     action: Option<Action>,
     ws_action: Option<WsAction>,
     /// View pressed this frame (becomes the active one).
@@ -3701,7 +3718,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                         self.ws_action = Some(a);
                     }
                 });
-                app.ssh_section(ui);
+                self.ssh_actions = app.ssh_section(ui);
                 // Folders the Explorer expanded to show the open file are no action of their own
                 // (a folder added in the same frame still is).
                 if let Some(before) = revealing.filter(|_| app.explorer.reveal.is_none()) {
@@ -3850,6 +3867,15 @@ impl TakViewerApp {
             }
             self.updater.show(ctx, self.others_open, false, None);
             return;
+        }
+        // A subsequent frame starts only after the preceding frame was handed to the
+        // renderer. A repeated sizing pass instead replaces the previous pass's candidates.
+        if ctx.output(|output| output.num_completed_passes == 0) {
+            for paint in self.painted_markers.drain(..) {
+                if let Some(request) = paint.finish() { self.ssh.markers_painted(request); }
+            }
+        } else {
+            self.painted_markers.clear();
         }
         self.poll_comment_types(ctx);
         // Clip rectangles still constrain every painter. Avoid rescanning all vertices of
@@ -4028,7 +4054,7 @@ impl TakViewerApp {
         let mut dock_state = std::mem::replace(&mut self.dock, dock::scene_only(0));
         let style = dock::style(&ctx.style());
         let dock_enabled = self.dirty_prompt.is_none();
-        let mut tabs = Tabs { app: self, action: None, ws_action: None, pressed_view: None, closed_view: None, open, lone, tags: Default::default(), order, ed_action: None };
+        let mut tabs = Tabs { app: self, ssh_actions: Vec::new(), action: None, ws_action: None, pressed_view: None, closed_view: None, open, lone, tags: Default::default(), order, ed_action: None };
         let area = egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -4046,6 +4072,7 @@ impl TakViewerApp {
         let (action, ws_action) = (tabs.action.take(), tabs.ws_action.take());
         let (pressed_view, closed_view) = (tabs.pressed_view, tabs.closed_view);
         let ed_action = tabs.ed_action.take();
+        let ssh_actions = std::mem::take(&mut tabs.ssh_actions);
         self.dock = dock_state;
         self.dock_area = area;
         if let Some(rect) = dock::layout_strip_rect(&self.dock).filter(|_| self.capture.is_none()) {
@@ -4107,6 +4134,9 @@ impl TakViewerApp {
         }
         if let Some(a) = ed_action {
             self.editor_action(ctx, a);
+        }
+        for action in ssh_actions {
+            self.remote_action(ctx, action);
         }
         // A name tag of a laid-over view clicked (plan step 7): hide / show, ✕ = take it off.
         // (The press on the tag chose its view above, `pressed_view`.)
@@ -4370,6 +4400,7 @@ impl TakViewerApp {
         }
         self.finish_launch_frame(ctx);
         self.publish_window(ctx);
+        if !self.painted_markers.is_empty() { ctx.request_repaint(); }
     }
 
 }
