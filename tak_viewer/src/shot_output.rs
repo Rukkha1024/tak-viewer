@@ -22,6 +22,7 @@ pub const USAGE: &str =
   --overlay FILE (repeat)   --hide 1|2   --hover NAME
   --comments   --pick-comment ID   --edit-comment ID[:markers|frames|comment|type]   --type-strip ID
   --edit-tools   --edit-pattern   --edit-split   --edit-bottom   --menu-capture
+  --shot-update menu|ready|progress|restart (headless screenshot only)
 종료 코드: 0 완료, 1 실패, 2 인자 오류.";
 
 const PANELS: &[&str] = &[
@@ -71,6 +72,7 @@ pub(crate) struct MarkerOrderPreview {
 pub struct Options {
     pub size: Option<[f32; 2]>,
     pub(crate) marker_order: Option<MarkerOrderPreview>,
+    pub(crate) update_preview: Option<crate::update::Preview>,
     crop: Option<Crop>,
     scale: usize,
     crop_only: bool,
@@ -82,6 +84,7 @@ impl Default for Options {
         Self {
             size: None,
             marker_order: None,
+            update_preview: None,
             crop: None,
             scale: 1,
             crop_only: false,
@@ -176,6 +179,9 @@ pub fn parse(args: &[String]) -> Result<(Options, Vec<String>), String> {
                     return Err("--shot-marker-order 뒤에 마커 이름을 하나 이상 써 주세요.".into());
                 }
                 options.marker_order = Some(MarkerOrderPreview { pane, names });
+            }
+            "--shot-update" => {
+                options.update_preview = Some(crate::update::Preview::parse(&value(arg, &mut input)?)?);
             }
             "--crop-only" => options.crop_only = true,
             "--regions" => options.regions = true,

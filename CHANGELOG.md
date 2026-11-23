@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.76.0 — 2026-11-23
+
+- Add Help → Check for Updates… on Windows and macOS. Click checks the source's upstream in the background, asks `Update` / `Not now`, runs the existing build script (Windows `빌드.cmd`, macOS `scripts/01_build_macos.sh`), then asks `Restart` / `Later` after the usual save prompt. Nothing runs at startup. Refusals and failures in easy Korean with the log path.
+
 ## v0.75.1 — 2026-11-23
 
 - Read SSH host names from the native home folder on Windows and macOS.

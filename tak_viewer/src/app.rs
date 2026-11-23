@@ -459,6 +459,7 @@ pub struct TakViewerApp {
     marker_click: Option<(usize, tak_core::tak::Uid)>,
     scene_marker_menu: scene_marker_menu::Menu,
     dirty_prompt: Option<marker_edit::DirtyPrompt>,
+    updater: crate::update::Updater,
     overlay_dirty: Option<overlay_dirty::OverlayDirty>,
     overlay_marker_ui: std::collections::HashMap<tak_core::edit::DocumentId, marker_edit::MarkerUi>,
     overlay_owner_scope: bool,
@@ -708,6 +709,7 @@ impl TakViewerApp {
             marker_click: None,
             scene_marker_menu: scene_marker_menu::Menu::default(),
             dirty_prompt: None,
+            updater: Default::default(),
             overlay_dirty: None,
             overlay_marker_ui: Default::default(),
             overlay_owner_scope: false,
@@ -2894,6 +2896,10 @@ impl TakViewerApp {
         }
     }
 
+    fn update_preview(&self) -> Option<crate::update::Preview> {
+        self.auto.as_ref().and_then(|shot| shot.output.update_preview)
+    }
+
     fn menu_bar(&mut self, ctx: &egui::Context) {
         let frame = egui::Frame::side_top_panel(&ctx.style()).fill(theme::MENU_BG);
         egui::TopBottomPanel::top("menu").frame(frame).show(ctx, |ui| {
@@ -3054,14 +3060,10 @@ impl TakViewerApp {
                         self.show_settings = true;
                     }
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Controls").clicked() {
-                        ui.close_menu();
-                        self.show_help = true;
-                    }
-                    ui.separator();
-                    ui.label(RichText::new(format!("TAK Viewer v{}", crate::version::VERSION)).weak());
-                });
+                let update_preview = self.update_preview();
+                let menu = crate::update::help_menu(ui, !self.no_persist, update_preview);
+                if menu.controls { self.show_help = true; }
+                if menu.check { self.updater.open(ctx); }
                 // Side toggles at the right end (VS Code layout controls): left, bottom, right.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(4.0);
@@ -3089,6 +3091,9 @@ impl TakViewerApp {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 let text = |s: String| RichText::new(s).size(12.0).color(theme::STATUS_TEXT);
+                if self.updater.updating(self.update_preview()) {
+                    ui.label(text("Updating…".into()).strong());
+                }
                 if !self.ssh_status(ui) {
                 match &self.views[self.active].data {
                     Some(d) => {
@@ -3834,6 +3839,18 @@ impl Drop for GraphFrame {
 impl TakViewerApp {
     /// One UI frame. Called by the window backend (`eframe::App::update`) and by `--headless`.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        if self.updater.poll() {
+            self.exit_approved = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.updater.restarting() {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            self.updater.show(ctx, self.others_open, false, None);
+            return;
+        }
         self.poll_comment_types(ctx);
         // Clip rectangles still constrain every painter. Avoid rescanning all vertices of
         // already-built graph meshes in egui's additional coarse tessellation culling.
@@ -4322,6 +4339,11 @@ impl TakViewerApp {
         if self.show_help {
             crate::ui::help_window::show(ctx, &mut self.show_help, area);
         }
+        let update_preview = self.update_preview();
+        let can_restart = self.dirty_prompt.is_none() && self.progress_job.is_none();
+        if self.updater.show(ctx, self.others_open, can_restart, update_preview) {
+            self.request_exit(ctx);
+        }
         if !self.desktop_hover.paths.is_empty() { self.paint_desktop_drop(ctx); }
         if let Some(regions) = &mut self.shot_regions {
             regions.freeze();
@@ -4537,8 +4559,20 @@ impl eframe::App for TakViewerApp {
         raw.events.extend(releases);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.frame(ctx);
+        if self.updater.restart_needs_launch() {
+            let saved_session = if self.persist_egui_memory() {
+                frame.storage_mut().and_then(|storage| {
+                    self.save(storage);
+                    storage.flush();
+                    storage.get_string(SAVED_KEY)
+                })
+            } else {
+                None
+            };
+            self.updater.launch_restart(ctx, saved_session);
+        }
     }
 
     /// A normal window saves on close and every `AUTO_SAVE` while alone. Each save writes

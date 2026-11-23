@@ -66,6 +66,7 @@ impl TakViewerApp {
     pub(super) fn cancel_overlay_dirty_bridge(&mut self, _ctx: &egui::Context) { self.overlay_dirty = None; }
 
     pub(super) fn cancel_dirty_transition(&mut self, ctx: &egui::Context) {
+        self.updater.cancel_restart();
         self.cancel_editor_batch();
         self.dirty_prompt = None;
         self.cancel_overlay_dirty_bridge(ctx);

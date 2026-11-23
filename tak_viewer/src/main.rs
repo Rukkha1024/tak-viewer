@@ -39,6 +39,7 @@ mod help_shot;
 mod instances;
 mod shot;
 mod shot_output;
+mod update;
 mod label_increment;
 mod marker_order;
 mod ssh;
@@ -266,6 +267,12 @@ fn main() -> eframe::Result<()> {
         && (!headless || !args.iter().any(|a| a == "--screenshot"))
     {
         cli_exit(2, "--shot-marker-order는 --headless --screenshot과 함께 써 주세요.");
+    }
+    if args.iter().any(|a| a == "--shot-update")
+        && (!headless || !args.iter().any(|a| a == "--screenshot")
+            || args.iter().any(|a| a == "--capture"))
+    {
+        cli_exit(2, "--shot-update는 --headless --screenshot과 함께 써 주세요.");
     }
     let capture = match capture::parse(&args[1..]) {
         Ok(c) => c,

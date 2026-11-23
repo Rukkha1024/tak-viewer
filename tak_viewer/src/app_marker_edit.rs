@@ -623,7 +623,7 @@ impl TakViewerApp {
         }) {
             self.switch_layout_tab_internal(id);
             self.request_exit(ctx);
-        } else {
+        } else if !self.updater.restart_if_requested(ctx) {
             self.exit_approved = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
