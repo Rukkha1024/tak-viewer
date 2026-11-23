@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.76.3 — 2026-11-23
+
+- Release helper: `finish` always updates the desktop shortcut exe to the finished version. Open windows keep the old exe. Skip when the shortcut is already newer or on a test remote.
+
 ## v0.76.1 — 2026-11-23
 
 - Fix EXPLORER → SSH opens from empty tabs. Create the 3D view and draw markers.
