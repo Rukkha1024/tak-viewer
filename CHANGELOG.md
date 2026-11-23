@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.74.2 — 2026-11-23
+
+- Explorer lists local `.tak` and `.takm` symlinks to regular files. Use target size and modification time.
+
 ## v0.74.0 — 2026-11-22
 
 - Labeling `Reorder: On/Off`: drag labeled rows inside a group. `Moved` tags only rows actually moved. Order icon menu: `Use file order`, `Add names from open files`; `Done` or Esc ends.

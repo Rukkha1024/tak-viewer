@@ -64,11 +64,17 @@ pub(crate) fn list_dir(dir: &Path) -> Listing {
             for e in it.flatten() {
                 let Ok(ft) = e.file_type() else { continue };
                 let name = e.file_name().to_string_lossy().into_owned();
-                let is_tak = ft.is_file() && is_take_file(&name);
+                let take_name = is_take_file(&name);
+                let linked_take = if take_name && ft.is_symlink() {
+                    std::fs::metadata(e.path()).ok().filter(std::fs::Metadata::is_file)
+                } else {
+                    None
+                };
+                let is_tak = take_name && (ft.is_file() || linked_take.is_some());
                 if !(ft.is_dir() || is_tak) {
                     continue;
                 }
-                let metadata = if is_tak { e.metadata().ok() } else { None };
+                let metadata = if is_tak { linked_take.or_else(|| e.metadata().ok()) } else { None };
                 let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 let modified = metadata.and_then(|m| m.modified().ok());
                 entries.push(RawEntry { name, is_dir: ft.is_dir(), size, modified });
@@ -876,6 +882,32 @@ mod tests {
         let got: Vec<(&str, u64)> = files.iter().map(|f| (f.name.as_str(), f.size)).collect();
         assert_eq!(got, vec![("a.tak", 3), ("a.takm", 5), ("B.TAKM", 2)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_take_uses_the_target_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tak_core::test_support::TempDir::new("tak_viewer_ws_take_link");
+        let dir = temp.join("workspace");
+        std::fs::create_dir(&dir).unwrap();
+        let target = temp.join("original.tak");
+        std::fs::write(&target, b"take data").unwrap();
+        std::fs::write(dir.join("copy.takm"), b"copy").unwrap();
+        let link = dir.join("original.TAK");
+        symlink(&target, &link).unwrap();
+        symlink(temp.join("missing.tak"), dir.join("broken.tak")).unwrap();
+        symlink(&dir, dir.join("folder.tak")).unwrap();
+        symlink(&target, dir.join("notes.txt")).unwrap();
+
+        let Listing::Ready { dirs, files } = list_dir(&dir) else { panic!("listed") };
+        assert!(dirs.is_empty());
+        assert_eq!(files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(), ["copy.takm", "original.TAK"]);
+        let target_metadata = std::fs::metadata(&target).unwrap();
+        assert_eq!(files[1].path, link);
+        assert_eq!(files[1].size, target_metadata.len());
+        assert_eq!(files[1].modified, target_metadata.modified().ok());
     }
 
     #[test]
