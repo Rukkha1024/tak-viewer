@@ -16,7 +16,7 @@ use crate::ui::graph_float::{self, GraphBox, Kind, LaneSet};
 use crate::ui::panels::{self, Action, CommentBar, DeckAction};
 use crate::ui::scene::{self, SceneOptions};
 use crate::ui::theme;
-use crate::views::{self, Change, Loaded, Spot, View, MAX_VIEWS};
+use crate::views::{self, Change, Spot, View, MAX_VIEWS};
 use crate::window_command::{self, StartupTab};
 
 #[path = "app_key_focus.rs"]
@@ -1097,7 +1097,11 @@ impl TakViewerApp {
     fn open_in(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf) {
         if self.dirty_prompt.is_some() { return; }
         let creating_tab = self.layout_tabs.active_id().is_none();
-        if self.views[slot].target() == Some(path.as_path()) { self.discard_identity_candidate(); return; }
+        let view = &self.views[slot];
+        if view.target() == Some(path.as_path()) && (view.loading.is_some() || !view.local_stage_incomplete()) {
+            self.discard_identity_candidate();
+            return;
+        }
         if !self.allow_open_file(&path, Some(slot)) { return; }
         if self.save_destination_reserved(&path) || self.progress_writing(&path) {
             self.discard_identity_candidate();
@@ -1187,7 +1191,7 @@ impl TakViewerApp {
             return;
         }
         self.explorer.progress.pause();
-        self.views[slot].start_load(ctx, path, restore);
+        self.views[slot].start_primary_load(ctx, path, restore);
         self.views[slot].set_pending_identity(pending_identity);
         self.views[slot].set_fresh_open_candidate(retained);
         if let Some(old) = previous_load { self.promote_shared_waiter(ctx, &old); }
@@ -1291,8 +1295,8 @@ impl TakViewerApp {
     fn poll_loads(&mut self, ctx: &egui::Context) {
         for slot in self.open_views() {
             let _span=crate::bench_timing::span_view("view.load",Some(slot));
-            if let Some(loaded) = self.views[slot].poll_markers() {
-                self.finish_load(ctx, slot, loaded);
+            if let Some((path, result)) = self.views[slot].poll_local_open(ctx, self.settings.speed, &mut self.next_file_id) {
+                self.finish_load(ctx, slot, path, result);
             }
             self.views[slot].poll_comments();
             self.views[slot].poll_analog();
@@ -1311,10 +1315,9 @@ impl TakViewerApp {
         self.poll_remote_emg(ctx);
     }
 
-    fn finish_load(&mut self, ctx: &egui::Context, slot: usize, loaded: Loaded) {
-        let Loaded { path, result, rx } = loaded;
-        let (data, steps) = match result {
-            Ok(r) => r,
+    fn finish_load(&mut self, ctx: &egui::Context, slot: usize, path: PathBuf, result: Result<(), String>) {
+        match result {
+            Ok(()) => {}
             Err(e) => {
                 // The view keeps what it showed, with that file's comments.
                 self.views[slot].set_fresh_open_candidate(None);
@@ -1331,12 +1334,6 @@ impl TakViewerApp {
                 return;
             }
         };
-        self.next_file_id += 1;
-        let now = ctx.input(|i| i.time);
-        let speed = self.settings.speed;
-        let v = &mut self.views[slot];
-        v.load_steps = steps;
-        drop_later(v.show(data, rx, self.next_file_id, speed, now));
         push_recent(&mut self.settings.recent, path.to_string_lossy().into_owned());
         if slot == self.active {
             self.explorer.reveal = Some(path.clone());
@@ -3443,7 +3440,7 @@ impl TakViewerApp {
                 }
             }
         }
-        if let Some((path, _)) = &v.loading {
+        if let Some((path, _)) = v.loading.as_ref().filter(|_| !v.local_stage_visible()) {
             // Reading a file into this view: a small note in its middle.
             let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width().min(360.0), 34.0));
@@ -4430,8 +4427,10 @@ impl TakViewerApp {
 
 /// `--bench` (`headless.rs`): load state and timing of each view, read-only.
 pub struct BenchState {
-    /// Markers of every file are on screen.
+    /// Exact markers of every file have arrived.
     pub loaded: bool,
+    /// Every file has drawn markers, possibly from a progressive local open.
+    pub markers_shown: bool,
     /// Force plates / EMG still coming in some view.
     pub analog_pending: bool,
     /// A file to lay over a view (plan step 7) still coming.
@@ -4484,6 +4483,11 @@ impl TakViewerApp {
             .collect();
         BenchState {
             loaded: open.iter().all(|&k| self.views[k].data.is_some() && self.views[k].loading.is_none()),
+            markers_shown: open.iter().all(|&k| {
+                let view = &self.views[k];
+                view.data.is_some() && (view.loading.is_none() || view.local_stage_visible())
+                    && view.scene_rect.is_positive()
+            }),
             analog_pending: open.iter().any(|&k| self.views[k].analog_rx.is_some() || self.views[k].data.as_ref().is_some_and(|d| d.analog_pending)),
             overlay_pending: open.iter().any(|&k| self.views[k].overlay_load.is_some()),
             error: self.error.clone(),
@@ -6588,7 +6592,7 @@ mod tests {
         tak_core::test_support::TempDir::new(&format!("tak_viewer_comments_{name}"))
     }
 
-    /// Bytes of a `.takm` made from `tak_core`'s sample TAK (made once per test run).
+    /// Bytes of a v2 `.takm` made from `tak_core`'s sample TAK (made once per test run).
     fn fixture_takm() -> &'static [u8] {
         static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         BYTES.get_or_init(|| {
@@ -6608,10 +6612,31 @@ mod tests {
         }
     }
 
-    /// `file_a` of lines written for the fixture `.takm` named `name` (`<name>|<fixed length>`).
-    fn takm_label(name: &str) -> String {
-        let fixed = u64::from_le_bytes(fixture_takm()[32..40].try_into().unwrap());
+    /// An explicit layout 1 fixture for the legacy Comment path.
+    fn make_v1_takm(path: &Path) {
+        let mut file = std::fs::File::create(path).unwrap();
+        tak_core::takm::write(&mut file, &tak_core::sample_tak::sample_tak(), "fixture.tak", "2026-11-13T14:05:09Z").unwrap();
+        drop(file);
+        tak_core::takm::read_index_path(path).expect("layout 1 fixture");
+    }
+
+    /// `file_a` of lines written for this fixture (`<name>|<fixed length>`).
+    fn takm_label(path: &Path) -> String {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let fixed = tak_core::takm::fixed_len(path).unwrap();
         format!("{name}|{fixed}")
+    }
+
+    /// The physical prefix covered by the seal in either layout.
+    fn fixed_part(path: &Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes.truncate(tak_core::takm::fixed_len(path).unwrap() as usize);
+        bytes
+    }
+
+    fn assert_fixed_part_preserved(path: &Path, original: &[u8]) {
+        assert!(fixed_part(path) == original, "fixed bytes are untouched");
+        tak_core::takm::verify_fixed(path).unwrap();
     }
 
     /// The Comments of a `.takm` as the comment file's read gave them (None: no such file).
@@ -6961,7 +6986,8 @@ mod tests {
         let _dir_guard = comment_dir("m_key");
         let dir = _dir_guard.to_path_buf();
         let mut app = comment_app(&ctx, &dir, false);
-        assert!(no_events(&dir.join("a.takm")), "no file before the first comment");
+        let path = dir.join("a.takm");
+        assert!(no_events(&path), "no events before the first comment");
         // (Since v0.15.2 M without a selection makes a comment too: see
         // `comments_without_a_marker_…`.)
         // Markers and a range: one comment with both, the range goes, the selection stays.
@@ -6985,7 +7011,7 @@ mod tests {
         assert_eq!(ev.len(), 2);
         assert_eq!((ev[0].kind, ev[0].id, ev[0].markers.clone(), ev[0].start, ev[0].end), (comments::Kind::Add, 1, vec!["M".to_owned(), "N".to_owned()], 2, 7));
         assert_eq!((ev[1].id, ev[1].start, ev[1].end), (2, 4, 4));
-        assert_eq!((ev[0].shown_a.as_str(), ev[0].shown_b.as_str(), ev[0].file_a.as_str(), ev[0].file_b.as_str()), ("1", "", takm_label("a.takm").as_str(), ""));
+        assert_eq!((ev[0].shown_a.as_str(), ev[0].shown_b.as_str(), ev[0].file_a.as_str(), ev[0].file_b.as_str()), ("1", "", takm_label(&path).as_str(), ""));
         assert!(ev[0].comment_type.is_empty() && ev[0].text.is_empty(), "type and text come in step 3");
         let t = ev[0].time.as_bytes();
         assert!(t.len() == 25 && t[10] == b'T' && (t[19] == b'+' || t[19] == b'-') && t[22] == b':', "local time with offset: {}", ev[0].time);
@@ -7193,8 +7219,10 @@ mod tests {
         // Comment 3 (frames 4–5) overlaps comment 1 (3–6): since step 6 they share the band's
         // height, 1 in the upper row, 3 in the lower one.
         let three = Comment { id: 3, markers: vec!["N".into()], start: 4, end: 5, comment_type: String::new(), type_meaning: None, text: String::new() };
-        tail_append(&dir.join("a.takm"), &[Event::of(EventKind::Add, &three, "t".into(), "a.tak|0".into())]).unwrap();
-        let before = std::fs::read(dir.join("a.takm")).unwrap();
+        let path = dir.join("a.takm");
+        tail_append(&path, &[Event::of(EventKind::Add, &three, "t".into(), "a.tak|0".into())]).unwrap();
+        let fixed = fixed_part(&path);
+        let before = tak_core::takm::read_tail_text(&path).unwrap();
         let mut app = comment_app(&ctx, &dir, false);
         assert_eq!(ids(&app), vec![1, 2, 3]);
         let bar = Bar::of(&app, 0);
@@ -7208,8 +7236,9 @@ mod tests {
         right_click_at(&ctx, &mut app, bar.band(4.5));
         assert_eq!(ids(&app), vec![2]);
         until_saved(&ctx, &mut app);
-        let after = std::fs::read(dir.join("a.takm")).unwrap();
-        assert_eq!(&after[..before.len()], &before[..], "earlier lines are untouched");
+        let after = tak_core::takm::read_tail_text(&path).unwrap();
+        assert!(after.starts_with(&before), "earlier lines are untouched");
+        assert_fixed_part_preserved(&path, &fixed);
         let ev = file_events(&dir);
         assert_eq!(ev.len(), 5);
         assert_eq!((ev[3].kind, ev[3].id, ev[3].start, ev[3].end), (comments::Kind::Delete, 3, 4, 5), "a delete line with the comment's fields");
@@ -9644,6 +9673,8 @@ mod tests {
         let path = dir.join("a.takm");
         typed_on_disk(&dir, &[(1, 2, ""), (2, 3, ""), (3, 4, "Old label"), (4, 5, "Feet OK")]);
         let original = std::fs::read(&path).unwrap();
+        let fixed = fixed_part(&path);
+        let original_tail = tak_core::takm::read_tail_text(&path).unwrap();
         let mut app = comments_tab_app(&ctx, &dir, false);
         assert_eq!(type_of(&app, 3), "Old label");
         assert!(comment(&app, 3).type_meaning.is_none());
@@ -9678,7 +9709,8 @@ mod tests {
         until_saved(&ctx, &mut app);
         let disk = tak_core::takm::read_comments(&path).unwrap().comments();
         for id in 1..=4 { assert_eq!(disk.get(id), app.views[0].comments.list.get(id)); }
-        assert!(std::fs::read(path).unwrap().starts_with(&original));
+        assert!(tak_core::takm::read_tail_text(&path).unwrap().starts_with(&original_tail));
+        assert_fixed_part_preserved(&path, &fixed);
     }
 
     #[test]
@@ -9686,8 +9718,9 @@ mod tests {
         let ctx = egui::Context::default();
         let dir = comment_dir("type_agent_legacy_tail");
         let retired = [(1, 2, "Jitter"), (2, 3, "Marker swap"), (3, 4, "No problem"), (4, 5, "Keep this only")];
-        typed_on_disk(&dir, &retired);
         let path = dir.join("a.takm");
+        make_v1_takm(&path);
+        typed_on_disk(&dir, &retired);
         let added = tak_core::comment_command::add(
             &path,
             br#"[{"markers":[],"start":5,"end":5,"text":"agent review"}]"#,
@@ -11521,7 +11554,7 @@ mod tests {
         undo_key(&ctx, &mut app);
         until_saved(&ctx, &mut app);
         let ev = file_events(&dir);
-        let fa = takm_label("a.takm");
+        let fa = takm_label(&dir.join("a.takm"));
         let fa = fa.as_str();
         let cols: Vec<(String, u64, &str, &str, &str, &str)> =
             ev.iter().map(|e| (e.kind.as_str().to_owned(), e.id, e.shown_a.as_str(), e.shown_b.as_str(), e.file_a.as_str(), e.file_b.as_str())).collect();
@@ -11947,12 +11980,6 @@ mod tests {
 
     // ───────────── `.takm` step ③: Comments in the `.takm`, none on a TAK, save as `.takm` ─────────────
 
-    /// The fixed part of a `.takm` (every byte before its Comment tail).
-    fn fixed_part(path: &Path) -> Vec<u8> {
-        let start = tak_core::takm::read_index_path(path).unwrap().tail_start() as usize;
-        std::fs::read(path).unwrap()[..start].to_vec()
-    }
-
     /// The bytes of a file (compared whole: same content).
     fn sha(path: &Path) -> Vec<u8> {
         std::fs::read(path).unwrap()
@@ -12007,10 +12034,26 @@ mod tests {
 
     #[test]
     fn comments_on_a_takm_go_into_its_tail_with_undo_and_redo_and_read_back_the_same() {
+        let dir = comment_dir("takm_v2_tail");
+        let path = dir.join("a.takm");
+        make_takm(&path);
+        assert!(std::fs::read(&path).unwrap().starts_with(b"takm.json\0"), "layout 2 fixture");
+        comment_tail_roundtrip(&dir);
+    }
+
+    #[test]
+    fn comments_on_a_v1_takm_go_into_its_csv_tail_with_undo_and_redo() {
+        let dir = comment_dir("takm_v1_tail");
+        let path = dir.join("a.takm");
+        make_v1_takm(&path);
+        let original = std::fs::read(&path).unwrap();
+        comment_tail_roundtrip(&dir);
+        assert!(std::fs::read(path).unwrap().starts_with(&original), "layout 1 appends to the raw CSV");
+    }
+
+    fn comment_tail_roundtrip(dir: &Path) {
         let ctx = egui::Context::default();
-        let _dir_guard = comment_dir("takm_tail");
-        let dir = _dir_guard.to_path_buf();
-        let mut app = comment_app(&ctx, &dir, false);
+        let mut app = comment_app(&ctx, dir, false);
         let takm = dir.join("a.takm");
         let fixed = fixed_part(&takm);
         // Add (M twice), type (T on the new comment), note, delete, undo, redo.
@@ -12033,12 +12076,12 @@ mod tests {
         assert_eq!(ids(&app), vec![2]);
         until_saved(&ctx, &mut app);
         // Every change is a line in the tail; the fixed part is untouched; no CSV.
-        let ev = file_events(&dir);
+        let ev = file_events(dir);
         let kinds: Vec<(&str, u64)> = ev.iter().map(|e| (e.kind.as_str(), e.id)).collect();
         assert_eq!(kinds, vec![("add", 1), ("add", 2), ("edit", 2), ("edit", 2), ("delete", 1), ("add", 1), ("delete", 1)]);
-        assert!(ev.iter().all(|e| e.file_a == takm_label("a.takm")), "file_a = name|fixed length");
-        assert_eq!(fixed_part(&takm), fixed);
-        tak_core::takm::verify_fixed(&takm).unwrap();
+        let label = takm_label(&takm);
+        assert!(ev.iter().all(|e| e.file_a == label), "file_a = name|fixed length");
+        assert_fixed_part_preserved(&takm, &fixed);
         assert!(!dir.join("a.comments.csv").exists());
         // Read again (as an open does): the same list.
         let again = views::CommentsLoad::read(&takm).parsed.unwrap().comments();

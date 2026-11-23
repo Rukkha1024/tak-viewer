@@ -493,6 +493,12 @@ impl PayloadLimit {
             return Err("source_changed: inconsistent SSH source size".into());
         }
         let size = usize::try_from(size).map_err(|_| "Invalid source file size")?;
+        if header.get("archive_stage").is_some() {
+            if header.get("expanded_lengths").is_some() || header.get("exact_bytes").is_some() {
+                return Err("TAKM v2 ranges cannot announce SSH expansion lengths".into());
+            }
+            return Ok(size.min(ceiling));
+        }
         Ok(size.checked_add(FILE_MARGIN).ok_or("SSH source size overflow")?.min(ceiling))
     }
 }
@@ -596,6 +602,20 @@ mod tests {
         header["file_size"] = json!(u64::MAX);
         header["identity"][2] = json!(u64::MAX);
         assert!(PayloadLimit::Open.maximum(&header, ceiling).is_err());
+    }
+
+    #[test]
+    fn archive_ranges_have_a_packed_cap_independent_of_logical_size() {
+        let mut header = json!({"ok":true, "archive_stage":"first", "lengths":[33],
+            "file_size":32, "identity":[1,2,32,4,5,1,2,32,4,5]});
+        let packet = format!("{header}\n");
+        let error = read_frame_limited(&mut Cursor::new(packet), 1024, PayloadLimit::Open).unwrap_err();
+        assert!(error.contains("exceeds limit"), "{error}");
+        header["expanded_lengths"] = json!([1024]);
+        assert!(PayloadLimit::Open.maximum(&header, 1024).is_err());
+        header.as_object_mut().unwrap().remove("expanded_lengths");
+        assert_eq!(PayloadLimit::Open.maximum(&header, 1024).unwrap(), 32);
+        assert_eq!(PayloadLimit::Open.maximum(&header, 16).unwrap(), 16);
     }
 
     #[test]

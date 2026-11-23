@@ -141,7 +141,7 @@ fn multicomment_conflict_reloads_all_batch_rows_without_partial_delete() {
     let prior = app.views[0].selection();
     let mut changed = comment(&app, 3);
     changed.text = "Changed by another window".into();
-    let event = Event::of(EventKind::Edit, &changed, "t".into(), takm_label("a.takm"));
+    let event = Event::of(EventKind::Edit, &changed, "t".into(), takm_label(&path));
     tak_core::takm::append_events(&path, &[event]).unwrap();
     let before_bytes = std::fs::read(&path).unwrap();
     app.delete_comments(&ctx, 0, &[1, 3], false);

@@ -2430,8 +2430,7 @@ mod marker_edit_tests {
         app.views[0].source_stamp = Some(stamp);
         let tx = app.views[0].held.take().unwrap();
         tx.send(crate::views::LoadMsg::Markers(Ok((crate::views::sample_data(&text, &["M"]), vec![])))).unwrap();
-        let loaded = app.views[0].poll_markers().unwrap();
-        app.finish_load(&ctx, 0, loaded);
+        app.poll_loads(&ctx);
         app.views[0].fit_pending = false;
         app.views[0].fresh = false;
         app.observe(false);
@@ -2761,8 +2760,7 @@ mod marker_edit_tests {
         app.undo_redo(&ctx, false);
         let tx = app.views[1].held.take().unwrap();
         tx.send(crate::views::LoadMsg::Markers(Ok((crate::views::sample_data(&text, &["M"]), vec![])))).unwrap();
-        let loaded = app.views[1].poll_markers().unwrap();
-        app.finish_load(&ctx, 1, loaded);
+        app.poll_loads(&ctx);
         app.views[1].fit_pending = false;
         app.views[1].fresh = false;
         app.observe(false);

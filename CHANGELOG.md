@@ -1,5 +1,12 @@
 # 변경 사항
 
+## v0.78.0 — 2026-11-24
+
+- Save new `.takm` files as standard USTAR archives. Read layout 1 and layout 2.
+- Keep every retained source stream at its original ordinal. Verify rebuilt stream bytes, provenance and the camera ledger.
+- Show the first pose while exact markers load. Relay pre-encoded stages on SSH. Load plates and other analog separately.
+- Append Comment events in their own archive members. Recover earlier events after a torn final write.
+
 ## v0.77.0 — 2026-11-23
 
 - SSH opens draw the requested frame first. Preview adds one pose every eight frames, the requested frame, playback, exact Labels, gaps, and Comments.

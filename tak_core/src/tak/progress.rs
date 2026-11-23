@@ -61,6 +61,13 @@ fn read_with(
         let mut meta = metadata_buffer(entry.size)?;
         bounded_read(&mut meta, entry.offset)?;
         meta
+    } else if crate::takm::v2::has_magic(&magic) {
+        let limits = crate::takm::v2::Limits { packed: MAX_BYTES, expanded: MAX_BYTES };
+        let meta = crate::takm::v2::metadata_at(size, limits, &mut bounded_read)?;
+        if meta.len() as u64 > MAX_METADATA {
+            return err("Progress metadata exceeds read budget");
+        }
+        meta
     } else {
         return err("Unknown take format");
     };

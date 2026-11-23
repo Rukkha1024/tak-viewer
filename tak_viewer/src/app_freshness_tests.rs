@@ -25,12 +25,12 @@ mod freshness_tests {
     }
 
     fn add_disk_comment(path: &Path, id: u64, text: &str) {
-        let fixed = tak_core::takm::read_index_path(path).unwrap().fixed_len;
+        let fixed = tak_core::takm::fixed_len(path).unwrap();
         tak_core::takm::append_events(path, &[comments::Event {
             time: "2026-11-16T00:00:00+09:00".into(), kind: comments::Kind::Add, id,
             markers: vec![], start: 0, end: 0, comment_type: String::new(), text: text.into(),
             shown_a: "1".into(), shown_b: String::new(),
-            file_a: format!("{}|{fixed}", path.file_name().unwrap().to_string_lossy()), file_b: String::new(),
+            file_a: comments::file_label(path, fixed), file_b: String::new(),
             operation: None, expected: None,
         }]).unwrap();
     }

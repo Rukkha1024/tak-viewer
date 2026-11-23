@@ -5,6 +5,7 @@ pub(crate) mod progressive;
 pub use progressive::PreviewMotion;
 mod command;
 mod write;
+mod archive;
 pub use write::{RemoteEditStreams, RemoteProgress, RemoteWriteOutcome};
 pub use command::{python_tokens, PYTHON_NOT_FOUND};
 use crate::tak::Take;
@@ -13,7 +14,11 @@ use std::path::Path;
 use std::time::Duration;
 pub use transport::CancelToken;
 
-const HELPER: &str = include_str!("helper.py");
+const HELPER: &str = concat!(
+    include_str!("helper_v2.py"), "\n",
+    include_str!("helper_v2_write.py"), "\n",
+    include_str!("helper.py")
+);
 type Result<T> = std::result::Result<T, String>;
 
 /// Local Python is used only by backend tests of the server helper, never at runtime.
@@ -119,6 +124,7 @@ pub struct RemoteTake {
     channel_manifest: Vec<Vec<(String, String, usize)>>,
     pub marker_proof: Option<ChannelProof>,
     pub plate_proof: Option<ChannelProof>,
+    archive: Option<std::sync::Arc<archive::Base>>,
 }
 impl RemoteTake {
     pub fn analog_pending(&self) -> bool {
@@ -156,6 +162,7 @@ pub enum ReadMoment {
 /// Display-only data published while a staged SSH open is in progress.
 pub enum RemoteStage {
     FirstPose(Take, i64),
+    ArchiveFirstPose(RemoteTake, PreviewMotion),
     Preview(RemoteTake, PreviewMotion),
 }
 
@@ -194,6 +201,7 @@ pub struct RemoteSession {
     progressive: bool,
     first_pose: bool,
     motion_codecs: bool,
+    archive_writes: bool,
     read_observer: Option<ReadObserver>,
 }
 impl RemoteSession {
@@ -226,7 +234,7 @@ impl RemoteSession {
             "windows" => &config.windows_python,
             _ => return Err("remote platform must be linux or windows".into()),
         };
-        let (python_command, (transport, progressive, first_pose, motion_codecs)) = command::discover(command::candidates(platform, python, remembered)?, cancel, |python| {
+        let (python_command, (transport, progressive, first_pose, motion_codecs, archive_writes)) = command::discover(command::candidates(platform, python, remembered)?, cancel, |python| {
             let mut transport = transport::Transport::connect_cancellable(
                 host, platform, python,
                 Duration::from_secs(config.connect_timeout_seconds),
@@ -236,9 +244,9 @@ impl RemoteSession {
             if hello["protocol"] != "tak-ssh-1" || hello["python_major"] != 3 || !blocks.is_empty() {
                 return Err("Invalid Python 3 helper handshake".into());
             }
-            Ok((transport, hello["progressive_open"] == 1, hello["first_pose"] == 1, hello["motion_codecs"] == 1))
+            Ok((transport, hello["progressive_open"] == 1, hello["first_pose"] == 1, hello["motion_codecs"] == 1, hello["archive_ranges"] == 2))
         })?;
-        Ok(Self { host: host.into(), config, transport: Box::new(transport), python_command, progressive, first_pose, motion_codecs, read_observer: None })
+        Ok(Self { host: host.into(), config, transport: Box::new(transport), python_command, progressive, first_pose, motion_codecs, archive_writes, read_observer: None })
     }
 
     pub fn observe_reads(&mut self, observer: ReadObserver) {
@@ -256,6 +264,7 @@ impl RemoteSession {
         if let Some(observer) = &self.read_observer {
             let ms = |key| header[key].as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0);
             let codec = header["marker_encoding"].as_str().or_else(|| header["analog_encoding"].as_str())
+                .or_else(|| header["archive_stage"].is_string().then_some("takm-v2"))
                 .unwrap_or(if header["expanded_lengths"].is_array() { "zlib" } else { "raw" });
             observer(moment, ReadReceipt {
                 bytes: blocks.iter().map(Vec::len).sum(),
@@ -286,11 +295,14 @@ impl RemoteSession {
         self.record_request(ReadMoment::OpenRequested);
         let (header, blocks) = self.transport.request(request, cancel)?;
         self.record_packet(ReadMoment::FirstPacket, &header, &blocks);
+        if header.get("archive_stage").is_some() {
+            return self.finish_archive_open(path, header, blocks, cancel, None);
+        }
         self.decode_open(path, &header, blocks, true, None, cancel)
     }
 
     fn open_request(&self, path: &str) -> Value {
-        let mut request = json!({"op":"open","path":path,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes});
+        let mut request = json!({"op":"open","archive_ranges":2,"path":path,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes});
         if self.read_observer.is_some() { request["telemetry"] = json!(true); }
         request
     }
@@ -320,6 +332,9 @@ impl RemoteSession {
         if self.first_pose && self.motion_codecs { request["marker_encoding"] = json!("pco-axes-1"); }
         self.record_request(ReadMoment::OpenRequested);
         let (mut header, mut blocks) = self.transport.request(request, cancel)?;
+        if header.get("archive_stage").is_some() {
+            return self.finish_archive_open(path, header, blocks, cancel, Some(publish));
+        }
         if header.get("first_pose").is_some() {
             self.record_packet(ReadMoment::FirstPose, &header, &blocks);
             if !self.first_pose || header["first_pose"] != 1 {
@@ -557,6 +572,7 @@ impl RemoteSession {
             channel_manifest,
             marker_proof,
             plate_proof: None,
+            archive: None,
         })
     }
     /// Startup stage: forceplate samples only, or the previous full read on ambiguity.
@@ -579,6 +595,9 @@ impl RemoteSession {
         }
         if !loaded.analog_pending {
             return Ok(());
+        }
+        if loaded.archive.is_some() {
+            return self.read_archive_analog(loaded, selection, cancel);
         }
         self.record_request(ReadMoment::AnalogRequested);
         let mut request = json!({"op":"analog","codec":u8::from(self.progressive),"selection":selection,"path":loaded.source.path,"expected_identity":loaded.source.identity,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes});

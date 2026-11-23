@@ -218,7 +218,11 @@ fn verify_with_dir(
     let mut buf = vec![0; IO_CHUNK];
     let index = match File::open(path).and_then(|file| Ok((file.metadata()?.len(), file))) {
         Ok((len, file)) => {
-            let index = result.check_fixed(&file, len, &mut buf);
+            let (index, recovered) = if v2::is_archive(&file, len).unwrap_or(false) {
+                result.check_fixed_v2(&file, len)
+            } else {
+                (result.check_fixed(&file, len, &mut buf), None)
+            };
             if let (Some(dir), Some(index)) = (source_dir, &index) {
                 let name = &index.source.name;
                 if name.contains(['/', '\\', ':']) || !is_take_path(Path::new(name)) {
@@ -229,7 +233,22 @@ fn verify_with_dir(
                 }
             }
             if let Some(source) = result.source.clone() {
-                result.check_source(&file, index.as_ref(), &source, &mut buf);
+                let read = |out: &mut [u8], at: u64| {
+                    if let Some(bytes) = &recovered {
+                        let at = usize::try_from(at).map_err(|e| TakError(e.to_string()))?;
+                        let region = bytes.get(at..).and_then(|rest| rest.get(..out.len()))
+                            .ok_or_else(|| TakError("Recovered stream is outside its buffer".into()))?;
+                        out.copy_from_slice(region);
+                        Ok(())
+                    } else {
+                        read_exact_at(&file, out, at)
+                    }
+                };
+                result.check_source(index.as_ref(), &source, &mut buf, read);
+            } else if index.as_ref().is_some_and(|index| index.markers_only) {
+                result.checks.dropped_streams = Check::skipped(
+                    "마커 전용 파일이에요. 보관된 자료만 검사했고, 제외한 자료는 파일에 없어요.",
+                );
             }
             index
         }
@@ -264,6 +283,32 @@ fn verify_with_dir(
 }
 
 impl Verification {
+    fn check_fixed_v2(&mut self, file: &File, len: u64) -> (Option<Index>, Option<Vec<u8>>) {
+        let archive = match v2::Archive::open(file, len) {
+            Ok(archive) => archive,
+            Err(e) => {
+                self.checks.layout_version = Check::new(false, "TAKM2 목록을 읽지 못했어요.");
+                self.checks.header_table = Check::new(false, e.to_string());
+                return (None, None);
+            }
+        };
+        self.checks.layout_version = Check::new(true, "USTAR에 저장된 TAKM 모양 번호 2예요.");
+        self.comments = checked_comment_tail(archive.journal().map(|journal| parse_journal_comments(&journal)));
+        self.checks.fixed_seal = Check::from_result(
+            archive.verify_seal().map(|_| ()), "TAKM2 고정 부분의 SHA-256이 맞아요.",
+        );
+        match archive.restore_logical().and_then(|raw| Ok((v2::legacy_index(&raw)?, raw))) {
+            Ok((index, raw)) => {
+                self.checks.header_table = Check::new(true, "복원한 TAKM 머리, 표, 보관된 스트림과 SHA-256이 맞아요.");
+                (Some(index), Some(raw))
+            }
+            Err(e) => {
+                self.checks.header_table = Check::new(false, e.to_string());
+                (None, None)
+            }
+        }
+    }
+
     fn check_fixed(&mut self, file: &File, len: u64, buf: &mut [u8]) -> Option<Index> {
         let mut head = [0; HEADER_LEN as usize];
         if let Err(e) = read_exact_at(file, &mut head, 0) {
@@ -297,26 +342,7 @@ impl Verification {
             Ok(())
         })();
         self.checks.fixed_seal = Check::from_result(seal, "TAKM 고정 부분의 SHA-256이 맞아요.");
-        self.comments = match read_comments_at(file, len, fixed_len + SEAL_LEN) {
-            Ok((parsed, damage)) => {
-                let damage = damage.or((parsed.skipped != 0 || parsed.cut)
-                    .then_some("읽지 못한 Comment 줄이나 잘린 끝부분이 있어요."));
-                CommentTail {
-                    status: Check::new(
-                        damage.is_none(),
-                        damage.unwrap_or("Comment 꼬리를 읽었어요."),
-                    ),
-                    live_count: Some(parsed.comments().list().len()),
-                    malformed_lines: Some(parsed.skipped),
-                    skipped_lines: Some(parsed.skipped + usize::from(parsed.cut)),
-                    cut_tail: Some(parsed.cut),
-                }
-            }
-            Err(e) => CommentTail::unread(Check::new(
-                false,
-                format!("Comment 꼬리를 읽지 못했어요. ({e})"),
-            )),
-        };
+        self.comments = checked_comment_tail(read_comments_at(file, len, fixed_len + SEAL_LEN));
 
         let structure = (|| {
             let table = read_table(file, table_off, table_len)?;
@@ -335,7 +361,8 @@ impl Verification {
                 return err("TAKM 머리의 예약 영역 또는 표의 형식과 모양 번호가 맞지 않아요.");
             }
             let index = decode_table(&table, table_off, fixed_len)?;
-            check_structure(&index, table_off)?;
+            validate_ledger(&index)?;
+            v2::validate_extents(&index)?;
             Ok(index)
         })();
         match structure {
@@ -351,7 +378,10 @@ impl Verification {
         }
     }
 
-    fn check_source(&mut self, takm: &File, index: Option<&Index>, path: &Path, buf: &mut [u8]) {
+    fn check_source(
+        &mut self, index: Option<&Index>, path: &Path, buf: &mut [u8],
+        read_takm: impl Fn(&mut [u8], u64) -> Result<()>,
+    ) {
         self.source_unchanged = Some(false);
         let opened =
             File::open(path).and_then(|file| Ok((SourceStamp::read(file.metadata()?)?, file)));
@@ -365,7 +395,7 @@ impl Verification {
         };
         self.source_before = Some(before);
         if let Some(index) = index {
-            self.compare_source(takm, index, path, &source, before.size, buf);
+            self.compare_source(index, path, &source, before.size, buf, read_takm);
         } else {
             self.checks.source_name =
                 Check::skipped("TAKM 표를 읽지 못해 원본과 비교할 수 없어요.");
@@ -378,12 +408,12 @@ impl Verification {
 
     fn compare_source(
         &mut self,
-        takm: &File,
         index: &Index,
         path: &Path,
         source: &File,
         len: u64,
         buf: &mut [u8],
+        read_takm: impl Fn(&mut [u8], u64) -> Result<()>,
     ) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         self.checks.source_name = Check::new(
@@ -413,6 +443,12 @@ impl Verification {
             }
             Err(e) => Check::new(false, format!("원본 TAK의 SHA-256을 읽지 못했어요. ({e})")),
         };
+        if index.has_lettered_ordinals {
+            let detail = "TAKM 표에 글자로 적힌 스트림 번호가 있어요. 원본 TAK의 번호와 대조할 수 없어요.";
+            self.checks.retained_streams = Check::new(false, detail);
+            self.checks.dropped_streams = Check::new(false, detail);
+            return;
+        }
         let streams = match Container::file_streams(source, len) {
             Ok(streams) => streams,
             Err(e) => {
@@ -425,7 +461,12 @@ impl Verification {
         };
 
         let check_camera = (|| {
-            let camera = &index.dropped[0];
+            if index.markers_only {
+                return err("마커 전용 파일이에요. 카메라 기록만 제외한 파일로 확인할 수 없어요.");
+            }
+            let [camera] = index.dropped.as_slice() else {
+                return err("뺀 카메라 기록 하나가 표에 있어야 해요.");
+            };
             let mut cameras = streams
                 .iter()
                 .enumerate()
@@ -468,7 +509,7 @@ impl Verification {
             if map.len > LIMIT || stream.size > LIMIT { return Ok(false); }
             let original = map.read(source, 0, map.len)?;
             let mut edited = vec![0; stream.size as usize];
-            read_exact_at(takm, &mut edited, stream.offset)?;
+            read_takm(&mut edited, stream.offset)?;
             let value = |bytes: &[u8]| -> Result<Option<i64>> {
                 crate::tak::metadata::parse_properties(bytes)?.into_iter()
                     .find(|(name, _)| name == "Progress").map(|(_, value)| crate::tak::metadata::python_int(&value)).transpose()
@@ -493,7 +534,7 @@ impl Verification {
                 let mut pos = stream.offset;
                 let compared = map.visit(source, buf, |bytes| {
                     let region = &mut other[..bytes.len()];
-                    read_exact_at(takm, region, pos)?;
+                    read_takm(region, pos)?;
                     equal &= bytes == region;
                     pos += bytes.len() as u64;
                     Ok(())
@@ -533,35 +574,27 @@ impl Verification {
     }
 }
 
-fn check_structure(index: &Index, table_off: u64) -> Result<()> {
-    let sha = |text: &str| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit());
-    if index.source.name.is_empty() || !sha(&index.source.sha256) {
-        return err("TAKM 표의 원본 이름 또는 SHA-256이 맞지 않아요.");
-    }
-    let [camera] = index.dropped.as_slice() else {
-        return err("뺀 카메라 기록 하나가 표에 있어야 해요.");
-    };
-    if camera.name != CAMERA_STREAM || !sha(&camera.sha256) || camera.index > index.streams.len() {
-        return err("표에서 뺀 카메라 기록의 정보가 맞지 않아요.");
-    }
-    let mut offset = HEADER_LEN;
-    for (i, stream) in index.streams.iter().enumerate() {
-        if stream.offset != offset
-            || stream.index != i + usize::from(i >= camera.index)
-            || stream.name.is_empty()
-            || stream.name == CAMERA_STREAM
-        {
-            return err(format!(
-                "TAKM 표에서 {} (원래 번호 {})의 순서나 위치가 맞지 않아요.",
-                stream.name, stream.index
-            ));
+fn checked_comment_tail(checked: Result<(comments::Parsed, Option<&'static str>)>) -> CommentTail {
+    match checked {
+        Ok((parsed, damage)) => {
+            let damage = damage.or((parsed.skipped != 0 || parsed.cut)
+                .then_some("읽지 못한 Comment 줄이나 잘린 끝부분이 있어요."));
+            CommentTail {
+                status: Check::new(
+                    damage.is_none(),
+                    damage.unwrap_or("Comment 꼬리를 읽었어요."),
+                ),
+                live_count: Some(parsed.comments().list().len()),
+                malformed_lines: Some(parsed.skipped),
+                skipped_lines: Some(parsed.skipped + usize::from(parsed.cut)),
+                cut_tail: Some(parsed.cut),
+            }
         }
-        offset += stream.size; // decode_table checked overflow and bounds.
+        Err(e) => CommentTail::unread(Check::new(
+            false,
+            format!("Comment 꼬리를 읽지 못했어요. ({e})"),
+        )),
     }
-    if offset != table_off {
-        return err("마지막 스트림이 끝나는 자리와 이름표가 시작하는 자리가 달라요.");
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

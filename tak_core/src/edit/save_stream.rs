@@ -33,8 +33,12 @@ impl Data {
         streams[ni].bytes=nodes;streams[ci].bytes=channels;streams[ci].deferred=moved;
         let mut tail=Vec::new();
         let table=if let Some(table)=&source.table {
-            let mut f=file.try_clone().map_err(error)?;
-            f.seek(SeekFrom::Start(source.tail_start)).map_err(error)?;f.read_to_end(&mut tail).map_err(error)?;
+            if let Some(raw) = &source.v2_tail {
+                tail.clone_from(raw);
+            } else {
+                let mut f=file.try_clone().map_err(error)?;
+                f.seek(SeekFrom::Start(source.tail_start)).map_err(error)?;f.read_to_end(&mut tail).map_err(error)?;
+            }
             table.clone()
         }else{
             tail=comments::header_line().into_bytes();
@@ -54,11 +58,35 @@ impl Data {
         };
         Ok(Self{source,file,streams,table,tail,output_table:None,output_seal:None})
     }
-    pub fn write(&mut self,file:&mut File,inject:&mut impl FnMut(&str)->Result<(),EditError>)->Result<u64,EditError>{
+    pub fn write(
+        &mut self, file: &mut File, save_v2: bool,
+        inject: &mut impl FnMut(&str) -> Result<(), EditError>,
+    ) -> Result<u64, EditError> {
+        let fixed = self.write_logical(file, save_v2, inject)?;
+        if !save_v2 {
+            return Ok(fixed);
+        }
+        let mut logical = vec![0; (fixed + takm::SEAL_LEN) as usize];
+        tak::fast_read::read_exact_at(file, &mut logical, 0).map_err(error)?;
+        file.seek(SeekFrom::Start(0)).map_err(error)?;
+        let written = takm::v2_write::archive(file, &logical, &self.tail).map_err(error)?;
+        file.set_len(written.size).map_err(error)?;
+        file.sync_all().map_err(error)?;
+        takm::validate_v2_write(file, written.size, &logical, &self.tail).map_err(error)?;
+        Ok(written.fixed_identity)
+    }
+
+    fn write_logical(
+        &mut self, file: &mut File, save_v2: bool,
+        inject: &mut impl FnMut(&str) -> Result<(), EditError>,
+    ) -> Result<u64, EditError> {
         let mut offset=takm::HEADER_LEN;
         let mut entries=Vec::new();
-        for s in &self.streams {
-            entries.push(json!({"name":s.name,"index":s.index,"offset":offset,"size":s.bytes.len(),"sha256":"0".repeat(64)}));
+        for (i, s) in self.streams.iter().enumerate() {
+            let ordinal = self.source.table.as_ref().map_or_else(
+                || json!(s.index), |table| table["streams"][i]["index"].clone(),
+            );
+            entries.push(json!({"name":s.name,"index":ordinal,"offset":offset,"size":s.bytes.len(),"sha256":"0".repeat(64)}));
             offset=offset.checked_add(s.bytes.len() as u64).ok_or(EditError::UnsupportedLayout)?;
         }
         // Stage deferred samples directly into their final output positions while hashing
@@ -78,7 +106,7 @@ impl Data {
         copies.sort_unstable();
         let before=self.file.metadata().map_err(error)?;
         let mut hash=Sha256::new();let mut buffer=vec![0;64*1024];let mut off=0;let mut first=0;
-        while off<self.source.len {
+        while (self.source.table.is_none() || !copies.is_empty()) && off<self.source.len {
             let n=(self.source.len-off).min(buffer.len() as u64) as usize;let chunk=&mut buffer[..n];
             tak::fast_read::read_exact_at(&self.file,chunk,off).map_err(error)?;hash.update(&*chunk);
             while first<copies.len() && copies[first].1<=off {first+=1;}
@@ -95,6 +123,9 @@ impl Data {
         self.table["streams"]=entries.into();
         let template=serde_json::to_vec(&self.table).map_err(error)?;
         let fixed=offset.checked_add(template.len() as u64).ok_or(EditError::UnsupportedLayout)?;
+        if save_v2 && fixed > takm::v2_write::MAX_LOGICAL as u64 - takm::SEAL_LEN {
+            return Err(EditError::UnsupportedLayout);
+        }
         let mut header=[0;takm::HEADER_LEN as usize];
         header[..8].copy_from_slice(&takm::MAGIC);header[8..12].copy_from_slice(&takm::LAYOUT.to_le_bytes());
         header[16..24].copy_from_slice(&offset.to_le_bytes());header[24..32].copy_from_slice(&(template.len() as u64).to_le_bytes());header[32..40].copy_from_slice(&fixed.to_le_bytes());
@@ -122,7 +153,7 @@ impl Data {
             let bytes=&base.bytes[prev..];original.update(bytes);old.update(bytes);
             let bytes=&s.bytes[a..];file.write_all(bytes).map_err(error)?;output.update(bytes);new.update(bytes);
             let old_digest=format!("{:x}",old.finalize());
-            if let Some(expected)=self.source.table.as_ref().and_then(|t|t["streams"].as_array()).and_then(|rows|rows.iter().find(|r|r["index"].as_u64()==Some(s.index as u64))).and_then(|r|r["sha256"].as_str()){
+            if let Some(expected)=self.source.table.as_ref().and_then(|t|t["streams"][i]["sha256"].as_str()){
                 if expected!=old_digest{return Err(conflict());}
             }
             self.table["streams"][i]["sha256"]=format!("{:x}",new.finalize()).into();
@@ -139,10 +170,31 @@ impl Data {
         let actual=Source::read(path)?;
         if actual.table.as_ref()!=self.output_table.as_ref() || actual.seal!=self.output_seal || actual.streams.len()!=self.streams.len(){return Err(EditError::UnsupportedLayout);}
         for (a,b) in actual.streams.iter().zip(&self.streams){
-            if a.index!=b.index || a.name!=b.name || a.bytes!=b.bytes || a.deferred!=b.deferred{return Err(EditError::UnsupportedLayout);}
+            if a.index != b.index || a.name != b.name || a.bytes.len() != b.bytes.len() {
+                return Err(EditError::UnsupportedLayout);
+            }
+            if actual.v2_tail.is_some() {
+                let mut cursor = 0;
+                for &(start, end) in &b.deferred {
+                    if a.bytes[cursor..start as usize] != b.bytes[cursor..start as usize] {
+                        return Err(EditError::UnsupportedLayout);
+                    }
+                    cursor = end as usize;
+                }
+                if a.bytes[cursor..] != b.bytes[cursor..] {
+                    return Err(EditError::UnsupportedLayout);
+                }
+            } else if a.bytes != b.bytes || a.deferred != b.deferred {
+                return Err(EditError::UnsupportedLayout);
+            }
         }
-        let mut file=File::open(path).map_err(error)?;file.seek(SeekFrom::Start(actual.tail_start)).map_err(error)?;
-        let mut tail=Vec::new();file.read_to_end(&mut tail).map_err(error)?;
+        let tail = if let Some(tail) = actual.v2_tail {
+            tail
+        } else {
+            let mut file=File::open(path).map_err(error)?;file.seek(SeekFrom::Start(actual.tail_start)).map_err(error)?;
+            let mut tail=Vec::new();file.read_to_end(&mut tail).map_err(error)?;
+            tail
+        };
         if tail!=self.tail{return Err(EditError::UnsupportedLayout);}
         let (prepared,_)=PreparedInput::read_from_path(path)?;
         let mut doc=crate::edit::EditDocument::unloaded(path.to_path_buf());doc.install_prepared(doc.revision(),prepared)?;

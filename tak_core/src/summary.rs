@@ -302,9 +302,9 @@ pub fn read_summary_with_take(
     }
     let mut summary = summarize(&take, options)?;
     if is_takm {
-        let index = takm::read_index_path(path)
+        let (source_name, seal) = takm::summary_provenance(path)
             .map_err(|e| SummaryError::Read(format!("TAKM 정보를 읽지 못했어요. ({e})")))?;
-        let seal_ok = takm::verify_fixed(path)
+        let seal_ok = seal
             .map_err(|e| {
                 summary
                     .warnings
@@ -327,7 +327,7 @@ pub fn read_summary_with_take(
         summary.takm = Some(TakmSummary {
             seal_ok,
             comment_count: parsed.comments().len(),
-            source_name: index.source.name,
+            source_name,
         });
     }
     Ok((take, summary))

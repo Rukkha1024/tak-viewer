@@ -1792,7 +1792,13 @@ mod tests {
         let from_tak = CreationStreams::read_from_path(&tak).unwrap();
         let from_takm = CreationStreams::read_from_path(&converted.out).unwrap();
         assert_eq!(from_tak.nodes, from_takm.nodes);
-        assert_eq!(from_tak.channels, from_takm.channels);
+        let marker_records = |channels: &[u8]| {
+            crate::tak::channels::iter_channel_inventory(channels).unwrap().iter()
+                .filter(|record| record.kind == "Vector3fChannel" && record.name == "Translation")
+                .map(|record| channels[record.start..record.end].to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(marker_records(&from_tak.channels), marker_records(&from_takm.channels));
         assert_eq!(std::fs::read(&tak).unwrap(), bytes);
         assert_eq!(std::fs::read(&converted.out).unwrap(), takm_before);
     }

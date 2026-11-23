@@ -20,7 +20,7 @@ fn error(e: impl std::fmt::Display) -> EditError { EditError::Other(e.to_string(
 fn conflict() -> EditError { EditError::FileChangedOnDisk }
 
 /// Selectively read streams + layout fingerprint captured on a worker. Deferred payloads
-/// are verified during save passthrough, against stream hashes/the original seal if present.
+/// are verified during v1 save passthrough. For v2, use the verified archive seal.
 /// Comment-only appends do not change a TAKM version; other changes do. A missing target is
 /// a version too. Capture before loading, and compare again after loading, on a worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +29,15 @@ impl FileVersion {
     pub fn capture(path: &Path) -> Result<Self, EditError> {
         let path = takm::canonical_target(path).map_err(error)?;
         let digest = match File::open(&path) {
-            Ok(_) => Some(super::source::Source::read(&path)?.digest(&path)?),
+            Ok(file) => {
+                let len = file.metadata().map_err(error)?.len();
+                if takm::v2::is_archive(&file, len).map_err(error)? {
+                    let archive = takm::v2::Archive::open(&file, len).map_err(error)?;
+                    Some(archive.verify_seal().map_err(error)?.1)
+                } else {
+                    Some(super::source::Source::read(&path)?.digest(&path)?)
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(error(e)),
         };
@@ -123,6 +131,15 @@ struct SourceData { streams: Vec<SourceStream>, table: Value, tail: Vec<u8> }
 fn source_data(path: &Path) -> Result<SourceData, EditError> {
     let raw = std::fs::read(path).map_err(error)?;
     if takm::is_takm_path(path) {
+        let file = File::open(path).map_err(error)?;
+        if takm::v2::is_archive(&file, raw.len() as u64).map_err(error)? {
+            let (fixed, tail, _) = takm::restore_for_write(&file, raw.len() as u64).map_err(error)?;
+            let logical = takm::v2_write::Logical::parse(&fixed).map_err(error)?;
+            let streams = logical.index.streams.iter().map(|row| SourceStream {
+                name: row.name.clone(), index: row.index, bytes: logical.stream(row).to_vec(),
+            }).collect();
+            return Ok(SourceData { streams, table: logical.table, tail });
+        }
         let index = takm::read_index_path(path).map_err(error)?;
         let table_offset = u64::from_le_bytes(raw[16..24].try_into().map_err(error)?) as usize;
         let fixed = usize::try_from(index.fixed_len).map_err(error)?;
@@ -297,13 +314,26 @@ fn write_takm(file: &mut File, source: &mut SourceData, inject: &mut impl FnMut(
 fn guard_digest(path: &Path) -> Result<Option<[u8;32]>, EditError> {
     match File::open(path) {
         Ok(mut file) => {
-            let source = super::source::Source::read(path)?;
-            let mut h = Sha256::new(); h.update(source.digest(path)?);
-            if source.seal.is_some() {
-                file.seek(SeekFrom::Start(source.tail_start)).map_err(error)?;
-                std::io::copy(&mut file,&mut HashWriter(&mut h)).map_err(error)?;
+            let len = file.metadata().map_err(error)?.len();
+            let (digest, journal_at) = if takm::v2::is_archive(&file, len).map_err(error)? {
+                let archive = takm::v2::Archive::open(&file, len).map_err(error)?;
+                let (fixed, seal) = archive.verify_seal().map_err(error)?;
+                let journal = takm::v2_write::comment_header(fixed);
+                if len - journal > takm::v2_write::MAX_JOURNAL as u64 {
+                    return Err(error("TAKM Comment journal exceeds the byte limit"));
+                }
+                (seal, Some(journal))
+            } else {
+                let source = super::source::Source::read(path)?;
+                (source.digest(path)?, source.seal.map(|_| source.tail_start))
+            };
+            let mut hash = Sha256::new();
+            hash.update(digest);
+            if let Some(offset) = journal_at {
+                file.seek(SeekFrom::Start(offset)).map_err(error)?;
+                std::io::copy(&mut file, &mut HashWriter(&mut hash)).map_err(error)?;
             }
-            Ok(Some(h.finalize().into()))
+            Ok(Some(hash.finalize().into()))
         }
         Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(error(e)),
@@ -358,6 +388,10 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
     check_version(&destination, &request.expected_destination)?;
     let dest_before = guard_digest(&destination)?;
     let source_before = guard_digest(&source_path)?;
+    let save_v2 = source_path != destination || {
+        let input = File::open(&source_path).map_err(error)?;
+        takm::v2::is_archive(&input, input.metadata().map_err(error)?.len()).map_err(error)?
+    };
     let mut data = streaming::Data::read(&source_path, &request.snapshot)?;
     inject("before_write")?;
     let name = destination.file_name().unwrap_or_default().to_string_lossy();
@@ -371,7 +405,7 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
         }
     };
     let tmp = Temp(tmp_path);
-    let written = data.write(&mut file, &mut inject);
+    let written = data.write(&mut file, save_v2, &mut inject);
     drop(file);
     let fixed_len = written?;
     inject("after_write")?;
@@ -543,7 +577,9 @@ mod tests {
     #[test]
     fn deferred_corruption_is_rejected_by_stream_hash_and_original_seal_during_copy() {
         let f=Fixture::from_bytes("deferred_corrupt",&crate::sample_tak::sample_tak_with_devices());
-        let out=f.dir.join("sealed.takm");TakmSave.save(f.request(&f.tak,&out)).unwrap();
+        let out=f.dir.join("sealed.takm");
+        takm::write(&mut File::create(&out).unwrap(), &std::fs::read(&f.tak).unwrap(), "sample.tak", "test").unwrap();
+        TakmSave.save(f.request(&out,&out)).unwrap();
         let source=super::super::source::Source::read(&out).unwrap();let c=source.unique("Channels.dat").unwrap();
         let offset=c.map.pieces(c.deferred[0].0,c.deferred[0].0+1)[0].0;
         let req=f.request(&out,&out);let mut bytes=std::fs::read(&out).unwrap();bytes[offset as usize]^=1;
@@ -832,7 +868,7 @@ mod tests {
         f.doc.apply(&patch, true).unwrap();
         let second = TakmSave.save(SaveRequest { snapshot: f.doc.snapshot(), source: out.clone(), destination: out.clone(),
             expected_source: first.version.clone(), expected_destination: first.version }).unwrap();
-        assert_ne!(first.fixed_len, second.fixed_len);
+        assert_eq!(takm::fixed_len(&out).unwrap(), second.fixed_len);
         let next_label = comments::file_label(&out, second.fixed_len);
         takm::append_events(&out, &[event(2, next_label.clone())]).unwrap();
         f.doc.apply(&patch, false).unwrap();
@@ -1068,14 +1104,20 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_tail_is_kept_byte_exact_across_save_and_save_as() {
+    fn incomplete_v1_tail_is_kept_byte_exact_across_in_place_save_and_v2_save_as() {
         let mut f = Fixture::new("tail");
-        let (out, _) = saved(&mut f);
+        let out = f.dir.join("legacy.takm");
+        takm::write(&mut File::create(&out).unwrap(), &std::fs::read(&f.tak).unwrap(), "sample.tak", "test").unwrap();
         takm::append_events(&out, &[event(1, "old.tak|123".into())]).unwrap();
         OpenOptions::new().append(true).open(&out).unwrap().write_all(b"\xfftruncated").unwrap();
         let tail = source_data(&out).unwrap().tail;
+        f.edit(1.0);
+        TakmSave.save(f.request(&out, &out)).unwrap();
+        assert!(std::fs::read(&out).unwrap().starts_with(&takm::MAGIC));
+        assert_eq!(source_data(&out).unwrap().tail, tail);
         let as_path = f.dir.join("as.takm");
         let next = TakmSave.save(f.request(&out, &as_path)).unwrap();
+        assert!(std::fs::read(&as_path).unwrap().starts_with(b"takm.json"));
         assert_eq!(source_data(&as_path).unwrap().tail, tail);
         takm::append_events(&as_path, &[event(2, comments::file_label(&as_path, next.fixed_len))]).unwrap();
         let events = takm::read_comments(&as_path).unwrap().events;

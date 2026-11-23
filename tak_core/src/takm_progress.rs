@@ -1,6 +1,6 @@
 //! Copy the opaque TAKM body and tail around one metadata patch.
 use super::*;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 const META: &str = "MetaData.dat";
 
@@ -11,11 +11,42 @@ pub(crate) fn write(
     next: Option<i64>,
 ) -> Result<u64> {
     let len = source.metadata()?.len();
+    if v2::is_archive(source, len)? {
+        let (fixed, tail, _) = restore_for_write(source, len)?;
+        let mut logical = Vec::new();
+        let fixed_len = fixed.len() as u64;
+        patch_logical(
+            &mut Cursor::new(fixed),
+            &mut logical,
+            fixed_len,
+            expected,
+            next,
+        )?;
+        let written = v2_write::archive(out, &logical, &tail)?;
+        out.sync_all()?;
+        validate_v2_write(out, written.size, &logical, &tail)?;
+        return Ok(written.fixed_identity);
+    }
+    let fixed = patch_logical(source, out, len, expected, next)?;
+    out.sync_all()?;
+    Ok(fixed)
+}
+
+fn patch_logical(
+    source: &mut (impl Read + Seek),
+    out: &mut impl Write,
+    len: u64,
+    expected: Option<i64>,
+    next: Option<i64>,
+) -> Result<u64> {
     let mut header = [0; HEADER_LEN as usize];
+    // The Windows layout probe moves the file cursor.
+    source.seek(SeekFrom::Start(0))?;
     source.read_exact(&mut header)?;
     let (table_at, table_len, fixed) = parse_header(&header, len)?;
     let mut table_bytes = vec![0; table_len as usize];
-    read_exact_at(source, &mut table_bytes, table_at)?;
+    source.seek(SeekFrom::Start(table_at))?;
+    source.read_exact(&mut table_bytes)?;
     let mut table: Value =
         serde_json::from_slice(&table_bytes).map_err(|e| TakError(e.to_string()))?;
     let index = decode_table(&table, table_at, fixed)?;
@@ -32,7 +63,8 @@ pub(crate) fn write(
         prev = s.offset + s.size;
     }
     let mut raw = vec![0; meta.size as usize];
-    read_exact_at(source, &mut raw, meta.offset)?;
+    source.seek(SeekFrom::Start(meta.offset))?;
+    source.read_exact(&mut raw)?;
     let patched = crate::tak::metadata::patch_progress(&raw, expected, next)?;
     let shift = patched.len() as i64 - meta.size as i64;
     let rows = table["streams"].as_array_mut().expect("validated table");
@@ -65,21 +97,11 @@ pub(crate) fn write(
     old_hash.update(&buffer[..header.len()]);
     out.write_all(&header)?;
     new_hash.update(header);
-    let mut copy_fixed =
-        |source: &mut File, out: &mut File, length, old: &mut Sha256, new: &mut Sha256| {
-            copy(source, length, &mut buffer, |bytes| {
-                old.update(bytes);
-                new.update(bytes);
-                out.write_all(bytes)
-            })
-        };
-    copy_fixed(
-        source,
-        out,
-        meta.offset - HEADER_LEN,
-        &mut old_hash,
-        &mut new_hash,
-    )?;
+    copy(source, meta.offset - HEADER_LEN, &mut buffer, |bytes| {
+        old_hash.update(bytes);
+        new_hash.update(bytes);
+        out.write_all(bytes)
+    })?;
     let mut original = vec![0; raw.len()];
     source.read_exact(&mut original)?;
     if original != raw {
@@ -88,13 +110,11 @@ pub(crate) fn write(
     old_hash.update(original);
     out.write_all(&patched)?;
     new_hash.update(patched);
-    copy_fixed(
-        source,
-        out,
-        table_at - meta_end,
-        &mut old_hash,
-        &mut new_hash,
-    )?;
+    copy(source, table_at - meta_end, &mut buffer, |bytes| {
+        old_hash.update(bytes);
+        new_hash.update(bytes);
+        out.write_all(bytes)
+    })?;
     copy(source, table_len, &mut buffer, |bytes| {
         old_hash.update(bytes);
         Ok(())
@@ -110,7 +130,6 @@ pub(crate) fn write(
     copy(source, len - index.tail_start(), &mut buffer, |bytes| {
         out.write_all(bytes)
     })?;
-    out.sync_all()?;
     Ok(new_fixed)
 }
 
@@ -121,7 +140,7 @@ fn shifted(value: u64, delta: i64) -> Result<u64> {
 }
 
 fn copy(
-    input: &mut File,
+    input: &mut impl Read,
     mut length: u64,
     buf: &mut [u8],
     mut put: impl FnMut(&[u8]) -> io::Result<()>,
@@ -148,6 +167,7 @@ mod tests {
         let source = dir.join("sample.tak");
         let tak = crate::sample_tak::sample_tak();
         std::fs::write(&source, &tak).unwrap();
+        // This test compares physical v1 offsets. The v2 save has its own test.
         crate::takm::write(&mut original, &tak, "sample.tak", "test").unwrap();
         // Preserve a torn Comment fragment too.
         original.extend_from_slice(b"unfinished,tail");

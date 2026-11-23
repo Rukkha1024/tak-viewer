@@ -509,7 +509,7 @@ impl TakViewerApp {
                 if let Some(path) = view.clear_shared_wait() {
                     #[cfg(test)]
                     if hold_loads { view.hold_load(path, restore); view.set_pending_identity(wanted.clone()); return; }
-                    view.start_load(ctx, path, restore);
+                    view.start_primary_load(ctx, path, restore);
                     view.set_pending_identity(wanted.clone());
                 }
                 return;
@@ -523,7 +523,7 @@ impl TakViewerApp {
                     if let Some(path) = view.clear_shared_wait() {
                         #[cfg(test)]
                         if hold_loads { view.hold_load(path, restore); view.set_pending_identity(wanted.clone()); return; }
-                        view.start_load(ctx, path, restore);
+                        view.start_primary_load(ctx, path, restore);
                         view.set_pending_identity(wanted.clone());
                     }
                     return;
@@ -537,20 +537,14 @@ impl TakViewerApp {
     pub(super) fn poll_hidden_file_work(&mut self, ctx: &egui::Context) {
         let mut arrived = Vec::new();
         let mut failed = Vec::new();
-        let now = ctx.input(|input| input.time);
         let speed = self.settings.speed;
         let saving = self.saving_documents();
         for (tab, slot) in self.hidden_file_locations() {
             let Some(runtime) = self.layout_tabs.work_payload_mut(tab).and_then(|tab| tab.layout.as_mut()) else { continue };
             let view = &mut runtime.views[slot];
-            if let Some(Loaded { path, result, rx }) = view.poll_markers() {
+            if let Some((path, result)) = view.poll_local_open(ctx, speed, &mut self.next_file_id) {
                 match result {
-                    Ok((data, steps)) => {
-                        self.next_file_id += 1;
-                        view.load_steps = steps;
-                        drop_later(view.show(data, rx, self.next_file_id, speed, now));
-                        arrived.push(path);
-                    }
+                    Ok(()) => arrived.push(path),
                     Err(reason) => {
                         view.comments_rx = None;
                         self.error = Some(format!("{}\n\n{}", path.display(), reason));

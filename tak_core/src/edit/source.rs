@@ -1,5 +1,5 @@
 //! Selective original-stream access shared by edit preparation, creation and conflict checks.
-//! No full-reader fallback: an unsupported layout fails before deferred sample reads.
+//! Layout 2 edits use the verified logical archive streams.
 use super::EditError;
 use crate::{tak, takm};
 use tak::container::{Container, u16_at, u32_at, END};
@@ -23,6 +23,7 @@ pub(super) struct Source {
     pub table_bytes: Vec<u8>,
     pub seal: Option<[u8;32]>,
     pub tail_start: u64,
+    pub v2_tail: Option<Vec<u8>>,
     pub len: u64,
 }
 fn chain(fat: &[u32], start: u32) -> Vec<u32> {
@@ -47,6 +48,35 @@ impl Source {
         let len = metadata.len();
         let mut streams = Vec::new();
         let mut magic = [0;8]; read_exact_at(&file,&mut magic,0).map_err(error)?;
+        if takm::v2::is_archive(&file, len).map_err(error)? {
+            let (fixed, tail, identity) = takm::restore_for_write(&file, len).map_err(error)?;
+            let logical = takm::v2_write::Logical::parse(&fixed).map_err(error)?;
+            let mut offset = takm::HEADER_LEN;
+            for row in &logical.index.streams {
+                if row.offset != offset { return Err(EditError::UnsupportedLayout); }
+                offset += row.size;
+                streams.push(Stream {
+                    name: row.name.clone(),
+                    index: row.index,
+                    map: StreamMap { sector: 0, chain: vec![], len: row.size, flat: Some(row.offset) },
+                    bytes: logical.stream(row).to_vec(),
+                    deferred: vec![],
+                });
+            }
+            if offset != logical.table_at as u64 { return Err(EditError::UnsupportedLayout); }
+            let after = file.metadata().map_err(error)?;
+            if stamp != (after.len(), after.modified().ok()) { return Err(EditError::FileChangedOnDisk); }
+            return Ok(Self {
+                streams,
+                table: Some(logical.table),
+                header: fixed[..takm::HEADER_LEN as usize].to_vec(),
+                table_bytes: fixed[logical.table_at..logical.table_end].to_vec(),
+                seal: Some(fixed[logical.table_end..].try_into().map_err(error)?),
+                tail_start: takm::v2_write::comment_header(identity),
+                v2_tail: Some(tail),
+                len,
+            });
+        }
         let (table, header, table_bytes, seal, tail_start) = if magic == takm::MAGIC {
             let idx = takm::read_index(&file,len).map_err(error)?;
             let mut head = vec![0; takm::HEADER_LEN as usize];
@@ -107,7 +137,7 @@ impl Source {
         }
         let after=file.metadata().map_err(error)?;
         if stamp!=(after.len(),after.modified().ok()){return Err(EditError::FileChangedOnDisk);}
-        Ok(Self {streams,table,header,table_bytes,seal,tail_start,len})
+        Ok(Self {streams,table,header,table_bytes,seal,tail_start,v2_tail:None,len})
     }
     pub fn unique(&self,name:&str)->Result<&Stream,EditError>{
         let mut hits=self.streams.iter().filter(|s|s.name==name);

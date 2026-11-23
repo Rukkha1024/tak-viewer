@@ -17,6 +17,7 @@
 //! Reading gives the same `Take` as the TAK (`read_take` here; markers first in
 //! `tak::fast_read`, through the same stream walk).
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,9 @@ use crate::comments;
 use crate::tak::container::{sha256_hex, Container};
 use crate::tak::fast_read::read_exact_at;
 use crate::tak::{err, in_repo_input, is_take_path, repo_root, Result, Take, TakError};
+
+#[path = "takm_v2.rs"]
+pub mod v2;
 
 #[path = "takm_verify.rs"]
 pub mod verify;
@@ -73,7 +77,7 @@ pub struct Stream {
     pub size: u64,
 }
 
-/// A stream left out (the camera record).
+/// A stream left out. Canonical TAK conversion excludes only the camera record.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dropped {
     pub name: String,
@@ -100,6 +104,8 @@ pub struct Index {
     pub source: Source,
     pub made_by: String,
     pub made_at: String,
+    markers_only: bool,
+    has_lettered_ordinals: bool,
 }
 
 impl Index {
@@ -166,9 +172,32 @@ fn decode_table(v: &Value, table_off: u64, fixed_len: u64) -> Result<Index> {
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| bad(k));
     let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).ok_or_else(|| bad(k));
     let list = |k: &str| v.get(k).and_then(Value::as_array).ok_or_else(|| bad(k));
+    let (kept_rows, dropped_rows) = (list("streams")?, list("dropped")?);
+    let rows = || kept_rows.iter().chain(dropped_rows);
+    let has_lettered_ordinals = rows().any(|row| row["index"].is_string());
+    let occupied: HashSet<usize> = if has_lettered_ordinals {
+        rows().filter_map(|row| usize::try_from(row["index"].as_u64()?).ok()).collect()
+    } else {
+        HashSet::new()
+    };
+    // Letters are archive-local identifiers. Never use these temporary IDs to compare a TAK.
+    let mut free = (0..=usize::MAX).rev().filter(|id| !occupied.contains(id));
+    let mut letters = HashSet::new();
+    let mut ordinal = |row: &Value| {
+        if let Some(number) = row["index"].as_u64() {
+            return usize::try_from(number).map_err(|_| bad("index"));
+        }
+        let letter = row["index"].as_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic()))
+            .ok_or_else(|| bad("index"))?;
+        if !letters.insert(letter.to_owned()) {
+            return Err(bad("duplicate index"));
+        }
+        free.next().ok_or_else(|| bad("index"))
+    };
     let mut streams = Vec::new();
-    for s in list("streams")? {
-        let index = usize::try_from(num(s, "index")?).map_err(|_| bad("index"))?;
+    for s in kept_rows {
+        let index = ordinal(s)?;
         let st = Stream { name: text(s, "name")?, index, offset: num(s, "offset")?, size: num(s, "size")? };
         if st.offset < HEADER_LEN || st.offset.checked_add(st.size).is_none_or(|e| e > table_off) {
             return Err(bad(&format!("{} 자리", st.name)));
@@ -176,8 +205,8 @@ fn decode_table(v: &Value, table_off: u64, fixed_len: u64) -> Result<Index> {
         streams.push(st);
     }
     let mut dropped = Vec::new();
-    for d in list("dropped")? {
-        let index = usize::try_from(num(d, "index")?).map_err(|_| bad("index"))?;
+    for d in dropped_rows {
+        let index = ordinal(d)?;
         dropped.push(Dropped { name: text(d, "name")?, index, size: num(d, "size")?, sha256: text(d, "sha256")? });
     }
     let src = v.get("source").ok_or_else(|| bad("source"))?;
@@ -188,7 +217,27 @@ fn decode_table(v: &Value, table_off: u64, fixed_len: u64) -> Result<Index> {
         source: Source { name: text(src, "name")?, size: num(src, "size")?, sha256: text(src, "sha256")? },
         made_by: text(v, "made_by")?,
         made_at: text(v, "made_at")?,
+        markers_only: v["content_profile"] == "markers-only",
+        has_lettered_ordinals,
     })
+}
+
+/// Validate the archive's ledger without assuming it represents a full TAK conversion.
+fn validate_ledger(index: &Index) -> Result<()> {
+    let sha = |text: &str| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit());
+    if index.source.name.is_empty() || !sha(&index.source.sha256) {
+        return err("TAKM 표의 원본 이름 또는 SHA-256이 맞지 않아요.");
+    }
+    let mut ordinals = HashSet::new();
+    if index.streams.iter().any(|s| {
+        s.name.is_empty() || s.name == CAMERA_STREAM || !ordinals.insert(s.index)
+    }) || index.dropped.iter().any(|s| {
+        s.name.is_empty() || (!index.markers_only && s.name != CAMERA_STREAM)
+            || !sha(&s.sha256) || !ordinals.insert(s.index)
+    }) {
+        return err("TAKM 표의 스트림 이름, 번호 또는 제외한 자료의 SHA-256이 맞지 않아요.");
+    }
+    Ok(())
 }
 
 fn read_table(file: &File, table_off: u64, table_len: u64) -> Result<Value> {
@@ -223,11 +272,49 @@ pub fn read_index_path(path: &Path) -> Result<Index> {
     read_index(&file, len)
 }
 
+/// Logical stream table for either layout. V2 offsets apply to the restored V1 bytes.
+pub fn read_logical_index(path: &Path) -> Result<Index> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        let archive = v2::Archive::open(&file, len)?;
+        return v2::legacy_index(&archive.restore()?);
+    }
+    read_index(&file, len)
+}
+
+/// Source name and seal status for summaries. A bad physical seal can be reported
+/// alongside source provenance when the logical v2 body still verifies.
+pub(crate) fn summary_provenance(path: &Path) -> Result<(String, Result<()>)> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        let archive = v2::Archive::open(&file, len)?;
+        let index = v2::legacy_index(&archive.restore_logical()?)?;
+        return Ok((index.source.name, archive.verify_seal().map(|_| ())));
+    }
+    let index = read_index(&file, len)?;
+    Ok((index.source.name, verify_fixed_seal(path).map(|_| ())))
+}
+
+/// Physical immutable prefix length used by Comment labels, for either TAKM layout.
+pub fn fixed_len(path: &Path) -> Result<u64> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        return Ok(v2::Archive::open(&file, len)?.fixed_len());
+    }
+    Ok(read_index(&file, len)?.fixed_len)
+}
+
 /// Full read: the same `Take` as `tak::read_take` of the source TAK (path and `file_size` are
 /// the `.takm`'s). Later streams of the same name win, as in the TAK read.
 pub fn read_take(path: &Path) -> Result<Take> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        return v2::Archive::open(&file, len)?.read_take(path);
+    }
     let index = read_index(&file, len)?;
     let get = |name: &str| -> Result<Vec<u8>> {
         let s = index.last(name).ok_or_else(|| TakError("Required marker streams missing".into()))?;
@@ -244,6 +331,36 @@ pub fn read_take(path: &Path) -> Result<Take> {
 
 // ───────────────────────────── Writing (conversion) ─────────────────────────────
 
+#[path = "takm_v2_write.rs"]
+pub(crate) mod v2_write;
+
+/// Write a layout 2 archive from a complete, sealed layout 1 take and its raw Comment tail.
+/// The caller owns destination authorization and publication.
+pub fn write_v2_from_v1(w: &mut impl Write, legacy: &[u8]) -> Result<u64> {
+    let (fixed, tail) = v2_input(legacy)?;
+    Ok(v2_write::archive(w, fixed, tail)?.size)
+}
+
+fn v2_input(legacy: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (_, _, fixed) = parse_header(legacy, legacy.len() as u64)?;
+    Ok(legacy.split_at((fixed + SEAL_LEN) as usize))
+}
+
+pub(crate) fn restore_for_write(file: &File, len: u64) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    let archive = v2::Archive::open(file, len)?;
+    let fixed = archive.restore()?;
+    let journal = archive.journal()?;
+    Ok((fixed, journal.bytes, archive.fixed_len()))
+}
+
+pub(crate) fn validate_v2_write(file: &File, len: u64, fixed: &[u8], tail: &[u8]) -> Result<()> {
+    let (got_fixed, got_tail, _) = restore_for_write(file, len)?;
+    if got_fixed != fixed || got_tail != tail {
+        return err("TAKM archive cannot reproduce its logical bytes");
+    }
+    Ok(())
+}
+
 /// Writer that hashes what goes through it.
 struct Sealing<W: Write> {
     w: W,
@@ -259,15 +376,14 @@ impl<W: Write> Sealing<W> {
     }
 }
 
-/// Write a whole new `.takm` for the TAK bytes `tak` (named `source_name`): fixed part, its
-/// SHA-256, and a tail holding only the Comment CSV header line. Returns the bytes written.
-/// Peak memory: the TAK plus its largest stream.
+/// Write the layout 1 representation, including the Comment CSV header.
+/// For a new on-disk conversion use [convert].
 pub fn write(w: &mut impl Write, tak: &[u8], source_name: &str, made_at: &str) -> Result<u64> {
     let c = Container::parse(tak)?;
     let list = c.streams()?;
     let source = Source { name: source_name.into(), size: tak.len() as u64, sha256: sha256_hex(tak) };
     write_streams(w, list.iter().map(|(name, entry)| (name.as_str(), c.entries[*entry].size)), &source, made_at,
-        |i, consume| consume(&c.read_stream(list[i].1)?))
+        |i, consume| consume(&c.read_stream(list[i].1)?), None)
 }
 
 fn write_streams<'a>(
@@ -276,6 +392,7 @@ fn write_streams<'a>(
     source: &Source,
     made_at: &str,
     mut visit: impl FnMut(usize, &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
+    max_fixed: Option<u64>,
 ) -> Result<u64> {
     // Dropped streams first: their SHA-256 goes into the table.
     let mut dropped = Vec::new();
@@ -306,7 +423,10 @@ fn write_streams<'a>(
     }))
     .map_err(|e| TakError(format!("table: {e}")))?;
     let table_off = offset;
-    let fixed_len = table_off + table.len() as u64;
+    let fixed_len = table_off.checked_add(table.len() as u64).ok_or_else(|| TakError("TAKM 크기가 너무 커요.".into()))?;
+    if max_fixed.is_some_and(|max| fixed_len > max - SEAL_LEN) {
+        return err("TAKM logical body is outside the supported size");
+    }
     let mut head = [0u8; HEADER_LEN as usize];
     head[..8].copy_from_slice(&MAGIC);
     head[8..12].copy_from_slice(&LAYOUT.to_le_bytes());
@@ -522,23 +642,27 @@ pub fn convert(tak: &Path, out_dir: Option<&Path>) -> std::result::Result<Conver
         let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         comments::iso_time(comments::civil_from_unix(secs), 0)
     };
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)
+        .map_err(|e| format!("임시 파일을 만들지 못했어요: {e}"))?;
     let written = (|| -> std::result::Result<u64, String> {
-        let file = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| format!("임시 파일을 만들지 못했어요: {e}"))?;
-        let mut w = BufWriter::with_capacity(4 << 20, file);
-        let mut n = write_streams(&mut w, list.iter().map(|(name, map)| (name.as_str(), map.len)), &source, &made_at,
-            |i, consume| list[i].1.visit(&input, &mut buf, consume))
+        let mut logical = Vec::new();
+        write_streams(&mut logical, list.iter().map(|(name, map)| (name.as_str(), map.len)), &source, &made_at,
+            |i, consume| list[i].1.visit(&input, &mut buf, consume), Some(v2_write::MAX_LOGICAL as u64))
             .map_err(|e| format!("TAKM을 만들지 못했어요: {e}"))?;
         for e in old.iter().flat_map(|p| &p.events) {
-            let line = comments::encode(e);
-            w.write_all(line.as_bytes()).map_err(|e| format!("쓰지 못했어요: {e}"))?;
-            n += line.len() as u64;
+            logical.extend_from_slice(comments::encode(e).as_bytes());
         }
+        let (fixed, tail) = v2_input(&logical).map_err(|e| e.to_string())?;
+        let mut w = BufWriter::with_capacity(4 << 20, file);
+        let size = v2_write::archive(&mut w, fixed, tail)
+            .map_err(|e| format!("TAKM을 만들지 못했어요: {e}"))?.size;
         let file = w.into_inner().map_err(|e| format!("쓰지 못했어요: {e}"))?;
         file.sync_all().map_err(|e| format!("쓰지 못했어요: {e}"))?;
+        validate_v2_write(&file, size, fixed, tail).map_err(|e| e.to_string())?;
         if stat(tak).ok() != Some(before) {
             return Err("읽는 동안 TAK가 바뀌었어요".into());
         }
-        Ok(n)
+        Ok(size)
     })()
     .and_then(|n| place(&tmp, &out).map(|()| n));
     let takm_size = match written {
@@ -675,16 +799,30 @@ fn tail_bytes(file: &File) -> Result<(Index, Vec<u8>)> {
 
 /// The tail as text (UTF-8; bad bytes replaced).
 pub fn read_tail_text(path: &Path) -> Result<String> {
-    let (_, tail) = tail_bytes(&File::open(path)?)?;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let tail = if v2::is_archive(&file, len)? {
+        v2::Archive::open(&file, len)?.journal()?.bytes
+    } else {
+        tail_bytes(&file)?.1
+    };
     Ok(String::from_utf8_lossy(&tail).into_owned())
 }
 
 /// The tail's lines; a last line without a line break is ignored (as in the CSV).
 pub fn read_tail(path: &Path) -> Result<Tail> {
-    let text = read_tail_text(path)?;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let (bytes, cut) = if v2::is_archive(&file, len)? {
+        let journal = v2::Archive::open(&file, len)?.journal()?;
+        (journal.bytes, journal.cut)
+    } else {
+        (tail_bytes(&file)?.1, false)
+    };
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned()).collect();
     let rest = lines.pop().unwrap_or_default();
-    Ok(Tail { lines, cut: !rest.is_empty() })
+    Ok(Tail { lines, cut: cut || !rest.is_empty() })
 }
 
 /// The tail read as a comment file (`comments::parse`: header, cut-off last line and bad lines
@@ -696,6 +834,10 @@ pub fn read_comments(path: &Path) -> Result<comments::Parsed> {
 pub(crate) fn read_comments_with_health(path: &Path) -> Result<(comments::Parsed, Option<&'static str>)> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        let journal = v2::Archive::open(&file, len)?.journal()?;
+        return Ok(parse_journal_comments(&journal));
+    }
     let index = read_index(&file, len)?;
     read_comments_at(&file, len, index.tail_start())
 }
@@ -706,7 +848,17 @@ fn read_comments_at(file: &File, len: u64, start: u64) -> Result<(comments::Pars
     tail.try_reserve_exact(size).map_err(|_| TakError("Comment 영역을 읽을 메모리가 부족해요.".into()))?;
     tail.resize(size, 0);
     read_exact_at(file, &mut tail, start)?;
-    let text = String::from_utf8_lossy(&tail);
+    Ok(parse_comment_bytes(&tail))
+}
+
+pub(crate) fn parse_journal_comments(journal: &v2::Journal) -> (comments::Parsed, Option<&'static str>) {
+    let (mut parsed, damage) = parse_comment_bytes(&journal.bytes);
+    parsed.cut |= journal.cut;
+    (parsed, damage)
+}
+
+fn parse_comment_bytes(tail: &[u8]) -> (comments::Parsed, Option<&'static str>) {
+    let text = String::from_utf8_lossy(tail);
     let has_header = text.split_once('\n').is_some_and(|(line, _)| {
         line.strip_suffix('\r').unwrap_or(line) == comments::header_line().trim_end()
     });
@@ -717,7 +869,54 @@ fn read_comments_at(file: &File, len: u64, start: u64) -> Result<(comments::Pars
     } else {
         None
     };
-    Ok((comments::parse(&text), damage))
+    (comments::parse(&text), damage)
+}
+
+struct CommentAppend {
+    file: File,
+    tail: Vec<u8>,
+    v2: Option<(u64, u64, u64, bool)>,
+}
+
+impl CommentAppend {
+    fn open(target: &Path) -> Result<Self> {
+        let file = File::open(target)?;
+        let len = file.metadata()?.len();
+        if v2::is_archive(&file, len)? {
+            let file = OpenOptions::new().read(true).write(true).open(target)?;
+            let len = file.metadata()?.len();
+            let archive = v2::Archive::open(&file, len)?;
+            archive.verify_append_body()?;
+            let journal = archive.journal()?;
+            let start = v2_write::comment_header(archive.fixed_len());
+            let position = Some((start, journal.append_offset, journal.next_ordinal, journal.cut));
+            return Ok(Self { file, tail: journal.bytes, v2: position });
+        }
+        let file = OpenOptions::new().read(true).append(true).open(target)?;
+        let (_, tail) = tail_bytes(&file)?;
+        Ok(Self { file, tail, v2: None })
+    }
+
+    fn commit(&mut self, pending: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        if let Some((start, append_at, ordinal, torn)) = self.v2 {
+            if !pending.is_empty() || torn {
+                if !pending.is_empty() {
+                    v2_write::check_append_size(append_at - start, pending.len())?;
+                }
+                self.file.seek(SeekFrom::Start(append_at))?;
+                v2_write::append_member(&mut self.file, ordinal, pending)?;
+                let end = self.file.stream_position()?;
+                self.file.set_len(end)?;
+                self.file.sync_data()?;
+            }
+        } else {
+            self.file.write_all(pending)?;
+            self.file.flush()?;
+        }
+        Ok(())
+    }
 }
 
 /// Append lines (each without a line break; CRLF is added) to the tail. Only appends: the
@@ -736,8 +935,8 @@ pub fn append_lines(path: &Path, lines: &[String]) -> Result<()> {
     let target = canonical_target(path)?;
     if in_input(&target) || !is_takm_path(&target) { return err("안전하지 않은 Comment 대상이에요"); }
     let _lock = lock_path(&target)?;
-    let mut f = OpenOptions::new().read(true).append(true).open(&target)?;
-    let (_, tail) = tail_bytes(&f)?;
+    let mut append = CommentAppend::open(&target)?;
+    let tail = &append.tail;
     let mut out = String::new();
     if tail.last().is_some_and(|&b| b != b'\n') {
         if comments::ends_in_quote(&String::from_utf8_lossy(&tail)) {
@@ -750,9 +949,7 @@ pub fn append_lines(path: &Path, lines: &[String]) -> Result<()> {
         out += l;
         out += EOL;
     }
-    f.write_all(out.as_bytes())?;
-    f.flush()?;
-    Ok(())
+    append.commit(out.as_bytes())
 }
 
 /// Append comment events (`comments::encode` lines) to the tail.
@@ -799,10 +996,10 @@ pub fn append_events_guarded_stamped(path: &Path, events: &[comments::Event], ca
 /// Caller checked the canonical target and holds its path lock.
 pub(crate) fn append_events_locked(target: &Path, events: &[comments::Event], cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<(Option<CommentConflict>, Option<CommentWriteStamp>)> {
     if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
-    let mut file = OpenOptions::new().read(true).append(true).open(target)?;
-    let before = file.metadata()?;
+    let mut append = CommentAppend::open(target)?;
+    let before = append.file.metadata()?;
     let before = (target.to_path_buf(), before.len(), before.modified().ok());
-    let (_, mut tail) = tail_bytes(&file)?;
+    let mut tail = std::mem::take(&mut append.tail);
     let original = comments::parse(&String::from_utf8_lossy(&tail)).comments();
     let mut pending = Vec::new();
     for event in events {
@@ -845,20 +1042,28 @@ pub(crate) fn append_events_locked(target: &Path, events: &[comments::Event], ca
         pending.extend_from_slice(&out);
     }
     if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { return err("Comment write cancelled"); }
-    file.write_all(&pending)?;
-    file.flush()?;
-    let after = file.metadata()?;
+    append.commit(&pending)?;
+    let after = append.file.metadata()?;
     let after = (target.to_path_buf(), after.len(), after.modified().ok());
     Ok((None, Some(CommentWriteStamp { before, after })))
 }
 
 /// Check the fixed part against its SHA-256 in bounded chunks.
 pub fn verify_fixed(path: &Path) -> Result<()> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        return v2::Archive::open(&file, len)?.restore().map(|_| ());
+    }
     verify_fixed_seal(path).map(|_| ())
 }
 
 fn read_seal(file: &File) -> Result<(u64, [u8; SEAL_LEN as usize])> {
-    let fixed_len = read_index(file, file.metadata()?.len())?.fixed_len;
+    let len = file.metadata()?.len();
+    if v2::is_archive(file, len)? {
+        return v2::Archive::open(file, len)?.fixed_identity();
+    }
+    let fixed_len = read_index(file, len)?.fixed_len;
     let mut seal = [0; SEAL_LEN as usize];
     read_exact_at(file, &mut seal, fixed_len)?;
     Ok((fixed_len, seal))
@@ -870,6 +1075,10 @@ pub(crate) fn fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> 
 
 pub(crate) fn verify_fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as usize])> {
     let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        return v2::Archive::open(&file, len)?.verify_seal();
+    }
     let (fixed_len, seal) = read_seal(&file)?;
     let mut buf = vec![0; IO_CHUNK];
     if hash_file_prefix(&file, fixed_len, &mut buf)?.as_slice() != seal {
@@ -880,14 +1089,24 @@ pub(crate) fn verify_fixed_seal(path: &Path) -> Result<(u64, [u8; SEAL_LEN as us
 
 fn hash_file_prefix(file: &File, len: u64, buf: &mut [u8]) -> Result<sha2::digest::Output<Sha256>> {
     let mut hash = Sha256::new();
-    let mut pos = 0u64;
-    while pos < len {
-        let n = (len - pos).min(buf.len() as u64) as usize;
+    read_file_chunks(file, 0, len, buf, |bytes| hash.update(bytes))?;
+    Ok(hash.finalize())
+}
+
+fn read_file_chunks(
+    file: &File,
+    mut pos: u64,
+    end: u64,
+    buf: &mut [u8],
+    mut consume: impl FnMut(&[u8]),
+) -> Result<()> {
+    while pos < end {
+        let n = (end - pos).min(buf.len() as u64) as usize;
         read_exact_at(file, &mut buf[..n], pos)?;
-        hash.update(&buf[..n]);
+        consume(&buf[..n]);
         pos += n as u64;
     }
-    Ok(hash.finalize())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -914,6 +1133,16 @@ mod tests {
         let c = convert(&tak, None).unwrap();
         assert_eq!(c.out, d.0.join("walk_001.takm"));
         (d, tak, c.out)
+    }
+
+    fn legacy_converted(tag: &str) -> (TempDir, PathBuf, PathBuf) {
+        let d = TempDir::new(tag);
+        let tak = d.0.join("walk_001.tak");
+        let takm = tak.with_extension("takm");
+        let bytes = sample_tak();
+        std::fs::write(&tak, &bytes).unwrap();
+        write(&mut File::create(&takm).unwrap(), &bytes, "walk_001.tak", "test").unwrap();
+        (d, tak, takm)
     }
 
     fn file_sha(p: &Path) -> String {
@@ -973,9 +1202,12 @@ mod tests {
         assert_eq!((stat(&tak).unwrap(), file_sha(&tak)), before);
         assert_eq!(c.dropped, vec![(CAMERA_STREAM.to_string(), 20_000)]);
         assert!(c.csv_beside.is_none());
-        let takm = std::fs::read(&c.out).unwrap();
-        assert_eq!(takm.len() as u64, c.takm_size);
-        let index = read_index_path(&c.out).unwrap();
+        let archive = File::open(&c.out).unwrap();
+        let len = archive.metadata().unwrap().len();
+        assert_eq!(len, c.takm_size);
+        let archive = v2::Archive::open(&archive, len).unwrap();
+        let takm = archive.restore().unwrap();
+        let index = v2::legacy_index(&takm).unwrap();
         let container = Container::parse(&bytes).unwrap();
         let all = container.streams().unwrap();
         assert_eq!(all.len(), 6);
@@ -998,7 +1230,8 @@ mod tests {
         assert_eq!(&takm[..8], b"TAKM-2\r\n");
         let f = index.fixed_len as usize;
         assert_eq!(&takm[f..f + 32], &Sha256::digest(&takm[..f])[..]);
-        assert_eq!(&takm[f + 32..], comments::header_line().as_bytes());
+        assert_eq!(takm.len(), f + 32);
+        assert_eq!(archive.journal().unwrap().bytes, comments::header_line().as_bytes());
         verify_fixed(&c.out).unwrap();
         assert_eq!(read_tail(&c.out).unwrap(), Tail { lines: vec![comments::COLUMNS.join(",")], cut: false });
         assert!(read_comments(&c.out).unwrap().events.is_empty());
@@ -1032,7 +1265,7 @@ mod tests {
 
     #[test]
     fn a_takm_gives_the_same_take_and_view_data_as_its_tak_full_and_fast() {
-        let (_d, tak, takm) = converted("same");
+        let (_d, tak, takm) = legacy_converted("same");
         let full_tak = crate::tak::read_take(&tak).unwrap();
         let full_takm = crate::tak::read_take(&takm).unwrap();
         assert_eq!(full_takm.path, takm);
@@ -1051,7 +1284,7 @@ mod tests {
 
     #[test]
     fn verify_finds_a_flipped_byte_in_the_fixed_part_but_not_in_the_tail() {
-        let (_d, _tak, takm) = converted("flip");
+        let (_d, _tak, takm) = legacy_converted("flip");
         let good = std::fs::read(&takm).unwrap();
         let index = read_index_path(&takm).unwrap();
         let stream = &index.streams[2];
@@ -1103,7 +1336,7 @@ mod tests {
 
     #[test]
     fn every_interrupted_byte_with_an_interleaved_writer_retries_once() {
-        let (dir, _source, original) = converted("every_cut_interleaved");
+        let (dir, _source, original) = legacy_converted("every_cut_interleaved");
         let mut a = event(41, "한글, \"quoted\" text");
         a.operation = Some("writer-a".into());
         let mut b = event(42, "other writer");
@@ -1127,7 +1360,7 @@ mod tests {
 
     #[test]
     fn every_legacy_fragment_is_discarded_before_a_foreign_event() {
-        let (dir, _source, original) = converted("every_legacy_cut");
+        let (dir, _source, original) = legacy_converted("every_legacy_cut");
         let legacy = event(51, "legacy, \"quoted\" text");
         let mut other = event(52, "new writer");
         other.operation = Some("new-writer".into());
@@ -1191,7 +1424,7 @@ mod tests {
 
     #[test]
     fn the_tail_takes_appended_lines_and_ignores_a_cut_off_last_line_and_the_fixed_part_stays() {
-        let (_d, _tak, takm) = converted("tail");
+        let (_d, _tak, takm) = legacy_converted("tail");
         let index = read_index_path(&takm).unwrap();
         let fixed = |p: &Path| sha256_hex(&std::fs::read(p).unwrap()[..index.tail_start() as usize]);
         let before = fixed(&takm);
@@ -1274,7 +1507,7 @@ mod tests {
 
     #[test]
     fn old_foreign_and_broken_files_are_refused_clearly() {
-        let (d, tak, takm) = converted("refuse");
+        let (d, tak, takm) = legacy_converted("refuse");
         let check = |bytes: &[u8], want: &str| {
             let p = d.0.join("x.takm");
             std::fs::write(&p, bytes).unwrap();

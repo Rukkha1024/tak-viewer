@@ -125,6 +125,8 @@ A size mismatch exits 1 even if the ignore union covers every changed pixel. Opt
 
 Conversion stdout carries output path, source and output size, dropped camera bytes and elapsed time per successful file. With a sibling CSV, it reports imported Comments and any skipped rows. With verification it also carries the verdict. A failed verdict leaves the new TAKM for inspection. Conversion writes no JSON receipt. Use the verifier to get one later.
 
+`--to-takm` writes layout 2 to a new destination. `--verify-takm` reads both layouts. For layout 2, the fixed verdict includes the archive seal and recovered layout 1 seal. Source checks compare logical streams by original ordinal, including duplicate paths. Report an incomplete final Comment member separately from fixed integrity.
+
 | Field | Meaning |
 |---|---|
 | `takm`, `source`, `source_selection` | Input, nullable source path, one of `sibling`, `explicit`, `source_dir`, `none` |

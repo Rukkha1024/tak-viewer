@@ -26,6 +26,7 @@ use tak_core::view_data::{AnalogPart, ViewData};
 use tak_core::edit::{DocumentId, DocumentSnapshot, EditDocument, EditError, EditPatch, EditSelection, LabelKey, Revision};
 
 mod follow;
+mod local_first;
 
 /// One editable document per local file, shared by its views and layout history.
 pub type EditSession = Arc<Mutex<EditDocument>>;
@@ -151,7 +152,7 @@ impl CommentsLoad {
         if !tak_core::takm::is_takm_path(path) {
             return CommentsLoad { target: Err(TAK_NO_COMMENTS.to_owned()), parsed: None, label: None };
         }
-        let read = tak_core::takm::read_index_path(path).and_then(|index| Ok((index.fixed_len, tak_core::takm::read_comments(path)?)));
+        let read = tak_core::takm::fixed_len(path).and_then(|len| Ok((len, tak_core::takm::read_comments(path)?)));
         match read {
             Ok((fixed_len, parsed)) => CommentsLoad {
                 target: tak_core::takm::check_tail(path).map(|()| path.to_path_buf()),
@@ -556,6 +557,9 @@ pub struct View {
     load_cancel: Arc<AtomicBool>,
     pending_first_paint: Option<Arc<FirstPaint>>,
     first_paint: Option<Arc<FirstPaint>>,
+    local_stages: Option<Receiver<local_first::Stage>>,
+    local_stage_shown: bool,
+    local_stage_incomplete: bool,
     /// Put the file being read here once its markers arrive (remembered `Spot`).
     pub restore: Option<Spot>,
     /// Latest open: start, step times in ms, ms until markers / force plates (`--bench`).
@@ -614,6 +618,9 @@ impl Default for View {
             fresh_open_candidate: None,
             remote: None,
             remote_warning: None,
+            local_stages: None,
+            local_stage_shown: false,
+            local_stage_incomplete: false,
             remote_loading: None,
             file_id: 0,
             cam: Camera::default(),
@@ -752,7 +759,7 @@ impl View {
     /// opens keep the zero-copy analog path and allocate no shared-state wrapper.
     pub fn shared_file(&mut self) -> Option<SharedFile> {
         if self.loading.is_some() || self.remote_loading.is_some()
-            || self.waiting_shared.is_some() { return None; }
+            || self.waiting_shared.is_some() || self.local_stage_incomplete { return None; }
         if self.shared_file.is_none() {
             self.shared_file = Some(SharedFile(Arc::new(Mutex::new(SharedFileState {
                 generation: 0,
@@ -871,7 +878,8 @@ impl View {
     /// Read-only counterpart of `source.shared_file()` followed by the adoption check.
     /// A single-view source need not allocate or install a shared wrapper for preflight.
     pub fn can_adopt_from_view(&self, source: &View) -> Option<bool> {
-        if source.loading.is_some() || source.remote_loading.is_some() || source.waiting_shared.is_some() { return None; }
+        if source.loading.is_some() || source.remote_loading.is_some() || source.waiting_shared.is_some()
+            || source.local_stage_incomplete { return None; }
         if let Some(shared) = &source.shared_file { return Some(self.can_adopt_shared_preserving_state(shared)); }
         Some(self.can_adopt_document(source.edit_document.as_ref()?, &source.data.as_ref()?.take.path))
     }
@@ -1048,9 +1056,9 @@ impl View {
     }
 
     pub fn owns_shared_file_work(&self) -> bool {
-        self.analog_rx.is_some() || self.lazy_job_rx.is_some() || self.lazy_job.is_some()
+        !self.local_stage_shown && (self.analog_rx.is_some() || self.lazy_job_rx.is_some() || self.lazy_job.is_some()
             || self.emg_rx.is_some() || self.analog_merge.is_some() || !self.analog_queue.is_empty()
-            || self.comments_rx.is_some()
+            || self.comments_rx.is_some())
     }
 
     /// Before closing a load owner that has another view of this file, move its outstanding
@@ -1322,6 +1330,15 @@ impl View {
     /// Read markers and Comments off the UI thread. Initial forceplates wait for the
     /// marker scene. The other analog job remains deferred until a device requests it.
     pub fn start_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>) {
+        self.start_local_load(ctx, path, restore, false);
+    }
+
+    pub fn start_primary_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>) {
+        self.start_local_load(ctx, path, restore, true);
+    }
+
+    fn start_local_load(&mut self, ctx: &egui::Context, path: PathBuf, restore: Option<Spot>, allow_stages: bool) {
+        self.stop_local_stages();
         if self.data.is_some() && self.loading.is_none() && self.waiting_shared.is_none() {
             self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.shown_identity.take());
         }
@@ -1336,6 +1353,11 @@ impl View {
         let (tx, rx) = channel();
         let (comments_tx, comments_rx) = channel();
         let (lazy_tx, lazy_rx) = channel();
+        let early = if allow_stages && tak_core::takm::is_takm_path(&path) {
+            let (tx, rx) = channel();
+            self.local_stages = Some(rx);
+            Some(tx)
+        } else { None };
         drop_later(self.lazy_job.take());
         drop_later(self.lazy_job_rx.replace(lazy_rx));
         drop_later(self.emg_rx.take());
@@ -1354,6 +1376,7 @@ impl View {
         let paint = Arc::new(FirstPaint::default());
         self.pending_first_paint = Some(paint.clone());
         let paint = Arc::downgrade(&paint);
+        let started = Instant::now();
         MARKER_LOADS.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             let panic_msg = || "읽는 중 내부 오류(panic)가 났어요.".to_owned();
@@ -1365,7 +1388,11 @@ impl View {
                         }
                     }
                 }
-                let fast = tak_core::tak::fast_read::read_take_fast(&p, false).map_err(|e| e.to_string())?;
+                let fast = if let Some(tx) = early {
+                    local_first::read(&p, &ctx2, &cancel, tx)
+                } else {
+                    tak_core::tak::fast_read::read_take_fast(&p, false)
+                }.map_err(|e| e.to_string())?;
                 let t = Instant::now();
                 let mapping = fast.analog.as_ref().and_then(|j| j.plate_devices()).map(<[usize]>::to_vec);
                 let fallback = fast.analog.as_ref().and_then(|j| j.fallback_reason()).map(str::to_owned)
@@ -1425,7 +1452,7 @@ impl View {
         self.restore = restore;
         self.restore_range = None;
         self.restore_playback_controls = None;
-        self.open_started = Some(Instant::now());
+        self.open_started = Some(started);
         self.markers_ms = None;
         self.analog_ms = None;
     }
@@ -1443,6 +1470,7 @@ impl View {
 
     /// Stop reading (the view closes or shows another file).
     pub fn cancel_load(&mut self) {
+        self.stop_local_stages();
         self.waiting_shared = None;
         self.pending_identity = None;
         self.set_fresh_open_candidate(None);
@@ -1483,8 +1511,68 @@ impl View {
             self.pending_first_paint = None;
             self.set_fresh_open_candidate(None);
         }
-        self.markers_ms = self.open_started.map(ms_since);
+        if !self.local_stage_shown { self.markers_ms = self.open_started.map(ms_since); }
         Some(Loaded { path, result: msg, rx })
+    }
+
+    fn stop_local_stages(&mut self) {
+        drop_later(self.local_stages.take());
+        self.local_stage_incomplete |= std::mem::take(&mut self.local_stage_shown);
+    }
+
+    pub fn local_stage_visible(&self) -> bool { self.local_stage_shown }
+
+    pub fn local_stage_incomplete(&self) -> bool { self.local_stage_incomplete }
+
+    /// Exact data wins when both results are ready. Keep the first installed stage
+    /// through all sizing passes of its frame.
+    pub fn poll_local_open(&mut self, ctx: &egui::Context, speed: f64, next_file_id: &mut usize) -> Option<(PathBuf, Result<(), String>)> {
+        self.loading.as_ref()?;
+        let sizing_pass = self.local_stages.is_some() && ctx.output(|out| out.num_completed_passes != 0);
+        if self.local_stage_shown && sizing_pass {
+            return None;
+        }
+        let now = ctx.input(|i| i.time);
+        if let Some(Loaded { path, result, rx }) = self.poll_markers() {
+            let was_staged = self.local_stage_shown;
+            self.stop_local_stages();
+            return Some((path, result.map(|(data, steps)| {
+                if was_staged {
+                    self.load_steps.extend(steps);
+                    self.local_stage_incomplete = false;
+                    self.first_paint = self.pending_first_paint.take().filter(|_| data.analog_pending);
+                    self.analog_rx = data.analog_pending.then_some((self.file_id, rx));
+                    if !data.analog_pending { self.analog_ms = self.markers_ms; }
+                    self.install_shared_data(Arc::new(data));
+                } else {
+                    self.load_steps = steps;
+                    *next_file_id += 1;
+                    drop_later(self.show(data, rx, *next_file_id, speed, now));
+                }
+            })));
+        }
+        let stages = self.local_stages.as_ref()?;
+        if sizing_pass { return None; }
+        let wait = self.open_started.map(local_first::pose_wait).unwrap_or_default();
+        if !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return None;
+        }
+        let stage = stages.try_recv().ok()?;
+        match stage {
+            local_first::Stage::First(data, comments) => {
+                self.markers_ms = self.open_started.map(ms_since);
+                self.load_steps = vec![("TAKM2 first pose", self.markers_ms.unwrap_or_default())];
+                *next_file_id += 1;
+                let (_tx, rx) = channel();
+                drop_later(self.show(data, rx, *next_file_id, speed, now));
+                self.comments.take_load(comments);
+                self.local_stage_shown = true;
+            }
+            local_first::Stage::Preview(data) => self.install_shared_data(Arc::new(data)),
+        }
+        ctx.request_repaint();
+        None
     }
 
     /// Show a freshly read file: new playback, no selection, the remembered spot if any (else
@@ -1494,7 +1582,11 @@ impl View {
     }
 
     pub fn show_shared(&mut self, data: Arc<ViewData>, rx: Receiver<LoadMsg>, file_id: usize, speed: f64, now: f64) -> Option<Arc<ViewData>> {
-        self.first_paint = self.pending_first_paint.take().filter(|_| data.analog_pending);
+        self.first_paint = if self.local_stages.is_some() && data.is_first_pose() {
+            None
+        } else {
+            self.pending_first_paint.take().filter(|_| data.analog_pending)
+        };
         self.shown_identity = Self::stamp_identity(self.source_stamp.as_ref()).or(self.pending_identity.take());
         self.pending_identity = None;
         let mut verified_restore = false;
@@ -1519,6 +1611,7 @@ impl View {
         self.shared_generation = 0;
         self.remote = None;
         self.remote_warning = None;
+        self.local_stage_incomplete = false;
         self.remote_loading = None;
         drop_later(self.emg_rx.take());
         drop_later(self.analog_merge.take());
@@ -1580,7 +1673,9 @@ impl View {
         if let Some(range) = self.restore_range.take() {
             self.range = range.map(|(a, b)| panels::ordered_range(a, b, self.pb.first, self.pb.last));
         }
-        self.pb.hold(still, now);
+        // The layout-2 still is fixed in the archive. Keep a restored local cursor
+        // for the preview and exact stages even while the still is drawn.
+        self.pb.hold(if self.local_stages.is_some() && still.is_some() { Some(self.pb.frame) } else { still }, now);
         old
     }
 
@@ -1958,7 +2053,7 @@ impl View {
 
     /// Snapshot for an off-thread rebuild. Wait for analog before sharing or replacing its view.
     pub fn edit_refresh_snapshot(&self) -> Option<DocumentSnapshot> {
-        if self.analog_work_pending() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return None; }
+        if self.is_ssh_preview() || self.analog_work_pending() || self.data.as_ref().is_some_and(|d| d.analog_pending) { return None; }
         let desired = self.edit_refresh?;
         let document = self.edit_document.as_ref()?.lock().ok()?;
         (document.revision() == desired).then(|| document.snapshot())
@@ -2008,7 +2103,7 @@ impl View {
     }
 
     pub fn preview_status(&self) -> Option<&'static str> {
-        self.is_ssh_preview().then_some(if self.remote_warning.is_some() {
+        self.is_ssh_preview().then_some(if self.remote_warning.is_some() || self.local_stage_incomplete {
             "Preview · incomplete"
         } else {
             "Preview · loading full motion"
@@ -2016,7 +2111,7 @@ impl View {
     }
 
     pub fn preview_graph_status(&self) -> &'static str {
-        if self.remote_warning.is_some() { "Full motion incomplete" } else { "Loading full motion…" }
+        if self.remote_warning.is_some() || self.local_stage_incomplete { "Full motion incomplete" } else { "Loading full motion…" }
     }
 
     fn install_shared_data(&mut self, data: Arc<ViewData>) {
@@ -2352,6 +2447,132 @@ pub(crate) fn sample_take(path: &str, names: &[&str]) -> tak_core::tak::Take {
 #[cfg(test)]
 mod tests {
     include!("views_merge_tests.rs");
+
+    #[test]
+    fn local_stages_keep_state_until_exact_and_gate_initial_analog() {
+        use super::local_first::Stage;
+        let ctx = egui::Context::default();
+        let path = "stage.takm";
+        let mut view = View::default();
+        view.hold_load(path.into(), None);
+        view.restore = Some(Spot {
+            path: path.into(), frame: 3, pivot: [0.0; 3], yaw: 0.0, pitch: 0.0,
+            distance: 4.0, fov_y: 0.7, camera_mode: (Preset::Perspective, false),
+            selected: vec!["A".into()], primary: Some("A".into()), plate: None,
+        });
+        let markers = view.held.clone().unwrap();
+        let (stage, stages) = channel();
+        view.local_stages = Some(stages);
+        view.pending_first_paint = Some(Arc::new(FirstPaint::default()));
+        let first = ViewData::build_ssh_first_pose(sample_take(path, &["A"]), 0);
+        let text = format!("{}2026-11-23T00:00:00+09:00,add,1,A,1,1,,note,1,,stage.takm|512,\r\n", comments::header_line());
+        stage.send(Stage::First(first, CommentsLoad {
+            target: Ok(path.into()),
+            parsed: Some(comments::parse(&text)),
+            label: Some("stage.takm|512".into()),
+        })).unwrap();
+        let mut next = 10;
+        view.open_started = Some(Instant::now() + Duration::from_secs(30));
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        assert!(view.data.is_none(), "reserve the head start for an exact-only open");
+        view.open_started = Some(Instant::now() - Duration::from_millis(300));
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        assert!(view.is_first_pose());
+        view.pb.set_frame(5, 0.0);
+        assert_eq!(view.pb.frame, 3, "keep the saved cursor during the still");
+        assert_eq!(view.primary, Some(0));
+        assert_eq!(view.data.as_ref().unwrap().display_frame(3), 0);
+        assert!(view.loading.is_some() && view.pending_first_paint().is_none());
+        assert!(view.comments.list.get(1).is_some());
+        assert!(view.shared_file().is_none());
+        let id = view.document_id();
+
+        let mut sparse = sample_take(path, &["A"]);
+        let marker = &mut sparse.trajectories[0];
+        marker.frames = vec![0, 8].into();
+        marker.xyz = vec![marker.xyz[0], marker.xyz[8]].into();
+        stage.send(Stage::Preview(ViewData::build_local_preview(sparse, 0, vec![vec![(0, 9)]], false))).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        assert!(view.is_ssh_preview() && !view.is_first_pose());
+        assert!(view.data.as_ref().unwrap().markers[0].present(5));
+        assert!(view.data.as_ref().unwrap().markers[0].position(5).is_none());
+        view.select(0, false);
+        view.pb.set_frame(5, 0.0);
+        view.set_range(2, 7);
+        view.cam.yaw = 1.25;
+        view.select_comment(1);
+
+        let mut exact = sample_data(path, &["A"]);
+        exact.analog_pending = true;
+        exact.emg_pending = true;
+        markers.send(LoadMsg::Markers(Ok((exact, vec![])))).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).unwrap().1.is_ok());
+        assert_eq!(view.file_id, 11);
+        assert_eq!(view.document_id(), id);
+        assert_eq!((view.primary, view.picked), (Some(0), Some(1)));
+        assert_eq!((view.pb.frame, view.range, view.cam.yaw), (5, Some((2, 7)), 1.25));
+        assert!(!view.is_ssh_preview());
+        assert!(view.data.as_ref().unwrap().markers[0].position(5).is_some());
+        assert!(view.pending_first_paint().is_some() && view.analog_rx.is_some());
+        assert!(!view.emg_requested);
+    }
+
+    #[test]
+    fn local_stages_prefer_ready_exact_and_discard_late_cancelled_results() {
+        use super::local_first::Stage;
+        let ctx = egui::Context::default();
+        let path = "stage.takm";
+        let mut view = View::default();
+        let first = || Stage::First(ViewData::build_ssh_first_pose(sample_take(path, &["A"]), 0),
+            CommentsLoad { target: Ok(path.into()), parsed: None, label: None });
+        let mut next = 0;
+        view.hold_load(path.into(), None);
+        let (stage, stages) = channel();
+        view.local_stages = Some(stages);
+        stage.send(first()).unwrap();
+        view.held.as_ref().unwrap().send(LoadMsg::Markers(Ok((sample_data(path, &["A"]), vec![])))).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).unwrap().1.is_ok());
+        assert!(!view.is_ssh_preview());
+
+        view.hold_load(path.into(), None);
+        let old = view.held.clone().unwrap();
+        let (stage, stages) = channel();
+        view.local_stages = Some(stages);
+        stage.send(first()).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        view.cancel_load();
+        assert_eq!(view.preview_status(), Some("Preview · incomplete"));
+        assert!(view.shared_file().is_none());
+        view.hold_load("replacement.tak".into(), None);
+        let _ = old.send(LoadMsg::Markers(Ok((sample_data(path, &["A"]), vec![]))));
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        view.held.as_ref().unwrap().send(LoadMsg::Markers(Ok((sample_data("replacement.tak", &["B"]), vec![])))).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).unwrap().1.is_ok());
+        assert_eq!(view.path(), Some(Path::new("replacement.tak")));
+        assert!(view.preview_status().is_none());
+    }
+
+    #[test]
+    fn local_stage_failure_keeps_its_last_pose_unshareable() {
+        use super::local_first::Stage;
+        let ctx = egui::Context::default();
+        let path = "stage.takm";
+        let mut view = View::default();
+        view.hold_load(path.into(), None);
+        let (stage, stages) = channel();
+        view.local_stages = Some(stages);
+        let data = ViewData::build_ssh_first_pose(sample_take(path, &["A"]), 0);
+        stage.send(Stage::First(data, CommentsLoad { target: Ok(path.into()), parsed: None, label: None })).unwrap();
+        let mut next = 0;
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).is_none());
+        let before = view.data.as_ref().unwrap().clone();
+        view.held.as_ref().unwrap().send(LoadMsg::Markers(Err("exact decode failed".into()))).unwrap();
+        assert!(view.poll_local_open(&ctx, 1.0, &mut next).unwrap().1.is_err());
+        assert!(Arc::ptr_eq(&before, view.data.as_ref().unwrap()));
+        assert!(view.loading.is_none() && view.shared_file().is_none());
+        assert_eq!(view.preview_status(), Some("Preview · incomplete"));
+        assert!(view.pending_first_paint().is_none());
+    }
     use super::*;
 
     fn selection_view() -> View {
@@ -3226,22 +3447,17 @@ mod tests {
         let (_tx, arx) = channel();
         v.show(sample_data("b.tak", &["M"]), arx, 8, 1.0, 0.0);
         assert!(v.comments.list.is_empty() && v.comments.target.is_none());
-        // A TAK: no Comments, its CSV is not read; a `.takm`: its tail, the place comments are
-        // written to, a CSV next to it ignored.
-        let _temp = tak_core::test_support::TempDir::new("tak_viewer_comment_load");
-        let dir = _temp.join(format!("tak_viewer_comment_load_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // A TAKM reads its own Comment journal. The sibling CSV is ignored.
+        let dir = tak_core::test_support::TempDir::new("tak_viewer_comment_load");
         std::fs::write(dir.join("x.tak"), tak_core::sample_tak::sample_tak()).unwrap();
         let made = tak_core::takm::convert(&dir.join("x.tak"), None).unwrap();
         std::fs::write(dir.join("x.comments.csv"), "time,kind\r\n2026-11-14T10:00:00+09:00,add,1,M,1,2,,,1,,x.tak|1,\r\n").unwrap();
         let load = CommentsLoad::read(&dir.join("x.tak"));
         assert_eq!((load.target, load.parsed, load.label), (Err(TAK_NO_COMMENTS.to_owned()), None, None));
         let load = CommentsLoad::read(&made.out);
-        let fixed = tak_core::takm::read_index_path(&made.out).unwrap().fixed_len;
+        let fixed = tak_core::takm::fixed_len(&made.out).unwrap();
         assert_eq!((load.target, load.label), (Ok(made.out.clone()), Some(format!("x.takm|{fixed}"))));
         assert!(load.parsed.unwrap().events.is_empty(), "the CSV next to it is not read");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 
+use crate::takm::v2::{self, AnalogKind, Archive, Decoder};
+
 use super::channels::{channel_dim, CHANNELS_HEADER};
 use super::container::{u16_at, u32_at, utf16le_strict, Container, END, MAGIC};
 use super::{decode_analog, decode_markers, err, AnalogChannel, AnalogDevice, Result, Take, Uid};
@@ -24,9 +26,65 @@ pub struct FastRead {
     pub times: Vec<(&'static str, f64)>,
 }
 
+/// Data available before exact motion in a local hybrid TAKM2.
+pub struct LocalStage<'a> {
+    pub take: Take,
+    pub kind: LocalStageKind,
+    pub first_frame: u32,
+    pub decoder: &'a Decoder,
+    pub comments: &'a crate::comments::Parsed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalStageKind {
+    FirstPose,
+    Preview,
+}
+
+/// Open a local TAKM2 in display order, then return exact markers and the deferred
+/// analog job. The publisher can return an error to cancel before the next read.
+/// Existing TAK, v1 and opaque-v1 use their normal exact open with no previews.
+pub fn read_take_staged(
+    path: &Path,
+    sha: bool,
+    mut publish: impl FnMut(LocalStage<'_>) -> Result<()>,
+) -> Result<FastRead> {
+    if !crate::takm::is_takm_path(path) {
+        return read_take_fast(path, sha);
+    }
+    let t0 = Instant::now();
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if !v2::is_archive(&file, len)? {
+        return read_take_fast(path, sha);
+    }
+    let archive = Archive::open(&file, len)?;
+    if v2::is_opaque(archive.catalog_bytes())? {
+        return read_take_fast(path, sha);
+    }
+    let identity = archive.fixed_identity()?;
+    let mut decoder = archive.decoder()?;
+    let (comments, _) = crate::takm::parse_journal_comments(&archive.journal()?);
+    let member = |name: &str| archive.member(name);
+    let first = decoder.first_take(path, len as usize, member)?;
+    check_packed_identity(path, identity)?;
+    publish(LocalStage {
+        take: first, kind: LocalStageKind::FirstPose, first_frame: decoder.first_frame(),
+        decoder: &decoder, comments: &comments,
+    })?;
+    let preview = decoder.preview_take(path, len as usize, member)?;
+    check_packed_identity(path, identity)?;
+    publish(LocalStage {
+        take: preview, kind: LocalStageKind::Preview, first_frame: decoder.first_frame(),
+        decoder: &decoder, comments: &comments,
+    })?;
+    finish_packed_markers(path, len, &archive, decoder, sha, t0)
+}
+
 /// Stage 2: the analog records of `Channels.dat`.
 pub struct AnalogJob {
     path: PathBuf,
+    packed: Option<Arc<PackedAnalog>>,
     before: (u64, Option<SystemTime>),
     /// `.takm`: the file may grow (Comment tail); `before.0` is the least length it must keep.
     grows: bool,
@@ -44,6 +102,11 @@ pub struct AnalogJob {
     /// None = unchanged complete decode (the `--dump-fast` path).
     selected: Option<Vec<usize>>,
     indices: Vec<usize>,
+}
+
+struct PackedAnalog {
+    identity: (u64, [u8; 32]),
+    decoder: Decoder,
 }
 
 fn ms(t: Instant) -> f64 {
@@ -111,6 +174,14 @@ pub fn deferred_job_after_save(path: &Path) -> Result<Option<AnalogJob>> {
     }
     let file = File::open(path)?;
     let len = file.metadata()?.len();
+    if v2::is_archive(&file, len)? {
+        let archive = Archive::open(&file, len)?;
+        if v2::is_opaque(archive.catalog_bytes())? {
+            return Ok(None);
+        }
+        let job = packed_job(path, &archive, archive.analog_decoder()?)?;
+        return Ok(job.split().1);
+    }
     let index = crate::takm::read_index(&file, len)?;
     let (Some(nodes), Some(channels)) = (index.unique("Nodes.dat"), index.unique("Channels.dat")) else {
         return err("deferred analog metadata refresh requires unique Nodes.dat and Channels.dat streams");
@@ -133,7 +204,7 @@ pub fn deferred_job_after_save(path: &Path) -> Result<Option<AnalogJob>> {
     unchanged(path, before, true)?;
     let indices = (0..manifest.len()).collect();
     let job = AnalogJob {
-        path: path.to_path_buf(), before, grows: true, map,
+        path: path.to_path_buf(), packed: None, before, grows: true, map,
         kept: Vec::new(), analog: Vec::new(), records: Arc::new(walked.records), manifest,
         device_records: Arc::new(device_records), plate_devices: Some(plates), fallback: None,
         selected: None, indices,
@@ -175,6 +246,7 @@ impl AnalogJob {
         } else {
             Some(Self {
                 path: self.path.clone(),
+                packed: self.packed.clone(),
                 before: self.before,
                 grows: self.grows,
                 map: self.map.clone(),
@@ -196,6 +268,9 @@ impl AnalogJob {
     /// with samples filled only for `device_indices()` (all other channels remain empty).
     /// Split jobs return an error for invalid device data; full jobs keep legacy warnings.
     pub fn run(self) -> Result<(Vec<AnalogDevice>, Option<String>)> {
+        if let Some(packed) = &self.packed {
+            return self.run_packed(packed);
+        }
         unchanged(&self.path, self.before, self.grows)?;
         let file = File::open(&self.path)?;
         if let Some(indices) = &self.selected {
@@ -340,6 +415,13 @@ fn markers_first_takm(path: &Path, sha: bool) -> Result<Option<FastRead>> {
     let t0 = Instant::now();
     let len = std::fs::metadata(path)?.len();
     let file = File::open(path)?;
+    if v2::is_archive(&file, len)? {
+        let archive = Archive::open(&file, len)?;
+        if v2::is_opaque(archive.catalog_bytes())? {
+            return Ok(None);
+        }
+        return finish_packed_markers(path, len, &archive, archive.decoder()?, sha, t0).map(Some);
+    }
     let index = crate::takm::read_index(&file, len)?;
     let (Some(n), Some(m), Some(ch)) = (index.unique("Nodes.dat"), index.unique("MetaData.dat"), index.unique("Channels.dat"))
     else {
@@ -356,6 +438,20 @@ fn markers_first_takm(path: &Path, sha: bool) -> Result<Option<FastRead>> {
     };
     let t_container = ms(t0);
     markers_from(path, &file, ((index.tail_start(), None), true), len, &nodes, &meta, map, t_container, sha)
+}
+
+fn finish_packed_markers(
+    path: &Path, len: u64, archive: &Archive<'_>, mut decoder: Decoder, sha: bool, start: Instant,
+) -> Result<FastRead> {
+    let channels = decoder.exact_channels(|name| archive.member(name))?;
+    let typed = super::nodes::analog_device_nodes(decoder.nodes())?;
+    let mut take = decode_markers(path, len as usize, decoder.nodes(), &channels, decoder.metadata(), sha)?;
+    let job = packed_job(path, archive, decoder)?;
+    fill_device_metadata(&mut take, &typed, &job.records, &job.device_records, true);
+    take.analog = job.manifest.clone();
+    Ok(FastRead {
+        take, analog: Some(job), times: vec![("TAKM2 exact markers", ms(start))],
+    })
 }
 
 /// The rest of stage 1, the same for a TAK and a `.takm`: walk `Channels.dat` (`map`), decode
@@ -409,21 +505,11 @@ fn markers_from(
         Err(e) => (None, Some(e.0)),
     };
     // Headers alone are safe to publish; full `run` still reproduces the original decode.
-    take.device_sampling = if fallback.is_none() { device_records.iter().map(|rows| {
-        let uid = walked.records[rows[0]].uid;
-        if rows.iter().any(|&ri| walked.records[ri].uid != uid) { return None; }
-        typed.iter().find(|node| node.uid == uid).and_then(|node| node.sampling)
-            .filter(|sampling| rows.iter().all(|&ri| sampling.samples_per_frame <= walked.records[ri].dim))
-    }).collect() } else { vec![None; manifest.len()] };
-    take.device_names = device_records.iter().map(|rows| {
-        let uid = walked.records[rows[0]].uid;
-        if rows.iter().any(|&ri| walked.records[ri].uid != uid) { return None; }
-        typed.iter().find(|node| node.uid == uid).and_then(|node| node.name.clone())
-    }).collect();
+    fill_device_metadata(&mut take, &typed, &walked.records, &device_records, fallback.is_none());
     take.analog = manifest.clone();
     let indices = (0..manifest.len()).collect();
     let job = AnalogJob {
-        path: path.to_path_buf(), before, grows, map, kept: walked.kept, analog,
+        path: path.to_path_buf(), packed: None, before, grows, map, kept: walked.kept, analog,
         records: Arc::new(walked.records), manifest,
         device_records: Arc::new(device_records), plate_devices, fallback,
         selected: None, indices,
@@ -439,6 +525,108 @@ fn markers_from(
         analog: Some(job),
         times,
     }))
+}
+
+fn fill_device_metadata(
+    take: &mut Take,
+    typed: &[super::nodes::DeviceNode],
+    records: &[Record],
+    device_records: &[Vec<usize>],
+    selective: bool,
+) {
+    take.device_sampling = if selective { device_records.iter().map(|rows| {
+        let uid = records[rows[0]].uid;
+        if rows.iter().any(|&ri| records[ri].uid != uid) { return None; }
+        typed.iter().find(|node| node.uid == uid).and_then(|node| node.sampling)
+            .filter(|sampling| rows.iter().all(|&ri| sampling.samples_per_frame <= records[ri].dim))
+    }).collect() } else { vec![None; device_records.len()] };
+    take.device_names = device_records.iter().map(|rows| {
+        let uid = records[rows[0]].uid;
+        if rows.iter().any(|&ri| records[ri].uid != uid) { return None; }
+        typed.iter().find(|node| node.uid == uid).and_then(|node| node.name.clone())
+    }).collect();
+}
+
+fn packed_job(path: &Path, archive: &Archive<'_>, mut decoder: Decoder) -> Result<AnalogJob> {
+    let typed = super::nodes::analog_device_nodes(decoder.nodes())?;
+    let device_uids = typed.iter().map(|device| device.uid).collect();
+    let records = decoder.record_heads().filter_map(|(head, role)| role.map(|role| (head, role)))
+        .map(|(head, role)| {
+            let Head::Ok { header, data, analog } = parse_head(head) else {
+                return err("Invalid TAKM2 analog record header");
+            };
+            let record = channel_record(0, head, header, data, analog, &device_uids)?;
+            let expected = typed.iter().find(|n| n.uid == record.uid)
+                .map(|n| if n.forceplate { AnalogKind::Plates } else { AnalogKind::Other });
+            if expected != Some(role) {
+                return err("TAKM2 analog device differs from its manifest");
+            }
+            Ok(record)
+        }).collect::<Result<Vec<_>>>()?;
+    let (manifest, device_records) = device_manifest(&records)?;
+    let plates = selective_layout_for_nodes(&typed, &records, &device_records)?;
+    let identity = archive.fixed_identity()?;
+    check_packed_identity(path, identity)?;
+    decoder.clear_motion();
+    Ok(AnalogJob {
+        path: path.to_path_buf(),
+        packed: Some(Arc::new(PackedAnalog { identity, decoder })),
+        before: (0, None),
+        grows: true,
+        map: StreamMap { sector: 0, chain: Vec::new(), len: 0, flat: None },
+        kept: Vec::new(),
+        analog: Vec::new(),
+        records: Arc::new(records),
+        device_records: Arc::new(device_records),
+        indices: (0..manifest.len()).collect(),
+        manifest,
+        plate_devices: Some(plates),
+        fallback: None,
+        selected: None,
+    })
+}
+
+fn check_packed_identity(path: &Path, expected: (u64, [u8; 32])) -> Result<()> {
+    let file = File::open(path)?;
+    let archive = Archive::open(&file, file.metadata()?.len())?;
+    if archive.fixed_identity()? != expected {
+        return err("TAKM2 changed during staged read");
+    }
+    Ok(())
+}
+
+impl AnalogJob {
+    fn run_packed(&self, packed: &PackedAnalog) -> Result<(Vec<AnalogDevice>, Option<String>)> {
+        let file = File::open(&self.path)?;
+        let archive = Archive::open(&file, file.metadata()?.len())?;
+        if archive.fixed_identity()? != packed.identity {
+            return err("TAKM2 changed before analog read");
+        }
+        let mut result = self.manifest.clone();
+        if self.indices.is_empty() {
+            return Ok((result, None));
+        }
+        let kind = match self.selected {
+            None => AnalogKind::All,
+            Some(_) if self.plate_devices.as_deref() == Some(&self.indices) => AnalogKind::Plates,
+            Some(_) => AnalogKind::Other,
+        };
+        let stream = packed.decoder.analog_channels(kind, |name| archive.member(name))?;
+        let (devices, warning) = decode_analog(&stream);
+        check_packed_identity(&self.path, packed.identity)?;
+        if self.selected.is_none() {
+            return Ok((devices, warning));
+        }
+        if warning.is_some() || devices.len() != self.indices.len() {
+            return err(warning.unwrap_or_else(|| "TAKM2 analog device count changed".into()));
+        }
+        let mut indices = self.indices.clone();
+        indices.sort_unstable();
+        for (di, device) in indices.into_iter().zip(devices) {
+            result[di] = device;
+        }
+        Ok((result, None))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1175,6 +1363,7 @@ mod tests {
         let before = stat_key(&file.metadata().unwrap());
         let job = AnalogJob {
             path: path.clone(),
+            packed: None,
             before,
             grows: false,
             map,
@@ -1336,6 +1525,7 @@ mod tests {
         let indices = (0..manifest.len()).collect();
         AnalogJob {
             path: path.to_path_buf(),
+            packed: None,
             before: stat_key(&file.metadata().unwrap()),
             grows,
             map,
@@ -1557,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_takm_uses_same_selective_layout_and_all_analog_parity() {
+    fn actual_v1_takm_uses_same_selective_layout_and_all_analog_parity() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../input/static/000000_S01_static.tak");
         if !path.exists() {
             return;
@@ -1565,9 +1755,13 @@ mod tests {
         let _temp = crate::test_support::TempDir::new("tak_selective_takm");
         let dir = _temp.join(format!("tak_selective_takm_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let converted = crate::takm::convert(&path, Some(&dir)).unwrap();
-        let _ = converted;
         let out = crate::takm::path_for(&path, Some(&dir));
+        crate::takm::write(
+            &mut File::create(&out).unwrap(),
+            &std::fs::read(&path).unwrap(),
+            path.file_name().unwrap().to_str().unwrap(),
+            "test",
+        ).unwrap();
         let full = super::super::read_take(&out).unwrap();
         let read = read_take_fast(&out, true).unwrap();
         let job = read.analog.unwrap();

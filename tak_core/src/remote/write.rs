@@ -132,7 +132,7 @@ impl RemoteSession {
     fn finish_write(&mut self, operation: &str, source: &RemoteSource, cancel: &CancelToken) -> Result<RemoteWriteOutcome> {
         self.check_write_host(source)?;
         self.request_write(json!({"op":operation,"path":source.path,"expected_identity":source.identity,
-            "max_bytes":self.config.maximum_payload_bytes}), cancel)
+            "max_bytes":self.config.maximum_payload_bytes, "takm_layout":if self.archive_writes { 2 } else { 1 }}), cancel)
     }
     fn request_write(&mut self, request: Value, cancel: &CancelToken) -> Result<RemoteWriteOutcome> {
         let (header, blocks) = self.transport.request(request, cancel)?;

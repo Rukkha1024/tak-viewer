@@ -39,6 +39,7 @@ mod tests {
             progressive: false,
             first_pose: false,
             motion_codecs: false,
+            archive_writes: false,
             read_observer: None,
             transport: Box::new(
                 transport::Transport::local_python(
@@ -239,6 +240,7 @@ mod tests {
                 progressive: true,
                 first_pose: false,
                 motion_codecs: false,
+                archive_writes: false,
                 read_observer: None,
                 python_command: test_python().into(),
                 host: "local-test".into(),
@@ -750,6 +752,7 @@ mod fake_tests {
                 progressive: false,
                 first_pose: false,
                 motion_codecs: false,
+                archive_writes: false,
                 read_observer: None,
                 config: RemoteConfig::default(),
                 transport: Box::new(FakeConnection {

@@ -20,6 +20,13 @@ import zlib
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
+# The SSH bootstrap embeds both support modules. Standalone runs use adjacent files.
+if "V2Archive" not in globals():
+    for _name in ("helper_v2.py", "helper_v2_write.py"):
+        _support = os.path.join(os.path.dirname(__file__), _name)
+        with open(_support, encoding="utf-8") as _file:
+            exec(compile(_file.read(), _support, "exec"))
+
 CHANNELS_HEADER = bytes.fromhex("f30a394c0200")
 DIMENSIONS = {"FloatChannel": 1, "Float16Channel": 16, "Vector3fChannel": 3,
               "QuaternionChannel": 4,
@@ -288,6 +295,13 @@ class Source:
             self.identity = identity(self.file, path)
             self.reader = Reader(self.file, self.identity[2])
             magic = self.reader.read(0, min(8, self.reader.size))
+            self.archive = None
+            if magic == b"takm.jso" and has_v2(self.reader):
+                self.format = "takm"
+                self.archive = V2Archive(self.reader)
+                self.records, self.nodes = [], None
+                self.check()
+                return
             if magic == b"TAKM-2\r\n":
                 self.format = "takm"
                 self.streams, self.tail = takm_index(self.reader)
@@ -750,7 +764,7 @@ class Server:
             raise Failure("invalid_request", "Request must be an object")
         op = request.get("op")
         if op == "hello":
-            return dict(ok=True, lengths=[], protocol="tak-ssh-1", progressive_open=1, first_pose=1, motion_codecs=1, python_major=sys.version_info.major), []
+            return dict(ok=True, lengths=[], protocol="tak-ssh-1", progressive_open=1, first_pose=1, motion_codecs=1, archive_ranges=2, python_major=sys.version_info.major), []
         if op == "close":
             self.close()
             return dict(ok=True, lengths=[]), []
@@ -815,6 +829,8 @@ class Server:
             self.source = Source(path, probe)
         source = self.source
         source.check(expected if op == "analog" else None)
+        if source.archive is not None:
+            return open_v2(source, op, request, maximum, send_first, expected)
         maximum = min(maximum, source.reader.size + (64 << 10))
         source.classify(maximum)
         frames = None
@@ -967,12 +983,18 @@ def progress_batch(request):
             with open(path, "rb") as file:
                 version = identity(file, path)
                 reader = ProgressReader(file, version[2])
-                streams = (takm_index(reader)[0] if reader.read(0, 8) == b"TAKM-2\r\n"
-                           else Compound(reader, metadata_only=True).streams)
-                stream = streams["MetaData.dat"]
-                if stream.length > 256 << 10:
-                    raise ValueError("Metadata exceeds progress budget")
-                props = progress_properties(properties_xml(stream.read(0, stream.length))[0])
+                if has_v2(reader):
+                    metadata = metadata_v2(V2Archive(reader), INDEX_LIMIT)
+                    if len(metadata) > 256 << 10:
+                        raise ValueError("Metadata exceeds progress budget")
+                else:
+                    streams = (takm_index(reader)[0] if reader.read(0, 8) == b"TAKM-2\r\n"
+                               else Compound(reader, metadata_only=True).streams)
+                    stream = streams["MetaData.dat"]
+                    if stream.length > 256 << 10:
+                        raise ValueError("Metadata exceeds progress budget")
+                    metadata = stream.read(0, stream.length)
+                props = progress_properties(properties_xml(metadata)[0])
                 value = progress_number(props[-1]) if props else None
                 if version == identity(file, path):
                     result = dict(value=value, identity=version)
@@ -1141,7 +1163,9 @@ def stream_chunks(stream):
 
 
 def source_seal(source):
-    if source.format == "takm":
+    if source.archive is not None:
+        source.archive.verify_fixed()
+    elif source.format == "takm":
         fixed = source.tail - 32
         if hash_range(source.reader, 0, fixed) != source.reader.read(fixed, 32):
             raise Failure("invalid_file", "TAKM seal does not match")
@@ -1339,7 +1363,7 @@ def stream_slice_chunks(stream, start, length):
         yield stream.read(offset, min(COPY_CHUNK, start + length - offset))
 
 
-def write_container(source, file, nodes, channels, events):
+def write_container(source, file, nodes, channels, events, maximum=None):
     source_seal(source)
     imported = 0
     if source.format == "takm":
@@ -1383,6 +1407,9 @@ def write_container(source, file, nodes, channels, events):
     table_bytes = json.dumps(table, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     fixed = offset + len(table_bytes)
     header = b"TAKM-2\r\n" + struct.pack("<IIQQQ", 1, 0, offset, len(table_bytes), fixed) + bytes(24)
+    if maximum is not None:
+        budget([fixed, 32], maximum)
+        budget([len(tail)], min(INDEX_LIMIT, maximum))
     digest = hashlib.sha256()
     def put(block):
         file.write(block)
@@ -1403,7 +1430,8 @@ def write_container(source, file, nodes, channels, events):
     file.write(digest.digest())
     file.write(tail)
     file.flush()
-    os.fsync(file.fileno())
+    if maximum is None:
+        os.fsync(file.fileno())
     reader = Reader(file, file.tell())
     if hash_range(reader, 0, fixed) != reader.read(fixed, 32):
         raise Failure("verification_failed", "Written TAKM seal does not match")
@@ -1447,11 +1475,17 @@ def write_dispatch(server, request):
         return dict(ok=True, lengths=[], identity=version, file_size=version[2]), []
     expected = expected_identity(request)
     maximum = integer(request, "max_bytes", 1, 2 << 30)
+    requested_layout = request.get("takm_layout", 1)
+    if type(requested_layout) is not int or requested_layout not in (1, 2):
+        raise Failure("invalid_request", "Unsupported requested TAKM layout")
     if op == "comment_ids":
-        source = Source(path, 2)
+        source = Source(path, 2, progress_only=True)
         try:
             source.check(expected)
-            tail = source.reader.read(source.tail, source.reader.size - source.tail) if source.format == "takm" else b""
+            if source.archive is not None:
+                tail = source.archive.journal(min(maximum, INDEX_LIMIT))[0]
+            else:
+                tail = source.reader.read(source.tail, source.reader.size - source.tail) if source.format == "takm" else b""
             next_id = next_comment_id(source, tail)
             source.check(expected)
             return dict(ok=True, lengths=[], identity=source.identity, next_comment_id=next_id), []
@@ -1502,19 +1536,27 @@ def write_dispatch(server, request):
         if destination != path and os.path.lexists(destination):
             with open(destination, "rb") as file:
                 version = identity(file, destination)
-                source = Source(destination, 2)
+                source = Source(destination, 2, progress_only=True)
                 try:
                     if source.format != "takm":
                         raise Failure("invalid_file", "Existing sibling is not TAKM")
-                    source_seal(source)
-                    fixed = source.tail - 32
+                    if source.archive is not None:
+                        restore_v2(source.archive, maximum)
+                        source.archive.journal(min(maximum, INDEX_LIMIT))
+                        fixed = source.archive.fixed_len
+                    else:
+                        source_seal(source)
+                        fixed = source.tail - 32
+                    source.check(version)
                 finally:
                     source.file.close()
             return dict(ok=True, lengths=[], path=destination, identity=version, source_bytes=expected[2], output_bytes=version[2], fixed_len=fixed, existing=True, verified=True), []
-        source = Source(path, 2, progress_only=op == "takm_progress")
+        source = Source(path, 2, progress_only=op == "takm_progress" or (nodes is None and requested_layout == 2))
         try:
             source.check(expected)
-            if op == "takm_append":
+            if op == "takm_append" and source.archive is not None:
+                fixed, imported, hashes = append_v2(source, expected, events, maximum), 0, []
+            elif op == "takm_append":
                 source_seal(source)
                 tail = source.reader.read(source.tail, source.reader.size - source.tail)
                 combined = safe_append_tail(tail, events)
@@ -1537,9 +1579,19 @@ def write_dispatch(server, request):
                         mode = stat.S_IMODE(os.fstat(source.file.fileno()).st_mode)
                         if not mode & 0o222:
                             raise Failure("io_error", "Progress target is read-only")
-                        fixed = write_progress(source, output, request["before"], request["after"])
+                        if source.archive is not None:
+                            fixed, _ = rewrite_v2(source, output, maximum, progress=(request["before"], request["after"]))
+                        else:
+                            fixed = write_progress(source, output, request["before"], request["after"])
                         os.chmod(temporary, mode)
                         imported, hashes = 0, []
+                    elif source.archive is not None:
+                        fixed, hashes = rewrite_v2(source, output, maximum, nodes, channels, events)
+                        imported = 0
+                    elif source.format == "tak" and requested_layout == 2:
+                        with io.BytesIO() as logical:
+                            _, imported, hashes = write_container(source, logical, nodes, channels, events, maximum)
+                            fixed = write_v2(logical.getvalue(), output, maximum)
                     else:
                         fixed, imported, hashes = write_container(source, output, nodes, channels, events)
                 source.check(expected)

@@ -19,6 +19,7 @@ pub(super) struct RemoteRead {
     owner: RemoteOwner,
     pub(super) location: RemoteLocation,
     file_id: Option<usize>,
+    resume_frame: Option<i64>,
     document: Option<tak_core::edit::DocumentId>,
 }
 
@@ -160,6 +161,7 @@ impl TakViewerApp {
         self.ssh_reads.insert(request, RemoteRead {
             owner: self.remote_owner(slot), location,
             file_id: loaded.then_some(view.file_id),
+            resume_frame: None,
             document: loaded.then(|| view.document_id()).flatten(),
         });
     }
@@ -388,7 +390,7 @@ impl TakViewerApp {
                     view.restore = restore;
                     view.remote_loading = Some((id, location.clone(), path.to_path_buf()));
                 }
-                self.ssh_reads.insert(id, RemoteRead { owner, location, file_id: None, document: None });
+                self.ssh_reads.insert(id, RemoteRead { owner, location, file_id: None, resume_frame: None, document: None });
             }
             Err(reason) => {
                 self.finish_remote_waiters(path);
@@ -707,6 +709,7 @@ impl TakViewerApp {
                         }
                         let label = self.ssh.documents.get(&location)
                             .map(|doc| remote_comment_label(&location, doc.fixed_len, data.take.file_size));
+                        let now = ctx.input(|i| i.time);
                         let view = self.remote_view_mut(owner).unwrap();
                         let retired = std::mem::replace(&mut view.comments.list, comments);
                         drop_later(Some(retired));
@@ -714,6 +717,9 @@ impl TakViewerApp {
                         let document = view.document_id();
                         let saved = view.comments.list.clone();
                         view.install_remote_saved(data);
+                        if let Some(frame) = read.resume_frame {
+                            view.pb.set_frame(frame, now);
+                        }
                         if let Some(document) = document {
                             self.remote_edits.entry(document).or_default().saved = saved;
                         }
@@ -723,6 +729,10 @@ impl TakViewerApp {
                         if preview { installed_early.insert(request_id); }
                         if !preview && !pending { self.ssh_reads.remove(&request_id); }
                         continue;
+                    }
+                    if first_pose {
+                        read.resume_frame = self.remote_view(owner).and_then(|view| view.restore.as_ref())
+                            .map(|spot| spot.frame).or(self.ssh_probe_frame);
                     }
                     read.owner = owner;
                     read.file_id = self.show_remote_at(ctx, owner, location.clone(), data, comments);
@@ -1062,14 +1072,27 @@ mod tests {
         let (id, location, _) = server.opened();
         assert_eq!(app.open_views(), vec![0]);
         let take = views::sample_take(location.memory_key().to_str().unwrap(), &["M"]);
-        // An already queued preview still gives the first pose a frame of its own.
-        app.ssh.fake_marker_reply(id, location.clone(), first_pose_at_five(take.clone()));
-        app.ssh.fake_marker_reply(id, location.clone(), preview_at_five(take.clone()));
+        // The archived pose precedes the requested frame. Expected presence and Comments already
+        // cover the requested frame, although no coordinates for it have arrived.
+        let mut still = take.clone();
+        for track in &mut still.trajectories {
+            track.frames = vec![3].into();
+            track.xyz = vec![track.xyz[3]].into();
+        }
+        let pose = ViewData::build_archive_first_pose(still,
+            tak_core::remote::PreviewMotion::synthetic(3, vec![vec![(3, 9)]]));
+        let list = comments::parse("t,add,1,M,3,6,,review,1,,file,\r\n").comments();
+        app.ssh.fake_marker_reply_with_comments(id, location.clone(), pose, list.clone());
+        app.ssh.fake_marker_reply_with_comments(id, location.clone(), preview_at_five(take.clone()), list);
         let first_pose = painted_frame(&ctx, &mut app, vec![]);
         textures.set(&first_pose.textures_delta);
         measured.frame(&trace, &app, &ctx, &first_pose, &textures, Duration::ZERO, egui::Color32::BLACK);
         assert!(app.view().is_first_pose());
-        assert_eq!(app.view().pb.frame, 5);
+        assert_eq!(app.view().pb.frame, 3);
+        assert_eq!(app.view().comments.list.len(), 1);
+        let marker = &app.view().data.as_ref().unwrap().markers[0];
+        assert!(marker.present(5));
+        assert!(marker.position(5).is_none());
         assert!(!app.quick_label_available(&ctx, 0));
         assert!(app.comment_writable(0).is_err());
         assert!(app.view().data.as_ref().unwrap().markers[0].fill_pct.is_nan());
@@ -1077,7 +1100,7 @@ mod tests {
         view.pb.play(0.0);
         view.pb.set_frame(7, 0.0);
         assert!(!view.pb.playing);
-        assert_eq!(view.pb.frame, 5);
+        assert_eq!(view.pb.frame, 3);
         view.range = Some((2, 7));
         view.select(0, false);
         view.cam.yaw += 0.2;
@@ -1091,12 +1114,14 @@ mod tests {
         assert!(!app.view().is_first_pose() && app.view().is_ssh_preview());
         assert_eq!(app.view().data.as_ref().unwrap().markers[0].fill_pct, 100.0);
         assert_eq!(app.view().pb.frame, 5);
+        assert_eq!(app.view().comments.list.len(), 1);
         app.view_mut().pb.set_frame(6, 0.0);
         let exact = painted_frame(&ctx, &mut app, vec![]);
         textures.set(&exact.textures_delta);
         measured.frame(&trace, &app, &ctx, &exact, &textures, Duration::ZERO, egui::Color32::BLACK);
         assert!(!app.view().is_ssh_preview());
         assert_eq!(app.view().file_id, file_id);
+        assert_eq!(app.view().comments.list.len(), 1);
         assert_eq!(app.view().pb.frame, 6);
         assert_eq!(app.view().range, Some((2, 7)));
         assert_eq!(app.view().primary, Some(0));
@@ -1116,7 +1141,7 @@ mod tests {
         let installed = rows.iter().find(|row| row["event"] == "exact_installed").unwrap();
         assert_eq!(installed["sha256"], "abc");
         assert_eq!(installed["samples"], 10);
-        assert_eq!(marker["draw_frame"], 5);
+        assert_eq!(marker["draw_frame"], 3);
         assert_eq!(marker["first_pose"], true);
     }
 
@@ -1937,7 +1962,13 @@ impl TakViewerApp {
                     let result=result.unwrap_or_else(|_|Err("SSH 저장 작업이 중단됐어요.".into()));
                     match result {
                         Err(reason) => {
-                            let reason=if reason.contains("source_changed") || reason.contains("Source changed") || reason.contains("Source differs") {"파일을 연 뒤 서버의 원본이 바뀌었어요. 덮어쓰지 않았어요. 다시 열어 주세요.".into()} else {reason};
+                            let reason = if reason.contains("source_changed") || reason.contains("Source changed") || reason.contains("Source differs") {
+                                "파일을 연 뒤 서버의 원본이 바뀌었어요. 다시 열어 주세요.".into()
+                            } else if reason.starts_with("codec_unavailable:") {
+                                "서버에 TAKM 압축 패키지가 없어요.".into()
+                            } else {
+                                reason
+                            };
                             self.visit_remote_views(|_,view| {if view.document_id()==Some(id) {view.comments.failed=Some(reason.clone());view.publish_shared_file();}});
                             self.takm_note=Some((format!("서버에 저장 못 했어요: {reason}"),ctx.input(|i|i.time)));
                             if let Some(prompt)=&mut self.dirty_prompt {prompt.saving=false;}

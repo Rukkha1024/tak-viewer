@@ -1098,10 +1098,15 @@ impl SshManager {
 
     #[cfg(test)]
     pub(crate) fn fake_marker_reply(&self, id: u64, location: RemoteLocation, data: ViewData) {
+        self.fake_marker_reply_with_comments(id, location, data, Comments::default());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_marker_reply_with_comments(&self, id: u64, location: RemoteLocation, data: ViewData, comments: Comments) {
         self.tx.send(Envelope {
             host: location.host.clone(),
             generation: 0,
-            event: WorkerEvent::Markers { id, location, data: Arc::new(data), comments: Comments::default() },
+            event: WorkerEvent::Markers { id, location, data: Arc::new(data), comments },
         }).unwrap();
     }
 
@@ -1554,6 +1559,11 @@ fn host_worker(
                             take.path = location.memory_key();
                             (ViewData::build_ssh_first_pose(take, at), Comments::default())
                         }
+                        RemoteStage::ArchiveFirstPose(mut loaded, motion) => {
+                            let comments = comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
+                            loaded.take.path = location.memory_key();
+                            (ViewData::build_archive_first_pose(loaded.take, motion), comments)
+                        }
                         RemoteStage::Preview(mut loaded, motion) => {
                             let plate_devices = loaded.plate_devices().map(<[usize]>::to_vec);
                             let comments = comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
@@ -1681,7 +1691,9 @@ fn host_worker(
                     let mut view = if let Some(snapshot) = snapshot.as_ref() { data.rebuild_markers(snapshot).map_err(|e| format!("{e:?}"))? } else { (*data).clone() };
                     view.take.path = RemoteLocation {host:location.host.clone(),path:outcome.path.clone()}.memory_key();
                     view.take.file_size = outcome.output_bytes;
-                    let prepared = if snapshot.is_none() { Some(loaded.edit_streams.prepare(&data.take.path,loaded.take.file_size as usize)?.0) } else { None };
+                    let prepared = if snapshot.is_none() && !loaded.edit_streams.channels.is_empty() {
+                        Some(loaded.edit_streams.prepare(&data.take.path, loaded.take.file_size as usize)?.0)
+                    } else { None };
                     let comments=comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
                     let creation=Arc::new(tak_core::edit::label::CreationStreams::from_streams(loaded.edit_streams.nodes.to_vec(),loaded.edit_streams.channels.to_vec()));
                     Ok(RemoteWritten { outcome, loaded, view, prepared, comments, creation })

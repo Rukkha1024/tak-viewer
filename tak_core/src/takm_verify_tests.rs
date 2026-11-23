@@ -11,6 +11,26 @@ fn converted(tag: &str) -> (TempDir, PathBuf, PathBuf) {
     (dir, source, result.out)
 }
 
+fn write_legacy_fixture(source: &Path) -> PathBuf {
+    let path = source.with_extension("takm");
+    write(
+        &mut File::create(&path).unwrap(),
+        &std::fs::read(source).unwrap(),
+        source.file_name().unwrap().to_str().unwrap(),
+        "test",
+    )
+    .unwrap();
+    path
+}
+
+fn legacy_converted(tag: &str) -> (TempDir, PathBuf, PathBuf) {
+    let dir = TempDir::new(tag);
+    let source = dir.join("walk.tak");
+    std::fs::write(&source, sample_tak()).unwrap();
+    let path = write_legacy_fixture(&source);
+    (dir, source, path)
+}
+
 fn reseal(bytes: &mut [u8]) {
     let fixed = u64_le(bytes, 32) as usize;
     let digest = Sha256::digest(&bytes[..fixed]);
@@ -18,22 +38,108 @@ fn reseal(bytes: &mut [u8]) {
 }
 
 fn edit_table(path: &Path, change: impl FnOnce(&mut Value)) {
-    let mut raw = std::fs::read(path).unwrap();
+    let raw = std::fs::read(path).unwrap();
     let table_off = u64_le(&raw, 16) as usize;
     let previous_fixed = u64_le(&raw, 32) as usize;
     let mut table: Value = serde_json::from_slice(&raw[table_off..previous_fixed]).unwrap();
     change(&mut table);
+    write_with_table(path, raw[..table_off].to_vec(), &table, &raw[previous_fixed + SEAL_LEN as usize..]);
+}
+
+fn write_with_table(path: &Path, mut raw: Vec<u8>, table: &Value, tail: &[u8]) {
+    let table_off = raw.len();
     let table = serde_json::to_vec(&table).unwrap();
     let fixed = table_off + table.len();
-    let tail = raw.split_off(previous_fixed + SEAL_LEN as usize);
-    raw.truncate(table_off);
+    raw[16..24].copy_from_slice(&(table_off as u64).to_le_bytes());
     raw[24..32].copy_from_slice(&(table.len() as u64).to_le_bytes());
     raw[32..40].copy_from_slice(&(fixed as u64).to_le_bytes());
     raw.extend_from_slice(&table);
     raw.resize(fixed + SEAL_LEN as usize, 0);
     reseal(&mut raw);
-    raw.extend_from_slice(&tail);
+    raw.extend_from_slice(tail);
     std::fs::write(path, raw).unwrap();
+}
+
+fn wrap_legacy(legacy: &[u8], path: &Path) -> Result<()> {
+    write_v2_from_v1(&mut File::create(path).unwrap(), legacy).map(|_| ())
+}
+
+#[test]
+fn explicit_markers_only_derivative_keeps_the_existing_bytes_and_fails_full_source_check() {
+    let (dir, source, original) = legacy_converted("verify_markers_only");
+    let index = read_index_path(&original).unwrap();
+    let raw = std::fs::read(original).unwrap();
+    let table_at = u64_le(&raw, 16) as usize;
+    let mut table: Value = serde_json::from_slice(&raw[table_at..index.fixed_len as usize]).unwrap();
+    let mut shortened = raw[..HEADER_LEN as usize].to_vec();
+    let mut kept = Vec::new();
+    for (stream, row) in index.streams.iter().zip(table["streams"].as_array().unwrap().clone()) {
+        let body = &raw[stream.offset as usize..(stream.offset + stream.size) as usize];
+        if matches!(stream.name.as_str(), "Nodes.dat" | "Channels.dat" | "MetaData.dat") {
+            let mut row = row;
+            row["offset"] = json!(shortened.len());
+            kept.push(row);
+            shortened.extend_from_slice(body);
+        } else {
+            table["dropped"].as_array_mut().unwrap().push(json!({
+                "name":stream.name, "index":stream.index, "size":stream.size,
+                "sha256":format!("{:x}", Sha256::digest(body)),
+            }));
+        }
+    }
+    table["streams"] = json!(kept);
+    let v1 = dir.join("derivative-v1.takm");
+    let v2 = dir.join("derivative-v2.takm");
+    let tail = &raw[index.tail_start() as usize..];
+    write_with_table(&v1, shortened.clone(), &table, tail);
+    assert_eq!(verify(&v1, None).verdict, Verdict::Failed);
+    assert!(wrap_legacy(&std::fs::read(&v1).unwrap(), &v2).is_err());
+
+    table["content_profile"] = json!("markers-only");
+    write_with_table(&v1, shortened, &table, tail);
+    let legacy = std::fs::read(&v1).unwrap();
+    wrap_legacy(&legacy, &v2).unwrap();
+    let file = File::open(&v2).unwrap();
+    let (restored, journal, _) = restore_for_write(&file, file.metadata().unwrap().len()).unwrap();
+    assert_eq!([restored, journal].concat(), legacy);
+    for path in [v1, v2] {
+        let archive_only = verify(&path, None);
+        assert_eq!(archive_only.verdict, Verdict::NoSource);
+        assert_eq!(archive_only.checks.dropped_streams.pass, None);
+        let full = verify(&path, Some(&source));
+        assert_eq!(full.verdict, Verdict::Failed);
+        assert_eq!(full.checks.retained_streams.pass, Some(true));
+        assert_eq!(full.checks.dropped_streams.pass, Some(false));
+        assert!(full.checks.dropped_streams.detail.contains("마커 전용"));
+    }
+}
+
+#[test]
+fn legacy_lettered_and_sparse_ordinals_survive_wrapping_without_source_equivalence() {
+    let (dir, source, path) = legacy_converted("verify_legacy_ordinals");
+    let v1 = dir.join("legacy.takm");
+    std::fs::rename(path, &v1).unwrap();
+    edit_table(&v1, |table| {
+        table["streams"][0]["index"] = json!("A");
+        table["streams"][1]["index"] = json!(101);
+        table["dropped"][0]["index"] = json!("C");
+    });
+    let legacy = std::fs::read(&v1).unwrap();
+    let v2 = dir.join("wrapped.takm");
+    wrap_legacy(&legacy, &v2).unwrap();
+    let file = File::open(&v2).unwrap();
+    let (body, journal, _) = restore_for_write(&file, file.metadata().unwrap().len()).unwrap();
+    assert_eq!([body, journal].concat(), legacy);
+    for path in [&v1, &v2] {
+        assert_eq!(verify(path, None).verdict, Verdict::NoSource);
+        let against_source = verify(path, Some(&source));
+        assert_eq!(against_source.verdict, Verdict::Failed);
+        assert_eq!(against_source.checks.source_sha256.pass, Some(true));
+        assert_eq!(against_source.checks.retained_streams.pass, Some(false));
+    }
+    edit_table(&v1, |table| table["dropped"][0]["index"] = json!("A"));
+    assert_eq!(verify(&v1, None).verdict, Verdict::Failed);
+    assert!(wrap_legacy(&std::fs::read(v1).unwrap(), &v2).is_err());
 }
 
 #[test]
@@ -79,7 +185,7 @@ fn swapping_equal_length_duplicate_names_fails_at_each_original_index() {
     let at = raw.windows(from.len()).position(|b| b == from).unwrap();
     raw[at..at + from.len()].copy_from_slice(&encoded("Nodes.dat"));
     std::fs::write(&source, raw).unwrap();
-    let path = convert(&source, None).unwrap().out;
+    let path = write_legacy_fixture(&source);
     assert_eq!(verify(&path, None).verdict, Verdict::Identical);
     let index = read_index_path(&path).unwrap();
     assert_eq!(index.streams.len(), 2);
@@ -109,7 +215,7 @@ fn swapping_equal_length_duplicate_names_fails_at_each_original_index() {
 
 #[test]
 fn flipped_retained_byte_fails_and_names_stream_even_when_seal_fails() {
-    let (_dir, _source, path) = converted("verify_flipped");
+    let (_dir, _source, path) = legacy_converted("verify_flipped");
     let index = read_index_path(&path).unwrap();
     let stream = index.unique("Calibration.dat").unwrap();
     let mut raw = std::fs::read(&path).unwrap();
@@ -154,7 +260,7 @@ fn wrong_source_fails_even_if_its_container_streams_match() {
 
 #[test]
 fn checks_structure_layout_camera_hash_and_seal_independently() {
-    let (_dir, _source, path) = converted("verify_fixed");
+    let (_dir, _source, path) = legacy_converted("verify_fixed");
     let original = std::fs::read(&path).unwrap();
     let fixed = u64_le(&original, 32) as usize;
     let mut damaged = original.clone();
@@ -203,7 +309,7 @@ fn checks_structure_layout_camera_hash_and_seal_independently() {
 
 #[test]
 fn live_comments_and_tail_damage_do_not_change_fixed_verdict() {
-    let (_dir, _source, path) = converted("verify_tail");
+    let (_dir, _source, path) = legacy_converted("verify_tail");
     let event = "t,add,1,,0,0,,note,1,,walk.tak|1,\r\n";
     let tail = format!("{event}bad\r\nt,add,2");
     OpenOptions::new()
@@ -409,7 +515,7 @@ fn batch_verification_matches_the_recorded_source_and_returns_all_verdicts() {
 
 #[test]
 fn source_directory_refuses_non_basename_names_in_the_takm_table() {
-    let (dir, _, path) = converted("verify_source_dir_traversal");
+    let (dir, _, path) = legacy_converted("verify_source_dir_traversal");
     edit_table(&path, |table| {
         table["source"]["name"] = serde_json::json!("../walk.tak")
     });

@@ -569,8 +569,19 @@ impl ViewData {
         Self::build_with_previous_markers(take, plate_devices, None, Some(motion), None)
     }
 
+    /// Local still or stride-eight preview with exact presence in trajectory order.
+    pub fn build_local_preview(take: Take, requested: i64, runs: Vec<Vec<(i64, i64)>>, still: bool) -> ViewData {
+        let motion = crate::remote::PreviewMotion { requested, runs };
+        Self::build_with_previous_markers(take, None, None, Some(motion), still.then_some(requested))
+    }
+
     pub fn build_ssh_first_pose(take: Take, frame: i64) -> ViewData {
         Self::build_with_previous_markers(take, None, None, None, Some(frame))
+    }
+
+    pub fn build_archive_first_pose(take: Take, motion: crate::remote::PreviewMotion) -> ViewData {
+        let frame = motion.requested;
+        Self::build_with_previous_markers(take, None, None, Some(motion), Some(frame))
     }
 
     pub fn is_first_pose(&self) -> bool { self.first_pose }

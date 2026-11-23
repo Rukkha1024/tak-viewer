@@ -250,7 +250,7 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             eprintln!("bench: {e}");
             return 1;
         }
-        if markers.is_none() && st.loaded {
+        if markers.is_none() && st.markers_shown {
             markers = Some(ms(opened));
         }
         if analog.is_some() {
@@ -278,7 +278,7 @@ pub fn bench(files: Vec<PathBuf>, overlays: Vec<PathBuf>, frames: usize, size: [
             continue;
         }
         loading.push(took);
-        if markers.is_some() && !st.analog_pending && !st.overlay_pending {
+        if st.loaded && markers.is_some() && !st.analog_pending && !st.overlay_pending {
             analog = Some(ms(opened));
             plate_views = app.bench_play(start.elapsed().as_secs_f64());
             app.apply_graph_probe(&ctx);
@@ -373,9 +373,16 @@ mod tests {
     use super::*;
     use crate::app::{BenchState, BenchView};
 
+    #[test]
+    #[ignore = "requires a prepared local TAKM timing fixture"]
+    fn local_takm_first_pose_bench() {
+        let path = PathBuf::from(std::env::var_os("TAK_LOCAL_STAGE_BENCH").expect("TAK_LOCAL_STAGE_BENCH"));
+        assert_eq!(bench(vec![path], vec![], 1, [1100.0, 720.0], None), 0);
+    }
+
     fn ready_state(files: &[(&str, bool, Option<&str>)]) -> BenchState {
         BenchState {
-            loaded: true, analog_pending: false, overlay_pending: false, error: None,
+            loaded: true, markers_shown: true, analog_pending: false, overlay_pending: false, error: None,
             views: files.iter().map(|(file, lazy, fallback)| BenchView {
                 file: (*file).to_owned(), markers_ms: Some(20.0), analog_ms: Some(40.0),
                 lazy_analog: *lazy, fallback: fallback.map(str::to_owned), emg_failure: None, steps: vec![], overlay: None,
