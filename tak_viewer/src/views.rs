@@ -1567,6 +1567,7 @@ impl View {
         self.labels.reset(&data, file_id);
         if let Some(anchors) = self.restore_list_anchors.take() { self.labels.list_selection = anchors; }
         if let Some(pick) = self.restore_linked_pick.take() { self.labels.linked_pick = pick; }
+        let still = data.is_first_pose().then(|| data.preview_initial_frame()).flatten();
         let old = self.data.replace(data);
         match self.restore.take() {
             Some(spot) => self.apply_spot(&spot, now),
@@ -1579,6 +1580,7 @@ impl View {
         if let Some(range) = self.restore_range.take() {
             self.range = range.map(|(a, b)| panels::ordered_range(a, b, self.pb.first, self.pb.last));
         }
+        self.pb.hold(still, now);
         old
     }
 
@@ -1591,6 +1593,7 @@ impl View {
     }
 
     pub fn pending_first_paint(&self) -> Option<Arc<FirstPaint>> {
+        if !self.data.as_ref().is_some_and(|data| !data.is_preview() && data.analog_pending) { return None; }
         self.first_paint.as_ref().filter(|paint| paint.pending()).cloned()
     }
 
@@ -1915,6 +1918,7 @@ impl View {
     /// Commit or undo a prepared patch; the expensive view rebuild is requested separately.
     pub fn apply_marker_patch(&mut self, patch: &EditPatch, redo: bool) -> Result<(), EditError> {
         self.sync_shared();
+        if self.is_ssh_preview() { return Err(EditError::NotLoaded); }
         let session = self.edit_document.as_ref().ok_or(EditError::NotLoaded)?;
         let mut document = session.lock().map_err(|_| EditError::Other("편집 문서를 열 수 없어요".into()))?;
         document.apply(patch, redo)?;
@@ -1995,8 +1999,46 @@ impl View {
         self.publish_shared_file();
     }
 
+    pub fn is_first_pose(&self) -> bool {
+        self.data.as_ref().is_some_and(|d| d.is_first_pose())
+    }
+
+    pub fn is_ssh_preview(&self) -> bool {
+        self.data.as_ref().is_some_and(|d| d.is_preview())
+    }
+
+    pub fn preview_status(&self) -> Option<&'static str> {
+        self.is_ssh_preview().then_some(if self.remote_warning.is_some() {
+            "Preview · incomplete"
+        } else {
+            "Preview · loading full motion"
+        })
+    }
+
+    pub fn preview_graph_status(&self) -> &'static str {
+        if self.remote_warning.is_some() { "Full motion incomplete" } else { "Loading full motion…" }
+    }
+
     fn install_shared_data(&mut self, data: Arc<ViewData>) {
         let _span=crate::bench_timing::span("shared.install");
+        let was_first_pose = self.is_first_pose();
+        if was_first_pose && !data.is_first_pose() {
+            self.pb.hold(None, 0.0);
+            if let Some(old) = &self.data {
+                // Preserve the projection if the still did not give the same unit estimate.
+                if old.bounds.is_some() && old.unit_scale != data.unit_scale {
+                    let ratio = data.unit_scale / old.unit_scale;
+                    self.cam.pivot = self.cam.pivot * ratio;
+                    self.cam.distance *= ratio;
+                }
+            }
+        }
+        // The progressive decoder verifies the same channel headers, order and
+        // presence runs. Selections and label caches already refer to exact indices.
+        if !was_first_pose && self.is_ssh_preview() && !data.is_preview() && self.path() == Some(data.take.path.as_path()) {
+            drop_later(self.data.replace(data));
+            return;
+        }
         // Analog publication preserves all marker buffers and the edit revision. Keep the
         // already prepared graph/labels instead of rebuilding every view at EMG readiness.
         if self.data.as_ref().is_some_and(|old| old.take.path == data.take.path

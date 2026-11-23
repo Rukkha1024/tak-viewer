@@ -19,6 +19,9 @@ pub struct Probe {
     pub label:bool,
     pub save:bool,
     pub markers_only:bool,
+    pub(crate) timeline: Option<std::sync::Arc<crate::ssh_timeline::Timeline>>,
+    frame: Option<i64>,
+    exact_logged: bool,
     markers_only_phase:u8,
     markers_only_stop:Option<Instant>,
     edit_phase:u8,
@@ -43,6 +46,7 @@ pub struct State {
     pub error: Option<String>,
     pub diagnostic: Option<String>,
     pub markers: bool,
+    pub preview: bool,
     pub pending: bool,
     pub busy: bool,
     pub workers: bool,
@@ -80,7 +84,7 @@ impl Probe {
     fn print(&self, stage: &str, state: &State) {
         println!(
             "{}",
-            json!({"stage":stage,"elapsed_ms":self.ms(),"connect_ms":self.connected,"list_ms":self.listed,"markers_on_screen_ms":self.markers,"open_elapsed_ms":self.opened.map(|t|t.elapsed().as_secs_f64()*1000.0),"bytes_received":state.bytes,"python_command":state.python,"markers_kept":state.markers,"worker_running":state.workers,"note":state.error,"diagnostic":state.diagnostic})
+            json!({"stage":stage,"elapsed_ms":self.ms(),"connect_ms":self.connected,"list_ms":self.listed,"markers_on_screen_ms":self.markers,"open_elapsed_ms":self.opened.map(|t|t.elapsed().as_secs_f64()*1000.0),"bytes_received":state.bytes,"python_command":state.python,"markers_kept":state.markers,"preview":state.preview,"worker_running":state.workers,"note":state.error,"diagnostic":state.diagnostic})
         );
     }
     /// Agent-only sequence: ordinary marker open -> normal Escape cancellation ->
@@ -109,6 +113,10 @@ impl Probe {
             return Step::Wait;
         }
         let state = app.ssh_probe_state(&self.alias);
+        if self.timeline.is_some() && self.start.elapsed() > Duration::from_secs(180) {
+            self.print("timeline_timeout", &state);
+            return Step::Done(1);
+        }
         if state.bytes != self.last_bytes {
             self.last_bytes = state.bytes;
             self.last_received = Instant::now();
@@ -119,6 +127,10 @@ impl Probe {
         }
         if self.markers.is_none() && state.markers {
             self.markers=Some(self.ms());self.print("markers_on_screen",&state);
+        }
+        if state.markers && !state.preview && !self.exact_logged {
+            self.exact_logged = true;
+            self.print("exact_markers_ready", &state);
         }
         if !self.cancelled && state.busy && self.opened.is_some()
             && self.stall_after.is_some_and(|d| self.last_received.elapsed() >= d) {
@@ -180,7 +192,21 @@ impl Probe {
                     self.finished = true;
                     return Step::Done(0);
                 }
-                app.ssh_probe_open(ctx, &self.alias, &self.path);
+                let listed_path = listing["entries"].as_array().into_iter().flatten()
+                    .filter(|row| row["directory"] == false)
+                    .filter_map(|row| row["path"].as_str())
+                    .find(|path| *path == self.path || (self.platform == "windows"
+                        && path.replace('\\', "/").eq_ignore_ascii_case(&self.path.replace('\\', "/"))));
+                let path = if self.timeline.is_some() {
+                    let Some(path) = listed_path else {
+                        eprintln!("SSH timeline requested a file absent from its folder listing.");
+                        return Step::Done(1);
+                    };
+                    path
+                } else {
+                    listed_path.unwrap_or(&self.path)
+                };
+                app.ssh_probe_open(ctx, &self.alias, path, self.frame);
                 self.opened = Some(Instant::now());
             }
             return Step::Wait;
@@ -199,7 +225,7 @@ impl Probe {
             self.print("cancel_requested", &state);
             return Step::Escape;
         }
-        if state.markers && !state.pending && !state.busy && !app.ssh_probe_edit_busy() {
+        if state.markers && !state.preview && !state.pending && !state.busy && !app.ssh_probe_edit_busy() {
             if self.edit_phase==0 {
                 self.edit_phase=1;
                 if let Some(text)=&self.comment {if let Err(e)=app.ssh_probe_add_comment(ctx,text){eprintln!("{e}");return Step::Done(1);}}
@@ -250,6 +276,7 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
     let (mut list_only, mut cancel_after, mut dump, mut stall_after) = (false, None, None, None);
     let (mut comment,mut label,mut save)=(None,false,false);
     let mut markers_only=false;
+    let (mut timeline_path, mut milestone_shots, mut requested_frame) = (None, None, None);
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -269,6 +296,7 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
                 | "--ssh-path"
                 | "--ssh-cancel-after-ms"
                 | "--ssh-dump"
+                | "--ssh-timeline" | "--ssh-milestone-shots"
                 | "--ssh-stall-cancel-after-ms"
                 | "--ssh-comment" | "--ssh-label"
         ) {
@@ -300,14 +328,18 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
                         .filter(|n| *n > 0 && *n <= 600000).ok_or("시험 중 무수신 취소 시간은 1~600000 ms예요.")?));
                 }
                 "--ssh-dump" => dump = Some(workspace::resolve_path(value)),
+                "--ssh-timeline" => timeline_path = Some(workspace::resolve_path(value)),
+                "--ssh-milestone-shots" => milestone_shots = Some(workspace::resolve_path(value)),
                 "--ssh-comment"=>comment=Some(value.clone()),
                 "--ssh-label"=>{if value!="unlabel"{return Err("--ssh-label 값은 unlabel이에요.".into());} label=true;},
                 _ => unreachable!(),
             }
             i += 2;
         } else if matches!(key, "--screenshot" | "--frame" | "--select" | "--plate") {
+            let value = args.get(i + 1).ok_or("그림 옵션 값이 필요해요.")?;
+            if key == "--frame" { requested_frame = value.parse::<i64>().ok(); }
             rest.push(args[i].clone());
-            rest.push(args.get(i + 1).ok_or("그림 옵션 값이 필요해요.")?.clone());
+            rest.push(value.clone());
             i += 2;
         } else {
             return Err(format!("SSH 시험에서 모르는 옵션이에요: {key}"));
@@ -334,13 +366,20 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
     {
         return Err("TAK · TAKM 경로에는 출력할 수 없어요.".into());
     }
+    if milestone_shots.is_some() && timeline_path.is_none() {
+        return Err("--ssh-milestone-shots requires --ssh-timeline".into());
+    }
+    if timeline_path.is_some() && (list_only || markers_only || dump.is_some() || comment.is_some() || label || save) {
+        return Err("--ssh-timeline requires a read-only SSH open with initial forceplates".into());
+    }
+    let timeline = timeline_path.map(|path| crate::ssh_timeline::Timeline::new(path, milestone_shots)).transpose()?;
     let (auto, leftovers) = shot::parse_command(&rest)?;
     if !leftovers.is_empty()
-        || (!list_only && auto.is_none())
+        || (!list_only && auto.is_none() && timeline.is_none())
         || (list_only && (auto.is_some() || dump.is_some() || cancel_after.is_some() || stall_after.is_some()))
     {
         return Err(
-            "--ssh-open은 --screenshot과 함께, --ssh-list는 그림·덤프·취소 없이 써 주세요.".into(),
+            "--ssh-open에는 --screenshot이나 --ssh-timeline을 써 주세요. --ssh-list에는 그림·덤프·취소를 쓸 수 없어요.".into(),
         );
     }
     Ok((
@@ -352,6 +391,9 @@ fn parse(args: &[String]) -> Result<(Probe, Option<shot::AutoShot>), String> {
             list_only,
             cancel_after,
             dump,
+            frame: requested_frame,
+            timeline,
+            exact_logged: false,
             comment,label,save,markers_only,markers_only_phase:0,markers_only_stop:None,edit_phase:0,
             stall_after,
             last_bytes: 0,

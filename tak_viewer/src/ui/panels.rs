@@ -999,8 +999,13 @@ pub fn selected_pane(ui: &mut Ui, data: &ViewData, frame: i64, selected: &BTreeS
         row(ui, "slot", m.slot.map_or("-".into(), |s| s.to_string()));
         row(ui, "UID", uid_hex(&m.uid));
         row(ui, "Parent UID", m.parent.map_or("-".into(), |p| uid_hex(&p)));
-        row(ui, "Points / Gaps", format!("{} / {}", m.n_samples, if m.gaps.is_empty() { "0%".into() } else { gaps_text(m.fill_pct) }));
-        row(ui, "Gaps / Longest", format!("{} / {} frames", m.gaps.len(), m.max_gap));
+        if data.is_first_pose() {
+            row(ui, "Points / Gaps", "Loading…".into());
+            row(ui, "Gaps / Longest", "Loading…".into());
+        } else {
+            row(ui, "Points / Gaps", format!("{} / {}", m.n_samples, if m.gaps.is_empty() { "0%".into() } else { gaps_text(m.fill_pct) }));
+            row(ui, "Gaps / Longest", format!("{} / {} frames", m.gaps.len(), m.max_gap));
+        }
         match m.position(frame) {
             Some(p) => {
                 let scale = super::scene_measurement::DISPLAY_MM_PER_UNIT as f32;

@@ -290,7 +290,9 @@ fn label_scroll_offset(rows: &[ListRow], state: &LabelingState, pitch: f32) -> O
 }
 
 fn coverage_text(fill_pct: f32) -> String {
-    if fill_pct > 0.0 && fill_pct <= 0.5 {
+    if fill_pct.is_nan() {
+        "Loading…".into()
+    } else if fill_pct > 0.0 && fill_pct <= 0.5 {
         "<1%".into()
     } else if fill_pct >= 99.5 && fill_pct < 100.0 {
         ">99%".into()

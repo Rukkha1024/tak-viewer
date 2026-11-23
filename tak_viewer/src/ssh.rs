@@ -11,7 +11,7 @@ use std::sync::{
 };
 use tak_core::{
     comments::{self, Comments},
-    remote::{CancelToken, RemoteConfig, RemoteSession, RemoteTake},
+    remote::{CancelToken, RemoteConfig, RemoteSession, RemoteStage, RemoteTake},
     view_data::{AnalogPart, AnalogTarget, ViewData},
 };
 
@@ -93,6 +93,11 @@ pub enum SshEvent {
         location: RemoteLocation,
         data: Arc<ViewData>,
         comments: Comments,
+    },
+    ExactMarkers {
+        request_id: u64,
+        location: RemoteLocation,
+        data: Arc<ViewData>,
     },
     Analog {
         request_id: u64,
@@ -337,6 +342,7 @@ enum Command {
         location: RemoteLocation,
         cancel: CancelToken,
         full: bool,
+        frame: Option<i64>,
     },
     Analog {
         id: u64,
@@ -371,6 +377,11 @@ enum WorkerEvent {
         location: RemoteLocation,
         data: Arc<ViewData>,
         comments: Comments,
+    },
+    ExactMarkers {
+        id: u64,
+        location: RemoteLocation,
+        data: Arc<ViewData>,
     },
     Analog {
         id: u64,
@@ -408,6 +419,7 @@ pub struct SshManager {
     pub discovery_pending: bool,
     pub discovery_note: Option<String>,
     pub full_analog_probe: bool,
+    pub(crate) timeline: Option<Arc<crate::ssh_timeline::Timeline>>,
     pub documents: HashMap<RemoteLocation, RemoteDocument>,
     ctx: egui::Context,
     tx: Sender<Envelope>,
@@ -431,6 +443,7 @@ impl SshManager {
             discovery_pending: false,
             discovery_note: None,
             full_analog_probe: false,
+            timeline: None,
             documents: HashMap::new(),
             ctx: ctx.clone(),
             tx,
@@ -612,12 +625,13 @@ impl SshManager {
             self.ctx.clone(),
         );
         let workers = self.workers.clone();
+        let timeline = self.timeline.clone();
         workers.fetch_add(1, std::sync::atomic::Ordering::Release);
         std::thread::spawn(move || {
             struct Finished(Arc<std::sync::atomic::AtomicUsize>);
             impl Drop for Finished { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::Release); } }
             let _finished = Finished(workers);
-            host_worker(alias, platform, python, initial_path, generation, id, cancel, rx, events, ctx)
+            host_worker(alias, platform, python, initial_path, generation, id, cancel, rx, events, ctx, timeline)
         });
         Ok(())
     }
@@ -639,10 +653,9 @@ impl SshManager {
         }
     }
 
-    pub fn open(&mut self, location: RemoteLocation) -> Result<u64, String> {
-        self.open_mode(location, self.full_analog_probe)
-    }
-    fn open_mode(&mut self, location: RemoteLocation, full: bool) -> Result<u64, String> {
+    pub fn open_at(&mut self, location: RemoteLocation, frame: Option<i64>) -> Result<u64, String> {
+        let full = self.full_analog_probe;
+
         if self.demo {
             return Err("그림 확인용 SSH 목록이에요. 실제 서버에는 연결하지 않아요.".into());
         }
@@ -664,6 +677,7 @@ impl SshManager {
                 location,
                 cancel: cancel.clone(),
                 full,
+                frame,
             })
             .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
         worker.operations.insert(
@@ -946,6 +960,7 @@ impl SshManager {
             };
             let event_id = match &envelope.event {
                 WorkerEvent::Markers { id, .. }
+                | WorkerEvent::ExactMarkers { id, .. }
                 | WorkerEvent::Analog { id, .. }
                 | WorkerEvent::Done(id)
                 | WorkerEvent::Listed { id, .. } => Some(*id),
@@ -1018,6 +1033,11 @@ impl SshManager {
                     data,
                     comments,
                 }),
+                WorkerEvent::ExactMarkers { id, location, data } => self.emitted.push(SshEvent::ExactMarkers {
+                    request_id: id,
+                    location,
+                    data,
+                }),
                 WorkerEvent::Analog { id, location, part } => self.emitted.push(SshEvent::Analog {
                     request_id: id,
                     location,
@@ -1082,6 +1102,15 @@ impl SshManager {
             host: location.host.clone(),
             generation: 0,
             event: WorkerEvent::Markers { id, location, data: Arc::new(data), comments: Comments::default() },
+        }).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_exact_reply(&self, id: u64, location: RemoteLocation, data: ViewData) {
+        self.tx.send(Envelope {
+            host: location.host.clone(),
+            generation: 0,
+            event: WorkerEvent::ExactMarkers { id, location, data: Arc::new(data) },
         }).unwrap();
     }
 
@@ -1317,6 +1346,7 @@ fn host_worker(
     commands: Receiver<Command>,
     events: Sender<Envelope>,
     ctx: egui::Context,
+    timeline: Option<Arc<crate::ssh_timeline::Timeline>>,
 ) {
     let emit = |event| send(&events, &ctx, &alias, generation, event);
     let mut config = RemoteConfig::default();
@@ -1343,6 +1373,9 @@ fn host_worker(
     if connect_cancel.is_cancelled() {
         emit(WorkerEvent::Stopped { cancelled: true });
         return;
+    }
+    if let Some(trace) = timeline {
+        session.observe_reads(Arc::new(move |moment, bytes| trace.read(moment, bytes)));
     }
     if let Some(counter) = session.received_counter() { emit(WorkerEvent::Progress(counter)); }
     emit(WorkerEvent::Metrics(session.received_bytes()));
@@ -1508,12 +1541,37 @@ fn host_worker(
                 location,
                 cancel,
                 full,
+                frame,
             }) => {
                 if cancel.is_cancelled() {
                     emit(WorkerEvent::Done(id));
                     continue;
                 }
-                let opened = session.open(&location.path, &cancel);
+                let mut published_preview = false;
+                let opened = session.open_staged(&location.path, frame, &cancel, |stage| {
+                    let (data, comments) = match stage {
+                        RemoteStage::FirstPose(mut take, at) => {
+                            take.path = location.memory_key();
+                            (ViewData::build_ssh_first_pose(take, at), Comments::default())
+                        }
+                        RemoteStage::Preview(mut loaded, motion) => {
+                            let plate_devices = loaded.plate_devices().map(<[usize]>::to_vec);
+                            let comments = comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
+                            loaded.take.path = location.memory_key();
+                            published_preview = true;
+                            (ViewData::build_ssh_preview(loaded.take, plate_devices, motion), comments)
+                        }
+                    };
+                    data.prepare_marker_order();
+                    if !cancel.is_cancelled() && !emit(WorkerEvent::Markers {
+                        id,
+                        location: location.clone(),
+                        data: Arc::new(data),
+                        comments,
+                    }) {
+                        cancel.cancel();
+                    }
+                });
                 emit(WorkerEvent::Metrics(session.received_bytes()));
                 if let Err(error) = &opened { emit(WorkerEvent::Diagnostic(error.clone())); }
                 match opened {
@@ -1540,6 +1598,7 @@ fn host_worker(
                         let mut data = ViewData::build_with_plate_devices(marker_take, plate_devices);
                         data.analog_pending = pending;
                         data.emg_pending = lazy;
+                        data.ssh_marker_proof = loaded.marker_proof.take();
                         if !full {
                             if let Some(reason) = fallback {
                                 emit(WorkerEvent::Diagnostic(reason.clone()));
@@ -1548,8 +1607,14 @@ fn host_worker(
                         }
                         let target = data.analog_target();
                         loaded.take.warnings.clear();
-                        let parsed =
-                            comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
+                        let event = if published_preview {
+                            data.prepare_marker_order();
+                            WorkerEvent::ExactMarkers { id, location: location.clone(), data: Arc::new(data) }
+                        } else {
+                            data.prepare_marker_order();
+                            let comments = comments::parse(&String::from_utf8_lossy(&loaded.comments)).comments();
+                            WorkerEvent::Markers { id, location: location.clone(), data: Arc::new(data), comments }
+                        };
                         // The parsed list is already on its way to the view; do not retain
                         // the original tail allocation until the analog read finishes.
                         drop(std::mem::take(&mut loaded.comments));
@@ -1557,12 +1622,7 @@ fn host_worker(
                             emit(WorkerEvent::Stopped { cancelled: true });
                             return;
                         }
-                        if !emit(WorkerEvent::Markers {
-                            id,
-                            location: location.clone(),
-                            data: Arc::new(data),
-                            comments: parsed,
-                        }) {
+                        if !emit(event) {
                             return;
                         }
                         if loaded.next_comment_id==0 {
@@ -1697,8 +1757,9 @@ fn host_worker(
                             Some(loaded.take.warnings.join("\n"))
                         };
                         let values = std::mem::take(&mut loaded.take.analog);
-                        let part = if matches!(stage, AnalogStage::Full) || !selective { AnalogPart::prepare(values, warning, &target) }
+                        let mut part = if matches!(stage, AnalogStage::Full) || !selective { AnalogPart::prepare(values, warning, &target) }
                             else { AnalogPart::prepare_selected(values, warning, &target, indices, matches!(stage, AnalogStage::Initial)) };
+                        part.ssh_plate_proof = loaded.plate_proof.take();
                         if cancel.is_cancelled() {
                             emit(WorkerEvent::Stopped { cancelled: true });
                             return;
@@ -2134,7 +2195,7 @@ mod tests {
         host.worker = Some(WorkerHandle { tx, operations: HashMap::new() });
         manager.hosts.push(host);
         let location = RemoteLocation { host:"lab".into(), path:"/data/a.tak".into() };
-        let opened = manager.open(location.clone()).unwrap();
+        let opened = manager.open_at(location.clone(), None).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Command::Open { id, full:false, .. } if id == opened));
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         let data = crate::views::sample_data("test.tak", &["marker"]);
@@ -2144,7 +2205,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Command::ReleaseAnalog(sent) if sent == id));
         assert!(manager.drain_events().iter().any(|event| matches!(event, SshEvent::Cancelled { request_id } if *request_id == id)));
         manager.full_analog_probe = true;
-        manager.open(location).unwrap();
+        manager.open_at(location, None).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Command::Open { full:true, .. }));
     }
 

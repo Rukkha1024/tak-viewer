@@ -15,6 +15,8 @@ import re
 import stat
 import struct
 import sys
+import time
+import zlib
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
@@ -210,7 +212,7 @@ def inventory(stream, probe_bytes):
         if end > stream.length:
             raise ValueError("Truncated channel samples")
         records.append(dict(start=pos, header=header, data=pos + header, count=n,
-                            stride=stride, analog=name.startswith("AnalogChannel"),
+                            stride=stride, head=data, analog=name.startswith("AnalogChannel"),
                             name=name, uid=data[uid:uid + 16], end=end))
         pos = end
     if pos != stream.length:
@@ -333,7 +335,7 @@ class Source:
         result = [CHANNELS_HEADER, struct.pack("<I", len(selected))]
         for record in selected:
             if headers_only or (devices is not None and record["device"] not in devices):
-                head = stream.read(record["start"], record["header"])
+                head = record["head"]
                 result.append(head[:-4] + bytes(4))
             else:
                 result.append(stream.read(record["start"], record["end"] - record["start"]))
@@ -509,6 +511,230 @@ def encoded(header):
     return json.dumps(header, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
 
 
+def shuffle_channels(channels, records, xor=True):
+    """XOR consecutive words from a channel, then group by sample byte offset."""
+    result = bytearray(channels)
+    cursor = 10
+    for row in records:
+        start = cursor + row["header"]
+        count = struct.unpack_from("<I", channels, start - 4)[0]
+        stride = row["stride"]
+        end = start + count * stride
+        samples = channels[start:end]
+        for lane in range(stride):
+            column = samples[lane::stride]
+            if xor:
+                bits = int.from_bytes(column, "little")
+                column = (bits ^ (int.from_bytes(column[:-1], "little") << 8)).to_bytes(count, "little")
+            offset = start + lane * count
+            result[offset:offset + count] = column
+        cursor = end
+    if cursor != len(channels):
+        raise ValueError("Channel transform did not consume the stream")
+    return result
+
+
+def split_preview(channels, records, first, last, requested, maximum):
+    preview = bytearray(channels[:10])
+    tail = bytearray(channels[:10])
+    presence = bytearray()
+    cursor = 10
+    for row in records:
+        start = cursor + row["header"]
+        stride, count = row["stride"], row["count"]
+        end = start + stride * count
+        head = channels[cursor:start]
+        cursor = end
+        if row["name"] != "Translation" or stride != 16:
+            preview.extend(head[:-4] + bytes(4))
+            tail.extend(channels[start - len(head):end])
+            presence.extend(bytes(4))
+            continue
+
+        early, late = bytearray(), bytearray()
+        runs = []
+        prior = first - 2
+        for i, (frame, _) in enumerate(struct.iter_unpack("<I12s", memoryview(channels)[start:end])):
+            if frame <= prior or not first <= frame <= last:
+                return None
+            if frame == prior + 1:
+                runs[-1] = (runs[-1][0], frame)
+            else:
+                if len(presence) + 4 + (len(runs) + 1) * 8 > maximum:
+                    return None
+                runs.append((frame, frame))
+            prior = frame
+            destination = early if (frame - first) % 8 == 0 or frame == requested else late
+            pos = start + i * stride
+            destination.extend(channels[pos:pos + stride])
+        for output, samples in ((preview, early), (tail, late)):
+            output.extend(head[:-4])
+            output.extend(struct.pack("<I", len(samples) // stride))
+            output.extend(samples)
+        presence.extend(struct.pack("<I", len(runs)))
+        for a, b in runs:
+            presence.extend(struct.pack("<II", a, b))
+    return preview, tail, presence
+
+
+def preview_range(meta, requested, maximum):
+    try:
+        xml, _, _, _ = properties_xml(meta)
+        props = {p.findtext("name", p.get("name")): p.findtext("value", p.get("value"))
+                 for p in ET.fromstring(xml).findall("property")}
+        first, last = int(props["StartFrame"]), int(props["EndFrame"])
+    except (ValueError, TypeError, KeyError, ET.ParseError):
+        return None
+    # The viewer keeps an exact per-frame occlusion strip.
+    if not (0 <= first <= last <= 0xFFFFFFFF and last - first + 1 <= maximum // 8):
+        return None
+    if type(requested) is not int or not first <= requested <= last:
+        requested = first
+
+    return first, last, requested
+
+
+def sample_at(stream, row, frame):
+    if row["name"] != "Translation" or row["stride"] != 16 or not row["count"]:
+        return b""
+    start, stride = row["data"], row["stride"]
+    sample = stream.read(start, stride)
+    first = struct.unpack_from("<I", sample)[0]
+    if frame <= first:
+        return sample if frame == first else b""
+    lo, hi = 1, row["count"]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        sample = stream.read(start + mid * stride, stride)
+        at = struct.unpack_from("<I", sample)[0]
+        if at == frame:
+            return sample
+        if at < frame:
+            lo = mid + 1
+        else:
+            hi = mid
+    return b""
+
+
+def send_first_pose(source, meta, records, frame, maximum, send):
+    expanded_cap = len(source.nodes) + len(meta) + 10 + sum(row["header"] + row["stride"] for row in records)
+    if expanded_cap > maximum:
+        return
+    channels = [CHANNELS_HEADER, struct.pack("<I", len(records))]
+    stream = source.streams["Channels.dat"]
+    for row in records:
+        sample = sample_at(stream, row, frame)
+        channels.extend((row["head"][:-4], struct.pack("<I", int(bool(sample))), sample))
+    raw = [source.nodes, meta, b"".join(channels)]
+    packed = [zlib.compress(block, 1) for block in raw]
+    lengths = [len(block) for block in packed]
+    if sum(lengths) <= maximum:
+        source.check()
+        send(dict(ok=True, first_pose=1, frame=frame, identity=source.identity,
+                  file_size=source.reader.size, lengths=lengths,
+                  expanded_lengths=[len(block) for block in raw]), packed)
+
+
+def compress_part(part):
+    return zlib.compress(part, 6)
+
+
+def pco_columns(raw, records, pool):
+    import numpy as np
+    from pcodec import ChunkConfig, standalone
+
+    side = bytearray(raw[:10])
+    columns = []
+    cursor = 10
+    # Keep headers and grouped frame-index bytes in the zlib side block.
+    # Each track contributes distinct contiguous X, Y and Z series.
+    for row in records:
+        stride = row["stride"]
+        start = cursor + row["header"]
+        count = struct.unpack_from("<I", raw, start - 4)[0]
+        end = start + stride * count
+        side.extend(raw[cursor:start])
+        if row["name"] == "Translation" and stride == 16:
+            words = np.frombuffer(raw, dtype="<u4", count=count * 4, offset=start).reshape(-1, 4)
+            frames = words[:, 0].copy()
+            frames[1:] = frames[1:] ^ frames[:-1]
+            side.extend(frames.view("u1").reshape(-1, 4).T.tobytes())
+            if count:
+                columns.append(words[:, 1:].T.ravel())
+        else:
+            side.extend(raw[start:end])
+        cursor = end
+    if cursor != len(raw):
+        raise ValueError("Invalid PCo channel block")
+    values = np.concatenate(columns).view("<f4") if columns else np.empty(0, dtype="<f4")
+    parts = np.array_split(values, min(4, max(1, len(values) // 32768)))
+
+    def compress(part):
+        return standalone.simple_compress(part, ChunkConfig(compression_level=8))
+
+    packed = list(pool.map(compress, parts))
+    side_bytes = zlib.compress(side, 1)
+    header = struct.pack("<III", len(side), len(side_bytes), len(parts))
+    header += b"".join(struct.pack("<II", len(part), len(encoded)) for part, encoded in zip(parts, packed))
+    return header + side_bytes + b"".join(packed)
+
+
+def try_pco(raw, records, pool, enabled):
+    # On small blocks, retain the cheap codec and avoid cold optional imports.
+    if not enabled or len(raw) < (256 << 10):
+        return None
+    try:
+        payload = pco_columns(raw, records, pool)
+        return payload if len(payload) < len(raw) else None
+    except Exception:
+        # Optional package/import/encode failure. The same source is still readable.
+        return None
+
+
+def progressive_open(source, header, blocks, records, frames, maximum, send_first, pool, pco):
+    first, last, requested = frames
+    split = split_preview(blocks[2], records, first, last, requested, maximum)
+    if split is None:
+        return None
+    preview, tail, presence = split
+    del split
+    early = [blocks[0], blocks[1], preview, blocks[3], blocks[4], presence]
+    expanded = [len(block) for block in early]
+    if sum(expanded) > maximum:
+        return None
+    axes = try_pco(preview, records, pool, pco)
+    early[2] = b"" if axes is not None else shuffle_channels(preview, records)
+    packed = list(pool.map(lambda block: zlib.compress(block, 1), early)) if pool else [zlib.compress(block, 1) for block in early]
+    if axes is not None:
+        packed[2] = axes
+    lengths = [len(block) for block in packed]
+    if sum(lengths) > maximum:
+        return None
+    digest = hashlib.sha256(blocks[2]).hexdigest()
+    stage = dict(header, progressive=1, lengths=lengths, expanded_lengths=expanded,
+                 frame=requested, exact_bytes=len(blocks[2]), exact_sha256=digest,
+                 remainder_bytes=len(tail), remainder_parts=4 if pool else 1)
+    if axes is not None:
+        stage["marker_encoding"] = "pco-axes-1"
+    if len(encoded(stage)) > REQUEST_LIMIT:
+        return None
+    source.check()
+    send_first(stage, packed)
+    axes = try_pco(tail, records, pool, pco)
+    if axes is not None and len(axes) <= maximum:
+        source.check()
+        return dict(ok=True, progressive=1, marker_encoding="pco-axes-1",
+                    lengths=[len(axes)], expanded_lengths=[len(tail)], identity=source.identity), [axes]
+    shuffled = memoryview(shuffle_channels(tail, records))
+    parts = [shuffled[i * len(tail) // 4:(i + 1) * len(tail) // 4] for i in range(4)] if pool else [shuffled]
+    late = list(pool.map(compress_part, parts)) if pool else [compress_part(shuffled)]
+    lengths = [len(block) for block in late]
+    budget(lengths, maximum)
+    source.check()
+    return dict(ok=True, progressive=1, lengths=lengths, expanded_lengths=[len(part) for part in parts],
+                identity=source.identity), late
+
+
 class Server:
     def __init__(self):
         self.source = None
@@ -519,12 +745,12 @@ class Server:
             self.source.file.close()
             self.source = None
 
-    def dispatch(self, request):
+    def dispatch(self, request, send_first=None):
         if not isinstance(request, dict):
             raise Failure("invalid_request", "Request must be an object")
         op = request.get("op")
         if op == "hello":
-            return dict(ok=True, lengths=[], protocol="tak-ssh-1", python_major=sys.version_info.major), []
+            return dict(ok=True, lengths=[], protocol="tak-ssh-1", progressive_open=1, first_pose=1, motion_codecs=1, python_major=sys.version_info.major), []
         if op == "close":
             self.close()
             return dict(ok=True, lengths=[]), []
@@ -591,6 +817,9 @@ class Server:
         source.check(expected if op == "analog" else None)
         maximum = min(maximum, source.reader.size + (64 << 10))
         source.classify(maximum)
+        frames = None
+        streaming = send_first is not None and request.get("progressive") in (1, 2)
+        first_pose = request.get("progressive") == 2
         if op == "open" and source.full_fallback:
             lengths = [len(source.nodes), source.streams["MetaData.dat"].length,
                        source.streams["Channels.dat"].length, source.reader.size - source.tail]
@@ -607,7 +836,14 @@ class Server:
                        source.channel_length(False), source.reader.size - source.tail,
                        source.channel_length(True, headers_only=True)]
             budget(lengths, maximum)
-            blocks = [source.nodes, source.streams["MetaData.dat"].read(0, lengths[1])]
+            meta = source.streams["MetaData.dat"].read(0, lengths[1])
+            if streaming:
+                frames = preview_range(meta, request.get("frame"), maximum)
+                if frames is not None:
+                    records = [row for row in source.records if not row["analog"]]
+                    if first_pose:
+                        send_first_pose(source, meta, records, frames[2], maximum, send_first)
+            blocks = [source.nodes, meta]
             blocks.extend([source.channels(False), source.reader.read(source.tail, lengths[3]),
                            source.channels(True, headers_only=True)])
             header = dict(ok=True, lengths=lengths, identity=source.identity, file_size=source.reader.size,
@@ -634,6 +870,43 @@ class Server:
             header["next_comment_id"] = 0 if source.format == "tak" else 1
         if len(encoded(header)) > REQUEST_LIMIT:
             raise Failure("payload_too_large", "Response header exceeds transport limit")
+        if frames is not None:
+            if first_pose:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    result = progressive_open(source, header, blocks, records, frames, maximum, send_first, pool,
+                                              request.get("marker_encoding") == "pco-axes-1")
+            else:
+                result = progressive_open(source, header, blocks, records, frames, maximum, send_first, None, False)
+            if result is not None:
+                return result
+        if op == "analog" and request.get("codec") == 1:
+            records = [row for row in source.records if row["analog"]]
+            offered = request.get("analog_encodings")
+            grouped = request.get("selection") == "forceplates" and isinstance(offered, list) and "zlib-field-1" in offered
+            encoding = None
+            if grouped:
+                raw = shuffle_channels(blocks[0], records, xor=False)
+                packed = None
+                if "zstd-field-1" in offered and len(raw) >= (256 << 10):
+                    try:
+                        import zstandard
+                        candidate = zstandard.ZstdCompressor(level=3).compress(raw)
+                        if len(candidate) < len(raw):
+                            packed, encoding = candidate, "zstd-field-1"
+                    except Exception:
+                        pass
+                if packed is None:
+                    packed, encoding = zlib.compress(raw, 1), "zlib-field-1"
+            else:
+                packed = zlib.compress(shuffle_channels(blocks[0], records), 6)
+            if len(packed) <= maximum:
+                source.check(expected)
+                packed_header = dict(header, lengths=[len(packed)], expanded_lengths=lengths, codec=1,
+                                     sha256=hashlib.sha256(blocks[0]).hexdigest())
+                if encoding is not None:
+                    packed_header["analog_encoding"] = encoding
+                return packed_header, [packed]
         return header, blocks
 
 
@@ -1300,8 +1573,23 @@ def write_dispatch(server, request):
 def main():
     server = Server()
     input_stream, output = sys.stdin.buffer, sys.stdout.buffer
+    clock = None
+
+    def send_frame(header, blocks):
+        nonlocal clock
+        if clock is not None and header.get("ok"):
+            header = dict(header, server_wall_ms=(time.perf_counter() - clock[0]) * 1000,
+                          server_cpu_ms=(time.process_time() - clock[1]) * 1000)
+        output.write(encoded(header))
+        for block in blocks:
+            output.write(block)
+        output.flush()
+        if clock is not None:
+            clock = time.perf_counter(), time.process_time()
+
     try:
         while True:
+            clock = None
             line = input_stream.readline(REQUEST_LIMIT + 1)
             if not line:
                 break
@@ -1314,17 +1602,15 @@ def main():
                     request = json.loads(line)
                 except (ValueError, UnicodeError):
                     raise Failure("invalid_request", "Invalid JSON request")
-                header, blocks = server.dispatch(request)
+                clock = (time.perf_counter(), time.process_time()) if isinstance(request, dict) and request.get("telemetry") is True else None
+                header, blocks = server.dispatch(request, send_frame)
             except Failure as error:
                 header, blocks = dict(ok=False, error=error.code, message=str(error)), []
             except OSError as error:
                 header, blocks = dict(ok=False, error="io_error", message=str(error)), []
             except (ValueError, KeyError, IndexError, TypeError, struct.error, OverflowError, RecursionError, ET.ParseError, expat.ExpatError) as error:
                 header, blocks = dict(ok=False, error="invalid_file", message=str(error)), []
-            output.write(encoded(header))
-            for block in blocks:
-                output.write(block)
-            output.flush()
+            send_frame(header, blocks)
     finally:
         server.close()
 

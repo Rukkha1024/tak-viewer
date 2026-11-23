@@ -46,6 +46,7 @@ pub struct MarkerView {
     pub span: Option<(i64, i64)>,
     /// Dense positions over `span` (NaN = no sample), display units (metres).
     dense: SharedVec<[f32; 3]>,
+    preview_frames: Option<SharedVec<u32>>,
     pub n_samples: usize,
     pub fill_pct: f32,
     /// Missing ranges inside [start_frame, end_frame] (`src/trajectory.py` `gaps`).
@@ -231,11 +232,15 @@ pub struct ViewData {
     pub analog_pending: bool,
     /// Non-forceplate samples have not been requested / completed yet.
     pub emg_pending: bool,
+    pub ssh_marker_proof: Option<crate::remote::ChannelProof>,
+    pub ssh_plate_proof: Option<crate::remote::ChannelProof>,
     /// Plate geometry index -> original analog manifest index, when structurally verified.
     plate_devices: Option<Vec<usize>>,
     analog_generation: u64,
     /// Marker revision used to build this view; None for the initial read-only display.
     pub edit_revision: Option<Revision>,
+    preview_frame: Option<i64>,
+    first_pose: bool,
     marker_order: Arc<OnceLock<MarkerOrder>>,
 }
 
@@ -293,12 +298,13 @@ pub struct AnalogPart {
     plates: Vec<PlateView>,
     selected: Option<Vec<usize>>,
     initial: bool,
+    pub ssh_plate_proof: Option<crate::remote::ChannelProof>,
 }
 
 impl AnalogPart {
     pub fn prepare(analog: Vec<AnalogDevice>, warning: Option<String>, target: &AnalogTarget) -> AnalogPart {
         let (devices, plates) = analog_views(&analog, &target.plates, target.start, target.end, target.scale, target.plate_devices.as_deref(), target.frame_rate, &target.device_sampling, &target.device_names);
-        AnalogPart { analog, warning, devices, plates, selected: None, initial: true }
+        AnalogPart { analog, warning, devices, plates, selected: None, initial: true, ssh_plate_proof: None }
     }
 
     /// A selective stage carries a complete header manifest; only these indices replace samples.
@@ -377,7 +383,11 @@ impl MarkerView {
         if frame < s || frame > e {
             return None;
         }
-        let p = self.dense[(frame - s) as usize];
+        let i = match &self.preview_frames {
+            Some(frames) => frames.binary_search(&(frame as u32)).ok()?,
+            None => (frame - s) as usize,
+        };
+        let p = self.dense[i];
         if !display_sample_present(&p) {
             None
         } else {
@@ -386,7 +396,12 @@ impl MarkerView {
     }
 
     pub fn present(&self, frame: i64) -> bool {
-        self.position(frame).is_some()
+        if self.preview_frames.is_some() {
+            let i = self.segments.partition_point(|&(_, last)| last < frame);
+            self.segments.get(i).is_some_and(|&(first, _)| first <= frame)
+        } else {
+            self.position(frame).is_some()
+        }
     }
 }
 
@@ -416,7 +431,7 @@ fn union(a: Option<(Vec3, Vec3)>, b: Option<(Vec3, Vec3)>) -> Option<(Vec3, Vec3
     }
 }
 
-fn track(t: &Trajectory, start: i64, end: i64, scale: f32, runs: Option<&SharedVec<(i64, i64)>>) -> Track {
+fn track(t: &Trajectory, start: i64, end: i64, scale: f32, runs: Option<&SharedVec<(i64, i64)>>, preview: bool) -> Track {
     let span = match (t.frames.first(), t.frames.last()) {
         (Some(&a), Some(&b)) => Some((a as i64, b as i64)),
         _ => None,
@@ -424,10 +439,12 @@ fn track(t: &Trajectory, start: i64, end: i64, scale: f32, runs: Option<&SharedV
     let mut dense = Vec::new();
     let mut bounds = None;
     if let Some((s, e)) = span {
-        dense = vec![[f32::NAN; 3]; (e - s + 1) as usize];
+        dense = if preview { Vec::with_capacity(t.frames.len()) }
+            else { vec![[f32::NAN; 3]; (e - s + 1) as usize] };
         for (f, p) in t.frames.iter().zip(&t.xyz) {
             let q = [p[0] * scale, p[1] * scale, p[2] * scale];
-            dense[(*f as i64 - s) as usize] = q;
+            if preview { dense.push(q); }
+            else { dense[(*f as i64 - s) as usize] = q; }
             if q.iter().all(|v| v.is_finite()) {
                 let v = Vec3::from_arr(q);
                 bounds = union(bounds, Some((v, v)));
@@ -442,7 +459,11 @@ fn track(t: &Trajectory, start: i64, end: i64, scale: f32, runs: Option<&SharedV
         cursor = last + 1;
     }
     if cursor <= end { gap_list.push((cursor, end)); }
-    let in_range = t.frames.iter().filter(|&&f| start <= f as i64 && f as i64 <= end).count();
+    let in_range = if preview {
+        segments.iter().map(|&(a, b)| (b - a + 1) as usize).sum()
+    } else {
+        t.frames.iter().filter(|&&f| start <= f as i64 && f as i64 <= end).count()
+    };
     let max_gap = gap_list.iter().map(|(a, b)| b - a + 1).max().unwrap_or(0);
     Track { span, dense: dense.into(), bounds, in_range, gaps: gap_list, max_gap, segments }
 }
@@ -541,10 +562,37 @@ impl ViewData {
     }
 
     pub fn build_with_plate_devices(take: Take, plate_devices: Option<Vec<usize>>) -> ViewData {
-        Self::build_with_previous_markers(take, plate_devices, None)
+        Self::build_with_previous_markers(take, plate_devices, None, None, None)
     }
 
-    fn build_with_previous_markers(take: Take, plate_devices: Option<Vec<usize>>, previous: Option<&Self>) -> ViewData {
+    pub fn build_ssh_preview(take: Take, plate_devices: Option<Vec<usize>>, motion: crate::remote::PreviewMotion) -> ViewData {
+        Self::build_with_previous_markers(take, plate_devices, None, Some(motion), None)
+    }
+
+    pub fn build_ssh_first_pose(take: Take, frame: i64) -> ViewData {
+        Self::build_with_previous_markers(take, None, None, None, Some(frame))
+    }
+
+    pub fn is_first_pose(&self) -> bool { self.first_pose }
+
+    pub fn is_preview(&self) -> bool { self.preview_frame.is_some() }
+
+    pub fn preview_initial_frame(&self) -> Option<i64> { self.preview_frame }
+
+    /// Nearest globally received pose. Keep the playback cursor at the real frame.
+    pub fn display_frame(&self, frame: i64) -> i64 {
+        let Some(requested) = self.preview_frame else { return frame };
+        if self.first_pose { return requested; }
+        use crate::remote::progressive::INTERVAL;
+        let frame = frame.clamp(self.start_frame, self.end_frame);
+        let lo = self.start_frame + (frame - self.start_frame) / INTERVAL * INTERVAL;
+        let hi = lo + INTERVAL;
+        let grid = if hi <= self.end_frame && hi - frame < frame - lo { hi } else { lo };
+        if (requested - frame).abs() < (grid - frame).abs() { requested } else { grid }
+    }
+
+    fn build_with_previous_markers(take: Take, plate_devices: Option<Vec<usize>>, previous: Option<&Self>,
+        preview: Option<crate::remote::PreviewMotion>, pose_frame: Option<i64>) -> ViewData {
         let start = take.start_frame;
         let end = take.end_frame.max(start);
         let frame_count = (end - start + 1) as f32;
@@ -589,10 +637,16 @@ impl ViewData {
         let previous_tracks: HashMap<_, _> = previous.into_iter().flat_map(|data|
             data.markers.iter().map(|marker| (marker.uid, (&data.take.trajectories[marker.traj].frames, &marker.segments)))
         ).collect();
-        let tracks = crate::par::par_map(&take.trajectories, |t| {
-            let runs = previous_tracks.get(&t.uid).filter(|(frames, _)| t.frames.shares_storage(frames)).map(|(_, runs)| *runs);
-            track(t, start, end, scale, runs)
-        });
+        let preview_frame = pose_frame.or_else(|| preview.as_ref().map(|motion| motion.requested));
+        let tracks = if let Some(motion) = preview {
+            let inputs: Vec<_> = take.trajectories.iter().zip(motion.runs.into_iter().map(SharedVec::from)).collect();
+            crate::par::par_map(&inputs, |(t, runs)| track(t, start, end, scale, Some(runs), true))
+        } else {
+            crate::par::par_map(&take.trajectories, |t| {
+                let runs = previous_tracks.get(&t.uid).filter(|(frames, _)| t.frames.shares_storage(frames)).map(|(_, runs)| *runs);
+                track(t, start, end, scale, runs, false)
+            })
+        };
         let mut markers = Vec::with_capacity(take.trajectories.len());
         let mut bounds: Option<(Vec3, Vec3)> = None;
         let mut bounds_all: Option<(Vec3, Vec3)> = None;
@@ -654,10 +708,11 @@ impl ViewData {
                 group,
                 span: tr.span,
                 dense: tr.dense,
-                n_samples: t.frames.len(),
-                fill_pct: tr.in_range as f32 / frame_count * 100.0,
-                gaps: tr.gaps,
-                max_gap: tr.max_gap,
+                preview_frames: preview_frame.map(|_| t.frames.clone()),
+                n_samples: if preview_frame.is_some() { tr.in_range } else { t.frames.len() },
+                fill_pct: if pose_frame.is_some() { f32::NAN } else { tr.in_range as f32 / frame_count * 100.0 },
+                gaps: if pose_frame.is_some() { Vec::new() } else { tr.gaps },
+                max_gap: if pose_frame.is_some() { 0 } else { tr.max_gap },
                 segments: tr.segments,
             });
         }
@@ -770,8 +825,8 @@ impl ViewData {
             .iter()
             .filter(|m| if has_template { m.kind == MarkerKind::Template } else { !matches!(m.kind, MarkerKind::Unlabeled | MarkerKind::Unknown) })
             .collect();
-        let mut occlusion = vec![0.0f32; n];
-        if !labeled.is_empty() {
+        let mut occlusion = if pose_frame.is_some() { Vec::new() } else { vec![0.0f32; n] };
+        if !occlusion.is_empty() && !labeled.is_empty() {
             let mut missing = vec![0u32; n];
             for m in &labeled {
                 for &(a, b) in &m.gaps {
@@ -786,6 +841,16 @@ impl ViewData {
             }
         }
 
+        let mut scene_bounds = robust.or(bounds).or(bounds_all);
+        if pose_frame.is_some() && scene_bounds.is_some() {
+            // Keep the plate area in view when the initial pose is elsewhere on the walkway.
+            // Nodes already provides the corners without an analog sample read.
+            for corner in plates.iter().flat_map(|plate| plate.corners) {
+                if corner.is_finite() {
+                    scene_bounds = union(scene_bounds, Some((corner, corner)));
+                }
+            }
+        }
         ViewData {
             markers,
             groups,
@@ -793,16 +858,20 @@ impl ViewData {
             plates,
             devices,
             unit_scale: scale,
-            bounds: robust.or(bounds).or(bounds_all),
+            bounds: scene_bounds,
             start_frame: start,
             end_frame: end,
             occlusion: occlusion.into(),
             take,
             analog_pending: false,
             emg_pending: false,
+            ssh_marker_proof: None,
+            ssh_plate_proof: None,
             plate_devices,
             analog_generation: 0,
             edit_revision: None,
+            preview_frame,
+            first_pose: pose_frame.is_some(),
             marker_order: Arc::new(OnceLock::new()),
         }
     }
@@ -869,7 +938,7 @@ impl ViewData {
             tracks.push(trajectory);
         }
         take.trajectories = tracks;
-        let mut view = ViewData::build_with_previous_markers(take, plate_devices, previous);
+        let mut view = ViewData::build_with_previous_markers(take, plate_devices, previous, None, None);
         view.edit_revision = Some(snapshot.revision());
         Ok(view)
     }
@@ -900,6 +969,9 @@ impl ViewData {
     pub fn swap_prepared(&mut self, mut part: AnalogPart) -> AnalogPart {
         self.analog_generation = self.analog_generation.wrapping_add(1);
         self.take.warnings.extend(part.warning.take());
+        if let Some(proof) = part.ssh_plate_proof.take() {
+            self.ssh_plate_proof = Some(proof);
+        }
         if part.initial { self.analog_pending = false; }
         if !part.initial || part.selected.is_none() { self.emg_pending = false; }
         if let Some(selected) = &part.selected {
@@ -925,6 +997,7 @@ impl ViewData {
                 plates: std::mem::replace(&mut self.plates, part.plates),
                 selected: None,
                 initial: true,
+                ssh_plate_proof: None,
             }
         }
     }

@@ -12,7 +12,8 @@ const MAX_HEADER: usize = 1 << 20;
 const MAX_STDERR: usize = 16 << 10;
 const POLL: Duration = Duration::from_millis(10);
 const BOOTSTRAP: &str = "import json,os,sys; m=__import__('msvcrt') if os.name=='nt' else None; m.setmode(sys.stdin.fileno(),os.O_BINARY) if m else None; m.setmode(sys.stdout.fileno(),os.O_BINARY) if m else None; p=json.loads(sys.stdin.buffer.readline()); exec(p['helper_source'].lstrip(chr(65279)))";
-type Frame = (Value, Vec<Vec<u8>>);
+pub(super) type Frame = (Value, Vec<Vec<u8>>);
+type TimedFrame = (Frame, Option<Instant>);
 
 #[cfg(test)]
 // Observe logical response poll intervals. A test can signal expiration of its fake clock.
@@ -21,6 +22,14 @@ type ResponsePoll = Box<dyn FnMut(Duration) -> Option<Instant> + Send>;
 /// Keep session decoding testable without a network or a subprocess.
 pub(super) trait Connection: Send {
     fn request(&mut self, request: Value, cancel: &CancelToken) -> Result<Frame, String>;
+
+    fn followup(&mut self, _source_size: u64, _cancel: &CancelToken) -> Result<Frame, String> {
+        Err("SSH transport cannot read a second packet".into())
+    }
+
+    fn abort(&mut self) {}
+    fn enable_packet_timing(&mut self) {}
+    fn first_byte(&self) -> Option<Instant> { None }
 
     fn received_bytes(&self) -> u64 { 0 }
     fn received_counter(&self) -> Option<Arc<AtomicU64>> { None }
@@ -47,11 +56,13 @@ pub(super) struct Transport {
     child: Child,
     writes: Option<mpsc::SyncSender<Vec<u8>>>,
     written: mpsc::Receiver<Result<(), String>>,
-    frames: Option<mpsc::Receiver<Result<Frame, String>>>,
+    frames: Option<mpsc::Receiver<Result<TimedFrame, String>>>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     stderr_done: mpsc::Receiver<()>,
     connect_deadline: Instant,
-    reads: Option<mpsc::SyncSender<PayloadLimit>>,
+    reads: Option<mpsc::SyncSender<(PayloadLimit, bool)>>,
+    timestamp_packets: bool,
+    first_byte: Option<Instant>,
     closed: bool,
     received: Arc<AtomicU64>,
     #[cfg(test)]
@@ -169,8 +180,15 @@ impl Transport {
         let counter = received.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(CountingRead(stdout, counter));
-            while let Ok(limit) = pending_reads.recv() {
-                let frame = read_frame_limited(&mut reader, max_payload, limit);
+            while let Ok((limit, timing)) = pending_reads.recv() {
+                let frame = (|| {
+                    let first_byte = if timing && !reader.fill_buf().map_err(|e| format!("Read SSH response: {e}"))?.is_empty() {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    Ok((read_frame_limited(&mut reader, max_payload, limit)?, first_byte))
+                })();
                 let failed = frame.is_err();
                 if response.send(frame).is_err() || failed {
                     break;
@@ -205,6 +223,8 @@ impl Transport {
             stderr_done,
             connect_deadline,
             reads: Some(reads),
+            timestamp_packets: false,
+            first_byte: None,
             closed: false,
             received,
             #[cfg(test)]
@@ -234,15 +254,21 @@ impl Transport {
             return Err("SSH transport is closed".into());
         }
         let limit = PayloadLimit::for_request(&request)?;
+        self.receive(limit, Some(request), cancel, deadline)
+    }
+
+    fn receive(&mut self, limit: PayloadLimit, request: Option<Value>, cancel: &CancelToken, deadline: Option<Instant>) -> Result<Frame, String> {
+        if self.closed { return Err("SSH transport is closed".into()); }
         let result = self.reads.as_ref().ok_or("SSH transport is closed".to_string())
-            .and_then(|reads| reads.try_send(limit).map_err(|_| "SSH response reader unavailable".to_string()))
-            .and_then(|()| self.send(request, cancel, deadline))
+            .and_then(|reads| reads.try_send((limit, self.timestamp_packets)).map_err(|_| "SSH response reader unavailable".to_string()))
+            .and_then(|()| request.map_or(Ok(()), |request| self.send(request, cancel, deadline)))
             .and_then(|()| wait(self.frames.as_ref().unwrap(), cancel, deadline, &mut self.child,
                 #[cfg(test)]
                 self.response_poll.as_mut(),
             )?);
         match result {
-            Ok((header, buffers)) => {
+            Ok(((header, buffers), first_byte)) => {
+                self.first_byte = first_byte;
                 if header["ok"] == false {
                     let kind = header["error"].as_str().unwrap_or("remote_error");
                     let message = header["message"]
@@ -323,11 +349,18 @@ impl<R: Read> Read for CountingRead<R> {
 }
 
 impl Connection for Transport {
+    fn enable_packet_timing(&mut self) { self.timestamp_packets = true; }
+    fn first_byte(&self) -> Option<Instant> { self.first_byte }
     fn received_bytes(&self) -> u64 { self.received.load(Ordering::Relaxed) }
     fn received_counter(&self) -> Option<Arc<AtomicU64>> { Some(self.received.clone()) }
     fn request(&mut self, request: Value, cancel: &CancelToken) -> Result<Frame, String> {
         Transport::request(self, request, cancel)
     }
+
+    fn followup(&mut self, source_size: u64, cancel: &CancelToken) -> Result<Frame, String> {
+        self.receive(PayloadLimit::Analog(source_size), None, cancel, None)
+    }
+    fn abort(&mut self) { self.shutdown(); }
 
     fn is_alive(&mut self) -> bool {
         !self.closed && matches!(self.child.try_wait(), Ok(None))
@@ -497,6 +530,13 @@ fn read_frame_limited<R: BufRead>(reader: &mut R, max_payload: usize, limit: Pay
     let lengths = header["lengths"]
         .as_array()
         .ok_or("SSH response is missing lengths")?;
+    if header.get("expanded_lengths").is_some() {
+        super::progressive::expanded_sizes(&header, lengths.len(), max_payload)?;
+    }
+    if header.get("exact_bytes").is_some() {
+        super::progressive::size(&header["exact_bytes"], max_payload)?;
+        super::progressive::size(&header["remainder_bytes"], max_payload)?;
+    }
     let mut total = 0usize;
     let mut sizes = Vec::with_capacity(lengths.len());
     for length in lengths {

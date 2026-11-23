@@ -204,6 +204,15 @@ fn noise(n: usize, seed: u32) -> Vec<u8> {
 /// A TAK with 3 markers (one with a gap), 2 analog channels, a camera record and the other
 /// streams of a real TAK, in a real TAK's order.
 pub fn sample_tak() -> Vec<u8> {
+    sample_tak_frames(0, 50..60)
+}
+
+#[cfg(test)]
+pub(crate) fn sample_tak_for_ssh_preview() -> Vec<u8> {
+    sample_tak_frames(1, 2..4)
+}
+
+fn sample_tak_frames(first_sample: u32, short: std::ops::Range<u32>) -> Vec<u8> {
     let mut nodes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     for (name, uid) in [("LKNE", 1u8), ("RKNE", 2), ("Unl", 3)] {
         nodes.extend(marker_node(name, uid));
@@ -217,9 +226,9 @@ pub fn sample_tak() -> Vec<u8> {
     let recs = [
         analog(0, 300),
         analog(1, 300),
-        translation(1, 0..300),
-        translation(2, (0..300).filter(|f| !(100..140).contains(f))),
-        translation(3, 50..60),
+        translation(1, first_sample..300),
+        translation(2, (first_sample..300).filter(|f| !(100..140).contains(f))),
+        translation(3, short),
     ];
     let mut channels = CHANNELS_HEADER.to_vec();
     channels.extend((recs.len() as u32).to_le_bytes());

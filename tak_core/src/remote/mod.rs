@@ -1,6 +1,8 @@
 //! Memory-only SSH reads and server-side TAKM patches. Identity stays separate from local paths.
 //! Complete markers are returned before analog; failed retries never replace loaded data.
 mod transport;
+pub(crate) mod progressive;
+pub use progressive::PreviewMotion;
 mod command;
 mod write;
 pub use write::{RemoteEditStreams, RemoteProgress, RemoteWriteOutcome};
@@ -115,6 +117,8 @@ pub struct RemoteTake {
     fallback_reason: Option<String>,
     initial_read: bool,
     channel_manifest: Vec<Vec<(String, String, usize)>>,
+    pub marker_proof: Option<ChannelProof>,
+    pub plate_proof: Option<ChannelProof>,
 }
 impl RemoteTake {
     pub fn analog_pending(&self) -> bool {
@@ -139,11 +143,58 @@ impl RemoteTake {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum ReadMoment {
+    OpenRequested,
+    FirstPose,
+    FirstPacket,
+    Remainder,
+    AnalogRequested,
+    AnalogPacket,
+}
+
+/// Display-only data published while a staged SSH open is in progress.
+pub enum RemoteStage {
+    FirstPose(Take, i64),
+    Preview(RemoteTake, PreviewMotion),
+}
+
+/// Proof from the actual decoded channel block on a read with timeline telemetry enabled.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChannelProof {
+    pub sha256: String,
+    pub samples: usize,
+}
+
+impl ChannelProof {
+    fn decoded(bytes: &[u8], rows: &[crate::tak::channels::ChannelRecord], verified_sha: Option<&str>) -> Self {
+        Self {
+            sha256: verified_sha.map_or_else(|| progressive::sha256(bytes), str::to_owned),
+            samples: rows.iter().map(|row| row.n_samples).sum(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ReadReceipt {
+    pub bytes: usize,
+    pub codec: Option<String>,
+    pub server_wall_ms: Option<f64>,
+    pub server_cpu_ms: Option<f64>,
+    pub first_byte: Option<std::time::Instant>,
+}
+
+type ReadObserver = std::sync::Arc<dyn Fn(ReadMoment, ReadReceipt) + Send + Sync>;
+
 pub struct RemoteSession {
     host: String,
     config: RemoteConfig,
     transport: Box<dyn transport::Connection>,
     python_command: String,
+    progressive: bool,
+    first_pose: bool,
+    motion_codecs: bool,
+    read_observer: Option<ReadObserver>,
 }
 impl RemoteSession {
     pub fn connect(host: &str, platform: &str, config: RemoteConfig) -> Result<Self> {
@@ -175,7 +226,7 @@ impl RemoteSession {
             "windows" => &config.windows_python,
             _ => return Err("remote platform must be linux or windows".into()),
         };
-        let (python_command, transport) = command::discover(command::candidates(platform, python, remembered)?, cancel, |python| {
+        let (python_command, (transport, progressive, first_pose, motion_codecs)) = command::discover(command::candidates(platform, python, remembered)?, cancel, |python| {
             let mut transport = transport::Transport::connect_cancellable(
                 host, platform, python,
                 Duration::from_secs(config.connect_timeout_seconds),
@@ -185,9 +236,35 @@ impl RemoteSession {
             if hello["protocol"] != "tak-ssh-1" || hello["python_major"] != 3 || !blocks.is_empty() {
                 return Err("Invalid Python 3 helper handshake".into());
             }
-            Ok(transport)
+            Ok((transport, hello["progressive_open"] == 1, hello["first_pose"] == 1, hello["motion_codecs"] == 1))
         })?;
-        Ok(Self { host: host.into(), config, transport: Box::new(transport), python_command })
+        Ok(Self { host: host.into(), config, transport: Box::new(transport), python_command, progressive, first_pose, motion_codecs, read_observer: None })
+    }
+
+    pub fn observe_reads(&mut self, observer: ReadObserver) {
+        self.transport.enable_packet_timing();
+        self.read_observer = Some(observer);
+    }
+
+    fn record_request(&self, moment: ReadMoment) {
+        if let Some(observer) = &self.read_observer {
+            observer(moment, ReadReceipt::default());
+        }
+    }
+
+    fn record_packet(&self, moment: ReadMoment, header: &Value, blocks: &[Vec<u8>]) {
+        if let Some(observer) = &self.read_observer {
+            let ms = |key| header[key].as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0);
+            let codec = header["marker_encoding"].as_str().or_else(|| header["analog_encoding"].as_str())
+                .unwrap_or(if header["expanded_lengths"].is_array() { "zlib" } else { "raw" });
+            observer(moment, ReadReceipt {
+                bytes: blocks.iter().map(Vec::len).sum(),
+                codec: Some(codec.into()),
+                server_wall_ms: ms("server_wall_ms"),
+                server_cpu_ms: ms("server_cpu_ms"),
+                first_byte: self.transport.first_byte(),
+            });
+        }
     }
 
     pub fn python_command(&self) -> &str { &self.python_command }
@@ -205,11 +282,151 @@ impl RemoteSession {
         Ok(header)
     }
     pub fn open(&mut self, path: &str, cancel: &CancelToken) -> Result<RemoteTake> {
-        let (header, mut blocks) = self.transport.request(json!({"op":"open","path":path,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes}), cancel)?;
+        let request = self.open_request(path);
+        self.record_request(ReadMoment::OpenRequested);
+        let (header, blocks) = self.transport.request(request, cancel)?;
+        self.record_packet(ReadMoment::FirstPacket, &header, &blocks);
+        self.decode_open(path, &header, blocks, true, None, cancel)
+    }
+
+    fn open_request(&self, path: &str) -> Value {
+        let mut request = json!({"op":"open","path":path,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes});
+        if self.read_observer.is_some() { request["telemetry"] = json!(true); }
+        request
+    }
+
+    /// Publish each display-only stage on the worker. Only the return value is exact.
+    pub fn open_staged(&mut self, path: &str, frame: Option<i64>, cancel: &CancelToken,
+        mut publish: impl FnMut(RemoteStage)) -> Result<RemoteTake> {
+        if !self.progressive { return self.open(path, cancel); }
+        let result = self.read_staged(path, frame, cancel, &mut publish);
+        if result.is_err() { self.transport.abort(); }
+        result
+    }
+
+    #[cfg(test)]
+    fn open_progressive(&mut self, path: &str, frame: Option<i64>, cancel: &CancelToken,
+        mut preview: impl FnMut(RemoteTake, PreviewMotion)) -> Result<RemoteTake> {
+        self.open_staged(path, frame, cancel, |stage| {
+            if let RemoteStage::Preview(take, motion) = stage { preview(take, motion); }
+        })
+    }
+
+    fn read_staged(&mut self, path: &str, frame: Option<i64>, cancel: &CancelToken,
+        publish: &mut impl FnMut(RemoteStage)) -> Result<RemoteTake> {
+        let mut request = self.open_request(path);
+        request["progressive"] = json!(if self.first_pose { 2 } else { 1 });
+        request["frame"] = json!(frame);
+        if self.first_pose && self.motion_codecs { request["marker_encoding"] = json!("pco-axes-1"); }
+        self.record_request(ReadMoment::OpenRequested);
+        let (mut header, mut blocks) = self.transport.request(request, cancel)?;
+        if header.get("first_pose").is_some() {
+            self.record_packet(ReadMoment::FirstPose, &header, &blocks);
+            if !self.first_pose || header["first_pose"] != 1 {
+                return Err("Unknown SSH first pose version".into());
+            }
+            let identity = source_identity(&header)?;
+            let size = header["file_size"].as_u64().filter(|n| identity[2].as_u64() == Some(*n))
+                .ok_or("Invalid SSH first pose source size")?;
+            let limit = progressive::payload_limit(size, self.config.maximum_payload_bytes)?;
+            let pose_frame = header["frame"].as_i64().ok_or("Missing SSH first pose frame")?;
+            let raw = progressive::expand((header, blocks), 3, limit)?;
+            let take = crate::tak::decode_markers(Path::new(path), size as usize, &raw[0], &raw[2], &raw[1], false)
+                .map_err(|e| e.to_string())?;
+            if !(0 <= take.start_frame && take.start_frame <= pose_frame && pose_frame <= take.end_frame
+                && take.end_frame <= i64::from(u32::MAX) && take.end_frame - take.start_frame + 1 <= (limit / 8) as i64)
+                || pose_frame != frame.filter(|f| (take.start_frame..=take.end_frame).contains(f)).unwrap_or(take.start_frame)
+                || take.trajectories.iter().any(|t| t.frames.len() > 1
+                    || t.frames.first().is_some_and(|&f| i64::from(f) != pose_frame))
+            {
+                return Err("Invalid SSH first pose samples".into());
+            }
+            if cancel.is_cancelled() { return Err("cancelled".into()); }
+            publish(RemoteStage::FirstPose(take, pose_frame));
+            if cancel.is_cancelled() { return Err("cancelled".into()); }
+            (header, blocks) = self.transport.followup(size, cancel)?;
+            if source_identity(&header)? != identity || header["file_size"].as_u64() != Some(size)
+                || (header.get("progressive").is_some() && header["frame"].as_i64() != Some(pose_frame))
+            {
+                return Err("source_changed: SSH preview belongs to another open".into());
+            }
+        }
+        self.record_packet(ReadMoment::FirstPacket, &header, &blocks);
+        if header.get("progressive").is_none() {
+            return self.decode_open(path, &header, blocks, true, None, cancel);
+        }
+        self.finish_progressive(path, header, blocks, cancel, publish)
+    }
+
+    fn marker_is_pco(&self, header: &Value) -> Result<bool> {
+        match header.get("marker_encoding") {
+            None => Ok(false),
+            Some(encoding) if self.first_pose && self.motion_codecs && encoding == "pco-axes-1" => Ok(true),
+            _ => Err("Unknown SSH marker encoding".into()),
+        }
+    }
+
+    fn finish_progressive(&mut self, path: &str, header: Value, blocks: Vec<Vec<u8>>, cancel: &CancelToken,
+        publish: &mut impl FnMut(RemoteStage)) -> Result<RemoteTake> {
+        if header["progressive"] != 1 { return Err("Unknown SSH progressive packet version".into()); }
+        let source_size = header["file_size"].as_u64().ok_or("Missing SSH source size")?;
+        let identity = source_identity(&header)?;
+        let limit = progressive::payload_limit(source_size, self.config.maximum_payload_bytes)?;
+        let exact_bytes = progressive::size(&header["exact_bytes"], limit)?;
+        let remainder_bytes = progressive::size(&header["remainder_bytes"], limit)?;
+        let requested = header["frame"].as_i64().ok_or("Missing SSH preview frame")?;
+        let preview_pco = self.marker_is_pco(&header)?;
+        let mut blocks = progressive::expand_pco((header.clone(), blocks), 6, limit, preview_pco.then_some(2))?;
+        let presence = blocks.pop().unwrap();
+        let marker_bytes = std::mem::take(&mut blocks[2]);
+        let props = crate::tak::metadata::parse_properties(&blocks[1]).map_err(|e| e.to_string())?;
+        let frame = |key: &str| props.iter().find(|(name, _)| name == key)
+            .ok_or_else(|| format!("Missing SSH metadata {key}"))
+            .and_then(|(_, v)| crate::tak::metadata::python_int(v).map_err(|e| e.to_string()));
+        let (first, last) = (frame("StartFrame")?, frame("EndFrame")?);
+        if !(0 <= first && first <= requested && requested <= last && last <= i64::from(u32::MAX))
+            || last - first + 1 > (limit / 8) as i64 {
+            return Err("Invalid SSH preview frame range".into());
+        }
+        let channels = progressive::PreviewChannels::decode(marker_bytes, &presence, requested, (first, last), preview_pco)?;
+        blocks[2] = channels.bytes().to_vec();
+        let early = self.decode_open(path, &header, blocks.clone(), false, None, cancel)?;
+        let motion = channels.motion(&early.take)?;
+        publish(RemoteStage::Preview(early, motion));
+        if cancel.is_cancelled() { return Err("cancelled".into()); }
+        let (next, packed) = self.transport.followup(source_size, cancel)?;
+        self.record_packet(ReadMoment::Remainder, &next, &packed);
+        if next["progressive"] != 1 || source_identity(&next)? != identity {
+            return Err("source_changed: SSH remainder belongs to another open".into());
+        }
+        let tail_pco = self.marker_is_pco(&next)?;
+        let parts = if tail_pco { 1 } else {
+            match header.get("remainder_parts") {
+                None => 1,
+                Some(n) if n == 1 => 1,
+                Some(n) if self.first_pose && n == 4 => 4,
+                _ => return Err("Invalid SSH remainder part count".into()),
+            }
+        };
+        if progressive::expanded_sizes(&next, parts, limit)?.iter().sum::<usize>() != remainder_bytes {
+            return Err("SSH remainder length differs from preview".into());
+        }
+        let mut expanded = progressive::expand_pco((next, packed), parts, limit, tail_pco.then_some(0))?.into_iter();
+        let mut tail = expanded.next().unwrap();
+        if parts > 1 {
+            tail.try_reserve_exact(remainder_bytes - tail.len()).map_err(|_| "Cannot allocate SSH remainder")?;
+            for part in expanded { tail.extend(part); }
+        }
+        blocks[2] = channels.merge(tail, exact_bytes, tail_pco)?;
+        progressive::verify_digest(&blocks[2], &header["exact_sha256"])?;
+        self.decode_open(path, &header, blocks, true, header["exact_sha256"].as_str(), cancel)
+    }
+
+    fn decode_open(&self, path: &str, header: &Value, mut blocks: Vec<Vec<u8>>, exact: bool, verified_sha: Option<&str>, cancel: &CancelToken) -> Result<RemoteTake> {
         if !matches!(blocks.len(), 4 | 5) {
             return Err("Invalid marker response: expected four or five blocks".into());
         }
-        let identity = source_identity(&header)?;
+        let identity = source_identity(header)?;
         let file_size = header["file_size"]
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
@@ -226,7 +443,7 @@ impl RemoteSession {
             &blocks[0],
             &blocks[2],
             &blocks[1],
-            true,
+            exact,
         )
         .map_err(|e| e.to_string())?;
         if cancel.is_cancelled() {
@@ -238,10 +455,8 @@ impl RemoteSession {
             .iter()
             .map(|v| v.as_bool().ok_or("Invalid channel order".to_string()))
             .collect::<Result<Vec<_>>>()?;
-        let nonanalog_count = crate::tak::channels::iter_channel_inventory(&blocks[2])
-            .map_err(|e| e.to_string())?
-            .len();
-        if channel_order.iter().filter(|v| !**v).count() != nonanalog_count
+        let inventory = progressive::inventory(&blocks[2])?;
+        if channel_order.iter().filter(|v| !**v).count() != inventory.len()
             || channel_order.iter().any(|v| *v) != analog_pending
         {
             return Err("Invalid channel order".into());
@@ -293,22 +508,27 @@ impl RemoteSession {
         }
         // Ambiguous-device fallback returns complete channels for display. Keep only the
         // marker/non-device records in the edit payload; the server preserves analog bytes.
-        let edit_inventory = crate::tak::channels::iter_channel_inventory(&blocks[2]).map_err(|e| e.to_string())?;
-        let edit_records: Vec<_> = edit_inventory.iter().filter(|r| !r.name.starts_with("AnalogChannel")).collect();
-        let mut edit_channels = crate::tak::channels::CHANNELS_HEADER.to_vec();
-        edit_channels.extend_from_slice(&(edit_records.len() as u32).to_le_bytes());
-        for row in edit_records { edit_channels.extend_from_slice(&blocks[2][row.start..row.end]); }
-        let edit_streams = RemoteEditStreams { nodes: blocks[0].clone().into(), channels: edit_channels.into(), metadata: blocks[1].clone().into() };
+        let edit_streams = if exact {
+            let edit_records: Vec<_> = inventory.iter().filter(|r| !r.name.starts_with("AnalogChannel")).collect();
+            let mut edit_channels = crate::tak::channels::CHANNELS_HEADER.to_vec();
+            edit_channels.extend_from_slice(&(edit_records.len() as u32).to_le_bytes());
+            for row in edit_records { edit_channels.extend_from_slice(&blocks[2][row.start..row.end]); }
+            RemoteEditStreams { nodes: blocks[0].clone().into(), channels: edit_channels.into(), metadata: blocks[1].clone().into() }
+        } else {
+            RemoteEditStreams { nodes: Vec::new().into(), channels: Vec::new().into(), metadata: Vec::new().into() }
+        };
         let fixed_len = header["fixed_len"].as_u64().unwrap_or(file_size as u64);
         let next_comment_id = header["next_comment_id"].as_u64().unwrap_or(if header["format"] == "tak" { 0 } else { 1 });
         let comments = std::mem::take(&mut blocks[3]);
-        let mut marker_channels = if analog_pending {
+        let marker_proof = (exact && self.read_observer.is_some())
+            .then(|| ChannelProof::decoded(&blocks[2], &inventory, verified_sha));
+        let mut marker_channels = if analog_pending && exact {
             std::mem::take(&mut blocks[2])
         } else {
             Vec::new()
         };
         if !analog_pending { channel_order = Vec::new(); }
-        if analog_pending && device_types.as_ref().is_some_and(|kinds| !kinds.contains(&2)) {
+        if exact && analog_pending && device_types.as_ref().is_some_and(|kinds| !kinds.contains(&2)) {
             let (_, warning) = crate::tak::decode_analog(&marker_channels);
             take.warnings.extend(warning);
             marker_channels = Vec::new();
@@ -335,6 +555,8 @@ impl RemoteSession {
             fallback_reason,
             initial_read: false,
             channel_manifest,
+            marker_proof,
+            plate_proof: None,
         })
     }
     /// Startup stage: forceplate samples only, or the previous full read on ambiguity.
@@ -358,7 +580,14 @@ impl RemoteSession {
         if !loaded.analog_pending {
             return Ok(());
         }
-        let (header, blocks) = self.transport.request(json!({"op":"analog","selection":selection,"path":loaded.source.path,"expected_identity":loaded.source.identity,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes}), cancel)?;
+        self.record_request(ReadMoment::AnalogRequested);
+        let mut request = json!({"op":"analog","codec":u8::from(self.progressive),"selection":selection,"path":loaded.source.path,"expected_identity":loaded.source.identity,"max_bytes":self.config.maximum_payload_bytes,"probe_bytes":self.config.probe_bytes});
+        if self.read_observer.is_some() { request["telemetry"] = json!(true); }
+        if self.motion_codecs && selection == "forceplates" {
+            request["analog_encodings"] = json!(["zstd-field-1", "zlib-field-1"]);
+        }
+        let (header, blocks) = self.transport.request(request, cancel)?;
+        self.record_packet(ReadMoment::AnalogPacket, &header, &blocks);
         if blocks.len() != 1 {
             return Err("Invalid analog response: expected one block".into());
         }
@@ -368,6 +597,34 @@ impl RemoteSession {
         if cancel.is_cancelled() {
             return Err("SSH request cancelled".into());
         }
+        let blocks = if header.get("codec").is_some() {
+            if !self.progressive || header["codec"] != 1 { return Err("Unknown SSH analog codec".into()); }
+            let limit = progressive::payload_limit(loaded.source.identity[2].as_u64().ok_or("Missing SSH source size")?,
+                self.config.maximum_payload_bytes)?;
+            let named = header.get("analog_encoding");
+            let mut raw = match named {
+                Some(encoding) if self.motion_codecs && selection == "forceplates" && encoding == "zstd-field-1" => {
+                    progressive::expand_zstd((header.clone(), blocks), limit)?
+                }
+                Some(encoding) if self.motion_codecs && selection == "forceplates" && encoding == "zlib-field-1" => {
+                    progressive::expand((header.clone(), blocks), 1, limit)?.pop().unwrap()
+                }
+                None => progressive::expand((header.clone(), blocks), 1, limit)?.pop().unwrap(),
+                _ => return Err("Unknown SSH analog encoding".into()),
+            };
+            progressive::restore_grouped(&mut raw, named.is_none())?;
+            progressive::verify_digest(&raw, &header["sha256"])?;
+            vec![raw]
+        } else {
+            blocks
+        };
+        let plate_proof = if self.read_observer.is_some() && selection != "non_forceplates" && !loaded.take.plates.is_empty() {
+            let rows = progressive::inventory(&blocks[0])?;
+            let sha = header.get("codec").and_then(|_| header["sha256"].as_str());
+            Some(ChannelProof::decoded(&blocks[0], &rows, sha))
+        } else {
+            None
+        };
         let restored;
         let channels = if loaded.marker_channels.is_empty() && loaded.channel_order.is_empty() {
             &blocks[0]
@@ -400,6 +657,7 @@ impl RemoteSession {
             }
         }
         loaded.take.analog = analog;
+        loaded.plate_proof = plate_proof;
         loaded.take.warnings.extend(warning);
         loaded.initial_read = true;
         loaded.analog_pending = selection == "forceplates" && loaded.device_types.as_ref().is_some_and(|kinds| kinds.contains(&1));

@@ -44,6 +44,7 @@ mod label_increment;
 mod marker_order;
 mod ssh;
 mod ssh_probe;
+mod ssh_timeline;
 mod ssh_progress_probe;
 mod soft_render;
 mod take_progress;
@@ -367,7 +368,8 @@ fn usage() -> String {
         tak_core::takm::verify::USAGE,
         check_command::USAGE,
         tak_core::dump::USAGE,
-        "tak_viewer --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]\ntak_viewer --headless --ssh-open ALIAS --ssh-path FILE --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]\n  --ssh-cancel-after-ms N   --ssh-stall-cancel-after-ms N   --ssh-dump OUT.json\n  --ssh-markers-only   --ssh-comment TEXT   --ssh-label unlabel   --ssh-save\ntak_viewer --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--ssh-workspace-expand]\nLocal SSH demo screenshot: --ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress",
+        "tak_viewer --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]\ntak_viewer --headless --ssh-open ALIAS --ssh-path FILE --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]\n  --ssh-timeline OUT.json   --ssh-milestone-shots NEW_DIR
+  --ssh-cancel-after-ms N   --ssh-stall-cancel-after-ms N   --ssh-dump OUT.json\n  --ssh-markers-only   --ssh-comment TEXT   --ssh-label unlabel   --ssh-save\ntak_viewer --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot OUT.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--ssh-workspace-expand]\nLocal SSH demo screenshot: --ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress",
     ]
     .join("\n\n")
 }

@@ -36,6 +36,10 @@ mod tests {
         RemoteSession {
             host: "test".into(),
             python_command: "python3".into(),
+            progressive: false,
+            first_pose: false,
+            motion_codecs: false,
+            read_observer: None,
             transport: Box::new(
                 transport::Transport::local_python(
                     test_python(),
@@ -46,6 +50,205 @@ mod tests {
                 .unwrap(),
             ),
             config,
+        }
+    }
+
+    #[test]
+    fn progressive_helper_matches_old_open_and_analog_bytes_with_takm_comments() {
+        let fixture = Fixture::new(true);
+        let path = fixture.0.to_str().unwrap();
+        let source_tak = crate::sample_tak::sample_tak_for_ssh_preview();
+        let mut takm = Vec::new();
+        crate::takm::write(&mut takm, &source_tak, "sample.tak", "test").unwrap();
+        std::fs::write(path, takm).unwrap();
+        let mut session = session();
+        let cancel = CancelToken::default();
+        let first = session.open(path, &cancel).unwrap();
+        session.append(&first.source, &[write_event(1)], &cancel).unwrap();
+
+        let receipts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = receipts.clone();
+        session.observe_reads(std::sync::Arc::new(move |moment, receipt| {
+            events.lock().unwrap().push((moment, receipt));
+        }));
+        let mut legacy = session.open(path, &cancel).unwrap();
+        let expected = legacy.edit_streams.channels.clone();
+        let comments = legacy.comments.clone();
+        assert_eq!(crate::comments::parse(&String::from_utf8_lossy(&comments)).comments().list().len(), 1);
+        session.read_analog(&mut legacy, &cancel).unwrap();
+        let analog = verification_data(&legacy.take)["analog_samples"].clone();
+
+        session.progressive = true;
+        session.motion_codecs = true;
+        let mut displayed = None;
+        let mut loaded = session.open_progressive(path, Some(13), &cancel, |snapshot, motion| {
+            assert_eq!(snapshot.comments, comments);
+            let data = crate::view_data::ViewData::build_ssh_preview(snapshot.take, None, motion);
+            assert_eq!(data.display_frame(13), 13);
+            assert_eq!(data.display_frame(14), 13);
+            assert_eq!(data.display_frame(16), 16);
+            let short = &data.markers[2];
+            assert_eq!(short.n_samples, 2);
+            assert!(short.present(2) && short.present(3));
+            assert!(short.position(0).is_none() && short.position(2).is_none());
+            assert_eq!(short.gaps, [(0, 1), (4, 299)]);
+            assert!(data.markers[0].position(13).is_some());
+            assert!(data.markers.iter().all(|m| m.position(0).is_none()));
+            displayed = Some(data);
+        }).unwrap();
+        assert!(displayed.is_some());
+        assert_eq!(loaded.edit_streams.channels.as_ref(), expected.as_ref());
+        let proof = loaded.marker_proof.as_ref().unwrap();
+        assert_eq!(proof.sha256, progressive::sha256(&expected));
+        assert_eq!(proof.samples, progressive::inventory(&expected).unwrap().iter().map(|row| row.n_samples).sum::<usize>());
+        assert_eq!(loaded.comments, comments);
+        assert_eq!(verification_data(&loaded.take)["marker_samples"], verification_data(&legacy.take)["marker_samples"]);
+        assert_eq!(&displayed.unwrap().occlusion[..], &crate::view_data::ViewData::build(loaded.take.clone()).occlusion[..]);
+        session.read_analog(&mut loaded, &cancel).unwrap();
+        assert_eq!(verification_data(&loaded.take)["analog_samples"], analog);
+        if let Some(legacy_proof) = legacy.plate_proof {
+            let plate_proof = loaded.plate_proof.expect("analog install proof");
+            assert_eq!(plate_proof.sha256, legacy_proof.sha256);
+            assert_eq!(plate_proof.samples, legacy_proof.samples);
+        }
+        let receipts = receipts.lock().unwrap();
+        for (_, packet) in receipts.iter().filter(|(_, receipt)| receipt.bytes != 0) {
+            assert!(packet.server_wall_ms.is_some() && packet.server_cpu_ms.is_some() && packet.first_byte.is_some());
+        }
+    }
+
+    #[test]
+    fn first_pose_helper_keeps_off_grid_and_empty_frames_then_reconstructs_exact_bytes() {
+        let fixture = Fixture::new(false);
+        std::fs::write(&fixture.0, crate::sample_tak::sample_tak_for_ssh_preview()).unwrap();
+        let path = fixture.0.to_str().unwrap();
+        let mut session = session();
+        let cancel = CancelToken::default();
+        let old = session.open(path, &cancel).unwrap();
+        session.progressive = true;
+        session.first_pose = true;
+        for (requested, expected_frame, has_points) in [(Some(13), 13, true), (None, 0, false)] {
+            let mut stage_count = 0;
+            let exact = session.open_staged(path, requested, &cancel, |stage| {
+                match (stage_count, stage) {
+                    (0, RemoteStage::FirstPose(take, at)) => {
+                        assert_eq!(at, expected_frame);
+                        for (still, full) in take.trajectories.iter().zip(&old.take.trajectories) {
+                            assert_eq!(still.uid, full.uid);
+                            let expected = full.frames.iter().position(|f| i64::from(*f) == at)
+                                .map(|i| full.xyz[i].map(f32::to_bits));
+                            assert_eq!(still.xyz.first().map(|p| p.map(f32::to_bits)), expected);
+                        }
+                        let data = crate::view_data::ViewData::build_ssh_first_pose(take, at);
+                        assert!(data.is_first_pose() && data.is_preview());
+                        assert_eq!(data.display_frame(17), at);
+                        assert!(data.occlusion.is_empty());
+                        assert_eq!(data.markers.iter().any(|m| m.position(at).is_some()), has_points);
+                    }
+                    (1, RemoteStage::Preview(loaded, motion)) => {
+                        assert_eq!(motion.requested, expected_frame);
+                        let data = crate::view_data::ViewData::build_ssh_preview(loaded.take, None, motion);
+                        assert_eq!(data.markers[2].gaps, [(0, 1), (4, 299)]);
+                    }
+                    _ => panic!("Unexpected stage"),
+                }
+                stage_count += 1;
+            }).unwrap();
+            assert_eq!(stage_count, 2);
+            assert_eq!(exact.edit_streams.channels.as_ref(), old.edit_streams.channels.as_ref());
+        }
+        session.first_pose = false;
+        let mut previews = 0;
+        let old_helper = session.open_staged(path, None, &cancel, |stage| {
+            assert!(matches!(stage, RemoteStage::Preview(..)));
+            previews += 1;
+        }).unwrap();
+        assert_eq!(previews, 1);
+        assert_eq!(old_helper.edit_streams.channels.as_ref(), old.edit_streams.channels.as_ref());
+        session.progressive = false;
+        let legacy = session.open_staged(path, None, &cancel, |_| panic!("Legacy open must use one reply")).unwrap();
+        assert_eq!(legacy.edit_streams.channels.as_ref(), old.edit_streams.channels.as_ref());
+    }
+
+    #[test]
+    fn cancelling_after_first_pose_does_not_publish_preview_or_exact() {
+        let fixture = Fixture::new(false);
+        std::fs::write(&fixture.0, crate::sample_tak::sample_tak_for_ssh_preview()).unwrap();
+        let mut session = session();
+        session.progressive = true;
+        session.first_pose = true;
+        let cancel = CancelToken::default();
+        let error = session.open_staged(fixture.0.to_str().unwrap(), None, &cancel, |stage| {
+            assert!(matches!(stage, RemoteStage::FirstPose(..)));
+            cancel.cancel();
+        }).err().unwrap();
+        assert!(error.contains("cancel"), "{error}");
+        assert!(!session.is_alive());
+    }
+
+    #[test]
+    fn cancelling_after_the_preview_reaps_the_local_helper_and_withholds_exact_samples() {
+        let fixture = Fixture::new(false);
+        std::fs::write(&fixture.0, crate::sample_tak::sample_tak_for_ssh_preview()).unwrap();
+        let mut session = session();
+        session.progressive = true;
+        let cancel = CancelToken::default();
+        let mut preview = false;
+        let error = session.open_progressive(fixture.0.to_str().unwrap(), None, &cancel, |_, _| {
+            preview = true;
+            cancel.cancel();
+        }).err().unwrap();
+        assert!(preview && error.contains("cancel"), "{error}");
+        assert!(!session.is_alive());
+    }
+
+    #[test]
+    fn progressive_session_keeps_only_the_preview_on_bad_tail() {
+        use super::transport::{Connection, Frame, Transport};
+
+        struct BadTail {
+            transport: Transport,
+            changed: bool,
+        }
+        impl Connection for BadTail {
+            fn request(&mut self, request: Value, cancel: &CancelToken) -> Result<Frame> {
+                self.transport.request(request, cancel)
+            }
+            fn followup(&mut self, source_size: u64, cancel: &CancelToken) -> Result<Frame> {
+                let (mut header, mut blocks) = self.transport.followup(source_size, cancel)?;
+                if self.changed {
+                    header["identity"][3] = json!(0);
+                } else {
+                    blocks[0].pop().unwrap();
+                }
+                Ok((header, blocks))
+            }
+            fn abort(&mut self) { self.transport.abort(); }
+            fn is_alive(&mut self) -> bool { self.transport.is_alive() }
+        }
+
+        let fixture = Fixture::new(false);
+        std::fs::write(&fixture.0, crate::sample_tak::sample_tak_for_ssh_preview()).unwrap();
+        for changed in [false, true] {
+            let config = RemoteConfig::default();
+            let transport = Transport::local_python(test_python(), HELPER, Duration::from_secs(10),
+                config.maximum_payload_bytes).unwrap();
+            let mut session = RemoteSession {
+                transport: Box::new(BadTail { transport, changed }),
+                config,
+                progressive: true,
+                first_pose: false,
+                motion_codecs: false,
+                read_observer: None,
+                python_command: test_python().into(),
+                host: "local-test".into(),
+            };
+            let mut preview = false;
+            let error = session.open_progressive(fixture.0.to_str().unwrap(), None,
+                &CancelToken::default(), |_, _| preview = true).err().unwrap();
+            let expected = if changed { "source_changed" } else { "compressed SSH block" };
+            assert!(preview && error.contains(expected), "{error}");
+            assert!(!session.is_alive());
         }
     }
 
@@ -544,6 +747,10 @@ mod fake_tests {
             RemoteSession {
                 host: "lab_server".into(),
                 python_command: "python3".into(),
+                progressive: false,
+                first_pose: false,
+                motion_codecs: false,
+                read_observer: None,
                 config: RemoteConfig::default(),
                 transport: Box::new(FakeConnection {
                     replies: replies.into(),

@@ -46,6 +46,10 @@ impl ChannelRecord {
         channel_dim(&self.kind).unwrap_or(0)
     }
 
+    pub(crate) fn is_translation(&self) -> bool {
+        self.kind == "Vector3fChannel" && self.name == "Translation"
+    }
+
     pub fn default<'c>(&self, channels: &'c [u8]) -> &'c [u8] {
         &channels[self.default_start..self.default_start + 4 * self.dim()]
     }
@@ -53,6 +57,11 @@ impl ChannelRecord {
 
 /// `iter_channel_inventory`: walk declared records by lengths; whole stream must be consumed.
 pub fn iter_channel_inventory(channels: &[u8]) -> Result<Vec<ChannelRecord>> {
+    channel_inventory(channels, false)
+}
+
+/// PCo side blocks store only the frame word of each translation sample.
+pub(crate) fn channel_inventory(channels: &[u8], frames_only: bool) -> Result<Vec<ChannelRecord>> {
     if channels.len() < 10 || channels[..6] != CHANNELS_HEADER {
         return err("Unknown Channels version");
     }
@@ -91,7 +100,8 @@ pub fn iter_channel_inventory(channels: &[u8]) -> Result<Vec<ChannelRecord>> {
             .map_err(|_| TakError("Invalid channel property encoding".into()))?;
         let n = u32_at(channels, count_offset)? as u64;
         let data_start = count_offset + 4;
-        let end = data_start as u64 + n * (4 + 4 * dim as u64);
+        let stride = if frames_only && kind == "Vector3fChannel" && name == "Translation" { 4 } else { 4 + 4 * dim as u64 };
+        let end = data_start as u64 + n * stride;
         if end > len as u64 {
             return err("Truncated channel samples");
         }

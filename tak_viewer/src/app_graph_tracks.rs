@@ -5,6 +5,10 @@ impl TakViewerApp {
     pub(super) fn graph_tracks_tab(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let view = &mut self.views[self.active];
         let data = view.data.as_ref()?;
+        if data.is_preview() {
+            ui.label(view.preview_graph_status());
+            return None;
+        }
         let input_enabled = self.hold.is_none() && self.comment_edit.is_none();
         let interaction = ui
             .add_enabled_ui(input_enabled, |ui| {

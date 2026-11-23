@@ -21,6 +21,7 @@ pub struct Playback {
     controls: PlaybackControls,
     anchor_time: f64,
     anchor_frame: i64,
+    held: bool,
 }
 
 impl Playback {
@@ -38,6 +39,7 @@ impl Playback {
             controls: PlaybackControls::default(),
             anchor_time: 0.0,
             anchor_frame: first,
+            held: false,
         }
     }
 
@@ -83,8 +85,19 @@ impl Playback {
         if self.reverse() { start } else { end }
     }
 
+    /// Hold the provided frame while a remote still pose is on screen.
+    pub fn hold(&mut self, frame: Option<i64>, now: f64) {
+        self.held = false;
+        if let Some(frame) = frame {
+            self.playing = false;
+            self.set_frame(frame, now);
+            self.held = true;
+        }
+    }
+
     /// Jump to a frame (clamped). Keeps playing if playing.
     pub fn set_frame(&mut self, f: i64, now: f64) {
+        if self.held { return; }
         self.frame = self.clamp(f);
         self.anchor_time = now;
         self.anchor_frame = self.frame;
@@ -97,6 +110,7 @@ impl Playback {
     }
 
     pub fn play(&mut self, now: f64) {
+        if self.held { return; }
         let (start, end) = self.working_range();
         if !(start..=end).contains(&self.frame) {
             self.frame = start;

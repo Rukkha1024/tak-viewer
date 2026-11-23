@@ -234,14 +234,27 @@ impl TakViewerApp {
     }
     pub fn ssh_probe_start(&mut self, _ctx: &egui::Context, probe: &crate::ssh_probe::Probe) -> Result<(), String> {
         self.set_command_run();
+        if !probe.list_only { dock::set_editor_layout(&mut self.dock, &dock::EditorLayout::Empty); }
+        self.ssh.timeline = probe.timeline.clone();
         self.ssh.full_analog_probe = probe.dump.is_some() && !probe.markers_only;
         self.ssh.add_host(&probe.alias);
         self.ssh.set_platform(&probe.alias, &probe.platform);
         self.ssh.set_python(&probe.alias, &probe.python)?;
         self.ssh.connect_at(&probe.alias, &probe.folder())
     }
-    pub fn ssh_probe_open(&mut self, ctx: &egui::Context, host: &str, path: &str) {
-        self.remote_action(ctx, SshAction::Open { location: RemoteLocation { host:host.into(), path:path.into() }, side:false });
+    pub fn ssh_probe_open(&mut self, ctx: &egui::Context, host: &str, path: &str, frame: Option<i64>) {
+        self.ssh_probe_frame = frame;
+        self.ssh_probe_row = Some(SshAction::Open {
+            location: RemoteLocation { host: host.into(), path: path.into() }, side: false,
+        });
+        if let Some(trace) = &self.ssh.timeline { trace.click(); }
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn ssh_probe_scene(&self) -> Option<(&ViewData, egui::Rect, i64)> {
+        let view = self.view();
+        if view.remote.is_none() || !view.scene_rect.is_positive() { return None; }
+        Some((view.data.as_deref()?, view.scene_rect, view.pb.frame))
     }
     pub fn ssh_probe_state(&self, alias: &str) -> crate::ssh_probe::State {
         let host = self.ssh.hosts.iter().find(|h| h.alias == alias);
@@ -250,6 +263,7 @@ impl TakViewerApp {
             connected: self.ssh.is_connected(alias), listing:self.ssh.listing_json(alias),
             error:host.and_then(|h|h.note.clone()).or_else(||self.ssh_note.as_ref().map(|n|n.0.clone())),
             diagnostic:host.and_then(|h|h.diagnostic.clone()), markers:view.remote.is_some() && view.data.is_some(),
+            preview: view.is_ssh_preview(),
             pending:view.data.as_ref().is_some_and(|d|d.analog_pending), busy:self.ssh.is_busy(),
             workers:self.ssh.workers_running(), bytes:self.ssh.received_bytes(alias),
             python:self.ssh.python_settings.get(alias).and_then(|s|s.remembered.clone()),
@@ -265,7 +279,7 @@ impl TakViewerApp {
     }
     pub fn ssh_probe_dump(&self, path: &Path,markers_only:bool) -> Result<(), String> {
         if tak_core::tak::is_take_path(path) || tak_core::takm::is_takm_path(path) { return Err("TAK · TAKM 경로에는 출력할 수 없어요.".into()); }
-        let data = self.view().data.as_ref().ok_or("읽은 마커가 없어요.")?;
+        let data = self.view().data.as_ref().filter(|data| !data.is_preview()).ok_or("전체 마커를 아직 읽지 못했어요.")?;
         let file = std::fs::File::create(path).map_err(|e|e.to_string())?;
         use std::io::Write;
         let mut writer = std::io::BufWriter::new(file);
@@ -289,7 +303,7 @@ impl TakViewerApp {
         let Some(data) = &v.data else {
             return;
         };
-        if data.analog_pending { return; }
+        if data.is_preview() || data.analog_pending { return; }
         let key = data.take.path.clone();
         if let Some(i) = self.ssh_cache.iter().position(|c| c.key == key) {
             drop_later(self.ssh_cache.remove(i));
@@ -342,7 +356,7 @@ impl TakViewerApp {
         let unfinished = self.views[slot].remote_loading.as_ref().map(|(_, location, _)| location.memory_key())
             .or_else(|| self.views[slot].waiting_shared_path().filter(|path| is_remote_key(path)).map(Path::to_path_buf))
             .or_else(|| self.views[slot].remote.as_ref().filter(|_| self.views[slot].data.as_ref()
-                .is_some_and(|data| data.analog_pending || (data.emg_pending && self.views[slot].emg_requested)))
+                .is_some_and(|data| data.is_preview() || data.analog_pending || (data.emg_pending && self.views[slot].emg_requested)))
                 .map(RemoteLocation::memory_key));
         let restore = self.views[slot].restore.clone().or_else(|| self.views[slot].spot());
         self.cancel_remote_load(slot);
@@ -365,7 +379,8 @@ impl TakViewerApp {
         if self.ssh_reads.values().any(|read| read.location == location && read.file_id.is_none()) { return true; }
         let Some(owner) = self.find_remote_owner(|_, view| view.waiting_shared_path() == Some(path)) else { return true };
         if !self.allow_open_file(path, None) { return true; }
-        match self.ssh.open(location.clone()) {
+        let frame = self.remote_view(owner).and_then(|view| view.restore.as_ref()).map(|spot| spot.frame);
+        match self.ssh.open_at(location.clone(), frame) {
             Ok(id) => {
                 if let Some(view) = self.remote_view_mut(owner) {
                     let restore = view.restore.clone();
@@ -408,7 +423,7 @@ impl TakViewerApp {
                     slot = usize::from(new);
                     self.activate(slot);
                 }
-                self.open_remote_in(ctx, slot, location, false);
+                self.open_remote_at_frame(ctx, slot, location, false, self.ssh_probe_frame);
             }
         }
     }
@@ -441,6 +456,10 @@ impl TakViewerApp {
         location: RemoteLocation,
         cached: bool,
     ) {
+        self.open_remote_at_frame(ctx, slot, location, cached, None);
+    }
+
+    fn open_remote_at_frame(&mut self, ctx: &egui::Context, slot: usize, location: RemoteLocation, cached: bool, frame: Option<i64>) {
         let created = self.layout_tabs.active_id().is_none();
         let key = location.memory_key();
         if self.progress_writing(&key) {
@@ -504,7 +523,8 @@ impl TakViewerApp {
                 return;
             }
         }
-        match self.ssh.open(location.clone()) {
+        let frame = frame.or_else(|| restore.as_ref().map(|spot| spot.frame));
+        match self.ssh.open_at(location.clone(), frame) {
             Ok(id) => {
                 self.views[slot].cancel_load();
                 self.views[slot].restore = restore;
@@ -542,8 +562,10 @@ impl TakViewerApp {
         let speed = self.settings.speed;
         let (_, rx) = std::sync::mpsc::channel();
         let comment_label=self.ssh.documents.get(&location).map(|document|remote_comment_label(&location,document.fixed_len,data.take.file_size));
+        let frame = self.ssh_probe_frame;
         let v = self.remote_view_mut(owner)?;
         drop_later(v.take_overlay());
+        let requested = v.restore.is_none().then(|| data.preview_initial_frame().or(frame)).flatten();
         drop_later(v.show_shared(
             data,
             rx,
@@ -551,6 +573,9 @@ impl TakViewerApp {
             speed,
             ctx.input(|i| i.time),
         ));
+        if let Some(frame) = requested {
+            v.pb.set_frame(frame, ctx.input(|i| i.time));
+        }
         // Remote analog comes as a new worker-prepared Arc, never through the local reader.
         v.analog_rx = None;
         v.comments_rx = None;
@@ -566,7 +591,21 @@ impl TakViewerApp {
     }
 
     pub(super) fn poll_ssh(&mut self, ctx: &egui::Context) {
-        let events = self.ssh.drain_events();
+        let mut queued = std::mem::take(&mut self.ssh_next_frame);
+        let mut events = self.ssh.drain_events();
+        if !queued.is_empty() {
+            // Apply cancellation and disconnect before a stage buffered last frame.
+            let mut delayed = Vec::new();
+            for event in std::mem::take(&mut events) {
+                if matches!(event, SshEvent::Cancelled { .. } | SshEvent::Error { .. }) {
+                    events.push(event);
+                } else {
+                    delayed.push(event);
+                }
+            }
+            events.append(&mut queued);
+            events.append(&mut delayed);
+        }
         self.apply_ssh_events(ctx, events);
     }
 
@@ -598,10 +637,12 @@ impl TakViewerApp {
 
     fn finish_remote_read(&mut self, request: u64, read: RemoteRead, message: &str) {
         let mut force_wait = false;
+        let mut preview = false;
         if let Some(owner) = self.resolve_remote_read(request, &read) {
             let mut failed_initial = false;
             if let Some(view) = self.remote_view_mut(owner) {
                 force_wait = read.file_id.is_some() && view.data.as_ref().is_some_and(|data| data.analog_pending);
+                preview = view.is_ssh_preview();
                 stop_remote_analog_wait(view, &read.location, message);
                 if read.file_id.is_some() && view.remote.as_ref() == Some(&read.location) && view.emg_requested {
                     view.emg_failure = Some(message.to_owned());
@@ -617,7 +658,7 @@ impl TakViewerApp {
             self.visit_remote_views(|_, view| {
                 if view.remote.as_ref() == Some(&read.location)
                     && (read.document.is_none() || view.document_id() == read.document) {
-                    if force_wait { view.remote_warning.get_or_insert_with(|| message.to_owned()); }
+                    if force_wait || preview { view.remote_warning.get_or_insert_with(|| message.to_owned()); }
                     if view.emg_requested { view.emg_failure = Some(message.to_owned()); }
                 }
             });
@@ -626,7 +667,14 @@ impl TakViewerApp {
     }
 
     fn apply_ssh_events(&mut self, ctx: &egui::Context, events: Vec<SshEvent>) {
+        let mut installed_early = std::collections::HashSet::new();
         for event in events {
+            if matches!(&event, SshEvent::Markers { request_id, .. } | SshEvent::ExactMarkers { request_id, .. }
+                if installed_early.contains(request_id)) {
+                self.ssh_next_frame.push(event);
+                ctx.request_repaint();
+                continue;
+            }
             match event {
                 SshEvent::Markers {
                     request_id,
@@ -639,7 +687,7 @@ impl TakViewerApp {
                         continue;
                     };
                     let owner = self.resolve_remote_read(request_id, &read);
-                    if read.location != location || read.file_id.is_some() || owner.is_none() {
+                    if read.location != location || owner.is_none() {
                         drop_later(Some(data));
                         self.ssh_reads.remove(&request_id);
                         self.ssh.cancel_request(request_id);
@@ -647,19 +695,77 @@ impl TakViewerApp {
                     }
                     let owner = owner.unwrap();
                     let pending = data.analog_pending;
+                    let preview = data.is_preview();
+                    let first_pose = data.is_first_pose();
+                    let proof = data.ssh_marker_proof.clone();
+                    let milestone = if first_pose { "first_pose_installed" }
+                        else if preview { "preview_installed" } else { "exact_installed" };
+                    if read.file_id.is_some() {
+                        if first_pose || self.remote_view(owner).is_none_or(|view| !view.is_first_pose()) {
+                            drop_later(Some(data));
+                            continue;
+                        }
+                        let label = self.ssh.documents.get(&location)
+                            .map(|doc| remote_comment_label(&location, doc.fixed_len, data.take.file_size));
+                        let view = self.remote_view_mut(owner).unwrap();
+                        let retired = std::mem::replace(&mut view.comments.list, comments);
+                        drop_later(Some(retired));
+                        view.comments.label = label;
+                        let document = view.document_id();
+                        let saved = view.comments.list.clone();
+                        view.install_remote_saved(data);
+                        if let Some(document) = document {
+                            self.remote_edits.entry(document).or_default().saved = saved;
+                        }
+                        if let Some(trace) = &self.ssh.timeline {
+                            trace.record(milestone, serde_json::json!(proof));
+                        }
+                        if preview { installed_early.insert(request_id); }
+                        if !preview && !pending { self.ssh_reads.remove(&request_id); }
+                        continue;
+                    }
                     read.owner = owner;
                     read.file_id = self.show_remote_at(ctx, owner, location.clone(), data, comments);
+                    if let Some(trace) = &self.ssh.timeline {
+                        trace.record(milestone, serde_json::json!(proof));
+                    }
                     read.document = self.remote_view(owner).and_then(View::document_id);
-                    if !pending {
-                        self.ssh_reads.remove(&request_id);
-                    } else {
+                    if preview { installed_early.insert(request_id); }
+                    if preview || pending {
                         self.remote_view_mut(owner).unwrap().wait_for_remote_first_paint(request_id);
                         self.ssh_reads.insert(request_id, read);
+                    } else {
+                        self.ssh_reads.remove(&request_id);
                     }
                     let older: Vec<_> = self.ssh_reads.iter().filter(|(id, read)| **id != request_id && read.location == location)
                         .map(|(&id, _)| id).collect();
                     for id in older { self.ssh_reads.remove(&id); self.ssh.cancel_request(id); }
                     self.publish_remote_aliases(ctx, owner, &location);
+                }
+                SshEvent::ExactMarkers { request_id, location, data } => {
+                    let Some(read) = self.ssh_reads.get(&request_id) else {
+                        drop_later(Some(data));
+                        continue;
+                    };
+                    let owner = self.resolve_remote_read(request_id, read);
+                    if read.location != location || read.file_id.is_none() || data.is_preview()
+                        || owner.and_then(|owner| self.remote_view(owner)).is_none_or(|v| !v.is_ssh_preview()) {
+                        drop_later(Some(data));
+                        continue;
+                    }
+                    let label = self.ssh.documents.get(&location)
+                        .map(|doc| remote_comment_label(&location, doc.fixed_len, data.take.file_size));
+                    let pending = data.analog_pending;
+                    let proof = data.ssh_marker_proof.clone();
+                    let view = self.remote_view_mut(owner.unwrap()).unwrap();
+                    view.comments.label = label;
+                    view.install_remote_saved(data);
+                    if let Some(trace) = &self.ssh.timeline {
+                        trace.record("exact_installed", serde_json::json!(proof));
+                    }
+                    if !pending {
+                        self.ssh_reads.remove(&request_id);
+                    }
                 }
                 SshEvent::Analog {
                     request_id,
@@ -937,6 +1043,210 @@ mod tests {
     }
 
     #[test]
+    fn headless_timeline_uses_the_list_open_and_proves_first_pose_pixels() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.set_command_run();
+        dock::set_editor_layout(&mut app.dock, &dock::EditorLayout::Empty);
+        let server = app.ssh.fake_open_list();
+        let directory = tak_core::test_support::TempDir::new("ssh_timeline");
+        let output = directory.join("timeline.json");
+        let shots = directory.join("shots");
+        let trace = crate::ssh_timeline::Timeline::new(output.clone(), Some(shots.clone())).unwrap();
+        app.ssh.timeline = Some(trace.clone());
+        let mut textures = crate::soft_render::Textures::default();
+        let mut measured = crate::ssh_timeline::Evidence::default();
+        app.ssh_probe_open(&ctx, "CHO_workstation", "~/data/2_gait/gait_001.tak", Some(5));
+        let first = painted_frame(&ctx, &mut app, vec![]);
+        textures.set(&first.textures_delta);
+        let (id, location, _) = server.opened();
+        assert_eq!(app.open_views(), vec![0]);
+        let take = views::sample_take(location.memory_key().to_str().unwrap(), &["M"]);
+        // An already queued preview still gives the first pose a frame of its own.
+        app.ssh.fake_marker_reply(id, location.clone(), first_pose_at_five(take.clone()));
+        app.ssh.fake_marker_reply(id, location.clone(), preview_at_five(take.clone()));
+        let first_pose = painted_frame(&ctx, &mut app, vec![]);
+        textures.set(&first_pose.textures_delta);
+        measured.frame(&trace, &app, &ctx, &first_pose, &textures, Duration::ZERO, egui::Color32::BLACK);
+        assert!(app.view().is_first_pose());
+        assert_eq!(app.view().pb.frame, 5);
+        assert!(!app.quick_label_available(&ctx, 0));
+        assert!(app.comment_writable(0).is_err());
+        assert!(app.view().data.as_ref().unwrap().markers[0].fill_pct.is_nan());
+        let view = app.view_mut();
+        view.pb.play(0.0);
+        view.pb.set_frame(7, 0.0);
+        assert!(!view.pb.playing);
+        assert_eq!(view.pb.frame, 5);
+        view.range = Some((2, 7));
+        view.select(0, false);
+        view.cam.yaw += 0.2;
+        let (yaw, file_id) = (view.cam.yaw, view.file_id);
+        let mut exact = ViewData::build(take);
+        exact.ssh_marker_proof = Some(tak_core::remote::ChannelProof { sha256: "abc".into(), samples: 10 });
+        app.ssh.fake_exact_reply(id, location, exact);
+        let preview = painted_frame(&ctx, &mut app, vec![]);
+        textures.set(&preview.textures_delta);
+        measured.frame(&trace, &app, &ctx, &preview, &textures, Duration::ZERO, egui::Color32::BLACK);
+        assert!(!app.view().is_first_pose() && app.view().is_ssh_preview());
+        assert_eq!(app.view().data.as_ref().unwrap().markers[0].fill_pct, 100.0);
+        assert_eq!(app.view().pb.frame, 5);
+        app.view_mut().pb.set_frame(6, 0.0);
+        let exact = painted_frame(&ctx, &mut app, vec![]);
+        textures.set(&exact.textures_delta);
+        measured.frame(&trace, &app, &ctx, &exact, &textures, Duration::ZERO, egui::Color32::BLACK);
+        assert!(!app.view().is_ssh_preview());
+        assert_eq!(app.view().file_id, file_id);
+        assert_eq!(app.view().pb.frame, 6);
+        assert_eq!(app.view().range, Some((2, 7)));
+        assert_eq!(app.view().primary, Some(0));
+        assert_eq!(app.view().cam.yaw, yaw);
+        assert_eq!(measured.finish(&trace, 0, false), 0);
+        let value = std::fs::read_to_string(output).unwrap();
+        let rows = value.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for expected in ["click", "first_pose_installed", "first_pose_frame", "first_marker_pixels",
+            "preview_installed", "exact_installed", "exact_frame"] {
+            assert!(rows.iter().any(|row| row["event"] == expected), "{expected} {value}");
+        }
+        assert!(rows.last().unwrap()["swap_frame_ms"].as_f64().is_some());
+        assert!(shots.join("first_marker_pixels.png").is_file());
+        assert!(shots.join("first_pose_frame.png").is_file());
+        let marker = rows.iter().find(|row| row["event"] == "first_marker_pixels").unwrap();
+        let installed = rows.iter().find(|row| row["event"] == "exact_installed").unwrap();
+        assert_eq!(installed["sha256"], "abc");
+        assert_eq!(installed["samples"], 10);
+        assert_eq!(marker["draw_frame"], 5);
+        assert_eq!(marker["first_pose"], true);
+    }
+
+    #[test]
+    fn ssh_preview_swaps_in_place_and_releases_plates_after_exact_paint() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let server = app.ssh.fake_open_list();
+        click_fake_ssh_row(&ctx, &mut app, &mut crate::soft_render::Textures::default());
+        let (id, location, _) = server.opened();
+        let exact = views::sample_take(location.memory_key().to_str().unwrap(), &["M"]);
+        let preview = preview_at_five(exact.clone());
+        app.ssh.fake_marker_reply(id, location.clone(), preview);
+        let out = painted_frame(&ctx, &mut app, vec![]);
+        assert!(out.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t)
+            if t.galley.text() == "Preview · loading full motion")));
+        assert!(!app.quick_label_available(&ctx, 0));
+        assert!(app.comment_writable(0).is_err());
+        app.save_remote(&ctx, 0, false);
+        assert!(app.takm_note.as_ref().unwrap().0.contains("전체 마커"));
+        assert_eq!(app.view().pb.frame, 5);
+        let view = app.view_mut();
+        view.pb.set_frame(6, 0.0);
+        view.range = Some((2, 7));
+        view.select(0, false);
+        view.cam.yaw += 0.2;
+        let yaw = view.cam.yaw;
+        let file_id = view.file_id;
+        painted_frame(&ctx, &mut app, vec![]);
+        assert_eq!(server.analog_released(), None, "preview never releases forceplates");
+
+        let mut exact = ViewData::build(exact);
+        exact.analog_pending = true;
+        app.ssh.fake_exact_reply(id, location, exact);
+        app.poll_ssh(&ctx);
+        let v = app.view();
+        assert!(!v.is_ssh_preview());
+        assert_eq!(v.file_id, file_id);
+        assert_eq!(v.pb.frame, 6);
+        assert_eq!(v.range, Some((2, 7)));
+        assert_eq!(v.primary, Some(0));
+        assert_eq!(v.cam.yaw, yaw);
+        assert!(app.quick_label_available(&ctx, 0));
+        assert!(app.comment_writable(0).is_ok());
+        app.save_remote(&ctx, 0, false);
+        assert!(app.takm_note.as_ref().unwrap().0.contains("파일을 읽는 중"));
+        assert_eq!(server.analog_released(), None);
+        painted_frame(&ctx, &mut app, vec![]);
+        assert_eq!(server.analog_released(), None);
+        painted_frame(&ctx, &mut app, vec![]);
+        assert_eq!(server.analog_released(), Some(id));
+    }
+
+    fn first_pose_at_five(mut take: tak_core::tak::Take) -> ViewData {
+        for t in &mut take.trajectories {
+            t.frames = vec![5].into();
+            t.xyz = vec![t.xyz[5]].into();
+        }
+        ViewData::build_ssh_first_pose(take, 5)
+    }
+
+    fn preview_at_five(mut take: tak_core::tak::Take) -> ViewData {
+        for t in &mut take.trajectories {
+            t.frames = vec![0, 5, 8].into();
+            t.xyz = [0, 5, 8].map(|i| t.xyz[i]).to_vec().into();
+        }
+        let runs = vec![vec![(0, 9)]; take.trajectories.len()];
+        ViewData::build_ssh_preview(take, None, tak_core::remote::PreviewMotion::synthetic(5, runs))
+    }
+
+    #[test]
+    fn ssh_preview_keeps_cancelled_data_and_rejects_closed_or_replaced_remainder() {
+        for end in ["cancel", "close", "replace"] {
+            let ctx = egui::Context::default();
+            let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+            let server = app.ssh.fake_open_list();
+            click_fake_ssh_row(&ctx, &mut app, &mut crate::soft_render::Textures::default());
+            let (id, location, cancel) = server.opened();
+            let exact = views::sample_take(location.memory_key().to_str().unwrap(), &["M"]);
+            app.ssh.fake_marker_reply(id, location.clone(), preview_at_five(exact.clone()));
+            app.poll_ssh(&ctx);
+            match end {
+                "cancel" => app.ssh.cancel_request(id),
+                "close" => app.close_view(0),
+                "replace" => app.open_remote_in(&ctx, 0, RemoteLocation {
+                    host: location.host.clone(),
+                    path: "~/data/2_gait/gait_002.tak".into(),
+                }, false),
+                _ => unreachable!(),
+            }
+            assert!(cancel.is_cancelled());
+            app.ssh.fake_exact_reply(id, location, ViewData::build(exact));
+            app.poll_ssh(&ctx);
+            assert!(!app.ssh_reads.contains_key(&id));
+            if end == "cancel" {
+                assert_eq!(app.view().preview_status(), Some("Preview · incomplete"));
+                assert!(!app.quick_label_available(&ctx, 0));
+            } else if end == "close" {
+                assert!(app.view().data.is_none());
+            } else {
+                assert!(app.view().remote_loading.is_some());
+                assert!(app.view().is_ssh_preview(), "old exact coordinates must not install");
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_ssh_first_pose_rejects_a_preview_already_queued_for_the_next_frame() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let server = app.ssh.fake_open_list();
+        click_fake_ssh_row(&ctx, &mut app, &mut crate::soft_render::Textures::default());
+        let (id, location, cancel) = server.opened();
+        let take = views::sample_take(location.memory_key().to_str().unwrap(), &["M"]);
+        app.ssh.fake_marker_reply(id, location.clone(), first_pose_at_five(take.clone()));
+        app.ssh.fake_marker_reply(id, location, preview_at_five(take));
+        app.poll_ssh(&ctx);
+        assert!(app.view().is_first_pose());
+        assert_eq!(app.ssh_next_frame.len(), 1);
+        app.ssh.cancel_request(id);
+        assert!(cancel.is_cancelled());
+        app.poll_ssh(&ctx);
+        assert!(app.view().is_first_pose());
+        assert_eq!(app.view().preview_status(), Some("Preview · incomplete"));
+        assert!(!app.quick_label_available(&ctx, 0));
+        assert!(!app.ssh_reads.contains_key(&id));
+    }
+
+    #[test]
+
     fn hidden_ssh_open_waits_for_first_paint_or_close() {
         for close in [false, true] {
             let ctx = egui::Context::default();
@@ -1560,6 +1870,10 @@ impl TakViewerApp {
         if let Some(saved)=saved {self.visit_remote_views(|_,view| {if view.document_id()==Some(id){view.comments.list=saved.clone();view.comments.pending=0;view.comments.failed=None;view.publish_shared_file();}});}
     }
     pub(super) fn save_remote(&mut self, ctx: &egui::Context, slot:usize, close_after:bool) {
+        if self.views[slot].is_ssh_preview() {
+            self.takm_note = Some(("전체 마커를 읽은 뒤 저장해 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
         if (self.no_persist && !self.remote_write_probe) || self.remote_saving(slot) || self.marker_job_running(slot)
             || self.views[slot].path().is_some_and(|path| self.progress_writing(path))
             || self.views[slot].edit_refresh.is_some() || self.views[slot].remote_loading.is_some()

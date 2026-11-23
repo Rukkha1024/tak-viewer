@@ -454,6 +454,7 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
     }
     if let Some(p) = &mut probe { if let Err(e) = p.start(&mut app, &ctx) { eprintln!("{e}"); return 1; } }
     let mut textures = Textures::default();
+    let mut evidence = crate::ssh_timeline::Evidence::default();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(size[0], size[1]));
     let start = Instant::now();
     let mut events: Vec<Event> = Vec::new();
@@ -477,10 +478,20 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
                 }
             }
         }
+        let t0 = Instant::now();
         let out = ctx.run(raw, |ctx| app.frame(ctx));
+        let elapsed = t0.elapsed();
         events.extend(app.scene_menu_shot_hover().map(Event::PointerMoved));
         if let Some(p) = &mut probe {
-            match p.tick(&mut app, &ctx) {
+            if let Some(trace) = &p.timeline {
+                textures.set(&out.textures_delta);
+                evidence.frame(trace, &app, &ctx, &out, &textures, elapsed, CLEAR);
+            }
+            let step = match p.tick(&mut app, &ctx) {
+                crate::ssh_probe::Step::Capture if auto.is_none() => crate::ssh_probe::Step::Done(0),
+                other => other,
+            };
+            match step {
                 crate::ssh_probe::Step::Escape => events.push(Event::Key { key:egui::Key::Escape, physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::NONE }),
                 crate::ssh_probe::Step::Capture => { if let Some(auto) = auto.take() { app.start_headless_screenshot(auto); } },
                 crate::ssh_probe::Step::Done(mut code) => {
@@ -499,12 +510,14 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
                     app.ssh_probe_disconnect(&p.alias);
                     let deadline = Instant::now() + Duration::from_secs(10);
                     while app.ssh_probe_workers_running() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
-                    return if app.ssh_probe_workers_running() { 1 } else { code };
+                    let workers = app.ssh_probe_workers_running();
+                    let code = if workers { 1 } else { code };
+                    return p.timeline.as_ref().map_or(code, |trace| evidence.finish(trace, code, workers));
                 }
                 crate::ssh_probe::Step::Wait => (),
             }
         }
-        textures.set(&out.textures_delta);
+        if !probe.as_ref().is_some_and(|p| p.timeline.is_some()) { textures.set(&out.textures_delta); }
         let commands = out.viewport_output.get(&ViewportId::ROOT).map(|v| v.commands.as_slice()).unwrap_or(&[]);
         let close = commands.iter().any(|c| matches!(c, ViewportCommand::Close));
         let shot = commands.iter().any(|c| matches!(c, ViewportCommand::Screenshot));
@@ -521,7 +534,9 @@ fn run_with_probe(mut initial: Vec<PathBuf>, mut auto: Option<AutoShot>, capture
                 app.ssh_probe_disconnect(&p.alias);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while app.ssh_probe_workers_running() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
-                if app.ssh_probe_workers_running() { return 1; }
+                let workers = app.ssh_probe_workers_running();
+                let code = i32::from(app.failed || workers);
+                return p.timeline.as_ref().map_or(code, |trace| evidence.finish(trace, code, workers));
             }
             return i32::from(app.failed);
         }

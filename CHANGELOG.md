@@ -1,5 +1,13 @@
 # 변경 사항
 
+## v0.77.0 — 2026-11-23
+
+- SSH opens draw the requested frame first. Preview adds one pose every eight frames, the requested frame, playback, exact Labels, gaps, and Comments.
+- Verify original marker bytes before swapping in exact motion. Keep camera, frame, range, and selection. Enable graph values, editing, and saving when exact motion arrives.
+- Use PCo for preview and exact marker coordinates. Start forceplates after exact marker paint, with Zstandard and automatic zlib fallback. Keep other analog on demand.
+- Keep an interrupted preview visible and read-only. Headless diagnostics record transfer stages, offscreen pixels, and hashes and sample counts for installed exact data.
+- 50 connected-list opens across 25 takes drew first marker pixels in 181–524 ms. Median 247 ms. Connection setup and monitor display fall outside this timing.
+
 ## v0.76.3 — 2026-11-23
 
 - Release helper: `finish` always updates the desktop shortcut exe to the finished version. Open windows keep the old exe. Skip when the shortcut is already newer or on a test remote.

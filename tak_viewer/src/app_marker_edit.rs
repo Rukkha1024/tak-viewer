@@ -506,7 +506,8 @@ impl TakViewerApp {
         })
     }
     pub(super) fn quick_label_available(&self, ctx: &egui::Context, slot: usize) -> bool {
-        self.comment_edit.is_none()
+        !self.views[slot].is_ssh_preview()
+            && self.comment_edit.is_none()
             && self.hold.is_none()
             && self.dirty_prompt.is_none()
             && !ctx.memory(|m| m.any_popup_open())
@@ -1360,6 +1361,7 @@ impl TakViewerApp {
             return Some("진행 상태 저장이 끝난 뒤 편집해 주세요.");
         }
         let view = &self.views[slot];
+        if view.is_ssh_preview() { return Some("전체 마커를 읽은 뒤 편집해 주세요."); }
         if view.edit_document.is_none() || view.data.is_none() {
             return Some("이 파일은 편집할 수 없어요.");
         }
@@ -1914,11 +1916,13 @@ impl TakViewerApp {
         ui.labeling.armed = view.armed_label;
         ui.labeling.selected_labeled_count = selected_labeled_count;
         ui.labeling.label_marker_reason = label_marker_source(view).err().or_else(|| {
-            (busy || self.dirty_prompt.is_some() || self.hold.is_some() || self.comment_edit.is_some()
+            (data.is_preview() || busy || self.dirty_prompt.is_some() || self.hold.is_some() || self.comment_edit.is_some()
                 || view.edit_refresh.is_some() || view.loading.is_some() || data.analog_pending)
                 .then_some("지금은 마커를 편집할 수 없어요.")
         });
-        ui.labeling.blocked_reason = if self.dirty_prompt.is_some()
+        ui.labeling.blocked_reason = if data.is_preview() {
+            Some("전체 마커를 읽은 뒤 편집해 주세요.".to_owned())
+        } else if self.dirty_prompt.is_some()
             || busy
             || view.edit_refresh.is_some()
             || view.loading.is_some()

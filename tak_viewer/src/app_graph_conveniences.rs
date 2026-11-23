@@ -45,6 +45,10 @@ impl TakViewerApp {
         let slot = self.active;
         let view = &mut self.views[slot];
         let data = view.data.as_ref()?;
+        if data.is_preview() {
+            ui.label(view.preview_graph_status());
+            return None;
+        }
         let input_enabled = self.hold.is_none() && self.comment_edit.is_none();
         let mut fit = false;
         let mut toggle_lock = false;

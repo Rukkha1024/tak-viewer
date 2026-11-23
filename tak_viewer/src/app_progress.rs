@@ -61,6 +61,7 @@ impl TakViewerApp {
             result.busy |= pending
                 || view.loading.is_some()
                 || view.remote_loading.is_some()
+                || view.is_ssh_preview()
                 || view.waiting_shared_path().is_some()
                 || view.analog_work_pending()
                 || view.edit_refresh.is_some()

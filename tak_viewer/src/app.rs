@@ -499,9 +499,12 @@ pub struct TakViewerApp {
     ssh_sources: std::collections::HashMap<PathBuf, crate::ssh::RemoteLocation>,
     ssh_cache: std::collections::VecDeque<remote_ui::Cached>,
     ssh_reads: std::collections::HashMap<u64, remote_ui::RemoteRead>,
+    ssh_next_frame: Vec<crate::ssh::SshEvent>,
     remote_edits: std::collections::HashMap<tak_core::edit::DocumentId, remote_ui::RemoteEdits>,
     remote_write_probe: bool,
     ssh_note: Option<(String, f64)>,
+    ssh_probe_row: Option<crate::ssh::SshAction>,
+    ssh_probe_frame: Option<i64>,
     ssh_demo_applied: bool,
     explorer: ExplorerState,
     /// Pane layout (saved into `settings.layout` on save).
@@ -743,9 +746,12 @@ impl TakViewerApp {
             ssh_sources: Default::default(),
             ssh_cache: Default::default(),
             ssh_reads: Default::default(),
+            ssh_next_frame: Vec::new(),
             remote_edits: Default::default(),
             remote_write_probe: false,
             ssh_note: None,
+            ssh_probe_row: None,
+            ssh_probe_frame: None,
             ssh_demo_applied: false,
             explorer: ExplorerState::default(),
             dock,
@@ -1297,7 +1303,10 @@ impl TakViewerApp {
         self.poll_remote_writes(ctx);
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
-        self.poll_ssh(ctx);
+        // Keep the same SSH stage through every sizing pass of one painted frame.
+        if ctx.output(|output| output.num_completed_passes == 0) {
+            self.poll_ssh(ctx);
+        }
         self.poll_progress_write(ctx);
         self.poll_remote_emg(ctx);
     }
@@ -1887,6 +1896,7 @@ impl TakViewerApp {
             return Err("파일을 열면 Comment를 남길 수 있어요.".into());
         }
         if v.remote.is_some() {
+            if v.is_ssh_preview() { return Err("전체 마커를 읽은 뒤 Comment를 고칠 수 있어요.".into()); }
             if self.no_persist && !self.remote_write_probe { return Err("명령 실행은 서버에 쓰지 않아요.".into()); }
             if v.remote.as_ref().and_then(|location|self.ssh.documents.get(location)).is_some_and(|document|document.next_comment_id==0) {
                 return Err("서버의 Comment 번호를 준비하는 중이에요. 잠시 뒤 다시 눌러 주세요.".into());
@@ -1920,6 +1930,7 @@ impl TakViewerApp {
             return None;
         }
         let v = &self.views[slot];
+        if v.is_ssh_preview() { return None; }
         match (&v.data, &v.comments.target) {
             (Some(d), Some(Ok(p))) => {
                 let remote_label=v.remote.as_ref().and_then(|location|self.ssh.documents.get(location)
@@ -3141,6 +3152,9 @@ impl TakViewerApp {
                     }
                 }
                 }
+                if let Some(status) = self.view().preview_status() {
+                    ui.label(text(status.to_owned()).strong());
+                }
                 if let Some((note, t)) = &self.ssh_note {
                     if now - t < 8.0 && self.view().remote_warning.as_ref() != Some(note) {
                         ui.label(text(note.clone()).strong());
@@ -3342,7 +3356,7 @@ impl TakViewerApp {
         // No plate graph (and no note) while the forces are still loading. Its lanes: those
         // chosen for this view slot that the plate's device has.
         let graph_plate = v.data.as_ref().and_then(|d| {
-            let pi = v.plate.filter(|p| !capturing && !d.analog_pending && *p < d.plates.len())?;
+            let pi = v.plate.filter(|p| !capturing && !d.is_preview() && !d.analog_pending && *p < d.plates.len())?;
             let offer = panels::plate_offer(d, pi);
             Some((pi, Kind::Plate { shown: pset.shown(offer), offer }))
         });
@@ -3360,14 +3374,15 @@ impl TakViewerApp {
         };
         let own_shown = layers.own && v.data.is_some();
         let overlay_shown = layers.overlay.is_some() && v.data.is_some();
-        let measurement = v.measurement(layers.own && scene_opts.measurements);
+        let measurement = v.measurement(layers.own && scene_opts.measurements && !v.is_ssh_preview());
+        let display_frame = v.data.as_ref().map_or(v.pb.frame, |data| data.display_frame(v.pb.frame));
         for &cover in &covers {
             key_focus::region(ui, cover, key_focus::Target::Markers(slot));
         }
         let out = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(input), |ui| {
                 let _span=crate::bench_timing::span_view("scene.build",Some(slot));
-                scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), v.pb.frame, &mut v.cam, scene_opts, &v.selected, v.primary, measurement, v.plate, hud.as_deref(), legacy_capture, follow_target, layers)
+                scene::show(ui, rect, row, tag_size, &covers, v.data.as_deref(), display_frame, &mut v.cam, scene_opts, &v.selected, v.primary, measurement, v.plate, hud.as_deref(), legacy_capture, follow_target, layers)
             })
             .inner;
         if (own_shown || overlay_shown) && !ui.is_sizing_pass() && ui.is_visible()
@@ -3474,7 +3489,14 @@ impl TakViewerApp {
         let pset = &mut self.settings.plate_channels[slot];
         let frame = v.pb.frame;
         let mut goto = None;
-        if let (Some(mi), Some(d)) = (graph_marker, v.data.as_ref()) {
+        if v.is_ssh_preview() {
+            if let Some(area) = v.graph_rect {
+                let paint = ui.painter().with_clip_rect(rect);
+                paint.rect_filled(area, 3.0, theme::PANEL_BG);
+                paint.text(area.center(), egui::Align2::CENTER_CENTER, v.preview_graph_status(),
+                    egui::FontId::proportional(13.0), theme::TEXT_DIM);
+            }
+        } else if let (Some(mi), Some(d)) = (graph_marker, v.data.as_ref()) {
             let m = &d.markers[mi];
             // v0.27.0: every selected marker (up to `panels::GRAPH_MAX`) in the same lanes.
             let (graphed, total) = panels::graphed(d, &v.selected, mi);
@@ -4135,7 +4157,8 @@ impl TakViewerApp {
         if let Some(a) = ed_action {
             self.editor_action(ctx, a);
         }
-        for action in ssh_actions {
+        let probe_row = self.ssh_probe_row.take();
+        for action in ssh_actions.into_iter().chain(probe_row) {
             self.remote_action(ctx, action);
         }
         // A name tag of a laid-over view clicked (plan step 7): hide / show, ✕ = take it off.

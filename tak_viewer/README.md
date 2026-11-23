@@ -366,11 +366,13 @@ Stages = `demean`, `rect`, `rms:50`, `lp:6:4`, `hp:20:4`, `bp:20:450:4`, `bs:59:
 ~~~text
 tak_viewer.exe --headless --ssh-list ALIAS --ssh-path FOLDER [--ssh-platform linux|windows] [--ssh-python COMMAND]
 tak_viewer.exe --headless --ssh-open ALIAS --ssh-path FILE --screenshot out.png [--ssh-platform linux|windows] [--ssh-python COMMAND] [--frame N] [--select A,B] [--plate N]
+tak_viewer.exe --headless --ssh-open ALIAS --ssh-path FILE --ssh-timeline OUT.json [--ssh-milestone-shots NEW_DIR] [--frame N] [--ssh-platform linux|windows] [--ssh-python COMMAND]
 tak_viewer.exe --headless --ssh-workspace ALIAS --ssh-path FOLDER --screenshot out.png [--ssh-platform linux|windows] [--ssh-workspace-expand] [--ssh-python COMMAND]
 tak_viewer.exe --headless --ssh-test-progress ALIAS FOLDER [1|3] --ssh-platform linux|windows --ssh-python "COMMAND"
 ~~~
 
-- Default platform is `linux`, including macOS hosts. Omit `--ssh-python` for discovery. Pass empty `--ssh-path` to list top-level drives or `/`. Open requires a file and screenshot, lists its parent, then attaches marker and analog results.
+- Default platform is `linux`, including macOS hosts. Omit `--ssh-python` for discovery. Pass empty `--ssh-path` to list top-level drives or `/`. Open requires a file and either a screenshot or timeline. It lists the parent and opens the listed row in an empty tab.
+- `--ssh-timeline` runs read-only without a desktop window. Reports first-byte and packet timing, server preparation, uncompressed install proofs, marker/force pixels and UI frame timings as JSON lines. `--ssh-milestone-shots` saves the offscreen frames. Set `--frame` to a frame with points and active forces when the first frame is empty. UI timings exclude software raster time and desktop presentation. Send no write flags with a timeline.
 - For open, `--ssh-cancel-after-ms N` sends Escape after N ms from open. `--ssh-stall-cancel-after-ms N` tests no-byte cancellation. `--ssh-dump OUT.json` exports the loaded data. `--ssh-markers-only` keeps received markers and ends deferred analog reads. Use it without timed cancellation.
 - Open edit hooks `--ssh-comment TEXT` and `--ssh-label unlabel` require `--ssh-save` and exercise the normal server write path. Workspace restart is in-memory. Add `--ssh-workspace-expand` for explicit real connect/list.
 - For local screenshot fixtures, `--ssh-demo off|connecting|connected|markers_ready|lost|top_windows|top_linux|progress` uses fake state without SSH. Ready/top scene needs a local sample. The `progress` demo shows saved marks beside fake SSH rows.

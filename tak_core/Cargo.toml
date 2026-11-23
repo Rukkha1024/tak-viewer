@@ -14,6 +14,9 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 roxmltree = "0.20"
 sha2 = "0.10"
+flate2 = "1"
+pco = "1.1.0"
+zstd = { version = "0.13.5", default-features = false }
 same-file = "1"
 # Fast byte search (already used by serde_json; no new crate).
 memchr = "2"
