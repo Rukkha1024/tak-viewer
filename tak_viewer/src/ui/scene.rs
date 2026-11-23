@@ -6,6 +6,7 @@
 //! orbit, middle drag = pan, wheel = zoom. A left click on a force plate (no marker there)
 //! chooses / un-chooses that plate for its floating graph (`graph_float.rs`).
 
+use super::input::{self, PrimaryNavigation};
 use super::theme;
 use super::scene_measurement::Measurement;
 use crate::camera::{Camera, Preset, View};
@@ -432,30 +433,34 @@ pub fn show(
     // Mouse (Motive): left click / left drag box = select markers, right drag = orbit
     // around the pivot, middle drag = pan, wheel = zoom.
     let delta = response.drag_delta();
-    if response.dragged_by(PointerButton::Secondary) && delta != egui::Vec2::ZERO {
+    let navigation = input::primary_navigation(ui, &response);
+    let primary_drag = response.dragged_by(PointerButton::Primary);
+    let orbit = response.dragged_by(PointerButton::Secondary) || (primary_drag && navigation == Some(PrimaryNavigation::Orbit));
+    if orbit && delta != egui::Vec2::ZERO {
         cam.orbit(delta.x, delta.y);
     }
     let box_id = response.id.with("box_select");
-    if response.drag_started_by(PointerButton::Primary) {
+    if navigation.is_none() && response.drag_started_by(PointerButton::Primary) {
         let start = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
         ui.data_mut(|d| d.insert_temp(box_id, start));
     }
     let box_start: Option<Pos2> = ui.data(|d| d.get_temp::<Option<Pos2>>(box_id)).flatten();
     let box_end = response.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
     let box_drag = match (box_start, box_end) {
-        (Some(a), Some(b)) if response.dragged_by(PointerButton::Primary) || response.drag_stopped_by(PointerButton::Primary) => Some((a, b)),
+        (Some(a), Some(b)) if navigation.is_none() && (primary_drag || response.drag_stopped_by(PointerButton::Primary)) => Some((a, b)),
         _ => None,
     };
     let box_done = response.drag_stopped_by(PointerButton::Primary);
     let box_active = response.dragged_by(PointerButton::Primary) || response.drag_started_by(PointerButton::Primary);
-    if box_done || !box_active {
+    if navigation.is_some() || box_done || !box_active {
         ui.data_mut(|d| d.remove::<Option<Pos2>>(box_id));
     }
-    if response.dragged_by(PointerButton::Middle) && follow_target.is_none() {
+    let pan = response.dragged_by(PointerButton::Middle) || (primary_drag && navigation == Some(PrimaryNavigation::Pan));
+    if pan && follow_target.is_none() {
         cam.pan(delta.x, delta.y, rect);
     }
     if response.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = input::zoom_scroll(ui);
         if scroll != 0.0 {
             cam.zoom(scroll);
         }
@@ -628,7 +633,7 @@ pub fn show(
             out.ctrl = gesture == MarkerClick::Toggle;
         }
     }
-    if gesture == MarkerClick::Plain && response.double_clicked() {
+    if navigation.is_none() && gesture == MarkerClick::Plain && response.double_clicked() {
         if let Some(pointer) = scene_pointer {
             out.double_clicked = pick(&projected, pointer);
         }

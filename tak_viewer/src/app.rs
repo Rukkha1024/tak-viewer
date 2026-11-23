@@ -2900,7 +2900,8 @@ impl TakViewerApp {
             if self.dirty_prompt.is_some() { ui.disable(); }
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open File… (Ctrl+O)").clicked() {
+                    let command = |mac, other| if cfg!(target_os = "macos") { mac } else { other };
+                    if ui.button(command("Open File… (Cmd+O)", "Open File… (Ctrl+O)")).clicked() {
                         ui.close_menu();
                         self.pick_file(ctx, false);
                     }
@@ -2913,18 +2914,18 @@ impl TakViewerApp {
                         self.pick_file(ctx, true);
                     }
                     if ui
-                        .add_enabled(!self.workspace.is_full(), egui::Button::new(format!("Add Folder… (Ctrl+Shift+O) · Max {MAX_ROOTS}")))
+                        .add_enabled(!self.workspace.is_full(), egui::Button::new(format!("{} · Max {MAX_ROOTS}", command("Add Folder… (Cmd+Shift+O)", "Add Folder… (Ctrl+Shift+O)"))))
                         .on_disabled_hover_text(format!("저장 폴더 {MAX_ROOTS}개가 다 찼어요. Explorer에서 ✕로 하나 빼세요."))
                         .clicked()
                     {
                         ui.close_menu();
                         self.pick_folder();
                     }
-                    if ui.button("Open by Path… (Ctrl+L)").clicked() {
+                    if ui.button(command("Open by Path… (Cmd+L)", "Open by Path… (Ctrl+L)")).clicked() {
                         ui.close_menu();
                         self.open_path_dialog();
                     }
-                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new("Save (Ctrl+S)")).clicked() {
+                    if ui.add_enabled(self.view().data.is_some(), egui::Button::new(command("Save (Cmd+S)", "Save (Ctrl+S)"))).clicked() {
                         ui.close_menu();
                         self.save_markers(ctx, self.active, false, false);
                     }
@@ -2967,7 +2968,7 @@ impl TakViewerApp {
                         }
                     });
                     if ui
-                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new("Save Captures (Ctrl+Shift+S)"))
+                        .add_enabled(self.view().data.is_some() && self.capture.is_none(), egui::Button::new(command("Save Captures (Cmd+Shift+S)", "Save Captures (Ctrl+Shift+S)")))
                         .on_hover_text("Save images to experiments/tak_captures/.")
                         .clicked()
                     {
@@ -4145,12 +4146,14 @@ impl TakViewerApp {
             let (focus, name) = (&mut self.path_focus, &mut self.path_name);
             egui::Window::new("Open by Path").id(egui::Id::new("경로로 열기")).open(&mut open).collapsible(false).default_width(620.0).show(ctx, |ui| {
                 if locked { ui.disable(); }
-                ui.label("Paste a file or folder path. WSL paths work too.");
-                ui.label(
-                    RichText::new("Example: /home/user/workspace/tak-viewer · /mnt/c/Users/User/… · \\\\wsl.localhost\\Ubuntu\\… · C:\\…")
-                        .small()
-                        .color(theme::TEXT_DIM),
-                );
+                let (instruction, example) = if cfg!(target_os = "macos") {
+                    ("Paste a file or folder path.", "Example: /Users/your-name/Documents/session.takm")
+                } else {
+                    ("Paste a file or folder path. WSL paths work too.",
+                    "Example: /home/user/workspace/tak-viewer · /mnt/c/Users/User/… · \\\\wsl.localhost\\Ubuntu\\… · C:\\…")
+                };
+                ui.label(instruction);
+                ui.label(RichText::new(example).small().color(theme::TEXT_DIM));
                 let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
                 if !locked && std::mem::take(focus) {
                     resp.request_focus();
@@ -4217,6 +4220,16 @@ impl TakViewerApp {
                 if let Some(dir) = &dir {
                     ui.horizontal(|ui| {
                         if ui.button("Open Folder").clicked() {
+                            #[cfg(target_os = "macos")]
+                            match std::process::Command::new("/usr/bin/open").arg(dir).spawn() {
+                                Ok(mut child) => {
+                                    std::thread::spawn(move || {
+                                        let _ = child.wait();
+                                    });
+                                }
+                                Err(error) => self.notice = Some(format!("캡처 폴더를 열 수 없어요. {error}")),
+                            }
+                            #[cfg(not(target_os = "macos"))]
                             let _ = std::process::Command::new("explorer").arg(dir).spawn();
                         }
                         if let Some(w) = workspace::to_wsl_path(dir) {

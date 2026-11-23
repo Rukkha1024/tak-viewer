@@ -1,6 +1,6 @@
 # TAK 뷰어
 
-`.tak`과 `.takm`의 마커와 움직임을 3D로 살펴보는 Windows 프로그램이에요. 주석을 달려면 `.takm` 사본을 만들어 사용해요. 파일 읽기 성공은 Motive와의 호환성이나 동등한 동작을 검증했다는 뜻이 아니에요.
+`.tak`과 `.takm`의 마커와 움직임을 3D로 살펴보는 Windows와 macOS 프로그램이에요. 주석을 달려면 `.takm` 사본을 만들어 사용해요. 파일 읽기 성공은 Motive와의 호환성이나 동등한 동작을 검증했다는 뜻이 아니에요.
 
 현재 공개물은 소스 코드예요. 별도 실행 파일이나 시험용 촬영 데이터는 포함하지 않아요. 아직 사용 허가 조건(라이선스)을 정하지 않았어요.
 
@@ -17,6 +17,8 @@ cargo build --release --locked
 ```
 
 `빌드.cmd`의 기본 결과는 `%LOCALAPPDATA%\tak_viewer\target_public\release\tak_viewer.exe`예요. 위 Cargo 명령은 별도 설정이 없다면 `target\release\tak_viewer.exe`를 만들어요. 처음 실행은 의존 도구를 내려받으므로 시간이 걸릴 수 있어요.
+
+macOS 설치 방법은 [맥용 빌드와 설치](docs/macos.md)를 보세요.
 
 ## 사용
 

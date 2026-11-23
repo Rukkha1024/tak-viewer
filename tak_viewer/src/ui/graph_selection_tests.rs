@@ -237,3 +237,36 @@ fn graph_selection_discards_a_drag_released_while_the_panel_is_hidden() {
     g.frame_select(vec![Event::PointerMoved(from + vec2(25.0, 0.0))], &mut range);
     assert_eq!(range, Some((50, 75)), "reopening cannot resume a released drag");
 }
+
+#[test]
+fn macos_option_drag_pans_without_changing_the_graph_selection() {
+    use eframe::egui::{vec2, Event, Id, Modifiers, PointerButton};
+    let mut graph = HoverGraph::new(true, false);
+    let mut range = Some((50, 75));
+    graph.frame_select(vec![], &mut range);
+    let start = graph.at(1, 2000.0, 50.0);
+    graph.frame_select(vec![Event::PointerMoved(start)], &mut range);
+    let before = graph.ctx.data(|data| data.get_temp::<ViewRange>(Id::new("g"))).unwrap();
+    graph.frame_select(vec![Event::Zoom(2.0)], &mut range);
+    let zoomed = graph.ctx.data(|data| data.get_temp::<ViewRange>(Id::new("g"))).unwrap();
+    let expected_span = (before.hi - before.lo) * if cfg!(target_os = "macos") { 0.5 } else { 1.0 };
+    assert!((zoomed.hi - zoomed.lo - expected_span).abs() < 0.1);
+
+    graph.frame_select(vec![Event::PointerButton {
+        pos: start,
+        button: PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers { alt: true, ..Modifiers::NONE },
+    }], &mut range);
+    let end = start + vec2(60.0, 0.0);
+    assert_eq!(graph.frame_select(vec![Event::PointerMoved(end)], &mut range).1, None);
+    assert_eq!(graph.frame_select(vec![graph_selection_button(end, false)], &mut range).1, None);
+    let panned = graph.ctx.data(|data| data.get_temp::<ViewRange>(Id::new("g"))).unwrap();
+    if cfg!(target_os = "macos") {
+        assert!(panned.lo < zoomed.lo);
+        assert_eq!(range, Some((50, 75)));
+    } else {
+        assert_eq!(panned.lo, zoomed.lo);
+        assert_ne!(range, Some((50, 75)));
+    }
+}

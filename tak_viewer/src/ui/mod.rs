@@ -23,6 +23,7 @@ pub mod empty;
 pub mod graph;
 pub mod graph_float;
 pub(crate) mod help_window;
+mod input;
 pub mod labeling;
 pub mod marker_order;
 pub mod open_editors;

@@ -130,9 +130,13 @@ pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()), m(a.a(), b.a()))
 }
 
-/// Load Malgun Gothic (Hangul) when present; keep egui defaults as fallback.
+/// Load an installed Hangul font when present; keep egui defaults as fallback.
 pub fn install_fonts(ctx: &egui::Context) {
     let candidates = [
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         r"C:\Windows\Fonts\malgun.ttf",
         "/mnt/c/Windows/Fonts/malgun.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -141,6 +145,15 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
+            #[cfg(target_os = "macos")]
+            {
+                use ab_glyph::Font;
+                if !ab_glyph::FontRef::try_from_slice(&bytes)
+                    .is_ok_and(|font| ['한', '글', '화', '면'].iter().all(|&ch| font.glyph_id(ch).0 != 0))
+                {
+                    continue;
+                }
+            }
             fonts.font_data.insert("korean".to_owned(), FontData::from_owned(bytes));
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
                 fonts.families.entry(family).or_default().insert(0, "korean".to_owned());
@@ -186,4 +199,18 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(6.0, 2.0);
         style.spacing.interact_size.y = 20.0;
     });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn installed_font_renders_hangul() {
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    ctx.begin_pass(egui::RawInput::default());
+    ctx.fonts(|fonts| {
+        for ch in ['한', '글', '화', '면'] {
+            assert!(fonts.has_glyph(&egui::FontId::proportional(14.0), ch), "missing {ch}");
+        }
+    });
+    let _ = ctx.end_pass();
 }

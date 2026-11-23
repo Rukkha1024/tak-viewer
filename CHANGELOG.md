@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.75.0 — 2026-11-23
+
+- Build, verify and install a native macOS app from the shared source.
+- macOS: Option drag and pinch, Command labels in File, Korean system font, local time, and Finder capture folder opening.
+
 ## v0.74.2 — 2026-11-23
 
 - Explorer lists local `.tak` and `.takm` symlinks to regular files. Use target size and modification time.

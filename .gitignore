@@ -20,3 +20,6 @@ __pycache__/
 *.zip
 .env
 .env.*
+
+# macOS app bundles
+build/

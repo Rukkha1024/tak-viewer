@@ -1433,13 +1433,16 @@ fn show_inner(
     let x_of = |f: f64, vr: &ViewRange| vr.x(plot, f);
     let f_of = |x: f32, vr: &ViewRange| vr.at(plot, x);
 
-    // Interaction.
+    // Option reserves the press for panning, including its release frame.
+    let navigation = super::input::primary_navigation(ui, &resp);
     let mut goto = None;
     let zoom = resp.hover_pos().and_then(|p| {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = super::input::zoom_scroll(ui);
         (scroll != 0.0).then_some((p.x, scroll))
     });
-    let pan = if resp.dragged_by(egui::PointerButton::Middle) { resp.drag_delta().x } else { 0.0 };
+    let panning = resp.dragged_by(egui::PointerButton::Middle)
+        || (navigation.is_some() && resp.dragged_by(egui::PointerButton::Primary));
+    let pan = if panning { resp.drag_delta().x } else { 0.0 };
     vr.navigate(full, plot, zoom, pan);
     let mut value_drag_lane = None;
     if let Some(zoom) = value_zoom.as_deref_mut().filter(|_|
@@ -1454,15 +1457,19 @@ fn show_inner(
         }
     }
     let (range_press, selecting) = range.as_deref_mut().map_or((false, false), |range| {
+        if navigation.is_some() {
+            ui.data_mut(|data| data.remove::<RangeDrag>(id.with("range_drag")));
+            return (false, false);
+        }
         // The empty panel still paints its navigation strip at the top. That strip scrubs.
         let input_plot = if lanes.is_empty() {
             Rect::from_min_max(rect.left_bottom(), hit_rect.right_bottom() - vec2(0.0, NAV_H))
         } else { plot };
         select_drag(ui, &resp, id, input_plot, RangeDragAxis::Any, |x| f_of(x, &vr).round().clamp(first as f64, last as f64) as i64, first, last, range)
     });
-    if !selecting && resp.double_clicked() {
+    if navigation.is_none() && !selecting && resp.double_clicked() {
         vr = full;
-    } else if !selecting && (resp.clicked_by(egui::PointerButton::Primary) || (!range_press && resp.dragged_by(egui::PointerButton::Primary))) {
+    } else if navigation.is_none() && !selecting && (resp.clicked_by(egui::PointerButton::Primary) || (!range_press && resp.dragged_by(egui::PointerButton::Primary))) {
         if let Some(p) = resp.interact_pointer_pos() {
             goto = Some(f_of(p.x, &vr).round().clamp(first as f64, last as f64) as i64);
         }

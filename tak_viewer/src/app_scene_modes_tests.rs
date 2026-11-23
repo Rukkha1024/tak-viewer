@@ -131,3 +131,41 @@ fn scene_modes_orthographic_click_and_marker_name_hover_match_what_is_drawn() {
     let output = frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(at_corner)]);
     assert!(drawn_in_scene(&output), "L displays a selected name without hover");
 }
+
+#[test]
+fn macos_option_drag_binds_camera_motion_to_the_initial_modifiers() {
+    use egui::{Event, PointerButton};
+    for shift in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = one_view(&ctx);
+        app.set_graph_float(false);
+        frame_with(&ctx, &mut app, vec![]);
+        let at = app.views[0].scene_rect.center();
+        frame_with(&ctx, &mut app, vec![Event::PointerMoved(at)]);
+        let initial = app.views[0].cam;
+        let selected = app.views[0].selected.clone();
+        frame_with(&ctx, &mut app, vec![Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers { alt: true, shift, ..Modifiers::NONE },
+        }]);
+        let end = at + egui::vec2(60.0, 25.0);
+        // The move and the release occur after the user lets go of Option and Shift.
+        frame_with(&ctx, &mut app, vec![Event::PointerMoved(end)]);
+        frame_with(&ctx, &mut app, vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        let moved = app.views[0].cam;
+        if cfg!(target_os = "macos") {
+            assert_eq!(moved.yaw != initial.yaw, !shift);
+            assert_eq!(moved.pivot != initial.pivot, shift);
+            assert_eq!(app.views[0].selected, selected);
+        } else {
+            assert_eq!(moved, initial);
+        }
+    }
+}

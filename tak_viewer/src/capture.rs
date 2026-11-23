@@ -353,7 +353,8 @@ pub fn check_out_dir(out: &Path, tak: &Path) -> Result<(), String> {
 }
 
 /// Default output folder: `<repo>/experiments/tak_captures/<time>_<file stem>`, with the repo
-/// found above the TAK, else above the current folder.
+/// found above the TAK, else above the current folder. On Mac, captures of files outside
+/// either root use the system temporary folder.
 pub fn default_out_dir(tak: &Path, stamp: &str) -> Result<PathBuf, String> {
     let root = repo_root(tak)
         .or_else(|| std::env::current_dir().ok().as_deref().and_then(repo_root));
@@ -390,7 +391,7 @@ pub fn new_dir(base: &Path) -> Result<PathBuf, String> {
 }
 
 /// The wall clock now: [year, month, day, hour, minute, second] in local time and the local
-/// offset from UTC in minutes. Without a local clock (not Windows): UTC and None.
+/// offset from UTC in minutes. Without a supported local clock: UTC and None.
 pub fn local_clock() -> ([i64; 6], Option<i32>) {
     #[cfg(windows)]
     {
@@ -426,7 +427,57 @@ pub fn local_clock() -> ([i64; 6], Option<i32>) {
     #[cfg(not(windows))]
     {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
-        (tak_core::comments::civil_from_unix(secs), None)
+        #[cfg(target_os = "macos")]
+        { local_clock_at(secs) }
+        #[cfg(not(target_os = "macos"))]
+        { (tak_core::comments::civil_from_unix(secs), None) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_clock_at(secs: i64) -> ([i64; 6], Option<i32>) {
+    let time: libc::time_t = secs;
+    let mut result = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers refer to local storage of the required sizes.
+    if unsafe { libc::localtime_r(&time, result.as_mut_ptr()) }.is_null() {
+        return (tak_core::comments::civil_from_unix(secs), None);
+    }
+    // SAFETY: localtime_r initialized result on success.
+    let result = unsafe { result.assume_init() };
+    let civil = [
+        i64::from(result.tm_year) + 1900,
+        i64::from(result.tm_mon) + 1,
+        i64::from(result.tm_mday),
+        i64::from(result.tm_hour),
+        i64::from(result.tm_min),
+        i64::from(result.tm_sec),
+    ];
+    (civil, Some((result.tm_gmtoff / 60) as i32))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn local_clock_uses_the_offset_for_each_date() {
+        const CHILD: &str = "TAK_VIEWER_TEST_LOCAL_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            for (utc, local, offset) in [
+                ([2025, 1, 15, 12, 0, 0], [2025, 1, 15, 7, 0, 0], -300),
+                ([2025, 7, 15, 12, 0, 0], [2025, 7, 15, 8, 0, 0], -240),
+            ] {
+                assert_eq!(local_clock_at(tak_core::comments::unix_from_civil(utc)), (local, Some(offset)));
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "capture::macos_tests::local_clock_uses_the_offset_for_each_date", "--nocapture"])
+            .env("TZ", "America/New_York")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
     }
 }
 
@@ -855,6 +906,14 @@ mod tests {
     }
 
     #[test]
+    fn default_capture_outside_roots_uses_temp_folder() {
+        assert_eq!(
+            default_out_dir_for_root(Path::new("/outside/example.tak"), "stamp", None, Path::new("/temp")),
+            Path::new("/temp/tak_viewer/captures/stamp_example")
+        );
+    }
+
+    #[test]
     fn standalone_root_requires_exact_marker_and_protects_input() {
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("tak_standalone_test_{}_{unique}", std::process::id()));
@@ -873,14 +932,6 @@ mod tests {
         assert!(check_out_dir(&root.join("output"), &tak).is_ok());
         assert_eq!(default_out_dir(&tak, "stamp").unwrap(), root.join("experiments/tak_captures/stamp_a"));
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn default_capture_outside_roots_uses_temp_folder() {
-        assert_eq!(
-            default_out_dir_for_root(Path::new("/outside/example.tak"), "stamp", None, Path::new("/temp")),
-            Path::new("/temp/tak_viewer/captures/stamp_example")
-        );
     }
 
     #[test]
