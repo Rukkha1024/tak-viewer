@@ -407,6 +407,17 @@ impl TakViewerApp {
                 self.add_remote_workspace(ctx, location, platform);
             }
             SshAction::Notice(s) => self.ssh_note = Some((s, ctx.input(|i| i.time))),
+            SshAction::Menu { command, location, platform } => {
+                use crate::ui::explorer_menu::Command::*;
+                match command {
+                    Open | Beside => self.remote_action(ctx, SshAction::Open { location, side: command == Beside }),
+                    Convert => self.save_remote_takm(ctx, location),
+                    AddRoot => self.add_remote_workspace(ctx, location, platform),
+                    CopyPath => ctx.copy_text(crate::file_ops::remote_path_text(&location.host, &location.path)),
+                    CopyName => ctx.copy_text(super::explorer_menu_app::remote_name(&location.path).to_owned()),
+                    _ => {}
+                }
+            }
             SshAction::Open { location, side } => {
                 let key = location.memory_key();
                 self.ssh_sources.insert(key.clone(), location.clone());
@@ -855,7 +866,8 @@ impl TakViewerApp {
     /// Root lays out WORKSPACE above this section with enough reserved space for SSH.
     pub(super) fn ssh_section(&mut self, ui: &mut egui::Ui) -> Vec<SshAction> {
         let current = self.view().remote.clone();
-        crate::ui::ssh_explorer::show(ui, &mut self.ssh, current.as_ref())
+        let beside = self.open_views().len() < MAX_VIEWS;
+        crate::ui::ssh_explorer::show(ui, &mut self.ssh, current.as_ref(), &self.workspace, beside)
     }
 
     pub(super) fn ssh_status(&self, ui: &mut egui::Ui) -> bool {

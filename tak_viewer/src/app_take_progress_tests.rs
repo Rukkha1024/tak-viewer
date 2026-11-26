@@ -34,7 +34,11 @@ fn progress_worker_waits_for_explorer_and_foreground_open() {
     assert!(!app.explorer.progress.worker_started());
 
     app.views[0].loading = None;
-    frame_with(&ctx, &mut app, vec![]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.explorer.progress.worker_started() && Instant::now() < deadline {
+        frame_with(&ctx, &mut app, vec![]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(app.explorer.progress.worker_started());
 }
 

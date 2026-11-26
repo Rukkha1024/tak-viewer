@@ -281,6 +281,8 @@ impl Folders {
 #[derive(Clone)]
 pub(super) enum Part {
     Progress(crate::take_progress::Pick),
+    /// An EXPLORER file change; undoing it runs `file_ops::undo` on this record.
+    Files(Arc<super::file_ops_app::Change>),
     CommentTypes(crate::comment_types::Change),
     View { tab: Option<layout_tabs::TabId>, slot: usize, part: Box<Part> },
     Frame { file: PathBuf, before: i64, after: i64 },
@@ -309,6 +311,9 @@ pub(super) enum Part {
     Options { tab: Option<layout_tabs::TabId>, before: Box<Options>, after: Box<Options> },
     EditorBatch { archive: Arc<EditorBatchArchive>, close_after: bool },
     EditorSelection { before: crate::ui::open_editors::EditorSelection, after: crate::ui::open_editors::EditorSelection },
+    WorkspaceSelection { before: explorer::Selection, after: explorer::Selection },
+    FileClipboard { before: Option<explorer::Clipboard>, after: Option<explorer::Clipboard> },
+    FolderScope { before: Option<PathBuf>, after: Option<PathBuf> },
     Folders { before: Box<Folders>, after: Box<Folders> },
     /// How the COMMENTS pane is sorted (v0.17.0; not saved in the settings).
     Sort { before: comment_list::Sort, after: comment_list::Sort },
@@ -557,10 +562,14 @@ impl History {
             Part::Comment { .. } => "Comment",
             Part::MarkerEdit { .. } => "MarkerEdit",
             Part::Progress(_) => "Progress",
+            Part::Files(_) => "Files",
             Part::CommentTypes(_) => "Comment types",
             Part::Layout { .. } => "Layout",
             Part::TakmSwitch { .. } => "TakmSwitch",
             Part::EditorSelection { .. } => "EditorSelection",
+            Part::WorkspaceSelection { .. } => "WorkspaceSelection",
+            Part::FileClipboard { .. } => "FileClipboard",
+            Part::FolderScope { .. } => "FolderScope",
             Part::EditorBatch { .. } => "EditorBatch",
             Part::Options { .. } => "Options",
             Part::Folders { .. } => "Folders",
@@ -1467,6 +1476,7 @@ impl TakViewerApp {
     /// undone one again. What was changed just before is recorded first. An action on a file
     /// being read waits; one that cannot be done any more is dropped and the next one is taken.
     pub(super) fn finish_progress_history(&mut self, pick: crate::take_progress::Pick, replay: Option<bool>, now: f64) {
+        if self.progress_batch_took(pick.clone()) { return; }
         match replay {
             None => self.history.push(vec![Part::Progress(pick)]),
             Some(redo) => {
@@ -1510,8 +1520,12 @@ impl TakViewerApp {
             self.history.note = Some(("Comment 종류 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
             return;
         }
-        if self.progress_job.is_some() {
+        if self.progress_job.is_some() || self.progress_batch.is_some() {
             self.history.note = Some(("진행 상태 저장이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
+            return;
+        }
+        if self.file_working() {
+            self.history.note = Some(("파일 작업이 끝난 뒤 다시 해 주세요.".into(), ctx.input(|i| i.time)));
             return;
         }
         if self.open_views().into_iter().any(|slot| self.marker_saving(slot))
@@ -1524,6 +1538,20 @@ impl TakViewerApp {
         self.stop_history_playback();
         self.observe(true);
         self.history.merge_open = false;
+        let picks = (if redo { self.history.redo.last() } else { self.history.undo.last() }).and_then(|action| {
+            let picks: Vec<_> = action.iter().filter_map(|part| match part { Part::Progress(pick) => Some(pick.clone()), _ => None }).collect();
+            (picks.len() > 1 && picks.len() == action.len()).then_some(picks)
+        });
+        if let Some(picks) = picks {
+            self.replay_progress_batch(ctx, picks, redo);
+            return;
+        }
+        let files = (if redo { self.history.redo.last() } else { self.history.undo.last() })
+            .and_then(|action| match action.as_slice() { [Part::Files(done)] => Some(done.clone()), _ => None });
+        if let Some(done) = files {
+            self.replay_file_change(ctx, done, redo);
+            return;
+        }
         let progress = (if redo { self.history.redo.last() } else { self.history.undo.last() })
             .and_then(|action| match action.as_slice() { [Part::Progress(pick)] => Some(pick.clone()), _ => None });
         if let Some(mut pick) = progress {
@@ -1741,6 +1769,19 @@ impl TakViewerApp {
                 self.editor_selection = if redo { after.clone() } else { before.clone() };
                 return format!("{} open files selected", self.editor_selection.selected.len());
             }
+            Part::WorkspaceSelection { before, after } => {
+                self.explorer.selection = if redo { after.clone() } else { before.clone() };
+                self.explorer.focused_folder = None;
+                return format!("{} files selected", self.explorer.selection.selected.len());
+            }
+            Part::FileClipboard { before, after } => {
+                self.explorer.clipboard = if redo { after.clone() } else { before.clone() };
+                return "File clipboard".into();
+            }
+            Part::FolderScope { before, after } => {
+                self.set_folder_scope(if redo { after.clone() } else { before.clone() }, false);
+                return "Find in Folder".into();
+            }
             Part::Options { before, after, .. } => {
                 let (from, to) = if redo { (before, after) } else { (after, before) };
                 let s = &mut self.settings;
@@ -1885,7 +1926,9 @@ impl TakViewerApp {
                     Err(_) => "Marker edit failed".into(),
                 }
             }
-            Part::Progress(_) | Part::CommentTypes(_) | Part::EditorBatch { .. } | Part::EditorSelection { .. } | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
+            Part::Progress(_) | Part::Files(_) | Part::CommentTypes(_) | Part::EditorBatch { .. } | Part::EditorSelection { .. }
+            | Part::WorkspaceSelection { .. } | Part::FileClipboard { .. } | Part::FolderScope { .. }
+            | Part::Layout { .. } | Part::TakmSwitch { .. } | Part::Options { .. } | Part::Folders { .. } | Part::Sort { .. }
             | Part::TabSwitch { .. } | Part::TabRename { .. } | Part::TabMove { .. }
             | Part::TabLifecycle { .. } | Part::View { .. } => String::new(),
         }

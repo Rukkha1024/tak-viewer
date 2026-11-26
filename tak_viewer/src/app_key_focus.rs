@@ -13,6 +13,7 @@ pub(crate) enum Target {
     UnlabeledMarkers(usize),
     Comments,
     Editors,
+    Workspace,
 }
 
 #[derive(Clone)]
@@ -37,7 +38,7 @@ pub(crate) fn text_input_focused(ctx: &egui::Context) -> bool {
 }
 
 fn input_priority(ctx: &egui::Context) -> bool {
-    text_input_focused(ctx) || ctx.memory(|m| m.any_popup_open()) || ctx.input(|i| {
+    text_input_focused(ctx) || crate::ui::explorer_menu::is_open(ctx) || ctx.memory(|m| m.any_popup_open()) || ctx.input(|i| {
         !i.focused || i.key_down(Key::M) || i.events.iter().any(|event| matches!(event,
             egui::Event::Key { key: Key::M, pressed: true, modifiers, .. } if modifiers.is_none()))
     })
@@ -136,7 +137,7 @@ impl TakViewerApp {
                 self.labeling_select_all(ctx, slot, list);
             }
         }
-        if !matches!(focus, Target::Comments | Target::Editors)
+        if !matches!(focus, Target::Comments | Target::Editors | Target::Workspace)
             && exact_key(ctx, Key::Delete, false, false, false) {
             let slot = match focus {
                 Target::Markers(slot) | Target::Scene(slot) | Target::Graph(slot) | Target::NamedMarkers(slot) | Target::UnlabeledMarkers(slot) => Some(slot),
@@ -148,7 +149,7 @@ impl TakViewerApp {
             }
         }
         // An editing list consumes Esc first. Else preserve the existing range-first rule.
-        if !self.explorer.is_renaming(ctx.cumulative_pass_nr())
+        if focus != Target::Workspace && !self.explorer.is_renaming(ctx.cumulative_pass_nr())
             && exact_key(ctx, Key::Escape, false, false, false) {
             let view = &mut self.views[self.active];
             if view.range.is_some() { view.range = None; }

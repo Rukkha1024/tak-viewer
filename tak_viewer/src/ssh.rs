@@ -39,6 +39,7 @@ pub enum SshAction {
         side: bool,
     },
     Notice(String),
+    Menu { command: crate::ui::explorer_menu::Command, location: RemoteLocation, platform: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -326,6 +327,11 @@ pub struct RemoteWritten {
 }
 enum Command {
     ProgressRead { id: u64, paths: Vec<String>, cancel: CancelToken },
+    /// Save an unopened server TAK as a sibling `.takm` on that server.
+    Convert {
+        id: u64, location: RemoteLocation,
+        reply: Sender<Result<tak_core::remote::RemoteWriteOutcome, String>>, cancel: CancelToken,
+    },
     ProgressWrite {
         id: u64, location: RemoteLocation, source: Option<tak_core::remote::RemoteSource>, use_open: bool,
         before: Option<i64>, after: Option<i64>,
@@ -731,6 +737,16 @@ impl SshManager {
         self.hosts.iter_mut().find(|h| h.alias == location.host)?.visible_progress(&location.path)
     }
 
+    /// The explicit batch action uses the same bounded read queue as row badges.
+    /// Outer None means the connected worker has yet to supply the value.
+    pub fn queued_progress(&mut self, location: &RemoteLocation) -> Option<Option<crate::take_progress::State>> {
+        let Some(host) = self.hosts.iter_mut().find(|h| h.alias == location.host && h.state == HostState::Connected) else {
+            return Some(None);
+        };
+        if let Some(value) = host.visible_progress(&location.path) { return Some(Some(value)); }
+        (host.worker.is_none() || host.progress.contains_key(&location.path)).then_some(None)
+    }
+
     pub fn write_progress(&mut self, location: RemoteLocation, before: Option<i64>, after: Option<i64>, use_open: bool)
         -> Result<Receiver<Result<tak_core::remote::RemoteWriteOutcome, String>>, String> {
         let id = self.id();
@@ -747,6 +763,21 @@ impl SshManager {
         worker.tx.send(Command::ProgressWrite { id, location, source, use_open, before, after, reply, cancel: cancel.clone() })
             .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
         worker.operations.insert(id, Operation { cancel, kind: OperationKind::ProgressWrite });
+        Ok(rx)
+    }
+
+    /// Save a server TAK (open or not) as a sibling `.takm` on that server. An existing `.takm` is
+    /// never overwritten (`existing` in the outcome).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn convert(&mut self, location: RemoteLocation) -> Result<Receiver<Result<tak_core::remote::RemoteWriteOutcome, String>>, String> {
+        let id = self.id();
+        let worker = self.hosts.iter_mut().find(|h| h.alias == location.host && h.state == HostState::Connected)
+            .and_then(|h| h.worker.as_mut()).ok_or("SSH를 다시 연결한 뒤 .takm으로 저장해 주세요.")?;
+        let cancel = CancelToken::default();
+        let (reply, rx) = mpsc::channel();
+        worker.tx.send(Command::Convert { id, location, reply, cancel: cancel.clone() })
+            .map_err(|_| "SSH 연결이 끝났어요. 다시 연결해 주세요.")?;
+        worker.operations.insert(id, Operation { cancel, kind: OperationKind::Open });
         Ok(rx)
     }
 
@@ -1201,6 +1232,13 @@ pub(crate) struct FakeOpenList(mpsc::Receiver<Command>);
 
 #[cfg(test)]
 impl FakeOpenList {
+    pub(crate) fn converted(&self) -> RemoteLocation {
+        match self.0.try_recv().expect("clicked SSH row sends Convert") {
+            Command::Convert { location, .. } => location,
+            _ => panic!("expected SSH conversion request"),
+        }
+    }
+
     pub(crate) fn opened(&self) -> (u64, RemoteLocation, CancelToken) {
         match self.0.try_recv().expect("clicked SSH row sends Open") {
             Command::Open { id, location, cancel, .. } => (id, location, cancel),
@@ -1469,6 +1507,17 @@ fn host_worker(
                 }
                 let rows = result.unwrap_or_else(|_| vec![None; paths.len()]);
                 emit(WorkerEvent::ProgressRows { id, rows: paths.into_iter().zip(rows).collect() });
+            }
+            Some(Command::Convert { id, location, reply, cancel }) => {
+                if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }
+                let result = session.stat(&location.path, &cancel).and_then(|source| session.convert(&source, &cancel));
+                emit(WorkerEvent::Done(id));
+                let _ = reply.send(result.map_err(|error| match classify_error(&error).0 {
+                    SshErrorKind::Changed => CHANGED_NOTE.to_owned(),
+                    SshErrorKind::Lost => LOST_NOTE.to_owned(),
+                    SshErrorKind::Failed => format!("서버에서 .takm으로 만들지 못했어요: {error}"),
+                }));
+                ctx.request_repaint();
             }
             Some(Command::ProgressWrite { id, location, source, use_open, before, after, reply, cancel }) => {
                 if cancel.is_cancelled() { emit(WorkerEvent::Done(id)); continue; }

@@ -37,6 +37,14 @@ mod takm_save;
 mod comment_types_ui;
 #[path = "app_progress.rs"]
 mod progress_edit;
+#[path = "app_file_ops.rs"]
+mod file_ops_app;
+#[path = "app_explorer_menu.rs"]
+mod explorer_menu_app;
+#[path = "app_takm_batch.rs"]
+mod takm_batch;
+#[path = "app_progress_batch.rs"]
+mod progress_batch;
 #[path = "app_editors.rs"]
 mod editors;
 #[path = "app_comment_multi.rs"]
@@ -572,6 +580,18 @@ pub struct TakViewerApp {
     /// "`.takm`으로 저장" running in the background (`app_takm.rs`), one at a time.
     takm_job: Option<takm_save::Job>,
     progress_job: Option<progress_edit::Job>,
+    /// EXPLORER file change (new folder, rename, paste, trash) or its undo, one at a time.
+    file_job: Option<file_ops_app::Job>,
+    /// `Find in Folder…` search and its results (`app_file_ops.rs`).
+    folder_find: Option<file_ops_app::FolderFind>,
+    explorer_progress_read: Option<explorer_menu_app::ProgressRead>,
+    explorer_remote_saves: std::collections::VecDeque<crate::ssh::RemoteLocation>,
+    explorer_paste_seen: bool,
+    /// Many TAK files saved as `.takm` one after another (`app_takm_batch.rs`).
+    takm_batch: Option<takm_batch::Batch>,
+    remote_convert: Option<takm_batch::RemoteConvert>,
+    /// Progress set on many TAKM files as one undo step (`app_progress_batch.rs`).
+    progress_batch: Option<progress_batch::Batch>,
     /// Its result, or why it or a Comment on a TAK cannot be done (plain Korean) and when:
     /// shown in the status bar for a few seconds.
     takm_note: Option<(String, f64)>,
@@ -789,6 +809,14 @@ impl TakViewerApp {
             overlay_click: None,
             takm_job: None,
             progress_job: None,
+            file_job: None,
+            folder_find: None,
+            explorer_progress_read: None,
+            explorer_remote_saves: Default::default(),
+            explorer_paste_seen: false,
+            takm_batch: None,
+            remote_convert: None,
+            progress_batch: None,
             takm_note: None,
             #[cfg(test)]
             takm_gate: None,
@@ -1307,11 +1335,17 @@ impl TakViewerApp {
         self.poll_remote_writes(ctx);
         self.poll_comment_writes(ctx);
         self.poll_takm(ctx);
+        self.advance_takm_batch(ctx);
+        self.poll_remote_convert(ctx);
         // Keep the same SSH stage through every sizing pass of one painted frame.
         if ctx.output(|output| output.num_completed_passes == 0) {
             self.poll_ssh(ctx);
         }
         self.poll_progress_write(ctx);
+        self.advance_progress_batch(ctx);
+        self.poll_file_job(ctx);
+        self.poll_folder_find();
+        self.poll_explorer_saves(ctx);
         self.poll_remote_emg(ctx);
     }
 
@@ -1539,6 +1573,11 @@ impl TakViewerApp {
             6 if self.drive_label_shot(ctx) => {}
             6 if self.wait_for_scene_menu_shot(ctx) => {}
             6 => {
+                if crate::ui::explorer_menu::preview_missing(ctx) {
+                    eprintln!("screenshot: 탐색기에서 지정한 행을 찾지 못했어요.");
+                    self.finish_command(ctx, false);
+                    return;
+                }
                 if auto.output.needs_regions() || auto.output.size.is_some() {
                     self.shot_regions = Some(crate::shot_output::Regions::begin(ctx.pixels_per_point()));
                 }
@@ -2728,7 +2767,8 @@ impl TakViewerApp {
 
     /// Keys act on the active view.
     fn handle_keys(&mut self, ctx: &egui::Context, now: f64) {
-        if self.typing(ctx) || self.dirty_prompt.is_some() || self.scene_marker_menu.is_open() || ctx.memory(|m| m.any_popup_open()) {
+        if self.typing(ctx) || self.dirty_prompt.is_some() || self.scene_marker_menu.is_open()
+            || crate::ui::explorer_menu::is_open(ctx) || ctx.memory(|m| m.any_popup_open()) {
             return;
         }
         // Ctrl+Z / Ctrl+Y work on the whole app (v0.16.0), also with no file in the active view.
@@ -2752,9 +2792,6 @@ impl TakViewerApp {
         }
         if self.view().data.is_none() {
             return;
-        }
-        if exact_key(ctx, Key::S, true, false, false) && self.hold.is_none() && self.comment_edit.is_none() && !ctx.memory(|m| m.any_popup_open()) {
-            self.save_markers(ctx, self.active, false, false);
         }
         self.marker_keys(ctx);
         // `T` (step 5): the selected comment's next type. A real press only (an auto-repeat
@@ -3136,18 +3173,17 @@ impl TakViewerApp {
                                 ctx.request_repaint_after(Duration::from_secs_f64(SAVED_NOTE_S - (now - t) + 0.05));
                             }
                         }
-                        // After a delete, undo or redo: what happened, for a few seconds.
-                        if let Some((note, t)) = &self.history.note {
-                            if now - t < CHANGE_NOTE_S {
-                                ui.label(text(note.clone()));
-                                ctx.request_repaint_after(Duration::from_secs_f64(CHANGE_NOTE_S - (now - t) + 0.05));
-                            }
-                        }
                     }
                     None => {
                         ui.label(text("Open a take to see its details.".to_owned()));
                     }
                 }
+                }
+                if let Some((note, t)) = &self.history.note {
+                    if now - t < CHANGE_NOTE_S {
+                        ui.label(text(note.clone()));
+                        ctx.request_repaint_after(Duration::from_secs_f64(CHANGE_NOTE_S - (now - t) + 0.05));
+                    }
                 }
                 if let Some(status) = self.view().preview_status() {
                     ui.label(text(status.to_owned()).strong());
@@ -3250,6 +3286,17 @@ impl TakViewerApp {
             WsAction::OverlayOff => self.overlay_off(self.active),
             WsAction::ToTakm(p) => self.save_takm(ctx, p),
             WsAction::Progress(pick) => self.pick_progress(ctx, pick),
+            WsAction::Select { path, ctrl, shift, open, plain } => self.workspace_pick(ctx, path, ctrl, shift, open, plain),
+            WsAction::Command(command, paths) => self.workspace_menu_command(ctx, command, paths),
+            WsAction::CommitName(op) => {
+                if self.file_op(ctx, op) {
+                    self.file_job.as_mut().unwrap().name_edit = true;
+                } else {
+                    self.explorer.disk_edit_result(self.takm_note.as_ref().map(|(why, _)| why.clone()));
+                }
+            }
+            WsAction::Scope(folder) => self.change_folder_scope(folder),
+            WsAction::Search(dir, needle) => self.find_in_folder(ctx, dir, needle),
         }
     }
 
@@ -3707,12 +3754,9 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 // OPEN EDITORS on top (`ui/open_editors.rs`), the WORKSPACE tree under it.
                 let groups = app.editor_groups(&self.order);
                 app.editor_selection.retain(&crate::ui::open_editors::displayed_rows(&groups));
-                let editors_min = ui.cursor().min;
                 if let Some(a) = crate::ui::open_editors::show(ui, &groups, app.workspace.is_full(), &mut app.explorer.editors_collapsed, &app.editor_selection) {
                     self.ed_action = Some(a);
                 }
-                let editors_rect = egui::Rect::from_min_max(editors_min, egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
-                key_focus::region(ui, editors_rect, key_focus::Target::Editors);
                 let current = app.view().remote.as_ref().and_then(|l| app.workspace.key_for_remote(l)).or_else(|| app.view().target().map(Path::to_path_buf));
                 // Other open files: the other views' files and every laid-over file.
                 let mut others: Vec<PathBuf> = self
@@ -3723,9 +3767,16 @@ impl egui_dock::TabViewer for Tabs<'_> {
                     .filter_map(|k| app.views[k].remote.as_ref().and_then(|l| app.workspace.key_for_remote(l)).or_else(|| app.views[k].target().map(Path::to_path_buf)))
                     .collect();
                 others.extend(self.open.iter().flat_map(|&k| app.views[k].overlay_paths().map(Path::to_path_buf).collect::<Vec<_>>()));
-                // The menu offers "얹은 파일 내리기" while the active view has one.
-                let overlaid = app.view().overlay_target().is_some();
                 let revealing = app.explorer.reveal.is_some().then(|| app.explorer.folds().0.clone());
+                let open_files: Vec<_> = groups.iter().flat_map(|g| &g.entries).map(|e| e.path.clone()).collect();
+                let scoped = app.folder_find.as_ref().map(|f| explorer::ScopedRows { dir: &f.dir,
+                    needle: &f.needle, found: &f.found, running: app.folder_find_running(), capped: f.cut });
+                let options = explorer::MenuOptions {
+                    overlay: app.view().data.is_some(),
+                    beside: self.open.len() < MAX_VIEWS,
+                    open_files: &open_files,
+                    scoped,
+                };
                 // WORKSPACE keeps its existing height when short; a long tree reserves room
                 // for the SSH section, so all three section headers remain reachable.
                 let available = ui.available_height();
@@ -3733,7 +3784,7 @@ impl egui_dock::TabViewer for Tabs<'_> {
                 let workspace_h = (available - reserve).max(26.0);
                 let max = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), workspace_h));
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(max), |ui| {
-                    if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, overlaid, &mut app.explorer, &mut app.ssh) {
+                    if let Some(a) = explorer::show(ui, &mut app.workspace, current.as_deref(), &others, &mut app.explorer, &mut app.ssh, options) {
                         self.ws_action = Some(a);
                     }
                 });
@@ -3936,6 +3987,7 @@ impl TakViewerApp {
         }
         let global_keys = !self.typing(ctx) && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none()
             && self.capture.is_none() && !self.scene_marker_menu.is_open()
+            && !crate::ui::explorer_menu::is_open(ctx)
             && !ctx.input(|input| input.key_down(Key::M)) && !ctx.memory(|m| m.any_popup_open());
         if global_keys && exact_key(ctx, Key::O, true, true, false) {
             self.pick_folder();
@@ -3955,7 +4007,8 @@ impl TakViewerApp {
         if tab_keys && (exact_key(ctx, Key::Tab, true, false, false) || exact_key(ctx, Key::PageDown, true, false, false)) {
             self.step_layout_tab(1);
         }
-        if tab_keys && exact_key(ctx, Key::F2, false, false, false) {
+        if tab_keys && key_focus::target(ctx) != key_focus::Target::Workspace
+            && !ctx.input(|i| i.pointer.any_pressed()) && exact_key(ctx, Key::F2, false, false, false) {
             if let Some(id) = self.layout_tabs.active_id() { self.layout_strip.begin_rename(&self.layout_tabs, id); }
         }
         // Side toggles (VS Code keys). Ctrl+Alt+B first: Ctrl+B also matches it.
@@ -3994,7 +4047,8 @@ impl TakViewerApp {
             self.labeling_reorder = false;
             ctx.memory_mut(|memory| memory.close_popup());
             egui::DragAndDrop::clear_payload(ctx);
-        } else if self.ssh.is_busy() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        } else if self.ssh.is_busy() && !matches!(key_focus::target(ctx), key_focus::Target::Workspace | key_focus::Target::Editors)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.ssh.cancel_all();
         }
         // Background loads: markers ready? Then force plates / EMG.
@@ -4017,6 +4071,7 @@ impl TakViewerApp {
         }
         self.explorer.progress.begin_frame();
         self.ssh.begin_progress_frame();
+        self.poll_explorer_progress(ctx);
         // A cell edit of the COMMENTS pane first (its Enter / Esc), then `M` held (comment while
         // watching): its Esc and its key-up come before the rest.
         // The type strip closes on the next action elsewhere (it uses nothing up).
@@ -4105,7 +4160,10 @@ impl TakViewerApp {
                     ui.set_min_width(rect.width());
                     ui.set_max_width(rect.width());
                     key_focus::region(ui, rect, key_focus::Target::Blocked);
-                    ui.add_enabled_ui(self.dirty_prompt.is_none(), |ui| self.layout_strip.show(ui, &self.layout_tabs)).inner
+                    let rename_shortcut = key_focus::target(ctx) != key_focus::Target::Workspace
+                        && !ctx.input(|i| i.pointer.any_pressed()) && !crate::ui::explorer_menu::is_open(ctx);
+                    ui.add_enabled_ui(self.dirty_prompt.is_none(), |ui|
+                        self.layout_strip.show(ui, &self.layout_tabs, rename_shortcut)).inner
                 }).inner;
             for action in actions { self.layout_strip_action(ctx, action); }
         } else {
@@ -4403,6 +4461,17 @@ impl TakViewerApp {
         self.graph_fit_keys(ctx);
         self.comment_list_keys(ctx);
         self.editor_list_keys(ctx);
+        self.workspace_list_keys(ctx);
+        let focus = key_focus::target(ctx);
+        if tab_keys && focus != key_focus::Target::Workspace && !key_focus::keys_blocked(ctx)
+            && exact_key(ctx, Key::F2, false, false, false) {
+            if let Some(id) = self.layout_tabs.active_id() { self.layout_strip.begin_rename(&self.layout_tabs, id); }
+        }
+        if global_keys && focus != key_focus::Target::Editors && !key_focus::keys_blocked(ctx)
+            && self.view().data.is_some() && self.dirty_prompt.is_none() && self.hold.is_none() && self.comment_edit.is_none()
+            && exact_key(ctx, Key::S, true, false, false) {
+            self.save_markers(ctx, self.active, false, false);
+        }
         self.marker_focus_keys(ctx);
         self.follow_scene_key(ctx);
         // Last: what a person changed this frame becomes an undo action (`app_undo.rs`).
@@ -10839,12 +10908,14 @@ mod tests {
     }
 
     include!("app_editor_batch_tests.rs");
+    include!("app_file_ops_tests.rs");
+    include!("app_explorer_menu_tests.rs");
 
     fn editor_lines(ctx: &egui::Context, app: &mut TakViewerApp) -> Vec<String> {
         let explorer = place_of(app, Pane::Explorer);
         let out = frame_with(ctx, app, vec![]);
         editor_texts(&out, explorer).into_iter().map(|t| t.1)
-            .filter(|text| !text.contains(" selected · Ctrl/Shift") && !text.starts_with("Ctrl+A all") && text != "·").collect()
+            .filter(|text| !text.ends_with(" selected") && text != "·").collect()
     }
 
     /// Where an OPEN EDITORS text is (its middle).

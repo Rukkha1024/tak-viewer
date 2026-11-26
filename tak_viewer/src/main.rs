@@ -28,6 +28,7 @@ mod camera;
 mod device_filter;
 mod desktop_drop;
 mod device_grid;
+mod file_ops;
 mod comment_selection;
 mod comment_types;
 mod capture;
@@ -181,6 +182,9 @@ fn main() -> eframe::Result<()> {
     if let Err(error) = take_progress::parse_demo(&mut args, headless) {
         eprintln!("{error}");
         std::process::exit(2);
+    }
+    if let Err(error) = ui::explorer_menu::parse_preview(&mut args, headless) {
+        cli_exit(2, error);
     }
     if let Err(error) = ui::graph::tracks::parse_probe(&mut args) {
         eprintln!("{error}");
@@ -347,6 +351,7 @@ fn usage() -> String {
         "Headless 3D camera: --scene-view perspective|front|back|left|right|top|bottom and --scene-follow",
         "Saved progress benchmark: tak_viewer --bench-progress file.tak [file.takm …]",
         "Headless Progress menu: --progress-menu NAME with --screenshot. Use --ssh-demo progress for fake SSH rows.",
+        "Headless Explorer menu: --context-menu [workspace:|editors:|ssh:]ROW[,ROW…] with --headless --screenshot.",
         ssh_progress_probe::USAGE,
         "Workspace benchmark: tak_viewer --bench 600 file.tak --bench-workspace folder",
         "GRAPH screenshot or benchmark: --graph-layout channels|tracks|combined and --graph-zoom A-B",

@@ -4,9 +4,9 @@ use super::explorer::{
     chevron, file_icon, ACTIVE_SEL_BG, BUTTON_BG, FG, FG_DIM, HOVER_BG, ICON_FG, SIDEBAR_BG,
     TAK_ICON,
 };
+use super::explorer_menu::{self as menu, Section};
 use crate::ssh::{
     is_drive_root, parent_path, HostState, RemoteLocation, SshAction, SshManager, TreeRow, REMOTE_DRAG_NOTE,
-    REMOTE_OVERLAY_NOTE,
 };
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
@@ -130,6 +130,8 @@ pub fn show(
     ui: &mut Ui,
     manager: &mut SshManager,
     current: Option<&RemoteLocation>,
+    workspace: &crate::workspace::Workspace,
+    beside: bool,
 ) -> Vec<SshAction> {
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
     let mut actions = Vec::new();
@@ -284,14 +286,18 @@ pub fn show(
                                 chevron(ui.painter(), pos2(x + 7.0, rect.center().y), *expanded, ICON_FG);
                                 label(ui, name, Rect::from_min_max(pos2(x + 20.0, rect.top()), rect.right_bottom()), FontId::proportional(12.0), FG);
                                 if response.clicked() && connected { inputs.push(folder_input(&host.alias, &host.path, path)); }
-                                response.context_menu(|ui| {
-                                    if ui.button("Add to WORKSPACE").clicked() {
-                                        actions.push(SshAction::AddWorkspace { location: RemoteLocation { host: host.alias.clone(), path: path.clone() }, platform: if platform == "Windows" { "windows" } else { "linux" }.into() });
-                                        ui.close_menu();
-                                    }
-                                });
+                                let location = RemoteLocation { host: host.alias.clone(), path: path.clone() };
+                                let platform = if platform == "Windows" { "windows" } else { "linux" };
+                                if let Some(command) = menu::popup(ui, &response, Section::Ssh, menu::matches_preview(Section::Ssh, name), || {
+                                    let saved = crate::workspace::RemoteRoot { alias: host.alias.clone(), path: path.clone(), platform: platform.into() };
+                                    menu::remote_folder(!workspace.is_full() && !workspace.roots().contains(&saved.key()), false, None)
+                                }) {
+                                    actions.push(SshAction::Menu { command, location, platform: platform.into() });
+                                }
                             }
                             TreeRow::File { path, name, .. } => {
+                                let preview = menu::matches_preview(Section::Ssh, name);
+                                let tak = menu::take(std::path::Path::new(path));
                                 let icon_x = x + crate::take_progress::SLOT;
                                 file_icon(ui.painter(), pos2(icon_x + 8.0, rect.center().y), TAK_ICON);
                                 let avail = (rect.right() - icon_x - 20.0).max(0.0);
@@ -311,13 +317,10 @@ pub fn show(
                                     else { actions.push(SshAction::Notice("연결 버튼을 눌러 다시 연결한 뒤 열어 주세요.".into())); }
                                 }
                                 if response.drag_started() { actions.push(SshAction::Notice(REMOTE_DRAG_NOTE.into())); }
-                                response.context_menu(|ui| {
-                                    if ui.add_enabled(connected, egui::Button::new("Open")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: false }); ui.close_menu(); }
-                                    if ui.add_enabled(connected, egui::Button::new("Open Beside")).clicked() { actions.push(SshAction::Open { location: location.clone(), side: true }); ui.close_menu(); }
-                                    ui.separator();
-                                    ui.add(egui::Label::new(RichText::new("원격 파일은 얹거나 끌어 놓을 수 없어요.").size(11.0).color(FG_DIM)).wrap());
-                                    if ui.button("Show Reason").clicked() { actions.push(SshAction::Notice(format!("{REMOTE_OVERLAY_NOTE} {REMOTE_DRAG_NOTE}"))); ui.close_menu(); }
-                                });
+                                if let Some(command) = menu::popup(ui, &response, Section::Ssh, preview, ||
+                                    menu::remote_file(tak, connected, beside)) {
+                                    actions.push(SshAction::Menu { command, location, platform: String::new() });
+                                }
                             }
                             TreeRow::Note { text, .. } => label(ui, text, Rect::from_min_max(pos2(x + 4.0, rect.top()), rect.right_bottom()), FontId::proportional(11.0), FG_DIM),
                         }

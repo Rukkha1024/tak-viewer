@@ -484,10 +484,14 @@ impl Workspace {
             return;
         }
         let name = name.trim();
+        let before = self.names.get(root).cloned();
         if name.is_empty() || name == folder_name(root) {
             self.names.remove(root);
         } else {
             self.names.insert(root.to_path_buf(), name.to_owned());
+        }
+        if before.as_ref() != self.names.get(root) {
+            self.revision += 1;
         }
     }
 
@@ -635,6 +639,27 @@ impl Workspace {
 
     pub fn listing(&self, dir: &Path) -> Option<&Listing> {
         self.listings.get(dir).map(|l| &**l)
+    }
+
+    /// Share immutable listings with the Explorer row builder. This copies one handle per
+    /// folder and leaves file rows on the worker.
+    pub fn explorer_snapshot(&self) -> Self {
+        let mut snapshot = Self::with(self.roots.clone(), self.listings.clone(), None);
+        snapshot.names = self.names.clone();
+        snapshot.missing = self.missing.clone();
+        snapshot.revision = self.revision;
+        snapshot
+    }
+
+    pub fn explorer_needs_worker(&self) -> bool {
+        let mut count = self.listings.len();
+        for listing in self.listings.values() {
+            if let Listing::Ready { dirs, files } = &**listing {
+                count += dirs.len() + files.len();
+            }
+            if count > 512 { return true; }
+        }
+        false
     }
 
     pub fn is_loading(&self) -> bool {

@@ -441,6 +441,13 @@ fn read_row(path: &Path, expected: Stamp, can_read: &dyn Fn() -> bool) -> Option
     Some(State(value))
 }
 
+/// Read the starting value for an explicit batch pick, including rows off screen.
+pub fn read_pick(path: PathBuf, after: State) -> Option<Pick> {
+    let stamp = Stamp::of(std::fs::metadata(&path).ok()?)?;
+    let before = read_row(&path, stamp, &|| true)?;
+    Some(Pick { target: Target::Local(path), before, after, stamp: Some(stamp) })
+}
+
 pub fn bench(paths: &[String]) -> i32 {
     use std::time::Instant;
     if paths.is_empty() {

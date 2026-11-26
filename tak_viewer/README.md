@@ -84,12 +84,15 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | Ctrl+T / Ctrl+Shift+T / Ctrl+W | New tab / reopen closed view or tab / close focused view |
 | Ctrl+Tab / Ctrl+PageDown | Next tab |
 | Ctrl+Shift+Tab / Ctrl+PageUp | Previous tab |
-| F2 | Rename active tab. Enter commits, Esc cancels |
+| F2 | Rename active tab outside the WORKSPACE list. Enter commits, Esc cancels |
 | PageDown / PageUp | Next / previous file from the same folder |
 | Ctrl+Shift+S | Save screen captures |
 | Ctrl+S | Save active edit document |
 | Ctrl+Z or Ctrl+Alt+Z / Ctrl+Y | Undo / redo; Ctrl+Shift+Z disabled |
 | List Ctrl+click / Shift+click / Ctrl+A | Toggle / range / all; last-clicked list focus |
+| WORKSPACE Enter / Ctrl+Enter / F2 / Delete | Open / open beside / rename TAKM / move TAKM to trash |
+| WORKSPACE Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut TAKM / paste with the app file clipboard |
+| WORKSPACE Shift+Alt+C / Shift+Alt+R / Shift+Alt+F | Copy path / show in File Explorer / find in focused folder |
 | Frame number drag | Up/right positive, down/left negative; Shift fast; click types number |
 | Upper timeline / floating-graph click/drag | Seek frame |
 | GRAPH curve click / drag>4 pt | Seek / inclusive edit range, current frame unchanged |
@@ -181,6 +184,7 @@ WSL and Windows output paths work. Create the parent folder first. For paths pri
 | --crop-only | Save only the crop. Without it, also save the full-size screenshot |
 | --regions | Save full-image pixel rectangles to `<stem>.regions.json` |
 | `--progress-menu NAME` | Open the matching file row’s progress menu in a headless screenshot. Add `--ssh-demo progress` for fake SSH rows with the local views still visible. Read only |
+| `--context-menu [workspace:|editors:|ssh:]ROW[,ROW…]` | Show the matching Explorer right-click menu in a headless screenshot. Use displayed names and list multiple file names for batch selection. Default section is WORKSPACE. Read only |
 | --select-visible | Select current visible markers as 3D Ctrl+A does. Use `--select A,B` for distance or `--select A,B,C` for angle, with B as vertex. |
 | --plate index/name | Zero-based plate, exact name preferred |
 | --scene-view perspective\|front\|back\|left\|right\|top\|bottom | Set direction in all screenshot views |

@@ -1,9 +1,16 @@
 
 use crate::views::MAX_VIEWS;
+use super::explorer_menu::{self as menu, Command, Section};
+use crate::app::key_focus;
 use crate::workspace::{ancestors_between, folder_name, to_wsl_path, Listing, WsFile, Workspace, MAX_ROOTS};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, ScrollArea, Sense, Shape, Stroke, Ui};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+#[path = "explorer_interaction.rs"]
+mod interaction;
+pub use interaction::{Clipboard, EditKind, Selection};
 
 // VS Code Default Dark+ theme values.
 pub const SIDEBAR_BG: Color32 = Color32::from_rgb(0x25, 0x25, 0x26);
@@ -46,12 +53,26 @@ pub enum WsAction {
     OverlayOff,
     /// Save this TAK as `<stem>.takm` next to it (right-click menu ".takm으로 저장").
     ToTakm(PathBuf),
+    Select { path: PathBuf, ctrl: bool, shift: bool, open: bool, plain: bool },
+    Command(Command, Vec<PathBuf>),
+    CommitName(crate::file_ops::Op),
+    Scope(Option<PathBuf>),
+    Search(PathBuf, String),
 }
 
 #[derive(Default)]
 pub struct ExplorerState {
     pub progress: crate::take_progress::Cache,
     pub filter: String,
+    pub selection: Selection,
+    pub clipboard: Option<Clipboard>,
+    pub focused_folder: Option<PathBuf>,
+    pub scope: Option<PathBuf>,
+    pub focus_search: bool,
+    disk_edit: Option<interaction::DiskEdit>,
+    rows: Option<Arc<Rows>>,
+    row_job: Option<std::sync::mpsc::Receiver<Arc<Rows>>>,
+    row_rev: u64,
     /// Expanded folders, saved folders included (a saved folder is open when it is in here).
     expanded: HashSet<PathBuf>,
     section_collapsed: bool,
@@ -78,7 +99,7 @@ pub const MISSING_NOTE: &str = " · Folder Missing";
 
 /// Folders shown expanded in the tree (what ↻ and the watcher re-read), parents first. A saved
 /// folder that is gone shows nothing below it, so neither it nor anything under it is in here.
-fn watch_dirs(ws: &Workspace, st: &ExplorerState) -> Vec<PathBuf> {
+fn expanded_dirs(ws: &Workspace, st: &ExplorerState, include_remote: bool) -> Vec<PathBuf> {
     fn walk(ws: &Workspace, st: &ExplorerState, dir: &Path, out: &mut Vec<PathBuf>) {
         out.push(dir.to_path_buf());
         if let Some(Listing::Ready { dirs, .. }) = ws.listing(dir) {
@@ -91,7 +112,7 @@ fn watch_dirs(ws: &Workspace, st: &ExplorerState) -> Vec<PathBuf> {
     }
     let mut out = Vec::new();
     for r in ws.roots() {
-        if st.expanded.contains(r) && !ws.is_missing(r) && !crate::workspace::is_remote_root_key(r) {
+        if st.expanded.contains(r) && !ws.is_missing(r) && (include_remote || !crate::workspace::is_remote_root_key(r)) {
             walk(ws, st, r, &mut out);
         }
     }
@@ -105,7 +126,7 @@ pub fn keep_watch(st: &mut ExplorerState, ws: &mut Workspace) {
     if !ws.is_watching() || st.watch_key == Some((ws.revision(), st.folds_rev)) {
         return;
     }
-    let dirs = watch_dirs(ws, st);
+    let dirs = expanded_dirs(ws, st, false);
     for d in &dirs {
         if ws.listing(d).is_none() {
             ws.request(d);
@@ -127,6 +148,27 @@ impl ExplorerState {
     /// An edit box was on screen this frame or the last one (keys belong to it then).
     pub fn is_renaming(&self, pass_nr: u64) -> bool {
         self.renaming.is_some() && (self.rename_started || self.rename_drawn + 1 >= pass_nr)
+    }
+
+    pub fn invalidate_rows(&mut self) { self.row_rev = self.row_rev.wrapping_add(1); }
+
+    pub fn pick(&mut self, path: PathBuf, ctrl: bool, shift: bool) {
+        let order = self.rows.as_ref().map_or(&[][..], |rows| rows.files.as_slice());
+        self.selection.click(order, path, ctrl, shift);
+    }
+
+    pub fn pick_all_files(&mut self) {
+        let order = self.rows.as_ref().map_or(&[][..], |rows| rows.files.as_slice());
+        self.selection.all(order);
+    }
+
+    pub fn picked_paths(&self) -> Vec<PathBuf> {
+        let Some(rows) = &self.rows else { return vec![] };
+        let mut paths: Vec<_> = self.selection.selected.iter().filter_map(|path| {
+            Some((*rows.positions.get(path)?, path.clone()))
+        }).collect();
+        paths.sort_unstable_by_key(|(index, _)| *index);
+        paths.into_iter().map(|(_, path)| path).collect()
     }
 
     /// Expand `dir` and list it (that one level only).
@@ -177,6 +219,59 @@ enum Row {
     Dir { depth: usize, path: PathBuf, name: String, open: bool },
     File { depth: usize, file: WsFile, folder: Option<String> },
     Note { depth: usize, text: String },
+    NewFolder { depth: usize, path: PathBuf },
+    EditError { depth: usize, text: String },
+}
+
+impl Row {
+    fn depth(&self) -> usize {
+        match self {
+            Self::Root { .. } => 0,
+            Self::Dir { depth, .. } | Self::File { depth, .. } | Self::Note { depth, .. }
+            | Self::NewFolder { depth, .. } | Self::EditError { depth, .. } => *depth,
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Root { path, .. } | Self::Dir { path, .. } => Some(path),
+            Self::File { file, .. } => Some(&file.path),
+            _ => None,
+        }
+    }
+}
+
+struct Rows {
+    key: RowsKey,
+    rows: Vec<Row>,
+    files: Vec<PathBuf>,
+    positions: HashMap<PathBuf, usize>,
+    indices: HashMap<PathBuf, usize>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RowsKey {
+    workspace_revision: u64,
+    folds_revision: u64,
+    rows_revision: u64,
+    needle: String,
+    scope: Option<PathBuf>,
+}
+
+pub struct ScopedRows<'a> {
+    pub dir: &'a Path,
+    pub needle: &'a str,
+    pub found: &'a [PathBuf],
+    pub running: bool,
+    pub capped: bool,
+}
+
+#[derive(Default)]
+pub struct MenuOptions<'a> {
+    pub overlay: bool,
+    pub beside: bool,
+    pub open_files: &'a [PathBuf],
+    pub scoped: Option<ScopedRows<'a>>,
 }
 
 /// Saved folder label: the given name exactly as typed, or the folder's own name in
@@ -188,15 +283,15 @@ fn root_label(ws: &Workspace, root: &Path) -> (String, bool) {
     }
 }
 
-fn push_rows(ws: &Workspace, dir: &Path, depth: usize, st: &ExplorerState, out: &mut Vec<Row>) {
+fn push_rows(ws: &Workspace, dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<Row>) {
     match ws.listing(dir) {
         Some(Listing::Ready { dirs, files }) => {
             for d in dirs {
-                let open = st.expanded.contains(d);
+                let open = expanded.contains(d);
                 let name = d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 out.push(Row::Dir { depth, path: d.clone(), name, open });
                 if open {
-                    push_rows(ws, d, depth + 1, st, out);
+                    push_rows(ws, d, depth + 1, expanded, out);
                 }
             }
             for f in files {
@@ -209,21 +304,27 @@ fn push_rows(ws: &Workspace, dir: &Path, depth: usize, st: &ExplorerState, out: 
 }
 
 /// The tree: one row per saved folder; only expanded ones show (and need) their contents.
+#[cfg(test)]
 fn tree_rows(ws: &Workspace, st: &ExplorerState) -> Vec<Row> {
+    tree_rows_for(ws, &st.expanded)
+}
+
+fn tree_rows_for(ws: &Workspace, expanded: &HashSet<PathBuf>) -> Vec<Row> {
     let mut out = Vec::new();
     for r in ws.roots() {
         let missing = ws.is_missing(r);
-        let open = st.expanded.contains(r) && !missing;
+        let open = expanded.contains(r) && !missing;
         let (name, named) = root_label(ws, r);
         out.push(Row::Root { path: r.clone(), name, open, named, missing });
         if open {
-            push_rows(ws, r, 1, st, &mut out);
+            push_rows(ws, r, 1, expanded, &mut out);
         }
     }
     out
 }
 
 /// Folders shown expanded right now (what "새로고침" re-reads).
+#[cfg(test)]
 fn open_dirs(rows: &[Row]) -> Vec<PathBuf> {
     rows.iter()
         .filter_map(|r| match r {
@@ -252,6 +353,109 @@ fn search_rows(ws: &Workspace, needle: &str) -> Vec<Row> {
             Row::File { depth: 0, file: f.clone(), folder }
         })
         .collect()
+}
+
+fn cached_rows(ctx: &egui::Context, ws: &Workspace, st: &mut ExplorerState, needle: &str, scope: Option<&ScopedRows<'_>>) -> Arc<Rows> {
+    let key = RowsKey { workspace_revision: ws.revision(), folds_revision: st.folds_rev, rows_revision: st.row_rev,
+        needle: needle.into(), scope: st.scope.clone() };
+    if let Some(rx) = &st.row_job {
+        match rx.try_recv() {
+            Ok(rows) => {
+                if rows.key == key { crate::views::drop_later(st.rows.replace(rows)); }
+                else { crate::views::drop_later(Some(rows)); }
+                st.row_job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => st.row_job = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if let Some(rows) = st.rows.as_ref().filter(|rows| rows.key == key) { return rows.clone(); }
+    let edit = st.row_edit();
+    if key.scope.is_none() && ws.explorer_needs_worker() {
+        if st.row_job.is_none() {
+            let snapshot = ws.explorer_snapshot();
+            let expanded = st.expanded.clone();
+            let wake = ctx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(build_rows(key, &snapshot, &expanded, None, edit));
+                wake.request_repaint();
+            });
+            st.row_job = Some(rx);
+        }
+        return st.rows.clone().unwrap_or_else(|| Arc::new(Rows { key: RowsKey::default(),
+            rows: vec![], files: vec![], positions: HashMap::new(), indices: HashMap::new() }));
+    }
+    let rows = build_rows(key, ws, &st.expanded, scope, edit);
+    crate::views::drop_later(st.rows.replace(rows.clone()).filter(|old| old.rows.len() > 512));
+    rows
+}
+
+fn build_rows(key: RowsKey, ws: &Workspace, expanded: &HashSet<PathBuf>, scope: Option<&ScopedRows<'_>>,
+    edit: Option<interaction::RowEdit>) -> Arc<Rows> {
+    let mut rows = if let Some(dir) = &key.scope {
+        let scope = scope.filter(|scope| scope.dir == dir && scope.needle == key.needle);
+        let mut rows: Vec<_> = scope.into_iter().flat_map(|scope| scope.found).map(|path| {
+            let folder = path.parent().and_then(|parent| parent.strip_prefix(dir).ok())
+                .filter(|relative| !relative.as_os_str().is_empty()).map(|relative| relative.display().to_string());
+            Row::File { depth: 0, file: WsFile { path: path.clone(), name: crate::file_ops::name_of(path), size: 0, modified: None }, folder }
+        }).collect();
+        if rows.is_empty() || scope.is_some_and(|scope| scope.capped) {
+            let text = match scope {
+                Some(scope) if scope.capped => "Showing the first 2,000 matches",
+                Some(scope) if !scope.running => "No matches in this folder",
+                _ => "Searching…",
+            };
+            rows.push(Row::Note { depth: 0, text: text.into() });
+        }
+        rows
+    } else if key.needle.is_empty() {
+        tree_rows_for(ws, expanded)
+    } else {
+        let mut rows = search_rows(ws, &key.needle);
+        if rows.is_empty() { rows.push(Row::Note { depth: 0, text: "No matches in open folders".into() }); }
+        rows
+    };
+    if let Some(edit) = edit { edit.insert(&mut rows); }
+    let mut files = Vec::new();
+    let mut positions = HashMap::new();
+    let mut indices = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(path) = row.path() { indices.insert(path.to_path_buf(), index); }
+        if let Row::File { file, .. } = row {
+            if !positions.contains_key(&file.path) {
+                positions.insert(file.path.clone(), files.len());
+                files.push(file.path.clone());
+            }
+        }
+    }
+    Arc::new(Rows { key, rows, files, positions, indices })
+}
+
+pub fn can_change_file(path: &Path, open: &[PathBuf]) -> bool {
+    menu::takm(path) && !crate::workspace::is_remote_root_key(path) && menu::may_write(path) && !open.contains(&path.to_path_buf())
+}
+
+fn file_menu(st: &ExplorerState, ws: &Workspace, path: &Path, options: &MenuOptions<'_>) -> menu::Menu {
+    if st.selection.selected.contains(path) {
+        let paths = st.picked_paths();
+        if paths.len() > 1 {
+            let local = |p: &Path| !crate::workspace::is_remote_root_key(p);
+            let connected = |p: &Path| crate::workspace::remote_address(p).is_some_and(|(root, _)| ws.remote_connected(&root.alias));
+            return menu::batch(paths.len(),
+                paths.iter().filter(|p| menu::take(p) && (if local(p) { menu::may_write(p) } else { connected(p) })).count(),
+                paths.iter().any(|p| menu::takm(p) && (local(p) || connected(p))),
+                paths.iter().filter(|p| can_change_file(p, options.open_files)).count(),
+                paths.iter().filter(|p| local(p)).count(), options.beside, false);
+        }
+    }
+    if let Some((root, location)) = crate::workspace::remote_address(path) {
+        return menu::remote_file(menu::take(Path::new(&location.path)), ws.remote_connected(&root.alias), options.beside);
+    }
+    let tak = menu::take(path);
+    let writable = menu::may_write(path);
+    menu::workspace_file(tak, if tak { writable } else { can_change_file(path, options.open_files) },
+        st.clipboard.is_some() && writable, options.overlay && !options.open_files.contains(&path.to_path_buf()), options.beside)
 }
 
 pub(super) fn chevron(p: &egui::Painter, c: Pos2, open: bool, color: Color32) {
@@ -382,9 +586,9 @@ fn mb(size: u64) -> String {
 }
 
 /// `current` = file of the active 3D view (blue row), `others` = files of the other views and the
-/// files laid over views (grey rows). `overlaid` = the active view has a file laid over it (its
-/// right-click menu then offers to take it off).
-pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[PathBuf], overlaid: bool, st: &mut ExplorerState, ssh: &mut crate::ssh::SshManager) -> Option<WsAction> {
+/// files laid over views (grey rows).
+pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[PathBuf], st: &mut ExplorerState,
+    ssh: &mut crate::ssh::SshManager, options: MenuOptions<'_>) -> Option<WsAction> {
     let mut action = None;
     // The pane below the OPEN EDITORS section (drawn first, `open_editors.rs`).
     let full = ui.available_rect_before_wrap();
@@ -450,7 +654,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
             action = Some(WsAction::EnterPath);
         }
         if icon_button(&mut child, Icon::Refresh, "Refresh Open Folders", true) {
-            let dirs = open_dirs(&tree_rows(ws, st));
+            let dirs = expanded_dirs(ws, st, true);
             ws.refresh(&dirs);
         }
         if icon_button(&mut child, Icon::CollapseAll, "Collapse All", true) {
@@ -488,29 +692,48 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
 
     // Search box (VS Code tree find): only folders opened so far.
     ui.add_space(4.0);
+    if let Some(dir) = &st.scope {
+        let chip = format!("in {} ×", folder_name(dir));
+        if ui.add(egui::Button::new(RichText::new(chip).size(11.0))).clicked() {
+            action = Some(WsAction::Scope(None));
+        }
+    }
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         let w = ui.available_width() - 8.0;
         egui::Frame::none().fill(INPUT_BG).inner_margin(egui::Margin::symmetric(6.0, 3.0)).show(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("Find Files").frame(false).desired_width(w - 12.0));
+            let response = ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("Find Files").frame(false).desired_width(w - 12.0));
+            if std::mem::take(&mut st.focus_search) { response.request_focus(); }
         });
     });
     ui.add_space(4.0);
 
     let needle = st.filter.trim().to_lowercase();
-    let rows = if needle.is_empty() {
-        tree_rows(ws, st)
-    } else {
-        let mut rows = search_rows(ws, &needle);
-        if rows.is_empty() {
-            rows.push(Row::Note { depth: 0, text: "No matches in open folders".to_owned() });
+    if action.is_none() {
+        if let Some(dir) = &st.scope {
+            if options.scoped.as_ref().is_none_or(|scope| scope.dir != dir || (!scope.running && scope.needle != needle)) {
+                action = Some(WsAction::Search(dir.clone(), needle.clone()));
+            }
         }
-        rows
-    };
+    }
+    let cached = cached_rows(ui.ctx(), ws, st, &needle, options.scoped.as_ref());
+    let rows = &cached.rows;
+    if let Some(names) = menu::preview(Section::Workspace).filter(|names| names.len() > 1) {
+        if st.selection.selected.len() != names.len() {
+            st.selection.selected = cached.files.iter().filter(|p| names.iter().any(|name|
+                p.file_name().is_some_and(|part| part.to_string_lossy().eq_ignore_ascii_case(name))))
+                .cloned().collect();
+        }
+    }
+    if st.selection.selected.len() > 1 {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+        ui.painter().text(pos2(rect.left() + 20.0, rect.center().y), Align2::LEFT_CENTER,
+            format!("{} selected", st.selection.selected.len()), FontId::proportional(11.0), FG);
+    }
 
     let mut area = ScrollArea::vertical().id_salt("explorer_rows").auto_shrink([false, true]);
     if let Some(target) = st.pending_scroll.clone() {
-        if let Some(k) = rows.iter().position(|r| matches!(r, Row::File { file, .. } if file.path == target)) {
+        if let Some(&k) = cached.indices.get(&target) {
             area = area.vertical_scroll_offset((k as f32 * ROW_H - 4.0 * ROW_H).max(0.0));
             st.pending_scroll = None;
         } else if !ws.is_loading() {
@@ -529,18 +752,19 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
     area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
         for row in &rows[range] {
             // File rows can also be dragged onto a 3D view.
-            let sense = if matches!(row, Row::File { .. }) { Sense::click_and_drag() } else { Sense::click() };
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), sense);
+            let depth = row.depth();
+            let (rect, allocated) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+            let resp = row.path().map_or(allocated, |path| {
+                let sense = if matches!(row, Row::File { .. }) { Sense::click_and_drag() } else { Sense::click() };
+                ui.interact(rect, ui.id().with(("workspace-row", depth, path)), sense)
+            });
             let p = ui.painter();
-            let depth = match row {
-                Row::Root { .. } => 0,
-                Row::Dir { depth, .. } | Row::File { depth, .. } | Row::Note { depth, .. } => *depth,
-            };
             let is_current = matches!(row, Row::File { file, .. } if current == Some(file.path.as_path()));
             let is_other = matches!(row, Row::File { file, .. } if others.contains(&file.path));
-            if is_current {
+            let selected = matches!(row, Row::File { file, .. } if st.selection.selected.contains(&file.path));
+            if is_current || selected {
                 p.rect_filled(rect, 0.0, ACTIVE_SEL_BG);
-                p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0_f32, FOCUS_OUTLINE));
+                if is_current { p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0_f32, FOCUS_OUTLINE)); }
             } else if is_other {
                 p.rect_filled(rect, 0.0, OTHER_SEL_BG);
             } else if ui.rect_contains_pointer(rect) && !matches!(row, Row::Note { .. }) {
@@ -553,9 +777,11 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
             }
             let tw = rect.left() + INDENT + depth as f32 * INDENT;
             let label_x = tw + TWISTIE + 2.0;
+            if row.path().is_some() {
+                key_focus::region(ui, rect.intersect(ui.clip_rect()), key_focus::Target::Workspace);
+            }
             match row {
                 Row::Root { path, name, open, named, missing } => {
-                    let mut refreshed = false;
                     let remote = crate::workspace::remote_address(path);
                     let disconnected = remote.as_ref().is_some_and(|(r, _)| !ws.remote_connected(&r.alias));
                     // A folder gone from disk cannot be opened: no chevron.
@@ -620,7 +846,6 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                             if refresh.on_hover_text("Refresh this server folder.").clicked() {
                                 ws.relist(path);
                                 ws.request(path);
-                                refreshed = true;
                             }
                         }
                     }
@@ -634,28 +859,23 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                         format!("{display}\n{wsl}\n\nRight-click to rename or remove.")
                     };
                     let resp = resp.on_hover_text(tip);
-                    resp.context_menu(|ui| {
-                        if remote.is_some() && ui.button("Refresh Folder").clicked() {
-                            ws.relist(path);
-                            ws.request(path);
-                            refreshed = true;
-                            ui.close_menu();
+                    if resp.clicked() || resp.secondary_clicked() { st.focused_folder = Some(path.clone()); }
+                    if let Some(command) = menu::popup(ui, &resp, Section::Workspace, menu::matches_preview(Section::Workspace, name), || {
+                        let named = named.then_some(own.as_str());
+                        if remote.is_some() {
+                            menu::remote_folder(false, true, named)
+                        } else {
+                            menu::workspace_folder(true, named, !missing, menu::may_write(path), st.clipboard.is_some(), false)
                         }
-                        if ui.button("Rename…").clicked() {
-                            rename_start = Some(path.clone());
-                            ui.close_menu();
+                    }) {
+                        match command {
+                            Command::RenameShown => rename_start = Some(path.clone()),
+                            Command::ResetShown => reset_name = Some(path.clone()),
+                            Command::RemoveRoot => remove = Some(path.clone()),
+                            _ => action = Some(WsAction::Command(command, vec![path.clone()])),
                         }
-                        if ui.add_enabled(*named, egui::Button::new(format!("Reset Name ({own})"))).clicked() {
-                            reset_name = Some(path.clone());
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Remove from Workspace").clicked() {
-                            remove = Some(path.clone());
-                            ui.close_menu();
-                        }
-                    });
-                    if resp.clicked() && !*missing && !refreshed {
+                    }
+                    if resp.clicked() && !*missing {
                         toggle = Some(path.clone());
                     }
                 }
@@ -665,13 +885,30 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                     if resp.clicked() {
                         toggle = Some(path.clone());
                     }
+                    if resp.clicked() || resp.secondary_clicked() { st.focused_folder = Some(path.clone()); }
+                    if let Some(command) = menu::popup(ui, &resp, Section::Workspace, menu::matches_preview(Section::Workspace, name), || {
+                        let can_add = !full_list && !ws.roots().contains(path);
+                        if crate::workspace::is_remote_root_key(path) {
+                            menu::remote_folder(can_add, false, None)
+                        } else {
+                            menu::workspace_folder(false, None, true, menu::may_write(path), st.clipboard.is_some(), can_add)
+                        }
+                    }) {
+                        action = Some(WsAction::Command(command, vec![path.clone()]));
+                    }
                 }
                 Row::File { file, folder, .. } => {
                     let remote = crate::workspace::is_remote_root_key(&file.path);
                     let icon_x = label_x + crate::take_progress::SLOT;
                     file_icon(p, pos2(icon_x + 6.0, rect.center().y), TAK_ICON);
-                    let color = if is_current || is_other { Color32::WHITE } else { FG };
+                    let color = if is_current || is_other || selected { Color32::WHITE } else { FG };
                     let name_left = icon_x + 17.0;
+                    if st.editing_disk_name(&file.path, EditKind::Rename) {
+                        if let Some(command) = st.paint_disk_edit(ui, rect, name_left, &file.path, EditKind::Rename) {
+                            action = Some(command);
+                        }
+                        continue;
+                    }
                     let clip = rect;
                     let name_rect = p.with_clip_rect(clip).text(
                         pos2(name_left, rect.center().y),
@@ -701,57 +938,41 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, current: Option<&Path>, others: &[P
                         }
                     }
                     let tip = if let Some((_, location)) = crate::workspace::remote_address(&file.path) {
-                        format!("{}:{}\n\nClick to open. Ctrl+click to open beside.\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
+                        format!("{}:{}\n\nClick to open. Ctrl+Enter to open beside.\n원격 파일은 끌어 놓거나 얹을 수 없어요.", location.host, location.path)
                     } else { format!(
-                        "{}\n{}\n{}\n\nClick to open. Ctrl+click to open beside (max {MAX_VIEWS}).\nDrop in the middle to replace or at an edge to add a view.",
+                        "{}\n{}\n{}\n\nClick to open. Ctrl+Enter to open beside (max {MAX_VIEWS}).\nDrop in the middle to replace or at an edge to add a view.",
                         mb(file.size),
                         file.path.display(),
                         to_wsl_path(&file.path).unwrap_or_default()
                     ) };
                     let resp = resp.on_hover_text(tip);
                     if !remote { resp.dnd_set_drag_payload(FileDrag(file.path.clone())); }
-                    resp.context_menu(|ui| {
-                        if ui.button("Open Here").clicked() {
-                            action = Some(WsAction::Open(file.path.clone()));
-                            ui.close_menu();
-                        }
-                        if ui.button("Open Beside (Ctrl+click)").clicked() {
-                            action = Some(WsAction::OpenSide(file.path.clone()));
-                            ui.close_menu();
-                        }
-                        if ui.button("Open in New Tab").clicked() {
-                            action = Some(WsAction::OpenNewTab(file.path.clone()));
-                            ui.close_menu();
-                        }
-                        // Plan step 7: both files in one 3D (acts on the active view).
-                        ui.separator();
-                        if !remote && ui.button("Add Overlay").clicked() {
-                            action = Some(WsAction::Overlay(file.path.clone()));
-                            ui.close_menu();
-                        }
-                        if overlaid && ui.button("Remove Overlay").clicked() {
-                            action = Some(WsAction::OverlayOff);
-                            ui.close_menu();
-                        }
-                        // `.takm` step ③: a TAK takes Comments once saved as `.takm`.
-                        if !remote && tak_core::tak::is_take_path(&file.path) {
-                            ui.separator();
-                            if ui.button("Save as .takm").clicked() {
-                                action = Some(WsAction::ToTakm(file.path.clone()));
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                    if resp.clicked() {
-                        if ui.input(|i| i.modifiers.command) {
-                            action = Some(WsAction::OpenSide(file.path.clone()));
-                        } else if !is_current {
-                            action = Some(WsAction::Open(file.path.clone()));
-                        }
+                    if resp.clicked() || resp.secondary_clicked() { st.focused_folder = None; }
+                    if let Some(command) = menu::popup(ui, &resp, Section::Workspace, menu::matches_preview(Section::Workspace, &file.name),
+                        || file_menu(st, ws, &file.path, &options)) {
+                        let paths = if selected { st.picked_paths() } else { vec![file.path.clone()] };
+                        action = Some(WsAction::Command(command, paths));
+                    } else if resp.clicked() {
+                        let modifiers = ui.input(|i| i.modifiers);
+                        let ctrl = modifiers.command || modifiers.ctrl;
+                        let shift = modifiers.shift;
+                        action = Some(WsAction::Select { path: file.path.clone(), ctrl, shift,
+                            open: !ctrl && !shift && !is_current, plain: !ctrl && !shift });
+                    } else if resp.secondary_clicked() && !selected {
+                        action = Some(WsAction::Select { path: file.path.clone(), ctrl: false, shift: false, open: false, plain: false });
                     }
                 }
                 Row::Note { text, .. } => {
                     p.with_clip_rect(rect).text(pos2(label_x, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(12.0), FG_DIM);
+                }
+                Row::NewFolder { path, .. } => {
+                    if let Some(command) = st.paint_disk_edit(ui, rect, label_x, path, EditKind::NewFolder) {
+                        action = Some(command);
+                    }
+                }
+                Row::EditError { text, .. } => {
+                    p.with_clip_rect(rect).text(pos2(label_x, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(11.5), Color32::LIGHT_RED);
+                    resp.on_hover_text(text);
                 }
             }
         }
@@ -796,6 +1017,7 @@ mod tests {
                 Row::Dir { depth, name, open, .. } => format!("{}{}{}", "  ".repeat(*depth), if *open { "v " } else { "> " }, name),
                 Row::File { depth, file, .. } => format!("{}{}", "  ".repeat(*depth), file.name),
                 Row::Note { depth, text } => format!("{}({})", "  ".repeat(*depth), text),
+                Row::NewFolder { .. } | Row::EditError { .. } => unreachable!(),
             })
             .collect()
     }
@@ -1054,7 +1276,7 @@ mod tests {
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 400.0));
         let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-                show(ui, ws, None, &[], false, st, &mut crate::ssh::SshManager::new(ctx, Default::default()));
+                show(ui, ws, None, &[], st, &mut crate::ssh::SshManager::new(ctx, Default::default()), MenuOptions::default());
             });
         });
         fn walk(shape: &Shape, found: &mut Vec<String>) {

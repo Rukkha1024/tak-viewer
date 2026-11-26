@@ -1,5 +1,23 @@
 # 변경 사항
 
+## v0.80.2 — 2026-11-27
+
+- Public copy: WSL trash path test uses only neutral names. v0.80.0 and v0.80.1 stay local; this release publishes them.
+- Release helper: `publish --supersede vX.Y.Z` skips an earlier finished version already contained in this one and records it as superseded.
+
+## v0.80.1 — 2026-11-27
+
+- Public copy check: neutral user name in the WSL trash path test. No app change.
+
+## v0.80.0 — 2026-11-27
+
+- EXPLORER right-click menus for WORKSPACE files and folders, OPEN EDITORS and SSH, as the approved Figma proposal. Only commands that work on that row show; no dim items.
+- New folder, inline rename (F2), cut/copy/paste, move to trash (Delete). Rename, cut and trash `.takm` only; `.tak` copies only. Never over another file; nothing in repo `input/`. Every change is one Ctrl+Z / Ctrl+Y step.
+- Trash: Windows Recycle Bin on drive paths, Linux home trash for Linux and WSL `/home` paths; elsewhere refused.
+- Pick several WORKSPACE files (Ctrl/Shift click, Ctrl+A). Batch Save as .takm (skips existing), Set Progress (one undo), Copy Paths, Cut, Copy, Delete. OPEN EDITORS: Save, Close Others, Close Saved, Close All, Show in WORKSPACE.
+- Save All TAK as .takm on a folder. Find in Folder searches every subfolder. Show in File Explorer, Copy Path, Copy Name. Server TAK saves as .takm on the server without opening.
+- List keys while EXPLORER has focus: Enter, Ctrl+Enter, F2, Delete, Ctrl+C/X/V/A, Shift+Alt+C/R/F.
+
 ## v0.78.1 — 2026-11-26
 
 - Wrap Comment text and marker names in the COMMENTS panel. Grow each visible row to fit.

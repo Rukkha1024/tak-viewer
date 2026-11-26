@@ -1,5 +1,6 @@
 
 use super::explorer::{chevron, file_icon, ACTIVE_SEL_BG, BUTTON_BG, FG, FG_DIM, HOVER_BG, ICON_FG, SIDEBAR_BG, TAK_ICON};
+use super::explorer_menu::{self as menu, Command, Section};
 use super::{scene, theme};
 use eframe::egui::{self, pos2, text::LayoutJob, vec2, Align2, Color32, FontId, Rect, ScrollArea, Sense, Stroke, Ui};
 use std::path::{Path, PathBuf};
@@ -162,6 +163,7 @@ pub enum EditorAction {
     AddFolder(PathBuf),
     /// `폴더 추가` while WORKSPACE is full: say why.
     Full,
+    Command { command: Command, row: EditorRowId, selected: BTreeSet<EditorRowId> },
 }
 
 /// Files listed, laid-over ones included.
@@ -258,9 +260,18 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool, 
     if hresp.clicked() {
         *collapsed = !*collapsed;
     }
-    for text in [format!("{} selected · Ctrl/Shift to pick more", selection.selected.len()), "Ctrl+A all · Delete close · Esc clear".to_owned()] {
+    let preview_selection = menu::preview(Section::Editors).filter(|names| names.len() > 1).map(|names| {
+        let mut picked = EditorSelection::default();
+        picked.selected = groups.iter().flat_map(|group| group.entries.iter().enumerate().filter_map(|(index, entry)| {
+            names.iter().any(|name| name.eq_ignore_ascii_case(&entry_name(entry))).then(|| group.row_id(index))
+        })).collect();
+        picked
+    });
+    let selection = preview_selection.as_ref().unwrap_or(selection);
+    if selection.selected.len() > 1 {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
-        ui.painter().with_clip_rect(r.intersect(ui.clip_rect())).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(11.0), FG_DIM);
+        ui.painter().with_clip_rect(r.intersect(ui.clip_rect())).text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER,
+            format!("{} selected", selection.selected.len()), FontId::proportional(11.0), FG);
     }
     if *collapsed { return None; }
     if groups.is_empty() {
@@ -274,7 +285,7 @@ pub fn show(ui: &mut Ui, groups: &[Group], ws_full: bool, collapsed: &mut bool, 
         for g in groups {
             group_header(ui, g);
             for (j, e) in g.entries.iter().enumerate() {
-                if let Some(a) = row(ui, g, j, e, ws_full, selection) {
+                if let Some(a) = row(ui, g, j, e, ws_full, selection, groups) {
                     action = Some(a);
                 }
             }
@@ -294,10 +305,44 @@ fn group_header(ui: &mut Ui, group: &Group) {
     }
 }
 
-fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &EditorSelection) -> Option<EditorAction> {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+pub fn entry_path(entry: &Entry) -> &Path {
+    entry.remote.as_ref().map_or(entry.path.as_path(), |location| Path::new(&location.path))
+}
+
+fn entry_name(entry: &Entry) -> String {
+    if let Some(location) = &entry.remote {
+        return location.path.rsplit(['/', '\\']).next().unwrap_or(&location.path).to_owned();
+    }
+    name_of(&entry.path)
+}
+
+fn editor_menu(groups: &[Group], entry: &Entry, row: &EditorRowId, selected: &EditorSelection) -> menu::Menu {
+    if selected.selected.contains(row) && selected.selected.len() > 1 {
+        let mut takes = std::collections::HashSet::new();
+        let mut progress = false;
+        for group in groups {
+            for (index, entry) in group.entries.iter().enumerate() {
+                if !selected.selected.contains(&group.row_id(index)) { continue; }
+                if menu::take(entry_path(entry)) && entry.connected && !entry.loading && menu::may_write(entry_path(entry)) {
+                    takes.insert(entry.path.clone());
+                }
+                progress |= menu::takm(entry_path(entry)) && entry.connected && !entry.loading;
+            }
+        }
+        return menu::batch(selected.selected.len(), takes.len(), progress, 0, 0, false, true);
+    }
+    menu::editors_file(menu::take(entry_path(entry)), entry.connected && !entry.loading && menu::may_write(entry_path(entry)),
+        entry.dirty && entry.connected && !entry.loading, row.overlay, entry.add_folder.is_none(),
+        entry.remote.is_none(), groups.len() > 1, groups.iter().any(|g| g.entries.iter().all(|entry| !entry.dirty)))
+}
+
+fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &EditorSelection, groups: &[Group]) -> Option<EditorAction> {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     if !ui.is_rect_visible(rect) { return None; }
-    let selected = selection.selected.contains(&g.row_id(j));
+    let resp = ui.interact(rect, ui.id().with(("open-editor-row", g.tab_id, g.slot, j, &e.path)), Sense::click());
+    crate::app::key_focus::region(ui, rect.intersect(ui.clip_rect()), crate::app::key_focus::Target::Editors);
+    let row_id = g.row_id(j);
+    let selected = selection.selected.contains(&row_id);
     let cy = rect.center().y;
     // × and `폴더 추가` are registered after the row, so they get their clicks.
     let x_rect = Rect::from_center_size(pos2(rect.left() + CLOSE_X, cy), vec2(20.0, 20.0));
@@ -380,6 +425,14 @@ fn row(ui: &mut Ui, g: &Group, j: usize, e: &Entry, ws_full: bool, selection: &E
     let text_clip = Rect::from_min_max(rect.min, pos2(right.max(rect.left() + NAME_X), rect.max.y)).intersect(ui.clip_rect());
     p.with_clip_rect(text_clip).galley(pos2(rect.left() + NAME_X, cy - galley.size().y / 2.0), galley, FG);
 
+    let preview = menu::preview(Section::Editors).is_some() && menu::matches_preview(Section::Editors, &entry_name(e));
+    if let Some(command) = menu::popup(ui, &resp, Section::Editors, preview, || editor_menu(groups, e, &row_id, selection)) {
+        let selected = if selected { selection.selected.clone() } else { BTreeSet::from([row_id.clone()]) };
+        return Some(EditorAction::Command { command, row: row_id, selected });
+    }
+    if resp.secondary_clicked() && !selected {
+        return Some(EditorAction::Select { id: row_id, ctrl: false, shift: false });
+    }
     let modifiers = ui.input(|input| input.modifiers);
     if (modifiers.ctrl || modifiers.command || modifiers.shift) && (resp.clicked() || x_resp.clicked() || button.as_ref().is_some_and(|(_, _, response)| response.clicked())) {
         return Some(EditorAction::Select { id: g.row_id(j), ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift });
@@ -449,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_count_and_shortcuts_are_visible_even_while_folded() {
+    fn selection_count_is_visible_even_while_folded() {
         let ctx = egui::Context::default();
         let groups = sample();
         let mut selection = EditorSelection::default();
@@ -464,7 +517,6 @@ mod tests {
         let mut text = String::new();
         out.shapes.iter().for_each(|shape| all_text(&shape.shape, &mut text));
         assert!(text.contains("3 selected"));
-        assert!(text.contains("Delete close · Esc clear"));
     }
 
     fn entry(path: &str, mark: Option<usize>, outside: bool) -> Entry {
@@ -514,7 +566,7 @@ mod tests {
         }
         let mut found = vec![];
         out.shapes.iter().for_each(|s| walk(&s.shape, &mut found));
-        found.retain(|(_, text, _)| !text.contains(" selected · Ctrl/Shift") && !text.starts_with("Ctrl+A all"));
+        found.retain(|(_, text, _)| !text.ends_with(" selected"));
         found.sort_by(|a, b| (a.0.center().y.round(), a.0.left()).partial_cmp(&(b.0.center().y.round(), b.0.left())).unwrap());
         found
     }

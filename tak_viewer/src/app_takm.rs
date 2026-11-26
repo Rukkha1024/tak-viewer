@@ -155,6 +155,7 @@ impl TakViewerApp {
 
     /// Status bar words while a conversion runs.
     pub(super) fn takm_working(&self) -> Option<String> {
+        if let Some(words) = self.takm_batch_working() { return Some(words); }
         self.takm_job.as_ref().map(|j| format!("Saving {} as .takm…", name_of(&j.tak)))
     }
 
@@ -206,6 +207,10 @@ impl TakViewerApp {
                     (c.out, line, false)
                 }
                 Outcome::Exists(out) => {
+                    if self.takm_batch.is_some() {
+                        self.takm_note = Some((format!("Already .takm: {}", name_of(&out)), now));
+                        return;
+                    }
                     let line = format!("Opened existing {}.", name_of(&out));
                     (out, line, true)
                 }

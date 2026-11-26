@@ -18,6 +18,7 @@ pub mod comment_list;
 pub mod dock;
 pub mod device_grid;
 pub mod explorer;
+pub(crate) mod explorer_menu;
 pub mod edit_tools;
 pub mod empty;
 pub mod graph;

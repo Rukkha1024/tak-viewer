@@ -256,6 +256,10 @@ impl TakViewerApp {
         if self.dirty_prompt.is_some() {
             return;
         }
+        if let EditorAction::Command { command, row, selected } = a {
+            self.editor_menu_command(ctx, command, row, selected);
+            return;
+        }
         let plain = matches!(&a, EditorAction::Activate(..) | EditorAction::ToggleShown(..));
         let before = self.editor_selection.clone();
         self.observe(true);
@@ -305,11 +309,133 @@ impl TakViewerApp {
                 let why = format!("폴더를 추가할 수 없어요: WORKSPACE가 다 찼어요 ({MAX_ROOTS}/{MAX_ROOTS}). WORKSPACE에서 폴더를 오른쪽 클릭 → 목록에서 빼기로 하나 뺀 뒤 다시 누르세요.");
                 self.overlay_note = Some((why, ctx.input(|i| i.time)));
             }
+            EditorAction::Command { .. } => unreachable!(),
         }
         self.editor_selection.retain(&self.editor_rows());
         self.observe(true);
         if plain { self.absorb_plain_editor_selection(); }
         else { self.record_editor_selection(before, pushed); }
+    }
+
+    fn editor_menu_command(&mut self, ctx: &egui::Context, command: crate::ui::explorer_menu::Command,
+        row: crate::ui::open_editors::EditorRowId, selected: std::collections::BTreeSet<crate::ui::open_editors::EditorRowId>) {
+        use crate::ui::explorer_menu::{self as menu, Command::*};
+        use crate::ui::open_editors::entry_path;
+        use crate::file_ops;
+        let order = dock::views_reading_order(&self.dock).into_iter().map(usize::from).collect::<Vec<_>>();
+        let groups = self.editor_groups(&order);
+        let entries = || groups.iter().flat_map(|g| g.entries.iter().enumerate().map(|(i, e)| (g.row_id(i), e)));
+        let Some((_, entry)) = entries().find(|(id, _)| id == &row) else { return };
+        let selection = || entries().filter(|(id, _)| selected.contains(id)).map(|(_, e)| e);
+        let copy_path = |entry: &Entry| entry.remote.as_ref().map_or_else(
+            || file_ops::paths_text(std::slice::from_ref(&entry.path)),
+            |loc| file_ops::remote_path_text(&loc.host, &loc.path));
+        match command {
+            Save if entry.dirty && !entry.loading && entry.connected => {
+                if row.overlay {
+                    if self.activate_editor_view(row.tab_id, row.slot) {
+                        self.with_overlay_owner(ctx, row.slot, |app| app.save_markers(ctx, row.slot, false, false));
+                    }
+                } else {
+                    self.save_editor(ctx, row.tab_id, row.slot);
+                }
+            }
+            Convert if selected.len() == 1 && menu::take(entry_path(entry)) => {
+                if let Some(location) = &entry.remote {
+                    if self.activate_editor_view(row.tab_id, row.slot) { self.save_remote_takm(ctx, location.clone()); }
+                } else {
+                    self.save_takm(ctx, entry.path.clone());
+                }
+            }
+            Convert => {
+                let mut local = Vec::new();
+                let mut remote = Vec::new();
+                for entry in selection() {
+                    if !entry.connected || entry.loading { continue; }
+                    if let Some(location) = &entry.remote {
+                        if menu::take(entry_path(entry)) && !remote.contains(location) { remote.push(location.clone()); }
+                    } else if !local.contains(&entry.path) {
+                        local.push(entry.path.clone());
+                    }
+                }
+                self.convert_explorer_batch(ctx, local, remote);
+            }
+            ShowWorkspace => {
+                let path = if let Some(location) = &entry.remote { self.workspace.key_for_remote(location) }
+                    else { Some(entry.path.clone()).filter(|path| self.workspace.root_of(path).is_some()) };
+                if let Some(path) = path { self.show_in_workspace(path); }
+            }
+            ShowFiles if entry.remote.is_none() => file_ops::show_in_files(&entry.path),
+            CopyPath => ctx.copy_text(selection().map(copy_path).collect::<Vec<_>>().join("\n")),
+            CopyName => ctx.copy_text(entry.remote.as_ref().map_or_else(|| file_ops::name_of(&entry.path),
+                |loc| super::explorer_menu_app::remote_name(&loc.path).to_owned())),
+            Close => self.begin_editor_batch(ctx, selected, None),
+            CloseOthers => self.close_other_editors(ctx, row.tab_id, row.slot),
+            CloseSaved => self.close_saved_editors(ctx),
+            CloseAll => self.close_all_editors(ctx),
+            Progress(value) => {
+                let mut local = Vec::new();
+                let mut remote = Vec::new();
+                for entry in selection().filter(|e| e.connected && !e.loading && menu::takm(entry_path(e))) {
+                    if let Some(location) = &entry.remote {
+                        if !remote.iter().any(|(other, _)| other == location) { remote.push((location.clone(), entry.progress)); }
+                    } else if !local.contains(&entry.path) {
+                        local.push(entry.path.clone());
+                    }
+                }
+                self.prepare_explorer_progress(ctx, local, remote, value);
+            }
+            _ => {}
+        }
+    }
+
+    /// Close every other view (this view keeps its laid-over file): the same one-undo batch
+    /// and save prompts as Delete on a selection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn close_other_editors(&mut self, ctx: &egui::Context, tab: u64, slot: usize) {
+        let rows = self.editor_rows().into_iter().filter(|row| (row.tab_id, row.slot) != (tab, slot)).collect();
+        self.begin_editor_batch(ctx, rows, None);
+    }
+
+    /// Close every view without unsaved edits (with its laid-over file).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn close_saved_editors(&mut self, ctx: &egui::Context) {
+        let order = dock::views_reading_order(&self.dock).into_iter().map(usize::from).collect::<Vec<_>>();
+        let rows = self.editor_groups(&order).iter()
+            .filter(|group| group.entries.iter().all(|entry| !entry.dirty))
+            .flat_map(|group| (0..group.entries.len()).map(|k| group.row_id(k))).collect();
+        self.begin_editor_batch(ctx, rows, None);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn close_all_editors(&mut self, ctx: &egui::Context) {
+        let rows = self.editor_rows().into_iter().collect();
+        self.begin_editor_batch(ctx, rows, None);
+    }
+
+    /// Save one OPEN EDITORS row's view (same as Ctrl+S with that view active).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn save_editor(&mut self, ctx: &egui::Context, tab: u64, slot: usize) {
+        if self.dirty_prompt.is_none() && self.activate_editor_view(tab, slot) {
+            self.save_markers(ctx, self.active, false, false);
+        }
+    }
+
+    /// Open the WORKSPACE folders down to `path` and scroll to it (as when a file opens).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn show_in_workspace(&mut self, path: PathBuf) {
+        if !dock::has(&self.dock, Pane::Explorer) { self.show_pane(Pane::Explorer); }
+        self.explorer.filter.clear();
+        self.set_folder_scope(None, false);
+        self.explorer.reveal = Some(path);
+    }
+
+    /// `Add to WORKSPACE` for any local or server folder (a subfolder's menu).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn add_folder_to_workspace(&mut self, ctx: &egui::Context, dir: PathBuf) {
+        if let Some((root, location)) = workspace::remote_address(&dir) {
+            self.add_remote_workspace(ctx, location, root.platform);
+        } else { self.open_workspace(dir); }
     }
 
     pub(super) fn editor_rows(&self) -> Vec<crate::ui::open_editors::EditorRowId> {
@@ -340,6 +466,14 @@ impl TakViewerApp {
         if exact_key(ctx, Key::A, true, false, false) { self.select_all_editors(); }
         if exact_key(ctx, Key::Escape, false, false, false) { self.clear_editor_selection(); }
         if exact_key(ctx, Key::Delete, false, false, false) { self.close_selected_editors(ctx); }
+        if exact_key(ctx, Key::S, true, false, false) {
+            if self.editor_selection.selected.len() == 1 {
+                if let Some(id) = self.editor_selection.selected.first().cloned() {
+                    self.editor_menu_command(ctx, crate::ui::explorer_menu::Command::Save, id.clone(),
+                        std::collections::BTreeSet::from([id]));
+                }
+            }
+        }
     }
 
     /// A queued click owns a stable tab id, so moving or closing another tab cannot redirect

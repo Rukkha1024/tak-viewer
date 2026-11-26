@@ -113,7 +113,7 @@ const SECTIONS: &[(&str, Rows)] = &[
         ("F2", "Rename this tab. Enter saves. Esc cancels."),
         ("Ctrl+W", "Close this 3D view. If it is the last view, close the tab."),
         ("PageDown / PageUp", "Open the next / previous file in this folder."),
-        ("Click a file in EXPLORER / Ctrl+click", "Open here / open beside this view. Up to four 3D views per tab in a 2×2 grid."),
+        ("WORKSPACE click / Ctrl+Enter", "Open here / open beside this view. Ctrl+click and Shift+click pick files."),
         (OVERLAY_INPUT, "Choose to show the file as white rings in this view. Both files need the same frame count and rate. Use the menu or × on tag 2 to remove it."),
         ("1 / 2 or file tags", "Hide or show markers from the first / second file."),
         ("Click a 3D view / Click × on its tab", "Make it the active view for keys and panels / close that view."),

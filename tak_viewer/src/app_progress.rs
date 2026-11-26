@@ -242,6 +242,7 @@ impl TakViewerApp {
             },
         };
         if let Err(reason) = result {
+            self.progress_batch_failed(&job.pick, &reason);
             self.takm_note = Some((reason, now));
             return;
         }

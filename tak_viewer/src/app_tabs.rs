@@ -495,7 +495,7 @@ impl TabStrip {
         true
     }
 
-    pub fn show<L, V>(&mut self, ui: &mut egui::Ui, model: &TabModel<L, V>) -> Vec<TabAction> {
+    pub fn show<L, V>(&mut self, ui: &mut egui::Ui, model: &TabModel<L, V>, rename_shortcut: bool) -> Vec<TabAction> {
         const BG: Color32 = Color32::from_rgb(0x25, 0x25, 0x26);
         const INACTIVE: Color32 = Color32::from_rgb(0x2d, 0x2d, 0x2d);
         const ACTIVE: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1c);
@@ -509,7 +509,7 @@ impl TabStrip {
         {
             self.rename = None;
         }
-        if ui.is_enabled()
+        if rename_shortcut && ui.is_enabled()
             && self.rename.is_none()
             && !ui.ctx().wants_keyboard_input()
             && !ui.memory(|memory| memory.any_popup_open())
@@ -1077,7 +1077,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    actions = strip.show(ui, model);
+                    actions = strip.show(ui, model, true);
                     ui.label("below tabs");
                 });
             },
