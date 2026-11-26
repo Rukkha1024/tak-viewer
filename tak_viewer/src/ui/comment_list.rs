@@ -1,4 +1,6 @@
 
+use std::{collections::HashMap, sync::Arc};
+
 use super::theme;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
 #[cfg(test)]
@@ -137,6 +139,7 @@ pub fn sorted(list: &[Comment], sort: Sort, types: &TypeList) -> Vec<usize> {
 pub struct Order {
     key: Option<(usize, u64, Sort)>,
     rows: Vec<usize>,
+    heights: RowHeights,
     /// How many times the order was made (checks).
     pub builds: usize,
 }
@@ -148,10 +151,68 @@ impl Order {
         let key = (file_id, list.revision(), sort);
         if self.key != Some(key) {
             self.rows = sorted(list.list(), sort, types);
+            self.heights = RowHeights::default();
             self.key = Some(key);
             self.builds += 1;
         }
         &self.rows
+    }
+}
+
+#[derive(Default)]
+struct RowHeights {
+    geometry: Option<(f32, f32)>,
+    measured: HashMap<usize, f32>,
+    // Sparse Fenwick tree of the height above ROW_H. No per-row setup before drawing.
+    extra: HashMap<usize, f32>,
+}
+
+impl RowHeights {
+    fn set_geometry(&mut self, width: f32, pixels_per_point: f32) {
+        let geometry = Some((width, pixels_per_point));
+        if self.geometry != geometry {
+            *self = Self { geometry, ..Self::default() };
+        }
+    }
+
+    fn measure(&mut self, row: usize, height: f32, len: usize) {
+        let above = height - ROW_H;
+        let previous = self.measured.get(&row).copied().unwrap_or(0.0);
+        if above != previous {
+            self.measured.insert(row, above);
+            let mut index = row + 1;
+            while index <= len {
+                *self.extra.entry(index).or_default() += above - previous;
+                index += index & index.wrapping_neg();
+            }
+        }
+    }
+
+    fn offset(&self, mut row: usize) -> f32 {
+        let mut top = row as f32 * ROW_H;
+        while row > 0 {
+            top += self.extra.get(&row).copied().unwrap_or(0.0);
+            row &= row - 1;
+        }
+        top
+    }
+
+    fn row_at(&self, y: f32, len: usize) -> usize {
+        let mut row = 0;
+        let mut top = 0.0;
+        let mut step = len.next_power_of_two();
+        while step > 0 {
+            let next = row + step;
+            if next <= len {
+                let bottom = top + step as f32 * ROW_H + self.extra.get(&next).copied().unwrap_or(0.0);
+                if bottom <= y {
+                    row = next;
+                    top = bottom;
+                }
+            }
+            step /= 2;
+        }
+        row.min(len.saturating_sub(1))
     }
 }
 
@@ -356,6 +417,7 @@ pub const FRAME_FONT: f32 = 11.5;
 const TYPE_W: f32 = 106.0;
 
 fn cols(r: Rect) -> Cols {
+    let r = r.with_max_y(r.bottom().min(r.top() + ROW_H));
     let w = r.width();
     let id_w = 34.0;
     let del_w = 20.0;
@@ -534,6 +596,42 @@ fn cell_text(ui: &Ui, cell: Rect, text: &str, color: Color32) {
     p.text(pos2(cell.left() + 6.0, cell.center().y), Align2::LEFT_CENTER, text, FontId::proportional(FONT), color);
 }
 
+fn wrap_cell(ui: &Ui, cell: Rect, text: String) -> Arc<egui::Galley> {
+    let width = (cell.width() - 9.0).max(1.0);
+    ui.fonts(|fonts| fonts.layout_delayed_color(text, FontId::proportional(FONT), width))
+}
+
+fn first_line_padding(galley: &egui::Galley) -> f32 {
+    galley.rows.first().map_or(0.0, |row| ((ROW_H - row.height()) / 2.0).max(0.0))
+}
+
+fn wrapped_height(galley: &egui::Galley) -> f32 {
+    galley.size().y + 2.0 * first_line_padding(galley)
+}
+
+struct WrappedRow {
+    markers: Arc<egui::Galley>,
+    text: Arc<egui::Galley>,
+}
+
+impl WrappedRow {
+    fn new(ui: &Ui, cols: &Cols, comment: &Comment) -> Self {
+        Self {
+            markers: wrap_cell(ui, cols.markers, marker_text(comment)),
+            text: wrap_cell(ui, cols.text, comment.text.clone()),
+        }
+    }
+
+    fn height(&self) -> f32 {
+        ROW_H.max(wrapped_height(&self.markers)).max(wrapped_height(&self.text))
+    }
+}
+
+fn paint_wrapped(ui: &Ui, cell: Rect, bottom: f32, galley: Arc<egui::Galley>, color: Color32) {
+    let pos = pos2(cell.left() + 6.0, cell.top() + first_line_padding(&galley));
+    ui.painter().with_clip_rect(cell.with_max_y(bottom).intersect(ui.clip_rect())).galley(pos, galley, color);
+}
+
 /// Font size of the line at the top.
 pub const LINE_FONT: f32 = 12.0;
 
@@ -593,7 +691,10 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
         ui.add(egui::Label::new(RichText::new(line).size(LINE_FONT).color(color)).wrap());
     });
     }
-    let picked = input.picked.and_then(|id| input.list.get(id));
+    let picked = input.picked.and_then(|id| {
+        let idx = list.partition_point(|c| c.id < id);
+        list.get(idx).filter(|c| c.id == id)
+    });
     let enabled = writable && edit.is_none() && picked.is_some();
     ui.horizontal_wrapped(|ui| {
         for (index, kind) in input.types.names().enumerate() {
@@ -621,20 +722,53 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
     }
     ui.painter().line_segment([head.left_bottom(), head.right_bottom()], Stroke::new(1.0_f32, theme::GRAPH_SEP));
 
-    let rows = order.get(input.list, input.file_id, input.sort, input.types);
+    order.get(input.list, input.file_id, input.sort, input.types);
+    let rows = &order.rows;
+    let heights = &mut order.heights;
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut area = ScrollArea::vertical().id_salt("comment_rows").auto_shrink([false, false]);
-    if let Some(id) = input.scroll_to {
-        if let Some(k) = rows.iter().position(|&i| list[i].id == id) {
-            area = area.vertical_scroll_offset((k as f32 * ROW_H - 3.0 * ROW_H).max(0.0));
+    let width = ui.available_width();
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    heights.set_geometry(width, pixels_per_point);
+    let measure_cols = cols(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, ROW_H)));
+    if let Some(k) = input.scroll_to.and_then(|id| rows.iter().position(|&i| list[i].id == id)) {
+        // A jump near the bottom is clamped to the viewport. Measure the preceding rows that
+        // could fit there so their later wrapping cannot push the requested row below it.
+        let mut above = 0.0;
+        for before in (0..k).rev() {
+            if above >= ui.available_height() {
+                break;
+            }
+            let height = WrappedRow::new(ui, &measure_cols, &list[rows[before]]).height();
+            heights.measure(before, height, rows.len());
+            above += height;
         }
+        area = area.vertical_scroll_offset((heights.offset(k) - 3.0 * ROW_H).max(0.0));
     }
     // The Type box whose list is open, if its row is drawn (comment id, box).
-    let mut type_anchor: Option<(u64, Rect)> = None;
-    area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
-        for k in range {
-            let c = &list[rows[k]];
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let mut type_anchor = None;
+    area.show_viewport(ui, |scroll_ui, viewport| {
+        let width = scroll_ui.available_width();
+        heights.set_geometry(width, pixels_per_point);
+        let last_top = (heights.offset(rows.len()) - viewport.height()).max(0.0);
+        let first = heights.row_at(viewport.top().min(last_top), rows.len());
+        let mut bottom = heights.offset(first);
+        let room = scroll_ui.max_rect();
+        let visible = Rect::from_x_y_ranges(room.x_range(), room.top() + bottom..=room.bottom().max(room.top() + bottom));
+        let mut body = scroll_ui.new_child(egui::UiBuilder::new().max_rect(visible));
+        body.skip_ahead_auto_ids(first);
+        let ui = &mut body;
+        let measure_cols = cols(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, ROW_H)));
+        for (k, &i) in rows.iter().enumerate().skip(first) {
+            if k > first && bottom >= viewport.bottom() {
+                break;
+            }
+            let c = &list[i];
+            let wrapped = WrappedRow::new(ui, &measure_cols, c);
+            let height = wrapped.height();
+            heights.measure(k, height, rows.len());
+            bottom += height;
+            let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
             let col = cols(rect);
             #[cfg(test)]
             out.rows.push((c.id, rect));
@@ -655,7 +789,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             }
             if here {
                 // The current frame is inside this comment: a thin orange bar only.
-                ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(3.0, ROW_H)), 0.0, theme::COMMENT);
+                ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 0.0, theme::COMMENT);
             }
             let text_color = if picked { theme::TAB_TEXT_ACTIVE } else { theme::TEXT };
             cell_text(ui, col.id, &c.id.to_string(), text_color);
@@ -673,7 +807,7 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             } else if c.markers.is_empty() {
                 cell_text(ui, col.markers, "—", theme::TEXT_DIM);
             } else {
-                cell_text(ui, col.markers, &marker_text(c), text_color);
+                paint_wrapped(ui, col.markers, rect.bottom(), wrapped.markers, text_color);
             }
             // Type (type-combo): a box with the short form (a value the app does not know as it
             // is, clipped) and a ▼; one click opens the list under it. Dim and not a box where
@@ -682,7 +816,10 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
             let open = field == Some(Field::Type);
             let clipped_type = draw_type_box(ui, tbox, &c.comment_type, text_color, writable, open);
             if open {
-                type_anchor = Some((c.id, tbox));
+                type_anchor = Some((c, tbox));
+            }
+            if field != Some(Field::Text) {
+                paint_wrapped(ui, col.text, rect.bottom(), wrapped.text, text_color);
             }
             match editing {
                 Some(e) if e.field != Field::Markers && e.field != Field::Type => {
@@ -737,18 +874,12 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
                     if e.field == Field::Frames {
                         let dash = pos2((sr.right() + er.left()) / 2.0, col.frames.center().y);
                         ui.painter().text(dash, Align2::CENTER_CENTER, "–", FontId::proportional(FONT), theme::TEXT_DIM);
-                        if !c.text.is_empty() {
-                            cell_text(ui, col.text, &c.text, text_color);
-                        }
                     } else {
                         cell_text(ui, col.frames, &frames_text(c), text_color);
                     }
                 }
                 _ => {
                     cell_text(ui, col.frames, &frames_text(c), text_color);
-                    if !c.text.is_empty() {
-                        cell_text(ui, col.text, &c.text, text_color);
-                    }
                 }
             }
             // ✕ at the end of the row: delete (the band's right click, same code).
@@ -790,12 +921,13 @@ fn show_inner(ui: &mut Ui, input: ListIn, order: &mut Order, edit: &mut Option<E
                 out.action = Some(ListAction::Select(c.id));
             }
         }
+        scroll_ui.set_min_height(heights.offset(rows.len()));
     });
     // The type list of the open Type box, on top of the rows (never clipped by their scroll
     // area), inside the pane. Its row not drawn (scrolled away): the list closes.
     if let Some(e) = edit.filter(|e| e.field == Field::Type) {
-        match (type_anchor, input.list.get(e.id)) {
-            (Some((id, anchor)), Some(c)) if id == e.id => {
+        match type_anchor {
+            Some((c, anchor)) if c.id == e.id => {
                 let name_w = type_choices(input.types).map(|v| ui.fonts(|f| f.layout_no_wrap(item_name(v).to_owned(), FontId::proportional(FONT), Color32::WHITE).size().x)).fold(0.0, f32::max);
                 let size = list_size(name_w, input.types.rows().len());
                 let fits_pane = (anchor.top() - room.top()).max(room.bottom() - anchor.bottom()) >= size.y;
@@ -822,6 +954,81 @@ mod tests {
 
     fn c(id: u64, markers: &[&str], start: i64, end: i64, text: &str) -> Comment {
         Comment { id, markers: markers.iter().map(|m| m.to_string()).collect(), start, end, comment_type: String::new(), type_meaning: None, text: text.into() }
+    }
+
+    #[test]
+    fn comment_cell_wraps_full_korean_text_at_default_panel_width() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let cell = cols(Rect::from_min_size(pos2(0.0, 0.0), vec2(376.0, ROW_H))).text;
+        let spaced = "58–60프레임에서 이름이 끊깁니다. 점과 이름을 확인해 주세요.";
+        let unspaced = "이름이끊긴프레임의점과이름을확인해주세요";
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (text, multiline) in [(spaced, true), (unspaced, true), ("확인", false)] {
+                    let galley = wrap_cell(ui, cell, text.to_owned());
+                    assert!(!galley.elided);
+                    assert!(galley.rows.iter().flat_map(|row| &row.glyphs).map(|glyph| glyph.chr).eq(text.chars()));
+                    assert_eq!(galley.rows.len() > 1, multiline, "{text}");
+                    assert_eq!(wrapped_height(&galley) > ROW_H, multiline, "{text}");
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn scroll_offsets_use_only_measured_heights() {
+        let mut heights = RowHeights::default();
+        heights.set_geometry(376.0, 1.0);
+        let len = 100_000;
+        let row = 24_321;
+        let top = row as f32 * ROW_H;
+        heights.measure(row, ROW_H + 48.0, len);
+        heights.measure(row + 1, ROW_H + 16.0, len);
+        assert_eq!(heights.offset(row), top);
+        assert_eq!(heights.offset(row + 1), top + 70.0);
+        assert_eq!(heights.offset(len), len as f32 * ROW_H + 64.0);
+        assert_eq!(heights.row_at(top + 69.0, len), row);
+        assert_eq!(heights.row_at(top + 70.0, len), row + 1);
+        assert_eq!(heights.measured.len(), 2);
+        heights.measure(row, ROW_H, len);
+        assert_eq!(heights.offset(row + 1), top + ROW_H);
+        heights.set_geometry(400.0, 1.0);
+        assert_eq!(heights.offset(len), len as f32 * ROW_H);
+    }
+
+    #[test]
+    fn long_comment_list_draws_only_the_viewport() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut list = Comments::default();
+        for id in 1..=20_000 {
+            let comment = c(id, &["M016", "LTOE_원래점"], 1, 2, &format!("{id}프레임의 점과 이름을 확인해 주세요."));
+            list.apply(&comments::Event::of(comments::Kind::Add, &comment, "t".into(), "a|1".into()));
+        }
+        let (mut order, mut edit) = (Order::default(), None);
+        let mut worst = std::time::Duration::ZERO;
+        for frame in 0..120 {
+            let start = std::time::Instant::now();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(392.0, 420.0))), ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let input = ListIn { list: &list, types: &TypeList::default(), file_id: 1, frame: 0,
+                        sort: Sort::default(), write: Ok(()), scroll_to: None, picked: Some(1),
+                        selection: &crate::comment_selection::CommentSelection::default(), live_markers: None, first: 0, last: 100 };
+                    let out = show(ui, input, &mut order, &mut edit);
+                    assert!((2..12).contains(&out.rows.len()), "visible rows: {}", out.rows.len());
+                    assert!(out.rows[0].1.height() > ROW_H);
+                });
+            });
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+            if frame > 0 {
+                worst = worst.max(start.elapsed());
+            }
+        }
+        assert_eq!(order.builds, 1);
+        assert!(order.heights.measured.len() < 12);
+        eprintln!("COMMENTS 20,000 rows, 119 steady frames, max {:.3} ms", worst.as_secs_f64() * 1000.0);
     }
 
     #[test]

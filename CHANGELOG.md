@@ -1,5 +1,9 @@
 # 변경 사항
 
+## v0.78.1 — 2026-11-26
+
+- Wrap Comment text and marker names in the COMMENTS panel. Grow each visible row to fit.
+
 ## v0.78.0 — 2026-11-24
 
 - Save new `.takm` files as standard USTAR archives. Read layout 1 and layout 2.
