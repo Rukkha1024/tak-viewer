@@ -1,21 +1,21 @@
 # Devices grid
 
-Standalone arrangement contract; numeric processing → [device-filter.md](device-filter.md). Approved Figma `ihdCliNxdtoMucIjjcjR3w`, page `111:184`, frame `378:882`, card `378:885`; synchronization paused, reference read-only.
+Standalone arrangement contract; numeric processing → [device-filter.md](device-filter.md). Approved Figma `ihdCliNxdtoMucIjjcjR3w`, page `111:184`, frame `378:882`, card `378:885`. Synchronization is paused for this approved frame. Keep it read-only.
 
 ## Placement
 
-- Devices offers square grids 1×1 through4×4, foldable device/channel list and saved presets. Drag only; cell click always seeks. Painted six-dot grips, grab cursor and pointer ghost identify drag sources. Empty cells get accent dashes; every receiving cell gets15% accent fill. Occupied target previews `Replace: <name>`. Cell-chip drop swaps occupied cells or moves into empty cells. Dim × stays visible at chip end, brighter on hover.
+- Devices offers square grids 1×1 through4×4, foldable device/channel list and saved presets. Place cells by dragging a device/channel name or a cell chip. Graph click and drag seek. Painted six-dot grips, grab cursor and pointer ghost identify drag sources. Empty cells get accent dashes; every receiving cell gets15% accent fill. Occupied target previews `Replace: <name>`. Cell-chip drop swaps occupied cells or moves into empty cells. Dim × stays visible at chip end, brighter on hover.
 - Drop whole plate → Fx/Fy/Fz; plate channel → selected lane only; other analog channel → single signal. Whole analog device replaces target, then fills later empty cells in channel order, preserving other occupied cells.
 - Resize keeps reading-order cells within new cap, discards overflow. Plate-row 3D toggles floating plate; scene plate click still works. Plate-cell hover shows current Fz and max |Fz| from prepared data.
-- Cell click/drag seeks; wheel zooms; middle drag pans; double-click restores full range. Empty cell says Drop here; unresolved saved identity says Not in this file.
+- Start on the graph to click/drag and seek; wheel zooms; middle drag pans; double-click restores full range. Empty cell says Drop here; unresolved saved identity says Not in this file.
 - Arrangement belongs to each open view/file; file replacement resets it. Grid size/place/replace/swap/move/clear/Fill grid/preset load and manual list fold use app undo/redo, per view. One gesture = one action; status confirms cell change with Ctrl+Z hint. Automatic initialization/folding adds no action. Only changed cells rebuild; unchanged graph state survives resize/place/preset load.
 - Analog-row `Fill grid` replaces arrangement with first16 channels in order; smallest square covering count, cap4×4 (8→3×3,16/20→4×4). One undo action.
-- List folds below620 px and unfolds above unless manually toggled in this view. Toolbar stays one line; narrow width sends items to ⋯. Save popover floats over grid with name, Save/Cancel, Enter/Esc; grid geometry unchanged.
+- List folds below 620 pt and unfolds above unless manually toggled in this view. Toolbar stays one line; narrow width sends items to ⋯. Save popover floats over grid with name, Save/Cancel, Enter/Esc; grid geometry unchanged.
 
 ## Saved layouts and defaults
 
 - + Save layout opens floating name field; Enter/Save commits, Esc/Cancel cancels. Same name updates preset; Saved layouts loads or deletes via ×.
-- app.ron stores name, rows/cols, device key + channel index or lane set. Old name-based channel cells still resolve by original file channel name; loading/saving upgrades resolvable legacy cells to index. Absent identities retained. No filter chains, file addresses or samples. Missing devices/channels retain saved identifiers for later files. Legacy Settings defaults to empty presets/names. Saving/updating/deleting preset = undoable App action (agent 정함).
+- app.ron stores name, rows/cols, device key + channel index or lane set. Old name-based channel cells still resolve by original file channel name; loading/saving upgrades resolvable legacy cells to index. Absent identities retained. No filter chains, file addresses or samples. Missing devices/channels retain saved identifiers for later files. Legacy Settings defaults to empty presets/names and keeps other preferences. Saving/updating/deleting preset = undoable App action (agent 정함).
 - Agent choice: on first display use newest preset fully resolvable in current file; empty preset valid. Otherwise fill plates first, then analog channels, maximum16; ≤4 cells→2×2, ≤9→3×3, otherwise4×4.
 - Each device chain affects every assigned cell and its floating plate graph; grid placement does not create separate processing state.
 

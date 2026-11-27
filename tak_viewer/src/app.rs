@@ -4244,7 +4244,7 @@ impl TakViewerApp {
 
         if let Some(e) = self.error.clone() {
             let mut open = true;
-            egui::Window::new("파일을 열 수 없어요").open(&mut open).collapsible(false).show(ctx, |ui| {
+            egui::Window::new("파일을 열 수 없어요").open(&mut open).order(egui::Order::Tooltip).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.screen_rect().center()).collapsible(false).show(ctx, |ui| {
                 ui.label(e);
             });
             if !open {
@@ -4371,7 +4371,7 @@ impl TakViewerApp {
         }
         if let Some(msg) = self.notice.clone() {
             let mut open = true;
-            egui::Window::new("Notice").id(egui::Id::new("알림")).open(&mut open).collapsible(false).default_width(460.0).show(ctx, |ui| {
+            egui::Window::new("Notice").id(egui::Id::new("알림")).open(&mut open).order(egui::Order::Tooltip).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.screen_rect().center()).collapsible(false).default_width(460.0).show(ctx, |ui| {
                 ui.label(msg);
             });
             if !open {
@@ -6169,6 +6169,24 @@ mod tests {
         let mut raw = egui::RawInput { screen_rect: Some(screen), focused: true, modifiers, events, ..Default::default() };
         eframe::App::raw_input_hook(app, ctx, &mut raw);
         let _ = ctx.run(raw, |ctx| app.frame(ctx));
+    }
+
+    #[test]
+    fn notice_draws_above_the_layout_tabs_in_the_middle_of_the_screen() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        run_frame(&ctx, &mut app, &[]);
+        app.notice = Some("test notice".into());
+        for _ in 0..3 {
+            run_frame(&ctx, &mut app, &[]);
+        }
+        let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("알림"));
+        let rect = ctx.memory(|m| m.area_rect(layer.id)).expect("notice window drawn");
+        assert!(ctx.memory(|m| m.areas().visible_layer_ids().contains(&layer)), "notice on the top layer");
+        assert!((rect.center().x - 800.0).abs() < 1.0 && (rect.center().y - 480.0).abs() < 1.0, "{rect:?}");
+        if let Some(strip) = dock::layout_strip_rect(&app.dock) {
+            assert!(!strip.intersects(rect), "strip {strip:?} notice {rect:?}");
+        }
     }
 
     #[test]

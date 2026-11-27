@@ -102,7 +102,7 @@ Exact modifiers required; focused text/popup/edit/held-M/capture priority → in
 | GRAPH red gap bar drag | Seek |
 | Tracks row click / Ctrl+click / Shift+click / Ctrl+Shift+click | Select / toggle / select through anchor / add anchor range. Keeps edit range |
 | Tracks row left-drag >4 pt horizontally | Pick edit range. Start right of names. Keeps selected rows and frame |
-| Tracks `Merge Keys Up` / `Merge Keys Down` | Move lower row into upper / upper into lower. Two rows, edit range or whole take. No shortcut |
+| Tracks (historical) | `Merge Keys Up` / `Merge Keys Down` moved the lower row into upper / upper into lower. Two rows, edit range or whole take. No shortcut. [Added](../CHANGELOG.md#L240), [removed](../CHANGELOG.md#L164) |
 | Tracks frame strip click/drag | Seek |
 | Lower band drag / blank click | Pick / clear range |
 | Green handles / `Working Range` `Start` and `End` numbers | Set playback bounds; Enter/blur commits valid frame, Esc cancels |

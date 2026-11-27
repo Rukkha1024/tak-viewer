@@ -345,3 +345,41 @@ fn same_label_and_empty_scope_do_not_create_history_and_invalid_edits_are_atomic
     assert_eq!(document.revision(), before.revision());
     assert!(!document.is_dirty());
 }
+
+#[test]
+fn unlabel_in_a_fully_labeled_file_uses_a_labeled_donor_and_round_trips() {
+    let (dir, mut document, streams) = fixture();
+    let before = document.snapshot();
+    assert!(before.tracks().all(|t| t.label.is_some()), "fixture has no unlabeled track");
+    let request = UnlabelRequest {
+        tracks: vec![A],
+        current_frame: 5,
+        scope: LabelScope::SelectedOrAll {
+            range: Some((3, 7)),
+        },
+        backward: true,
+        forward: true,
+        selection: EditSelection::default(),
+    };
+    let patch = LabelEditor::with_creation_streams(&streams)
+        .unlabel(&before, &request)
+        .unwrap()
+        .unwrap();
+    let created = displacements(&patch).clone();
+    assert_eq!(created.label, None);
+    assert_eq!(created.name, "Unlabeled 1");
+    let node = &created.records.node;
+    assert!(node[node.len() - 20..].iter().all(|&b| b == 0), "parent 0 and slot 0");
+    let moved: Vec<_> = (3..=7).filter_map(|f| sample(&before, A, f)).collect();
+    assert!(!moved.is_empty());
+    assert_eq!(created.samples.as_ref(), moved.as_slice());
+    document.apply(&patch, true).unwrap();
+    let after = document.snapshot();
+    for frame in 3..=7 {
+        assert_eq!(sample(&after, A, frame), None);
+    }
+    assert_eq!(sample(&after, B, 5), sample(&before, B, 5));
+    save_and_reopen(&dir, &document, "unlabel-fully-labeled.takm");
+    document.apply(&patch, false).unwrap();
+    assert_state(&document.snapshot(), &before);
+}

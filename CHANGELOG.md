@@ -1,5 +1,10 @@
 # 변경 사항
 
+## v0.80.3 — 2026-11-27
+
+- Unlabel works in fully labeled files (no Unlabeled marker yet). New Unlabeled track copies any plain marker record; parent 0, slot 0.
+- Notice and `파일을 열 수 없어요` windows draw on the top layer, above layout tabs, and open in the middle of the screen.
+
 ## v0.80.2 — 2026-11-27
 
 - Public copy: WSL trash path test uses only neutral names. v0.80.0 and v0.80.1 stay local; this release publishes them.

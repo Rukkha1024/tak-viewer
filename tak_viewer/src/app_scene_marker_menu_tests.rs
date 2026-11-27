@@ -240,15 +240,14 @@ mod scene_marker_menu {
         hover(&ctx, &mut app, unlabel);
         click_at(&ctx, &mut app, unlabel);
         wait(&ctx, &mut app, |app| !app.marker_job_running(0));
-        assert_eq!(steps(&app, 0), (undo, 0));
-        assert!(app
-            .takm_note
-            .as_ref()
-            .unwrap()
-            .0
-            .contains("이름 없는 원본 마커"));
+        // Fully labeled file: Unlabel copies a labeled marker record (no Unlabeled donor needed).
+        assert_eq!(steps(&app, 0), (undo + 1, 0), "{:?}", app.takm_note);
+        assert!(snapshot(&app).tracks().any(|t| t.label.is_none()));
+        undo_key(&ctx, &mut app);
+        wait(&ctx, &mut app, |app| app.views[0].edit_refresh.is_none());
+        assert!(snapshot(&app).tracks().all(|t| t.label.is_some()));
 
-        // Keep both named points at frame 5, and create a writable Unlabeled donor at frame 3.
+        // Keep both named points at frame 5, and create an Unlabeled point at frame 3.
         app.views[0].set_range(3, 3);
         app.assign_label_to_point(&ctx, 0, B, KEY_A);
         wait(&ctx, &mut app, |app| !app.marker_job_running(0));

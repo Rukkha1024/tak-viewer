@@ -63,7 +63,7 @@ Dump geometry = stored float values, coordinate unit unverified. Nonfinite vecto
 | `xyz` | Optional. `coordinate_units` note, `trajectories[]` with `name`, `uid_hex`, `kind`, nullable `parent_uid_hex` and signed `slot`, `samples[]` |
 | XYZ sample | `frame`, `present`, `xyz_mm` ([x,y,z] rounded to 0.01 mm, null when absent, null components for nonfinite values). Coordinate unit unverified |
 
-Coverage denominator = recorded template trajectories in that file. Empty template set gives present 0 and complete frames 0. Extra includes `skeleton_extra` and `other_parent`. Progress 1 = Recorded, 4 = Labeled, other values = Unknown. Static files can already contain labels at Progress 1. Analog samples per frame = 1 for scalar or verified device sampling for packed channels. Unverified packed sampling → null.
+Coverage denominator = recorded template trajectories in that file. Empty template set gives present 0 and complete frames 0. Extra includes `skeleton_extra` and `other_parent`. Summary Progress mapping: 1 = Recorded, 4 = Labeled, other values = Unknown. Explorer's six-state menu applies to viewer rows. Static files can already contain labels at Progress 1. Analog samples per frame = 1 for scalar or verified device sampling for packed channels. Unverified packed sampling → null.
 
 XYZ order = requested names, source trajectory order within each name, ascending unique frames. A frame list applies to XYZ only. A frame range also drives window coverage and gap search. Missing name, out-of-range frame or cap refusal → exit 2.
 

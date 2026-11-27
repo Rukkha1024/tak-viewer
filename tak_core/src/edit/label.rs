@@ -1108,8 +1108,15 @@ impl<'a> LabelEditor<'a> {
             .iter()
             .filter_map(|uid| input.track(uid))
             .find(|t| t.label.is_none() && strict_track(t).is_ok())
+            .or_else(|| {
+                input
+                    .track_order()
+                    .iter()
+                    .filter_map(|uid| input.track(uid))
+                    .find(|t| common_marker(t))
+            })
             .ok_or_else(|| {
-                other("같은 파일에 이름 없는 원본 마커가 없어 라벨을 해제할 수 없어요.")
+                other("같은 파일에 본뜰 마커 기록이 없어 라벨을 해제할 수 없어요.")
             })?;
         let mut used_names: HashSet<String> = input.tracks().map(|t| t.name.clone()).collect();
         let mut pending = HashSet::new();
@@ -1752,7 +1759,7 @@ mod tests {
             .is_some());
     }
     #[test]
-    fn creation_rejects_unverified_or_mismatched_source_and_no_unlabeled_template() {
+    fn creation_rejects_unverified_or_mismatched_source_and_unlabel_uses_labeled_template() {
         let (d, mut n, c) = fixture();
         let s = d.snapshot();
         n.push(9);
@@ -1775,9 +1782,13 @@ mod tests {
             forward: true,
             selection: EditSelection::default(),
         };
-        assert!(LabelEditor::with_creation(&proof)
+        // No unlabeled track: the labeled marker record is the template.
+        let patch = LabelEditor::with_creation(&proof)
             .unlabel(&s, &req)
-            .is_err());
+            .unwrap()
+            .unwrap();
+        let created = patch.changes.iter().find(|c| c.before.is_none()).unwrap();
+        assert_eq!(created.after.as_ref().unwrap().label, None);
         assert_eq!(d.revision(), s.revision());
     }
     #[test]
