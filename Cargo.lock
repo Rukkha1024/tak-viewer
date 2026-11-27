@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "tak_core"
-version = "0.80.3"
+version = "0.80.4"
 dependencies = [
  "flate2",
  "memchr",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "tak_viewer"
-version = "0.80.3"
+version = "0.80.4"
 dependencies = [
  "ab_glyph",
  "eframe",

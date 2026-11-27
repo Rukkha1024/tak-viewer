@@ -1266,6 +1266,10 @@ impl TakViewerApp {
                         }
                     }
                     Ok(SaveMessage::Done(Err(SaveFailure::Other(reason)))) => {
+                        // A failed save must not pass unnoticed in the status bar: also open Notice.
+                        if reason != "저장을 취소했어요." {
+                            self.notice = Some(format!("저장하지 못했어요. 편집 내용은 아직 남아 있어요.\n{reason}"));
+                        }
                         self.takm_note = Some((format!("Save · {reason}"), ctx.input(|i| i.time)));
                         if let Some(prompt) = self.dirty_prompt.as_mut().filter(|prompt| prompt.slot == slot) {
                             prompt.saving = false;
@@ -2750,6 +2754,36 @@ mod integration_tests {
         assert_eq!(app.layout_tabs.active_id(), Some(original));
     }
 
+    /// Real viewer path: unlabel then Ctrl+S, then unlabel and Save in the close prompt.
+    /// Run with TAK_LOCAL_SAVE_PROBE set to a scratch TAKM copy (for example one on Z:).
+    #[test]
+    fn local_unlabel_ctrl_s_and_close_prompt_save_reach_disk() {
+        let Some(path) = std::env::var_os("TAK_LOCAL_SAVE_PROBE").map(PathBuf::from) else { return };
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        app.open_in(&ctx, 0, path.clone());
+        wait_for(&ctx, &mut app, |app| app.views[0].data.is_some() && !app.views[0].analog_work_pending());
+        for round in 0..2 {
+            let before = FileVersion::capture(&path).unwrap();
+            app.active = 0;
+            app.ssh_probe_unlabel(&ctx).unwrap();
+            wait_for(&ctx, &mut app, settled);
+            assert!(app.views[0].marker_dirty(), "unlabel did nothing: {:?}", app.takm_note);
+            if round == 0 {
+                app.save_markers(&ctx, 0, false, false);
+            } else {
+                app.close_view(0);
+                assert!(app.dirty_prompt.is_some());
+                app.save_markers(&ctx, 0, false, true);
+            }
+            wait_for(&ctx, &mut app, |app| !app.marker_saving(0));
+            eprintln!("round {round} note: {:?}", app.takm_note);
+            assert_ne!(FileVersion::capture(&path).unwrap(), before, "round {round} save left the file unchanged: {:?}", app.takm_note);
+            if round == 0 { assert!(!app.views[0].marker_dirty(), "{:?}", app.takm_note); }
+            else { assert!(app.views[0].data.is_none(), "close after save: {:?}", app.takm_note); }
+        }
+    }
+
     #[test]
     fn saved_deferred_emg_error_reaches_closed_primary_and_overlay_aliases() {
         let ctx = egui::Context::default();
@@ -3910,6 +3944,8 @@ mod integration_tests {
         assert!(!app.marker_saving(0));
         assert!(!app.dirty_prompt.as_ref().unwrap().saving);
         assert!(app.takm_note.as_ref().unwrap().0.contains("test write failure"));
+        let notice = app.notice.as_deref().expect("a failed save opens Notice");
+        assert!(notice.starts_with("저장하지 못했어요.") && notice.contains("test write failure"), "{notice}");
     }
 
     #[test]

@@ -434,6 +434,19 @@ pub fn size_layout_strip(dock: &mut DockState<Pane>) {
     }
 }
 
+/// The pane whose dock tab egui is dragging (`ctx.dragged_id()`). Uses egui_dock 0.14's tab id
+/// inside `DockArea::id("panes")` (`show/leaf.rs`).
+pub fn dragged_pane(dock: &DockState<Pane>, id: egui::Id) -> Option<Pane> {
+    let root = egui::Id::new("panes");
+    dock.iter_surfaces().enumerate().find_map(|(s, surface)| {
+        surface.node_tree()?.iter().enumerate().find_map(|(n, node)| {
+            node.tabs()?.iter().enumerate().find_map(|(t, tab)| {
+                (root.with((SurfaceIndex(s), "surface")).with((NodeIndex(n), "node")).with((t, "tab")) == id).then_some(*tab)
+            })
+        })
+    })
+}
+
 /// Screen rectangle for the strip. `None` until the dock has been drawn at least once.
 pub fn layout_strip_rect(dock: &DockState<Pane>) -> Option<Rect> {
     let (surface, node, _) = dock.find_tab(&Pane::LayoutTabs)?;

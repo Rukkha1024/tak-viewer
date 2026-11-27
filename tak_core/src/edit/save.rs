@@ -339,6 +339,12 @@ fn guard_digest(path: &Path) -> Result<Option<[u8;32]>, EditError> {
         Err(e) => Err(error(e)),
     }
 }
+/// Plain Korean for a failed final replace; the system text stays at the end for support.
+fn replace_error(e: std::io::Error) -> EditError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        error(format!("새 내용으로 파일을 바꾸지 못했어요. 다른 프로그램이 이 파일을 쓰고 있거나 이 폴더에 쓸 수 없어요. 파일은 그대로예요. ({e})"))
+    } else { error(format!("새 내용으로 파일을 바꾸지 못했어요. 파일은 그대로예요. ({e})")) }
+}
 struct Temp(PathBuf);
 impl Drop for Temp { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
 fn backup_destination(source: &Path, path: PathBuf) -> Result<Temp, EditError> {
@@ -410,6 +416,9 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
     let fixed_len = written?;
     inject("after_write")?;
     data.validate(&tmp.0, &request.snapshot)?;
+    // Close the source handle before replacing. A Windows network or WSL drive (Z:) refuses to
+    // replace a file that this process still has open ("액세스가 거부되었습니다", os error 5).
+    drop(data);
     inject("after_validate")?;
     if guard_digest(&source_path)? != source_before || guard_digest(&destination)? != dest_before { return Err(conflict()); }
     check_version(&source_path, &request.expected_source)?;
@@ -427,7 +436,7 @@ fn save_inner(request: SaveRequest, mut inject: impl FnMut(&str) -> Result<(), E
     inject("before_replace")?;
     if let Some(old) = &backup {
         if guard_digest(&old.0)? != dest_before || guard_digest(&destination)? != dest_before { return Err(conflict()); }
-        std::fs::rename(&tmp.0, &destination).map_err(error)?;
+        std::fs::rename(&tmp.0, &destination).map_err(replace_error)?;
     } else {
         // Atomic create-if-absent; never use a replacing rename for a new destination.
         takm::place_new(&tmp.0, &destination).map_err(error)?;
@@ -749,6 +758,44 @@ mod tests {
             assert_eq!(std::fs::read(&out).unwrap(), prior, "{stage}");
             assert!(!std::fs::read_dir(&f.dir).unwrap().any(|x| x.unwrap().file_name().to_string_lossy().contains(".tmp.takm")));
         }
+    }
+
+    /// True when this process still has `path` open. A Windows WSL drive (Z:) refuses to
+    /// replace such a file with "액세스가 거부되었습니다. (os error 5)" (v0.80.3 Ctrl+S bug).
+    fn open_in_this_process(path: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Share mode 0 fails with a sharing violation while any other handle is open.
+            OpenOptions::new().read(true).share_mode(0).open(path).is_err()
+        }
+        #[cfg(unix)]
+        {
+            let target = std::fs::canonicalize(path).unwrap();
+            std::fs::read_dir("/proc/self/fd").unwrap().flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == target))
+        }
+    }
+
+    #[test]
+    fn in_place_save_closes_the_destination_before_replacing_it() {
+        let mut f = Fixture::new("closed_before_replace");
+        let (out, first) = saved(&mut f);
+        f.edit(2.0);
+        let req = SaveRequest { snapshot: f.doc.snapshot(), source: out.clone(), destination: out.clone(),
+            expected_source: first.version.clone(), expected_destination: first.version };
+        let mut open_at_replace = None;
+        save_inner(req, |stage| {
+            if stage == "before_replace" { open_at_replace = Some(open_in_this_process(&out)); }
+            Ok(())
+        }).unwrap();
+        assert_eq!(open_at_replace, Some(false), "the old file must be closed before it is replaced");
+    }
+
+    #[test]
+    fn denied_replace_explains_in_plain_korean() {
+        let EditError::Other(text) = replace_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) else { panic!() };
+        assert!(text.starts_with("새 내용으로 파일을 바꾸지 못했어요. 다른 프로그램이"), "{text}");
     }
 
     #[test]

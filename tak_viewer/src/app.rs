@@ -481,6 +481,8 @@ pub struct TakViewerApp {
     next_file_id: usize,
     /// Tab that had the dock focus last frame: a click on a view's tab makes it active.
     focused_tab: Option<Pane>,
+    /// Dock tab (pane) being dragged right now; read when it is let go over the layout tab row.
+    dock_drag: Option<Pane>,
     /// An Explorer file let go over a 3D view this frame: (view, where in it, file).
     file_drop: Option<(usize, dock::DropZone, PathBuf)>,
     desktop_hover: crate::desktop_drop::Hover,
@@ -745,6 +747,7 @@ impl TakViewerApp {
             active: 0,
             next_file_id: 0,
             focused_tab: None,
+            dock_drag: None,
             file_drop: None,
             desktop_hover: Default::default(),
             title_shown: String::new(),
@@ -1244,6 +1247,40 @@ impl TakViewerApp {
             if let Some(spot) = self.views[slot].spot() {
                 views::remember(&mut self.settings.file_memory, spot);
             }
+        }
+    }
+
+    /// A 3D view dragged onto the layout tab row: a new tab with just that view (same loaded file,
+    /// frame and camera), and the view leaves its first tab. A tab's only view already is a
+    /// one-view tab and stays. Two undo steps: the first puts the view back, the second removes
+    /// the new tab.
+    fn move_view_to_new_tab(&mut self, ctx: &egui::Context, slot: usize) {
+        if self.dirty_prompt.is_some() || !self.open_views().contains(&slot) || self.open_views().len() < 2 { return; }
+        let Some(first) = self.layout_tabs.active_id() else { return };
+        let Some(path) = self.views[slot].target().map(Path::to_path_buf) else {
+            self.notice = Some("파일을 읽는 중이라 새 탭으로 옮길 수 없어요. 다 읽은 뒤 다시 해 주세요.".into());
+            return;
+        };
+        self.remember(slot);
+        let (frame, cam, range) = (self.views[slot].pb.frame, self.views[slot].cam.clone(), self.views[slot].range);
+        let overlay = self.views[slot].overlay_path().map(Path::to_path_buf);
+        self.explorer_action(ctx, WsAction::OpenNewTab(path.clone()));
+        let Some(second) = self.layout_tabs.active_id().filter(|&id| id != first) else { return };
+        let k = self.active;
+        if self.views[k].target() == Some(path.as_path()) && self.views[k].data.is_some() {
+            self.views[k].pb.set_frame(frame, ctx.input(|i| i.time));
+            self.views[k].cam = cam;
+            self.views[k].range = range;
+        }
+        if let Some(overlay) = overlay { self.overlay_on(ctx, overlay); }
+        self.observe(false);
+        // Close the original view in its own tab. The file stays open in the new tab, so no
+        // save question appears and the loaded data is shared.
+        if self.switch_layout_tab_internal(first) {
+            self.observe(false);
+            self.close_view(slot);
+            self.observe(true);
+            if self.switch_layout_tab_internal(second) { self.observe(false); }
         }
     }
 
@@ -4125,6 +4162,14 @@ impl TakViewerApp {
             }
         }
         let order = dock::views_reading_order(&self.dock).into_iter().map(usize::from).collect();
+        // A dock tab let go over the layout tab row (whole_layout_strip) is no dock move. Keep the
+        // layout as it was before egui_dock moves the pane, then a 3D view becomes its own tab.
+        if let Some(pane) = ctx.dragged_id().and_then(|id| dock::dragged_pane(&self.dock, id)) {
+            self.dock_drag = Some(pane);
+        }
+        let strip_drop = dock::layout_strip_rect(&self.dock).filter(|strip| ctx.input(|i| i.pointer.any_released()
+            && i.pointer.interact_pos().is_some_and(|p| strip.contains(p))));
+        let dock_before = strip_drop.and(self.dock_drag).map(|pane| (pane, self.dock.clone()));
         let mut dock_state = std::mem::replace(&mut self.dock, dock::scene_only(0));
         let style = dock::style(&ctx.style());
         let dock_enabled = self.dirty_prompt.is_none();
@@ -4149,6 +4194,12 @@ impl TakViewerApp {
         let ssh_actions = std::mem::take(&mut tabs.ssh_actions);
         self.dock = dock_state;
         self.dock_area = area;
+        let mut view_to_new_tab = None;
+        if let Some((pane, before)) = dock_before {
+            self.dock = before;
+            if let Pane::View(k) = pane { view_to_new_tab = Some(usize::from(k)); }
+        }
+        if !ctx.input(|i| i.pointer.any_down()) { self.dock_drag = None; }
         if let Some(rect) = dock::layout_strip_rect(&self.dock).filter(|_| self.capture.is_none()) {
             if let Some(regions) = &mut self.shot_regions {
                 regions.record("Layout Tabs", rect);
@@ -4184,6 +4235,9 @@ impl TakViewerApp {
         }
         if let Some(k) = closed_view {
             self.close_view(k);
+        }
+        if let Some(k) = view_to_new_tab {
+            self.move_view_to_new_tab(ctx, k);
         }
         if std::mem::take(&mut self.graph_to_panel) {
             self.set_graph_float(false);
@@ -6356,6 +6410,83 @@ mod tests {
         frame_with(ctx, &mut app, vec![]);
         frame_with(ctx, &mut app, vec![]);
         app
+    }
+
+    #[test]
+    fn a_view_dragged_onto_the_layout_tab_row_becomes_its_own_new_tab() {
+        let ctx = egui::Context::default();
+        let mut app = two_views(&ctx);
+        let first = app.layout_tabs.active_id().unwrap();
+        let tabs_before = app.layout_tabs.tabs().len();
+        app.views[1].pb.set_frame(6, 0.0);
+        let data = app.views[1].data.clone().unwrap();
+        let tab = view_tab(&ctx, &app, 1);
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let name = text_rects(&out, "b.tak").into_iter().find(|t| tab.contains(t.center())).expect("name tag painted");
+        let strip = dock::layout_strip_rect(&app.dock).expect("the tab row is drawn");
+        drag(&ctx, &mut app, name.center(), strip.center());
+        frame_with(&ctx, &mut app, vec![]);
+        frame_with(&ctx, &mut app, vec![]);
+        assert_eq!(app.layout_tabs.tabs().len(), tabs_before + 1, "a new layout tab");
+        let second = app.layout_tabs.active_id().unwrap();
+        assert_ne!(second, first, "the new tab is shown");
+        assert_eq!(app.open_views().len(), 1, "the new tab holds just that one view");
+        let k = app.open_views()[0];
+        assert_eq!(app.views[k].target(), Some(Path::new("b.tak")));
+        assert!(std::sync::Arc::ptr_eq(&data, app.views[k].data.as_ref().unwrap()), "same loaded file, no reread");
+        assert_eq!(app.views[k].pb.frame, 6, "the view keeps its frame");
+        // v0.80.3 put the view into the tab row's own place as a second tab, 0 px high (gone).
+        let (s, n, _) = app.dock.find_tab(&Pane::LayoutTabs).unwrap();
+        assert_eq!(app.dock[s][n].tabs().unwrap(), &[Pane::LayoutTabs], "the tab row holds no view");
+        assert!(dock::layout_strip_rect(&app.dock).is_some_and(|r| r.height() < dock::TAB_H * 2.0), "the tab row keeps one row");
+        let hidden = app.layout_tabs.tab(first).unwrap().layout.as_ref().unwrap();
+        assert_eq!(hidden.views.iter().filter_map(View::target).collect::<Vec<_>>(), vec![Path::new("a.tak")], "the view moved out of the first tab");
+        // Nothing is lost: undo puts the view back in the first tab, then removes the new tab.
+        app.undo_redo(&ctx, false);
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(dock::views(&app.dock), vec![0, 1], "the view is back in its first tab");
+        assert_eq!(app.views[1].target(), Some(Path::new("b.tak")));
+        app.undo_redo(&ctx, false);
+        assert!(app.layout_tabs.tab(second).is_none(), "the second undo removes the new tab");
+        assert_eq!(app.layout_tabs.active_id(), Some(first));
+        assert_eq!(dock::views(&app.dock), vec![0, 1]);
+        assert!(std::sync::Arc::ptr_eq(&data, app.views[1].data.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn a_tab_s_only_view_or_a_side_panel_dropped_on_the_tab_row_stays_where_it_was() {
+        let ctx = egui::Context::default();
+        let mut app = TakViewerApp::build(&ctx, None, vec![], None, None);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.views[0].show(views::sample_data("a.tak", &["M"]), rx, 10, 1.0, 0.0);
+        frame_with(&ctx, &mut app, vec![]);
+        frame_with(&ctx, &mut app, vec![]);
+        let tabs_before = app.layout_tabs.tabs().len();
+        let layout = dock::editor_layout(&app.dock);
+        let tab = view_tab_response(&ctx, &app, 0).rect;
+        let out = frame_with(&ctx, &mut app, vec![]);
+        let name = text_rects(&out, "a.tak").into_iter().find(|t| tab.contains(t.center())).expect("name tag painted");
+        let strip = dock::layout_strip_rect(&app.dock).unwrap();
+        drag(&ctx, &mut app, name.center(), strip.center());
+        frame_with(&ctx, &mut app, vec![]);
+        assert_eq!(app.layout_tabs.tabs().len(), tabs_before, "it already is a one-view tab");
+        assert_eq!(app.open_views(), vec![0]);
+        assert!(dock::has(&app.dock, Pane::View(0)));
+        assert_eq!(dock::editor_layout(&app.dock), layout);
+        let (s, n, _) = app.dock.find_tab(&Pane::LayoutTabs).unwrap();
+        assert_eq!(app.dock[s][n].tabs().unwrap(), &[Pane::LayoutTabs]);
+        assert!(dock::layout_strip_rect(&app.dock).is_some_and(|r| r.height() < dock::TAB_H * 2.0));
+        // A side panel (Labeling) let go over the tab row also stays in its place.
+        let (s, n, t) = app.dock.find_tab(&Pane::Labeling).expect("Labeling is docked");
+        let id = egui::Id::new("panes").with((s, "surface")).with((n, "node")).with((t.0, "tab"));
+        let labeling = ctx.read_response(id).expect("the Labeling tab was drawn").rect;
+        let before = app.dock.find_tab(&Pane::Labeling);
+        drag(&ctx, &mut app, labeling.center(), strip.center());
+        frame_with(&ctx, &mut app, vec![]);
+        assert_eq!(app.dock.find_tab(&Pane::Labeling), before);
+        assert_eq!(app.layout_tabs.tabs().len(), tabs_before);
+        let (s, n, _) = app.dock.find_tab(&Pane::LayoutTabs).unwrap();
+        assert_eq!(app.dock[s][n].tabs().unwrap(), &[Pane::LayoutTabs]);
     }
 
     #[test]

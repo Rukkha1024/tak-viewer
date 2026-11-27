@@ -1,5 +1,11 @@
 # 변경 사항
 
+## v0.80.4 — 2026-11-27
+
+- Ctrl+S and Save in the close question work again on the WSL drive (`Z:`). Save closes the old file before it puts the new one in its place.
+- A failed save opens a Notice: `저장하지 못했어요. 편집 내용은 아직 남아 있어요.` with the reason in plain Korean.
+- Drag a 3D view's tab up onto the top tab row: a new tab opens with just that view. The view no longer disappears. Same file, frame and camera; no reread. A tab's only view and other panels stay where they were.
+
 ## v0.80.3 — 2026-11-27
 
 - Unlabel works in fully labeled files (no Unlabeled marker yet). New Unlabeled track copies any plain marker record; parent 0, slot 0.
